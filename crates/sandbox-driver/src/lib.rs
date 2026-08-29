@@ -83,8 +83,8 @@ pub use id::{CheckpointId, InvalidIdError, ProviderKind, SandboxId, SnapshotId, 
 pub use logs::{LogSink, LogSource, Logs};
 pub use probe::{BASH_PROBE_SCRIPT, ProbeFailure, activate, run_bash_probe};
 pub use provider::{
-    SandboxFilter, SandboxProvider, SnapshotFilter, SnapshotService, SnapshotSource, SnapshotSpec,
-    SnapshotState, SnapshotStatus, VolumeService, VolumeSpec, VolumeState, VolumeStatus,
+    SandboxFilter, SandboxProvider, SnapshotFilter, SnapshotProvider, SnapshotSource, SnapshotSpec,
+    SnapshotState, SnapshotStatus, VolumeProvider, VolumeSpec, VolumeState, VolumeStatus,
 };
 pub use pty::{Pty, PtyOptions, PtySession, PtySize};
 pub use sandbox::{

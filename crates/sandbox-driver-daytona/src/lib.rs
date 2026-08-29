@@ -38,8 +38,8 @@ use sandbox_driver::{
     Isolation, LifecycleAction, LifecycleTimers, NetworkPolicy, PlatformInfo, PreviewUrls,
     ProviderError, ProviderKind, ResourceKind, Resources, Result, Sandbox, SandboxEvent,
     SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec, SandboxState,
-    SandboxStatus, SnapshotCaps, SnapshotFilter, SnapshotId, SnapshotService, SnapshotSource,
-    SnapshotSpec, SnapshotState, SnapshotStatus, SshAccess, VolumeCaps, VolumeId, VolumeService,
+    SandboxStatus, SnapshotCaps, SnapshotFilter, SnapshotId, SnapshotProvider, SnapshotSource,
+    SnapshotSpec, SnapshotState, SnapshotStatus, SshAccess, VolumeCaps, VolumeId, VolumeProvider,
     VolumeSpec, VolumeState, VolumeStatus,
 };
 
@@ -486,11 +486,11 @@ impl SandboxProvider for DaytonaProvider {
         page.items.iter().map(status_from_sdk).collect()
     }
 
-    fn snapshots(&self) -> Option<&dyn SnapshotService> {
+    fn snapshots(&self) -> Option<&dyn SnapshotProvider> {
         Some(&self.snapshots)
     }
 
-    fn volumes(&self) -> Option<&dyn VolumeService> {
+    fn volumes(&self) -> Option<&dyn VolumeProvider> {
         Some(&self.volumes)
     }
 }
@@ -727,7 +727,7 @@ struct DaytonaSnapshots {
 }
 
 #[async_trait]
-impl SnapshotService for DaytonaSnapshots {
+impl SnapshotProvider for DaytonaSnapshots {
     async fn create(&self, spec: &SnapshotSpec) -> Result<SnapshotId> {
         let image = match &spec.source {
             SnapshotSource::Image { reference } => ImageSource::Name(reference.clone()),
@@ -847,7 +847,7 @@ struct DaytonaVolumes {
 }
 
 #[async_trait]
-impl VolumeService for DaytonaVolumes {
+impl VolumeProvider for DaytonaVolumes {
     async fn create(&self, spec: &VolumeSpec) -> Result<VolumeId> {
         // Daytona volumes are elastic; a requested size is ignored.
         let dto = self

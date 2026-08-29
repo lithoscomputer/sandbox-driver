@@ -14,8 +14,8 @@ use sandbox_driver::{
     Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, FileMetadata, Filesystem,
     ForkOptions, LifecycleTimers, NetworkPolicy, OutputSink, PlatformInfo, PreviewUrl, PreviewUrls,
     ProviderKind, Resources, Result, Sandbox, SandboxFilter, SandboxId, SandboxSnapshotOptions,
-    SandboxSpec, SandboxStatus, SnapshotFilter, SnapshotId, SnapshotService, SnapshotSpec,
-    SnapshotStatus, SpawnSpec, SshAccess, SshAccessInfo, StdioProcess, VolumeId, VolumeService,
+    SandboxSpec, SandboxStatus, SnapshotFilter, SnapshotId, SnapshotProvider, SnapshotSpec,
+    SnapshotStatus, SpawnSpec, SshAccess, SshAccessInfo, StdioProcess, VolumeId, VolumeProvider,
     VolumeSpec, VolumeStatus,
 };
 use serde::Serialize;
@@ -209,16 +209,16 @@ impl sandbox_driver::SandboxProvider for PluginProvider {
         Ok(result.sandboxes)
     }
 
-    fn snapshots(&self) -> Option<&dyn SnapshotService> {
+    fn snapshots(&self) -> Option<&dyn SnapshotProvider> {
         self.snapshots
             .as_ref()
-            .map(|service| service as &dyn SnapshotService)
+            .map(|service| service as &dyn SnapshotProvider)
     }
 
-    fn volumes(&self) -> Option<&dyn VolumeService> {
+    fn volumes(&self) -> Option<&dyn VolumeProvider> {
         self.volumes
             .as_ref()
-            .map(|service| service as &dyn VolumeService)
+            .map(|service| service as &dyn VolumeProvider)
     }
 }
 
@@ -228,7 +228,7 @@ struct ProviderSnapshots {
 }
 
 #[async_trait]
-impl SnapshotService for ProviderSnapshots {
+impl SnapshotProvider for ProviderSnapshots {
     async fn create(&self, spec: &SnapshotSpec) -> Result<SnapshotId> {
         let result: m::SnapshotIdResult = self
             .client
@@ -277,7 +277,7 @@ struct ProviderVolumes {
 }
 
 #[async_trait]
-impl VolumeService for ProviderVolumes {
+impl VolumeProvider for ProviderVolumes {
     async fn create(&self, spec: &VolumeSpec) -> Result<VolumeId> {
         let result: m::VolumeIdResult = self
             .client

@@ -47,12 +47,12 @@ pub trait SandboxProvider: Send + Sync {
     async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>>;
 
     /// Snapshot management, when the provider has it.
-    fn snapshots(&self) -> Option<&dyn SnapshotService> {
+    fn snapshots(&self) -> Option<&dyn SnapshotProvider> {
         None
     }
 
     /// Volume management, when the provider has it.
-    fn volumes(&self) -> Option<&dyn VolumeService> {
+    fn volumes(&self) -> Option<&dyn VolumeProvider> {
         None
     }
 }
@@ -67,9 +67,9 @@ pub struct SandboxFilter {
 
 /// Snapshot management for one provider.
 #[async_trait]
-pub trait SnapshotService: Send + Sync {
-    /// Starts creating a snapshot; poll [`SnapshotService::get`] or follow
-    /// [`SnapshotService::build_logs`] for progress.
+pub trait SnapshotProvider: Send + Sync {
+    /// Starts creating a snapshot; poll [`SnapshotProvider::get`] or follow
+    /// [`SnapshotProvider::build_logs`] for progress.
     async fn create(&self, spec: &SnapshotSpec) -> Result<SnapshotId>;
 
     async fn get(&self, id: &SnapshotId) -> Result<SnapshotStatus>;
@@ -105,7 +105,7 @@ pub enum SnapshotSource {
     },
 }
 
-/// Creation request for [`SnapshotService::create`].
+/// Creation request for [`SnapshotProvider::create`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct SnapshotSpec {
@@ -166,7 +166,7 @@ impl SnapshotStatus {
     }
 }
 
-/// Filter for [`SnapshotService::list`].
+/// Filter for [`SnapshotProvider::list`].
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct SnapshotFilter {
@@ -176,7 +176,7 @@ pub struct SnapshotFilter {
 /// Volume management for one provider. Volumes attach to sandboxes at
 /// create time only, via [`crate::VolumeMount`].
 #[async_trait]
-pub trait VolumeService: Send + Sync {
+pub trait VolumeProvider: Send + Sync {
     async fn create(&self, spec: &VolumeSpec) -> Result<VolumeId>;
 
     async fn get(&self, id: &VolumeId) -> Result<VolumeStatus>;
@@ -187,7 +187,7 @@ pub trait VolumeService: Send + Sync {
     async fn delete(&self, id: &VolumeId) -> Result<()>;
 }
 
-/// Creation request for [`VolumeService::create`].
+/// Creation request for [`VolumeProvider::create`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct VolumeSpec {
