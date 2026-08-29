@@ -104,12 +104,12 @@ impl PluginProvider {
             .as_ref()
             .and_then(|slot| slot.lock().expect("child lock").take());
         if let Some(mut child) = child {
-            match time::timeout(Duration::from_secs(5), child.wait()).await {
-                Ok(_) => {}
-                Err(_) => {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                }
+            if time::timeout(Duration::from_secs(5), child.wait())
+                .await
+                .is_err()
+            {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
             }
         }
         Ok(())

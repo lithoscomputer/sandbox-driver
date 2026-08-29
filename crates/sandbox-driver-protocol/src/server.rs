@@ -15,7 +15,7 @@ use sandbox_driver::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, stdin, stdout};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -36,7 +36,7 @@ use crate::wire::{
 ///
 /// Stdout belongs to the protocol; a plugin must log to stderr only.
 pub async fn serve_stdio(provider: Arc<dyn SandboxProvider>) -> Result<()> {
-    serve(provider, tokio::io::stdin(), tokio::io::stdout()).await
+    serve(provider, stdin(), stdout()).await
 }
 
 /// Serves `provider` over the byte streams until EOF or `shutdown`.
