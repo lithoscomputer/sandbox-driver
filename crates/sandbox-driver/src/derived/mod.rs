@@ -10,9 +10,11 @@
 //! let matches = search.grep("TODO", ".", &GrepOptions::default()).await?;
 //! ```
 
+mod fs;
 mod git;
 mod search;
 
+pub use fs::DerivedFs;
 pub use git::DerivedGit;
 pub use search::DerivedSearch;
 

@@ -68,7 +68,7 @@ pub use capabilities::{
     LogsCaps, NetworkCaps, PtyCaps, SearchCaps, SnapshotCaps, VolumeCaps,
 };
 pub use capture::OutputCaptureBuffer;
-pub use derived::{DerivedGit, DerivedSearch};
+pub use derived::{DerivedFs, DerivedGit, DerivedSearch};
 pub use error::{AuthError, Error, ExecFailure, ProviderError, ResourceKind, Result};
 pub use event::{ErrorReport, EventCallback, EventDispatcher, LifecycleAction, SandboxEvent};
 pub use exec::{

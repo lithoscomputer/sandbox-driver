@@ -1,0 +1,573 @@
+//! Docker container sandbox provider.
+//!
+//! Containers created from OCI images, with kernel-sharing container
+//! isolation (`Isolation::Container`). The Docker socket is
+//! host-root-equivalent, so this provider is host-trusted by definition.
+//!
+//! The container's data plane is the exec-derived [`DerivedFs`] — Docker
+//! has no file API worth preferring over exec — so `Capabilities::fs`
+//! reports `native: false`. Every image must provide `/bin/bash` (the
+//! Bash contract) and a Linux userland with `stat`, `find`, and `base64`.
+//!
+//! # Runtime behavior
+//!
+//! Async on Tokio; the caller owns the runtime. Spawned tasks: stream
+//! demux and stdin writers scoped to a running exec, and detached
+//! best-effort kill requests on cancellation. Docker itself is the
+//! sandbox registry — handles re-attach by container id across process
+//! restarts.
+
+mod exec;
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use bollard::Docker;
+use bollard::container::{
+    Config, CreateContainerOptions, InspectContainerOptions, ListContainersOptions,
+    RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
+};
+use bollard::image::CreateImageOptions;
+use bollard::models::{ContainerInspectResponse, ContainerStateStatusEnum, HostConfig};
+use futures_util::StreamExt;
+use sandbox_driver::{
+    Capabilities, DerivedFs, Error, ErrorReport, EventCallback, EventDispatcher, Exec, ExecSpec,
+    Filesystem, Isolation, LifecycleAction, NetworkPolicy, PlatformInfo, ProviderKind,
+    ResourceKind, Result, Sandbox, SandboxEvent, SandboxFilter, SandboxId, SandboxProvider,
+    SandboxSource, SandboxSpec, SandboxState, SandboxStatus,
+};
+
+pub use crate::exec::DockerExec;
+use crate::exec::{docker_error, is_not_found, tolerate_not_modified};
+
+const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
+const DEFAULT_WORKING_DIRECTORY: &str = "/workspace";
+
+/// The Docker provider. One per process, sharing one daemon connection.
+pub struct DockerProvider {
+    kind:         ProviderKind,
+    capabilities: Capabilities,
+    docker:       Docker,
+}
+
+impl DockerProvider {
+    /// Connects to the local Docker daemon and verifies it responds.
+    pub async fn connect() -> Result<Self> {
+        let docker = Docker::connect_with_local_defaults()
+            .map_err(|error| docker_error("connecting to the docker daemon", &error))?;
+        docker
+            .ping()
+            .await
+            .map_err(|error| docker_error("pinging the docker daemon", &error))?;
+        Ok(Self {
+            kind: ProviderKind::try_new("docker").expect("static kind is valid"),
+            capabilities: docker_capabilities(),
+            docker,
+        })
+    }
+
+    async fn ensure_image(
+        &self,
+        reference: &str,
+        dispatcher: Option<&EventDispatcher>,
+    ) -> Result<()> {
+        if self.docker.inspect_image(reference).await.is_ok() {
+            return Ok(());
+        }
+        if let Some(dispatcher) = dispatcher {
+            dispatcher
+                .emit(SandboxEvent::Progress {
+                    action:  LifecycleAction::Create,
+                    message: format!("pulling image {reference}"),
+                })
+                .await;
+        }
+        let options = CreateImageOptions {
+            from_image: reference.to_owned(),
+            ..Default::default()
+        };
+        let mut stream = self.docker.create_image(Some(options), None, None);
+        while let Some(progress) = stream.next().await {
+            progress.map_err(|error| docker_error("pulling image", &error))?;
+        }
+        Ok(())
+    }
+
+    async fn inspect(&self, container_id: &str) -> Result<ContainerInspectResponse> {
+        self.docker
+            .inspect_container(container_id, None::<InspectContainerOptions>)
+            .await
+            .map_err(|error| {
+                if is_not_found(&error) {
+                    Error::NotFound {
+                        resource: ResourceKind::Sandbox,
+                        id:       container_id.to_owned(),
+                    }
+                } else {
+                    docker_error("inspecting container", &error)
+                }
+            })
+    }
+
+    fn handle(
+        &self,
+        container_id: String,
+        working_dir: String,
+        labels: BTreeMap<String, String>,
+        env: BTreeMap<String, String>,
+        events: Option<EventCallback>,
+    ) -> Arc<DockerSandbox> {
+        let exec = Arc::new(DockerExec::new(
+            self.docker.clone(),
+            container_id.clone(),
+            working_dir.clone(),
+            env,
+        ));
+        let fs = DerivedFs::new(Arc::clone(&exec) as Arc<dyn Exec>);
+        Arc::new(DockerSandbox {
+            id: SandboxId::try_new(container_id).expect("container id is a valid sandbox id"),
+            capabilities: self.capabilities.clone(),
+            docker: self.docker.clone(),
+            working_dir,
+            labels,
+            exec,
+            fs,
+            dispatcher: events.map(EventDispatcher::new),
+        })
+    }
+}
+
+fn docker_capabilities() -> Capabilities {
+    let mut caps = Capabilities::minimal(Isolation::Container);
+    caps.lifecycle.pause = true;
+    caps.exec.live_streaming = true;
+    caps.exec.streams_separated = true;
+    caps.exec.stdin = true;
+    caps.exec.cancel = true;
+    caps.exec.stdio_process = true;
+    caps.fs.native = false;
+    caps.fs.upload = true;
+    caps.fs.download = true;
+    caps.fs.permissions = true;
+    caps.network.allow_all = true;
+    caps.network.block_all = true;
+    caps
+}
+
+fn map_state(inspect: &ContainerInspectResponse) -> SandboxState {
+    let Some(state) = &inspect.state else {
+        return SandboxState::Unknown;
+    };
+    if state.paused == Some(true) {
+        return SandboxState::Paused;
+    }
+    match state.status {
+        Some(ContainerStateStatusEnum::RUNNING) => SandboxState::Running,
+        Some(ContainerStateStatusEnum::CREATED | ContainerStateStatusEnum::EXITED) => {
+            SandboxState::Stopped
+        }
+        Some(ContainerStateStatusEnum::PAUSED) => SandboxState::Paused,
+        Some(ContainerStateStatusEnum::RESTARTING) => SandboxState::Starting,
+        Some(ContainerStateStatusEnum::REMOVING) => SandboxState::Deleting,
+        Some(ContainerStateStatusEnum::DEAD) => SandboxState::Error,
+        Some(ContainerStateStatusEnum::EMPTY) | None => SandboxState::Unknown,
+    }
+}
+
+fn status_from_inspect(id: SandboxId, inspect: &ContainerInspectResponse) -> SandboxStatus {
+    let mut status = SandboxStatus::new(id, map_state(inspect));
+    status.provider_state = inspect
+        .state
+        .as_ref()
+        .and_then(|state| state.status)
+        .map(|state| state.to_string())
+        .unwrap_or_default();
+    if let Some(config) = &inspect.config {
+        if let Some(labels) = &config.labels {
+            status.labels = labels
+                .iter()
+                .filter(|(key, _)| *key != MANAGED_LABEL)
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+        }
+        status.source.clone_from(&config.image);
+    }
+    status
+}
+
+fn network_mode(policy: &NetworkPolicy) -> Result<Option<String>> {
+    match policy {
+        NetworkPolicy::ProviderDefault => Ok(None),
+        NetworkPolicy::AllowAll => Ok(Some("bridge".to_owned())),
+        NetworkPolicy::Block => Ok(Some("none".to_owned())),
+        NetworkPolicy::CidrAllowList { .. } => Err(Error::invalid_spec(
+            "network",
+            "the docker provider does not support CIDR allow lists",
+        )),
+        NetworkPolicy::DomainAllowList { .. } => Err(Error::invalid_spec(
+            "network",
+            "the docker provider does not support domain allow lists",
+        )),
+        _ => Err(Error::invalid_spec("network", "unsupported network policy")),
+    }
+}
+
+#[async_trait]
+impl SandboxProvider for DockerProvider {
+    fn kind(&self) -> &ProviderKind {
+        &self.kind
+    }
+
+    fn capabilities(&self) -> &Capabilities {
+        &self.capabilities
+    }
+
+    async fn create(
+        &self,
+        spec: &SandboxSpec,
+        events: Option<EventCallback>,
+    ) -> Result<Arc<dyn Sandbox>> {
+        spec.validate()?;
+        let SandboxSource::Image { reference } = &spec.source else {
+            return Err(Error::invalid_spec(
+                "source",
+                "the docker provider supports SandboxSource::Image only",
+            ));
+        };
+        if !spec.volumes.is_empty() {
+            return Err(Error::invalid_spec(
+                "volumes",
+                "the docker provider does not support volumes yet",
+            ));
+        }
+        let network = network_mode(&spec.network)?;
+
+        let dispatcher = events.map(EventDispatcher::new);
+        if let Some(dispatcher) = &dispatcher {
+            dispatcher
+                .emit(SandboxEvent::ActionStarted {
+                    action: LifecycleAction::Create,
+                })
+                .await;
+        }
+        let started = Instant::now();
+        self.ensure_image(reference, dispatcher.as_ref()).await?;
+
+        let working_dir = spec
+            .working_directory
+            .clone()
+            .unwrap_or_else(|| DEFAULT_WORKING_DIRECTORY.to_owned());
+        let mut labels: HashMap<String, String> = spec
+            .labels
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        labels.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
+
+        let host_config = HostConfig {
+            network_mode: network,
+            memory: spec
+                .resources
+                .memory_mb
+                .and_then(|mb| i64::try_from(mb).ok())
+                .map(|mb| mb * 1024 * 1024),
+            cpu_quota: spec
+                .resources
+                .cpu_cores
+                .map(|cores| i64::from(cores) * 100_000),
+            ..Default::default()
+        };
+        let config = Config {
+            image: Some(reference.clone()),
+            cmd: Some(vec![
+                "/bin/bash".to_owned(),
+                "-c".to_owned(),
+                format!("mkdir -p '{working_dir}' && exec sleep infinity"),
+            ]),
+            working_dir: Some(working_dir.clone()),
+            env: Some(
+                spec.env
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect(),
+            ),
+            labels: Some(labels),
+            host_config: Some(host_config),
+            ..Default::default()
+        };
+        let options = spec.name.clone().map(|name| CreateContainerOptions {
+            name,
+            platform: None,
+        });
+        let created = self
+            .docker
+            .create_container(options, config)
+            .await
+            .map_err(|error| docker_error("creating container", &error))?;
+        self.docker
+            .start_container(&created.id, None::<StartContainerOptions<String>>)
+            .await
+            .map_err(|error| docker_error("starting container", &error))?;
+
+        let handle = self.handle(
+            created.id,
+            working_dir,
+            spec.labels.clone(),
+            spec.env.clone(),
+            None,
+        );
+        if let Some(dispatcher) = dispatcher {
+            dispatcher
+                .emit(SandboxEvent::ActionCompleted {
+                    action:   LifecycleAction::Create,
+                    duration: started.elapsed(),
+                })
+                .await;
+            // Hand the dispatcher to the sandbox for its later actions.
+            let handle = Arc::into_inner(handle)
+                .map(|mut sandbox| {
+                    sandbox.dispatcher = Some(dispatcher);
+                    Arc::new(sandbox)
+                })
+                .expect("handle has a single owner at creation");
+            return Ok(handle);
+        }
+        Ok(handle)
+    }
+
+    async fn attach(
+        &self,
+        id: &SandboxId,
+        events: Option<EventCallback>,
+    ) -> Result<Arc<dyn Sandbox>> {
+        let inspect = self.inspect(id.as_str()).await?;
+        let config = inspect.config.as_ref();
+        let labels = config.and_then(|config| config.labels.as_ref());
+        if labels
+            .and_then(|labels| labels.get(MANAGED_LABEL))
+            .map(String::as_str)
+            != Some("true")
+        {
+            return Err(Error::NotFound {
+                resource: ResourceKind::Sandbox,
+                id:       id.as_str().to_owned(),
+            });
+        }
+        let working_dir = config
+            .and_then(|config| config.working_dir.clone())
+            .unwrap_or_else(|| DEFAULT_WORKING_DIRECTORY.to_owned());
+        let user_labels: BTreeMap<String, String> = labels
+            .map(|labels| {
+                labels
+                    .iter()
+                    .filter(|(key, _)| *key != MANAGED_LABEL)
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(self.handle(
+            inspect.id.clone().unwrap_or_else(|| id.as_str().to_owned()),
+            working_dir,
+            user_labels,
+            BTreeMap::new(),
+            events,
+        ))
+    }
+
+    async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>> {
+        let mut label_filters = vec![format!("{MANAGED_LABEL}=true")];
+        for (key, value) in &filter.labels {
+            label_filters.push(format!("{key}={value}"));
+        }
+        let mut filters = HashMap::new();
+        filters.insert("label".to_owned(), label_filters);
+        let options = ListContainersOptions {
+            all: true,
+            filters,
+            ..Default::default()
+        };
+        let containers = self
+            .docker
+            .list_containers(Some(options))
+            .await
+            .map_err(|error| docker_error("listing containers", &error))?;
+        let mut statuses = Vec::new();
+        for container in containers {
+            let Some(id) = container.id else { continue };
+            if let Ok(inspect) = self.inspect(&id).await {
+                let sandbox_id = SandboxId::try_new(id)
+                    .map_err(|error| Error::invalid_spec("id", error.to_string()))?;
+                statuses.push(status_from_inspect(sandbox_id, &inspect));
+            }
+        }
+        Ok(statuses)
+    }
+}
+
+/// A container-backed sandbox.
+pub struct DockerSandbox {
+    id:           SandboxId,
+    capabilities: Capabilities,
+    docker:       Docker,
+    working_dir:  String,
+    labels:       BTreeMap<String, String>,
+    exec:         Arc<DockerExec>,
+    fs:           DerivedFs,
+    dispatcher:   Option<EventDispatcher>,
+}
+
+impl DockerSandbox {
+    async fn emit_action(&self, action: LifecycleAction, outcome: &Result<()>) {
+        let Some(dispatcher) = &self.dispatcher else {
+            return;
+        };
+        match outcome {
+            Ok(()) => {
+                dispatcher
+                    .emit(SandboxEvent::ActionCompleted {
+                        action,
+                        duration: Duration::ZERO,
+                    })
+                    .await;
+            }
+            Err(error) => {
+                dispatcher
+                    .emit(SandboxEvent::ActionFailed {
+                        action,
+                        error: ErrorReport::from(error),
+                    })
+                    .await;
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Sandbox for DockerSandbox {
+    fn id(&self) -> &SandboxId {
+        &self.id
+    }
+
+    fn capabilities(&self) -> &Capabilities {
+        &self.capabilities
+    }
+
+    async fn describe(&self) -> Result<SandboxStatus> {
+        match self
+            .docker
+            .inspect_container(self.id.as_str(), None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(inspect) => {
+                let mut status = status_from_inspect(self.id.clone(), &inspect);
+                if status.labels.is_empty() {
+                    status.labels = self.labels.clone();
+                }
+                Ok(status)
+            }
+            Err(error) if is_not_found(&error) => {
+                Ok(SandboxStatus::new(self.id.clone(), SandboxState::Deleted))
+            }
+            Err(error) => Err(docker_error("inspecting container", &error)),
+        }
+    }
+
+    fn working_directory(&self) -> &str {
+        &self.working_dir
+    }
+
+    async fn platform_info(&self) -> Result<PlatformInfo> {
+        let result = self
+            .exec
+            .run(&ExecSpec::new("uname -s -m -r").timeout(Duration::from_secs(30)))
+            .await?;
+        let text = result.stdout_lossy();
+        let mut parts = text.split_whitespace();
+        let os = parts.next().unwrap_or("linux").to_lowercase();
+        let arch = parts.next().unwrap_or("").to_owned();
+        let version = parts.next().unwrap_or("").to_owned();
+        Ok(PlatformInfo::new(os, arch, version))
+    }
+
+    async fn start(&self) -> Result<()> {
+        let inspect = self
+            .docker
+            .inspect_container(self.id.as_str(), None::<InspectContainerOptions>)
+            .await
+            .map_err(|error| docker_error("inspecting container", &error))?;
+        let outcome = if inspect.state.as_ref().and_then(|state| state.paused) == Some(true) {
+            self.docker
+                .unpause_container(self.id.as_str())
+                .await
+                .map_err(|error| docker_error("unpausing container", &error))
+        } else {
+            tolerate_not_modified(
+                self.docker
+                    .start_container(self.id.as_str(), None::<StartContainerOptions<String>>)
+                    .await,
+                "starting container",
+            )
+        };
+        self.emit_action(LifecycleAction::Start, &outcome).await;
+        outcome
+    }
+
+    async fn stop(&self) -> Result<()> {
+        let outcome = tolerate_not_modified(
+            self.docker
+                .stop_container(self.id.as_str(), Some(StopContainerOptions { t: 10 }))
+                .await,
+            "stopping container",
+        );
+        self.emit_action(LifecycleAction::Stop, &outcome).await;
+        outcome
+    }
+
+    async fn delete(&self) -> Result<()> {
+        let options = RemoveContainerOptions {
+            force: true,
+            ..Default::default()
+        };
+        let outcome = match self
+            .docker
+            .remove_container(self.id.as_str(), Some(options))
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) if is_not_found(&error) => Ok(()),
+            Err(error) => Err(docker_error("removing container", &error)),
+        };
+        self.emit_action(LifecycleAction::Delete, &outcome).await;
+        outcome
+    }
+
+    async fn pause(&self) -> Result<()> {
+        let outcome = self
+            .docker
+            .pause_container(self.id.as_str())
+            .await
+            .map_err(|error| docker_error("pausing container", &error));
+        self.emit_action(LifecycleAction::Pause, &outcome).await;
+        outcome
+    }
+
+    async fn resume(&self) -> Result<()> {
+        let outcome = self
+            .docker
+            .unpause_container(self.id.as_str())
+            .await
+            .map_err(|error| docker_error("unpausing container", &error));
+        self.emit_action(LifecycleAction::Resume, &outcome).await;
+        outcome
+    }
+
+    fn exec(&self) -> &dyn Exec {
+        self.exec.as_ref()
+    }
+
+    fn fs(&self) -> &dyn Filesystem {
+        &self.fs
+    }
+}
