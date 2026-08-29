@@ -151,6 +151,11 @@ impl ExecFailure {
         }
     }
 
+    /// The label the failure was reported under (e.g. `"bash probe"`).
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
     pub fn termination(&self) -> Termination {
         self.termination
     }

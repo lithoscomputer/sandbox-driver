@@ -10,6 +10,7 @@ publish = false
 
 [workspace.dependencies]
 async-trait = "0.1"
+base64 = "0.22"
 globset = "0.4"
 nix = { version = "0.30", features = ["signal"] }
 sandbox-driver = { path = "crates/sandbox-driver" }
