@@ -9,10 +9,17 @@
 //! [`Capabilities`] structure used for preflight checks and the JSON-RPC
 //! plugin handshake.
 //!
-//! # Async posture
+//! # Runtime contract
 //!
-//! This crate is async and assumes a Tokio runtime. It never creates a
-//! runtime of its own; callers own runtime creation and task spawning.
+//! This crate is async on **Tokio** (1.x) and never creates a runtime of
+//! its own — the caller owns runtime creation. Tokio appears in the
+//! public API: [`StdioProcess`] carries `tokio::io::{AsyncRead,
+//! AsyncWrite}` streams, and [`ExecControls`] carries
+//! `tokio_util::sync::CancellationToken`. The core crate itself spawns
+//! exactly one kind of task: the [`EventDispatcher`] delivery worker,
+//! which is owned by its dispatcher (ends on drop, joinable via
+//! `shutdown`) — never detached. Core does no blocking I/O; provider
+//! crates document their own spawning and blocking behavior.
 //!
 //! # Compatibility
 //!
@@ -57,7 +64,7 @@ pub use capabilities::{
     LogsCaps, NetworkCaps, PtyCaps, SearchCaps, SnapshotCaps, VolumeCaps,
 };
 pub use error::{AuthError, Error, ExecFailure, ProviderError, ResourceKind, Result};
-pub use event::{EventCallback, LifecycleAction, SandboxEvent};
+pub use event::{ErrorReport, EventCallback, EventDispatcher, LifecycleAction, SandboxEvent};
 pub use exec::{
     CaptureStats, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputSink,
     OutputStream, SpawnSpec, StderrTail, StdioProcess, StdioProcessHandle, Termination,

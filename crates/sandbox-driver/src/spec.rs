@@ -110,6 +110,13 @@ impl PlatformInfo {
 
 /// Provisioning request for [`crate::SandboxProvider::create`].
 ///
+/// This is deliberately an **unvalidated wire DTO**: fields are public so
+/// it round-trips the JSON-RPC boundary, and it can express combinations
+/// no provider accepts. Validation happens at the provider boundary —
+/// every provider calls [`SandboxSpec::validate`] for the cross-provider
+/// invariants and adds its own provider-specific checks, returning
+/// [`crate::Error::InvalidSpec`].
+///
 /// Construct with [`SandboxSpec::new`] and refine with the consuming
 /// setters. `provider_config` is the typed escape hatch for
 /// provider-specific options (GPU preference lists, spot instances, warm
@@ -221,6 +228,39 @@ impl SandboxSpec {
     pub fn provider_config(mut self, config: serde_json::Value) -> Self {
         self.provider_config = config;
         self
+    }
+
+    /// Checks the cross-provider invariants. Providers call this at
+    /// `create` before their own provider-specific validation.
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        if self.timers.auto_stop_after_idle.is_some() && self.timers.auto_pause_after_idle.is_some()
+        {
+            return Err(crate::Error::invalid_spec(
+                "timers",
+                "auto_stop_after_idle and auto_pause_after_idle are mutually exclusive",
+            ));
+        }
+        if self.working_directory.as_deref() == Some("") {
+            return Err(crate::Error::invalid_spec(
+                "working_directory",
+                "must not be empty",
+            ));
+        }
+        for mount in &self.volumes {
+            if mount.volume.is_empty() {
+                return Err(crate::Error::invalid_spec(
+                    "volumes",
+                    "volume id must not be empty",
+                ));
+            }
+            if !mount.mount_path.starts_with('/') {
+                return Err(crate::Error::invalid_spec(
+                    "volumes",
+                    "mount_path must be an absolute path",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 

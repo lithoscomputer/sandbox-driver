@@ -137,6 +137,7 @@ pub enum SnapshotState {
     Inactive,
     Error,
     Deleting,
+    #[serde(other)]
     Unknown,
 }
 
@@ -214,6 +215,7 @@ pub enum VolumeState {
     Deleting,
     Deleted,
     Error,
+    #[serde(other)]
     Unknown,
 }
 

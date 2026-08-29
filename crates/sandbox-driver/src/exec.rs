@@ -152,6 +152,7 @@ pub enum Termination {
     TimedOut,
     Cancelled,
     Killed,
+    #[serde(other)]
     Unknown,
 }
 

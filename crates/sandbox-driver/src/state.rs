@@ -30,6 +30,7 @@ pub enum SandboxState {
     Deleting,
     Deleted,
     Error,
+    #[serde(other)]
     Unknown,
 }
 

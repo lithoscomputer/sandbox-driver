@@ -47,6 +47,9 @@ pub enum Error {
         action:  LifecycleAction,
     },
 
+    #[error("invalid spec: {field}: {reason}")]
+    InvalidSpec { field: String, reason: String },
+
     #[error("{operation} timed out after {elapsed:?}")]
     Timeout {
         operation: String,
@@ -81,6 +84,14 @@ impl Error {
     /// provided default bodies of optional trait methods.
     pub fn unsupported(capability: Capability) -> Self {
         Self::Unsupported { capability }
+    }
+
+    /// Convenience constructor for the `InvalidSpec` variant.
+    pub fn invalid_spec(field: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::InvalidSpec {
+            field:  field.into(),
+            reason: reason.into(),
+        }
     }
 
     /// Convenience constructor for the `Io` variant.
