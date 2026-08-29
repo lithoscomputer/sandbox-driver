@@ -1,0 +1,37 @@
+//! The daytona provider against the black-box conformance suite.
+//!
+//! Live test: requires `DAYTONA_API_KEY` (and creates roughly a dozen
+//! short-lived sandboxes from the default snapshot); skipped when no
+//! credentials are configured so CI stays green.
+
+use std::env;
+use std::sync::Arc;
+use std::time::Duration;
+
+use sandbox_driver::{SandboxSource, SandboxSpec};
+use sandbox_driver_conformance::{Conformance, SpecFactory};
+use sandbox_driver_daytona::DaytonaProvider;
+
+const TEST_SNAPSHOT: &str = "daytona-medium";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn daytona_provider_passes_conformance() {
+    if env::var("DAYTONA_API_KEY").is_err() {
+        // No credentials; nothing to verify.
+        return;
+    }
+    let provider = DaytonaProvider::connect()
+        .await
+        .expect("connect with credentials");
+    let specs = SpecFactory::new(|| {
+        SandboxSpec::new(SandboxSource::Snapshot {
+            name: TEST_SNAPSHOT.to_owned(),
+        })
+        .ephemeral(true)
+    });
+    let mut conformance = Conformance::new(Arc::new(provider), specs);
+    conformance.check_timeout = Duration::from_secs(900);
+    conformance.wait.deadline = Some(Duration::from_secs(300));
+    let report = conformance.run().await;
+    report.assert_pass();
+}

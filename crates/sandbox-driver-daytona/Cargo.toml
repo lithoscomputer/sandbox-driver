@@ -1,0 +1,22 @@
+[package]
+name = "sandbox-driver-daytona"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Daytona cloud sandbox provider for sandbox-driver"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+daytona-api-client.workspace = true
+daytona-sdk.workspace = true
+sandbox-driver.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+tokio-util.workspace = true
+
+[dev-dependencies]
+sandbox-driver-conformance.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
