@@ -138,6 +138,10 @@ impl Conformance {
             ("create_emits_terminal_events", |ctx| {
                 Box::pin(create_emits_terminal_events(ctx))
             }),
+            ("services_match_capabilities", |ctx| {
+                Box::pin(services_match_capabilities(ctx))
+            }),
+            ("volume_round_trip", |ctx| Box::pin(volume_round_trip(ctx))),
         ];
 
         let mut results = Vec::new();
@@ -831,6 +835,96 @@ async fn attach_and_list_by_label(ctx: &Conformance) -> CheckOutcome {
     .await;
     cleanup(&sandbox).await;
     outcome
+}
+
+async fn services_match_capabilities(ctx: &Conformance) -> CheckOutcome {
+    let caps = ctx.caps();
+    let mut wrong: Vec<String> = Vec::new();
+    if caps.snapshots.is_some() != ctx.provider.snapshots().is_some() {
+        wrong.push(format!(
+            "snapshots service presence ({}) disagrees with capabilities ({})",
+            ctx.provider.snapshots().is_some(),
+            caps.snapshots.is_some()
+        ));
+    }
+    if caps.volumes.is_some() != ctx.provider.volumes().is_some() {
+        wrong.push(format!(
+            "volumes service presence ({}) disagrees with capabilities ({})",
+            ctx.provider.volumes().is_some(),
+            caps.volumes.is_some()
+        ));
+    }
+    let sandbox = ctx.create().await?;
+    if caps.access.preview_urls != sandbox.preview_urls().is_some() {
+        wrong.push("preview_urls facet presence disagrees with capabilities".to_owned());
+    }
+    if caps.access.ssh != sandbox.ssh().is_some() {
+        wrong.push("ssh facet presence disagrees with capabilities".to_owned());
+    }
+    cleanup(&sandbox).await;
+    if wrong.is_empty() {
+        PASS
+    } else {
+        fail(wrong.join("; "))
+    }
+}
+
+async fn volume_round_trip(ctx: &Conformance) -> CheckOutcome {
+    let Some(volumes) = ctx.provider.volumes() else {
+        return Ok(Some("volumes service not declared".to_owned()));
+    };
+    let name = format!("conformance-{}-{}", process::id(), {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.subsec_nanos())
+    });
+    let id = volumes
+        .create(&sandbox_driver::VolumeSpec::new(name.clone()))
+        .await
+        .map_err(|error| format!("volume create failed: {error}"))?;
+
+    // Poll briefly for a settled state; elastic backends are quick.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let status = volumes
+            .get(&id)
+            .await
+            .map_err(|error| format!("volume get failed: {error}"))?;
+        match status.state {
+            sandbox_driver::VolumeState::Ready => break,
+            sandbox_driver::VolumeState::Error => {
+                let _ = volumes.delete(&id).await;
+                return fail(format!(
+                    "volume entered error state: {:?}",
+                    status.error_reason
+                ));
+            }
+            _ if Instant::now() >= deadline => {
+                let _ = volumes.delete(&id).await;
+                return fail("volume never became ready".to_owned());
+            }
+            _ => time::sleep(Duration::from_secs(2)).await,
+        }
+    }
+
+    let listed = volumes
+        .list()
+        .await
+        .map_err(|error| format!("volume list failed: {error}"))?;
+    if !listed.iter().any(|status| status.id == id) {
+        let _ = volumes.delete(&id).await;
+        return fail("created volume missing from list".to_owned());
+    }
+    volumes
+        .delete(&id)
+        .await
+        .map_err(|error| format!("volume delete failed: {error}"))?;
+    volumes
+        .delete(&id)
+        .await
+        .map_err(|error| format!("second volume delete failed: {error}"))?;
+    PASS
 }
 
 async fn create_emits_terminal_events(ctx: &Conformance) -> CheckOutcome {

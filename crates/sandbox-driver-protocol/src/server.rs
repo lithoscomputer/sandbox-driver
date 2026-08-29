@@ -7,10 +7,11 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use sandbox_driver::{
-    CheckpointId, Error, EventCallback, ExecControls, OutputSink, Result, Sandbox, SandboxId,
-    SandboxProvider, SandboxStatus,
+    Capability, CheckpointId, Error, EventCallback, ExecControls, OutputSink, Result, Sandbox,
+    SandboxId, SandboxProvider, SandboxStatus, SnapshotId, VolumeId,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -535,6 +536,145 @@ async fn dispatch(
                 .fs()
                 .set_permissions(&request.path, request.mode)
                 .await?;
+            to_value(&m::Empty)
+        }
+        m::SNAPSHOT_CREATE => {
+            let request: m::SnapshotCreateParams = parse(params)?;
+            let service =
+                state
+                    .provider
+                    .snapshots()
+                    .ok_or(DispatchError::App(Error::unsupported(
+                        Capability::Snapshots,
+                    )))?;
+            let id = service.create(&request.spec).await?;
+            to_value(&m::SnapshotIdResult {
+                snapshot_id: id.as_str().to_owned(),
+            })
+        }
+        m::SNAPSHOT_GET => {
+            let request: m::SnapshotIdParams = parse(params)?;
+            let service =
+                state
+                    .provider
+                    .snapshots()
+                    .ok_or(DispatchError::App(Error::unsupported(
+                        Capability::Snapshots,
+                    )))?;
+            let id = SnapshotId::try_new(&request.snapshot_id)
+                .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))?;
+            let status = service.get(&id).await?;
+            to_value(&m::SnapshotStatusResult { status })
+        }
+        m::SNAPSHOT_LIST => {
+            let request: m::SnapshotListParams = parse(params)?;
+            let service =
+                state
+                    .provider
+                    .snapshots()
+                    .ok_or(DispatchError::App(Error::unsupported(
+                        Capability::Snapshots,
+                    )))?;
+            let snapshots = service.list(&request.filter).await?;
+            to_value(&m::SnapshotListResult { snapshots })
+        }
+        m::SNAPSHOT_DELETE => {
+            let request: m::SnapshotIdParams = parse(params)?;
+            let service =
+                state
+                    .provider
+                    .snapshots()
+                    .ok_or(DispatchError::App(Error::unsupported(
+                        Capability::Snapshots,
+                    )))?;
+            let id = SnapshotId::try_new(&request.snapshot_id)
+                .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))?;
+            service.delete(&id).await?;
+            to_value(&m::Empty)
+        }
+        m::VOLUME_CREATE => {
+            let request: m::VolumeCreateParams = parse(params)?;
+            let service = state
+                .provider
+                .volumes()
+                .ok_or(DispatchError::App(Error::unsupported(Capability::Volumes)))?;
+            let id = service.create(&request.spec).await?;
+            to_value(&m::VolumeIdResult {
+                volume_id: id.as_str().to_owned(),
+            })
+        }
+        m::VOLUME_GET => {
+            let request: m::VolumeIdParams = parse(params)?;
+            let service = state
+                .provider
+                .volumes()
+                .ok_or(DispatchError::App(Error::unsupported(Capability::Volumes)))?;
+            let id = VolumeId::try_new(&request.volume_id)
+                .map_err(|error| Error::invalid_spec("volume_id", error.to_string()))?;
+            let status = service.get(&id).await?;
+            to_value(&m::VolumeStatusResult { status })
+        }
+        m::VOLUME_LIST => {
+            let service = state
+                .provider
+                .volumes()
+                .ok_or(DispatchError::App(Error::unsupported(Capability::Volumes)))?;
+            let volumes = service.list().await?;
+            to_value(&m::VolumeListResult { volumes })
+        }
+        m::VOLUME_DELETE => {
+            let request: m::VolumeIdParams = parse(params)?;
+            let service = state
+                .provider
+                .volumes()
+                .ok_or(DispatchError::App(Error::unsupported(Capability::Volumes)))?;
+            let id = VolumeId::try_new(&request.volume_id)
+                .map_err(|error| Error::invalid_spec("volume_id", error.to_string()))?;
+            service.delete(&id).await?;
+            to_value(&m::Empty)
+        }
+        m::ACCESS_PREVIEW_URL => {
+            let request: m::PreviewUrlParams = parse(params)?;
+            let handle = state.sandbox(&request.sandbox_id).await?;
+            let facet = handle
+                .preview_urls()
+                .ok_or(DispatchError::App(Error::unsupported(
+                    Capability::PreviewUrls,
+                )))?;
+            let preview = facet.preview_url(request.port).await?;
+            to_value(&m::PreviewUrlResult { preview })
+        }
+        m::ACCESS_SIGNED_PREVIEW_URL => {
+            let request: m::SignedPreviewUrlParams = parse(params)?;
+            let handle = state.sandbox(&request.sandbox_id).await?;
+            let facet = handle
+                .preview_urls()
+                .ok_or(DispatchError::App(Error::unsupported(
+                    Capability::PreviewUrls,
+                )))?;
+            let preview = facet
+                .signed_preview_url(request.port, Duration::from_millis(request.expires_in_ms))
+                .await?;
+            to_value(&m::PreviewUrlResult { preview })
+        }
+        m::ACCESS_SSH_CREATE => {
+            let request: m::SshCreateParams = parse(params)?;
+            let handle = state.sandbox(&request.sandbox_id).await?;
+            let facet = handle
+                .ssh()
+                .ok_or(DispatchError::App(Error::unsupported(Capability::Ssh)))?;
+            let access = facet
+                .create_ssh_access(request.ttl_ms.map(Duration::from_millis))
+                .await?;
+            to_value(&m::SshCreateResult { access })
+        }
+        m::ACCESS_SSH_REVOKE => {
+            let request: m::SshRevokeParams = parse(params)?;
+            let handle = state.sandbox(&request.sandbox_id).await?;
+            let facet = handle
+                .ssh()
+                .ok_or(DispatchError::App(Error::unsupported(Capability::Ssh)))?;
+            facet.revoke_ssh_access(&request.token).await?;
             to_value(&m::Empty)
         }
         _ => Err(DispatchError::UnknownMethod),

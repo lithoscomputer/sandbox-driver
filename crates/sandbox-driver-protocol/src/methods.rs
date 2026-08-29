@@ -57,6 +57,19 @@ pub const FS_CREATE_DIR: &str = "fs/create_dir";
 pub const FS_RENAME: &str = "fs/rename";
 pub const FS_SET_PERMISSIONS: &str = "fs/set_permissions";
 
+pub const SNAPSHOT_CREATE: &str = "snapshot/create";
+pub const SNAPSHOT_GET: &str = "snapshot/get";
+pub const SNAPSHOT_LIST: &str = "snapshot/list";
+pub const SNAPSHOT_DELETE: &str = "snapshot/delete";
+pub const VOLUME_CREATE: &str = "volume/create";
+pub const VOLUME_GET: &str = "volume/get";
+pub const VOLUME_LIST: &str = "volume/list";
+pub const VOLUME_DELETE: &str = "volume/delete";
+pub const ACCESS_PREVIEW_URL: &str = "access/preview_url";
+pub const ACCESS_SIGNED_PREVIEW_URL: &str = "access/signed_preview_url";
+pub const ACCESS_SSH_CREATE: &str = "access/ssh_create";
+pub const ACCESS_SSH_REVOKE: &str = "access/ssh_revoke";
+
 // Notifications, plugin → host.
 pub const EXEC_OUTPUT: &str = "exec/output";
 pub const HOST_EVENT: &str = "host/event";
@@ -363,6 +376,96 @@ pub struct HostEventNotification {
 pub struct HostLogNotification {
     pub level:   String,
     pub message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SnapshotCreateParams {
+    pub spec: sandbox_driver::SnapshotSpec,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SnapshotIdParams {
+    pub snapshot_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SnapshotIdResult {
+    pub snapshot_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SnapshotStatusResult {
+    pub status: sandbox_driver::SnapshotStatus,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SnapshotListParams {
+    pub filter: sandbox_driver::SnapshotFilter,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SnapshotListResult {
+    pub snapshots: Vec<sandbox_driver::SnapshotStatus>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VolumeCreateParams {
+    pub spec: sandbox_driver::VolumeSpec,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VolumeIdParams {
+    pub volume_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VolumeIdResult {
+    pub volume_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VolumeStatusResult {
+    pub status: sandbox_driver::VolumeStatus,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VolumeListResult {
+    pub volumes: Vec<sandbox_driver::VolumeStatus>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PreviewUrlParams {
+    pub sandbox_id: String,
+    pub port:       u16,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SignedPreviewUrlParams {
+    pub sandbox_id:    String,
+    pub port:          u16,
+    pub expires_in_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PreviewUrlResult {
+    pub preview: sandbox_driver::PreviewUrl,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SshCreateParams {
+    pub sandbox_id: String,
+    pub ttl_ms:     Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SshCreateResult {
+    pub access: sandbox_driver::SshAccessInfo,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SshRevokeParams {
+    pub sandbox_id: String,
+    pub token:      String,
 }
 
 /// Empty result for side-effect-only methods.

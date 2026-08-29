@@ -1684,6 +1684,7 @@ dependencies = [
  "daytona-sdk",
  "sandbox-driver",
  "sandbox-driver-conformance",
+ "sandbox-driver-protocol",
  "tokio",
  "tokio-util",
 ]

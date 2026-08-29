@@ -8,10 +8,14 @@
 //!
 //! Protocol v1 (see `methods::PROTOCOL_VERSION`): lifecycle, exec
 //! (buffered and streamed via `exec/output` notifications with
-//! client-generated exec ids), filesystem, list/attach, and plugin→host
-//! `host/event` notifications. Deferred to a later version: the stdio
-//! side-channel transport, snapshot/volume services over the wire, PTY,
-//! logs, access facets, and `host/credentials`.
+//! client-generated exec ids), filesystem, list/attach, snapshot and
+//! volume services, preview-URL and SSH access facets, plugin→host
+//! `host/event` notifications, and plugin binaries spawned over stdio
+//! ([`serve_stdio`], [`PluginProvider::spawn`]). Deferred to a later
+//! version: the stdio side-channel transport (long-lived bidirectional
+//! processes), PTY, logs, native search/git passthrough, the reserved
+//! access facets, and `host/credentials` — the client masks all of
+//! these out of the capabilities it reports.
 //!
 //! Transport trust — checksums, environment scrubbing, deny-by-default
 //! discovery — is host policy and lives with the embedding application,

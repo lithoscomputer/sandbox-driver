@@ -12,9 +12,11 @@ use async_trait::async_trait;
 use sandbox_driver::{
     Capabilities, Capability, CheckpointId, CheckpointOptions, DirEntry, Error, EventCallback,
     Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, FileMetadata, Filesystem,
-    ForkOptions, LifecycleTimers, NetworkPolicy, OutputSink, PlatformInfo, ProviderKind, Resources,
-    Result, Sandbox, SandboxFilter, SandboxId, SandboxSnapshotOptions, SandboxSpec, SandboxStatus,
-    SnapshotId, SpawnSpec, StdioProcess,
+    ForkOptions, LifecycleTimers, NetworkPolicy, OutputSink, PlatformInfo, PreviewUrl, PreviewUrls,
+    ProviderKind, Resources, Result, Sandbox, SandboxFilter, SandboxId, SandboxSnapshotOptions,
+    SandboxSpec, SandboxStatus, SnapshotFilter, SnapshotId, SnapshotService, SnapshotSpec,
+    SnapshotStatus, SpawnSpec, SshAccess, SshAccessInfo, StdioProcess, VolumeId, VolumeService,
+    VolumeSpec, VolumeStatus,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -37,6 +39,8 @@ pub struct PluginProvider {
     client:       Arc<Client>,
     kind:         ProviderKind,
     capabilities: Capabilities,
+    snapshots:    Option<ProviderSnapshots>,
+    volumes:      Option<ProviderVolumes>,
     /// The plugin child process, when this provider spawned one.
     child:        Option<Mutex<Option<Child>>>,
 }
@@ -64,10 +68,18 @@ impl PluginProvider {
         }
         let mut capabilities = result.capabilities;
         mask_wire_capabilities(&mut capabilities);
+        let snapshots = capabilities.snapshots.is_some().then(|| ProviderSnapshots {
+            client: Arc::clone(&client),
+        });
+        let volumes = capabilities.volumes.is_some().then(|| ProviderVolumes {
+            client: Arc::clone(&client),
+        });
         Ok(Self {
             client,
             kind: result.provider.kind,
             capabilities,
+            snapshots,
+            volumes,
             child: None,
         })
     }
@@ -129,17 +141,21 @@ impl PluginProvider {
                 .expect("event callbacks lock")
                 .insert(id.as_str().to_owned(), callback);
         }
-        Arc::new(PluginSandbox {
+        Arc::new(SandboxHandle {
             client:            Arc::clone(&self.client),
             id:                id.clone(),
             capabilities:      info.capabilities,
             working_directory: info.working_directory,
             runtime_directory: info.runtime_directory,
-            exec:              PluginExec {
+            exec:              SandboxExec {
                 client:     Arc::clone(&self.client),
                 sandbox_id: id.clone(),
             },
-            fs:                PluginFs {
+            access:            SandboxAccess {
+                client:     Arc::clone(&self.client),
+                sandbox_id: id.clone(),
+            },
+            fs:                SandboxFs {
                 client:     Arc::clone(&self.client),
                 sandbox_id: id,
             },
@@ -192,13 +208,185 @@ impl sandbox_driver::SandboxProvider for PluginProvider {
             .await?;
         Ok(result.sandboxes)
     }
+
+    fn snapshots(&self) -> Option<&dyn SnapshotService> {
+        self.snapshots
+            .as_ref()
+            .map(|service| service as &dyn SnapshotService)
+    }
+
+    fn volumes(&self) -> Option<&dyn VolumeService> {
+        self.volumes
+            .as_ref()
+            .map(|service| service as &dyn VolumeService)
+    }
 }
 
-/// Removes capabilities protocol v1 cannot deliver through the wire, so
-/// the client never advertises what [`PluginExec::spawn_stdio`] would then
-/// refuse. The stdio side-channel transport lifts this in a later version.
+/// Snapshot service backed by the plugin.
+struct ProviderSnapshots {
+    client: Arc<Client>,
+}
+
+#[async_trait]
+impl SnapshotService for ProviderSnapshots {
+    async fn create(&self, spec: &SnapshotSpec) -> Result<SnapshotId> {
+        let result: m::SnapshotIdResult = self
+            .client
+            .call(m::SNAPSHOT_CREATE, &m::SnapshotCreateParams {
+                spec: spec.clone(),
+            })
+            .await?;
+        SnapshotId::try_new(result.snapshot_id)
+            .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))
+    }
+
+    async fn get(&self, id: &SnapshotId) -> Result<SnapshotStatus> {
+        let result: m::SnapshotStatusResult = self
+            .client
+            .call(m::SNAPSHOT_GET, &m::SnapshotIdParams {
+                snapshot_id: id.as_str().to_owned(),
+            })
+            .await?;
+        Ok(result.status)
+    }
+
+    async fn list(&self, filter: &SnapshotFilter) -> Result<Vec<SnapshotStatus>> {
+        let result: m::SnapshotListResult = self
+            .client
+            .call(m::SNAPSHOT_LIST, &m::SnapshotListParams {
+                filter: filter.clone(),
+            })
+            .await?;
+        Ok(result.snapshots)
+    }
+
+    async fn delete(&self, id: &SnapshotId) -> Result<()> {
+        let _: m::Empty = self
+            .client
+            .call(m::SNAPSHOT_DELETE, &m::SnapshotIdParams {
+                snapshot_id: id.as_str().to_owned(),
+            })
+            .await?;
+        Ok(())
+    }
+}
+
+/// Volume service backed by the plugin.
+struct ProviderVolumes {
+    client: Arc<Client>,
+}
+
+#[async_trait]
+impl VolumeService for ProviderVolumes {
+    async fn create(&self, spec: &VolumeSpec) -> Result<VolumeId> {
+        let result: m::VolumeIdResult = self
+            .client
+            .call(m::VOLUME_CREATE, &m::VolumeCreateParams {
+                spec: spec.clone(),
+            })
+            .await?;
+        VolumeId::try_new(result.volume_id)
+            .map_err(|error| Error::invalid_spec("volume_id", error.to_string()))
+    }
+
+    async fn get(&self, id: &VolumeId) -> Result<VolumeStatus> {
+        let result: m::VolumeStatusResult = self
+            .client
+            .call(m::VOLUME_GET, &m::VolumeIdParams {
+                volume_id: id.as_str().to_owned(),
+            })
+            .await?;
+        Ok(result.status)
+    }
+
+    async fn list(&self) -> Result<Vec<VolumeStatus>> {
+        let result: m::VolumeListResult = self.client.call(m::VOLUME_LIST, &m::Empty).await?;
+        Ok(result.volumes)
+    }
+
+    async fn delete(&self, id: &VolumeId) -> Result<()> {
+        let _: m::Empty = self
+            .client
+            .call(m::VOLUME_DELETE, &m::VolumeIdParams {
+                volume_id: id.as_str().to_owned(),
+            })
+            .await?;
+        Ok(())
+    }
+}
+
+/// Preview-URL and SSH access backed by the plugin.
+struct SandboxAccess {
+    client:     Arc<Client>,
+    sandbox_id: SandboxId,
+}
+
+#[async_trait]
+impl PreviewUrls for SandboxAccess {
+    async fn preview_url(&self, port: u16) -> Result<PreviewUrl> {
+        let result: m::PreviewUrlResult = self
+            .client
+            .call(m::ACCESS_PREVIEW_URL, &m::PreviewUrlParams {
+                sandbox_id: self.sandbox_id.as_str().to_owned(),
+                port,
+            })
+            .await?;
+        Ok(result.preview)
+    }
+
+    async fn signed_preview_url(&self, port: u16, expires_in: Duration) -> Result<PreviewUrl> {
+        let result: m::PreviewUrlResult = self
+            .client
+            .call(m::ACCESS_SIGNED_PREVIEW_URL, &m::SignedPreviewUrlParams {
+                sandbox_id: self.sandbox_id.as_str().to_owned(),
+                port,
+                expires_in_ms: u64::try_from(expires_in.as_millis()).unwrap_or(u64::MAX),
+            })
+            .await?;
+        Ok(result.preview)
+    }
+}
+
+#[async_trait]
+impl SshAccess for SandboxAccess {
+    async fn create_ssh_access(&self, ttl: Option<Duration>) -> Result<SshAccessInfo> {
+        let result: m::SshCreateResult = self
+            .client
+            .call(m::ACCESS_SSH_CREATE, &m::SshCreateParams {
+                sandbox_id: self.sandbox_id.as_str().to_owned(),
+                ttl_ms:     ttl.map(|ttl| u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX)),
+            })
+            .await?;
+        Ok(result.access)
+    }
+
+    async fn revoke_ssh_access(&self, token: &str) -> Result<()> {
+        let _: m::Empty = self
+            .client
+            .call(m::ACCESS_SSH_REVOKE, &m::SshRevokeParams {
+                sandbox_id: self.sandbox_id.as_str().to_owned(),
+                token:      token.to_owned(),
+            })
+            .await?;
+        Ok(())
+    }
+}
+
+/// Removes capabilities the protocol cannot yet deliver through the
+/// wire, so the client never advertises what its adapters would then
+/// refuse: long-lived stdio (needs the side-channel transport), PTY,
+/// logs, native search/git passthrough, and the reserved access facets.
+/// Snapshots, volumes, preview URLs, and SSH cross the wire and stay.
 fn mask_wire_capabilities(capabilities: &mut Capabilities) {
     capabilities.exec.stdio_process = false;
+    capabilities.pty = None;
+    capabilities.logs = None;
+    capabilities.search.native = false;
+    capabilities.git.native = false;
+    capabilities.access.shell_command = false;
+    capabilities.access.web_terminal = false;
+    capabilities.access.vnc = false;
+    capabilities.access.vpn = false;
 }
 
 /// Request/response correlation plus notification routing.
@@ -361,17 +549,18 @@ impl Client {
 }
 
 /// A sandbox handle backed by the plugin.
-struct PluginSandbox {
+struct SandboxHandle {
     client:            Arc<Client>,
     id:                SandboxId,
     capabilities:      Capabilities,
     working_directory: String,
     runtime_directory: Option<String>,
-    exec:              PluginExec,
-    fs:                PluginFs,
+    exec:              SandboxExec,
+    access:            SandboxAccess,
+    fs:                SandboxFs,
 }
 
-impl PluginSandbox {
+impl SandboxHandle {
     fn id_params(&self) -> m::SandboxIdParams {
         m::SandboxIdParams {
             sandbox_id: self.id.as_str().to_owned(),
@@ -385,7 +574,7 @@ impl PluginSandbox {
 }
 
 #[async_trait]
-impl Sandbox for PluginSandbox {
+impl Sandbox for SandboxHandle {
     fn id(&self) -> &SandboxId {
         &self.id
     }
@@ -465,11 +654,15 @@ impl Sandbox for PluginSandbox {
             capabilities:      info.capabilities,
             working_directory: info.working_directory,
             runtime_directory: info.runtime_directory,
-            exec:              PluginExec {
+            exec:              SandboxExec {
                 client:     Arc::clone(&self.client),
                 sandbox_id: id.clone(),
             },
-            fs:                PluginFs {
+            access:            SandboxAccess {
+                client:     Arc::clone(&self.client),
+                sandbox_id: id.clone(),
+            },
+            fs:                SandboxFs {
                 client:     Arc::clone(&self.client),
                 sandbox_id: id,
             },
@@ -562,15 +755,29 @@ impl Sandbox for PluginSandbox {
     fn fs(&self) -> &dyn Filesystem {
         &self.fs
     }
+
+    fn preview_urls(&self) -> Option<&dyn PreviewUrls> {
+        self.capabilities
+            .access
+            .preview_urls
+            .then_some(&self.access as &dyn PreviewUrls)
+    }
+
+    fn ssh(&self) -> Option<&dyn SshAccess> {
+        self.capabilities
+            .access
+            .ssh
+            .then_some(&self.access as &dyn SshAccess)
+    }
 }
 
-struct PluginExec {
+struct SandboxExec {
     client:     Arc<Client>,
     sandbox_id: SandboxId,
 }
 
 #[async_trait]
-impl Exec for PluginExec {
+impl Exec for SandboxExec {
     async fn run(&self, spec: &ExecSpec) -> Result<ExecResult> {
         let result: m::ExecResultDto = self
             .client
@@ -645,12 +852,12 @@ impl Exec for PluginExec {
     }
 }
 
-struct PluginFs {
+struct SandboxFs {
     client:     Arc<Client>,
     sandbox_id: SandboxId,
 }
 
-impl PluginFs {
+impl SandboxFs {
     fn path_params(&self, path: &str) -> m::FsPathParams {
         m::FsPathParams {
             sandbox_id: self.sandbox_id.as_str().to_owned(),
@@ -660,7 +867,7 @@ impl PluginFs {
 }
 
 #[async_trait]
-impl Filesystem for PluginFs {
+impl Filesystem for SandboxFs {
     async fn read(&self, path: &str) -> Result<Vec<u8>> {
         let result: m::FsReadResult = self
             .client
