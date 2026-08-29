@@ -1714,6 +1714,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandbox-driver-host-plugin"
+version = "0.1.0"
+dependencies = [
+ "sandbox-driver",
+ "sandbox-driver-conformance",
+ "sandbox-driver-host",
+ "sandbox-driver-protocol",
+ "tokio",
+]
+
+[[package]]
 name = "sandbox-driver-protocol"
 version = "0.1.0"
 dependencies = [

@@ -3,8 +3,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use sandbox_driver::{
@@ -17,9 +19,10 @@ use sandbox_driver::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::fs as tokio_fs;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
+use tokio::{fs as tokio_fs, time};
 
 use crate::methods as m;
 use crate::wire::{Message, decode_bytes, encode_bytes};
@@ -34,6 +37,8 @@ pub struct PluginProvider {
     client:       Arc<Client>,
     kind:         ProviderKind,
     capabilities: Capabilities,
+    /// The plugin child process, when this provider spawned one.
+    child:        Option<Mutex<Option<Child>>>,
 }
 
 impl PluginProvider {
@@ -63,12 +68,50 @@ impl PluginProvider {
             client,
             kind: result.provider.kind,
             capabilities,
+            child: None,
         })
     }
 
-    /// Asks the plugin to shut down cleanly.
+    /// Spawns a plugin binary as a child process and connects over its
+    /// stdin/stdout.
+    ///
+    /// The caller configures the command (arguments, environment
+    /// scrubbing, working directory — transport trust is host policy);
+    /// this constructor pipes stdio, leaves stderr inherited so plugin
+    /// logs reach the host's stderr, and marks the child kill-on-drop.
+    /// [`PluginProvider::shutdown`] asks the plugin to exit and reaps it,
+    /// killing after a grace period.
+    pub async fn spawn(mut command: Command) -> Result<Self> {
+        command.stdin(Stdio::piped());
+        command.stdout(Stdio::piped());
+        command.kill_on_drop(true);
+        let mut child = command
+            .spawn()
+            .map_err(|error| Error::io("spawning plugin process", error))?;
+        let stdin = child.stdin.take().expect("stdin was piped");
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let mut provider = Self::connect(stdout, stdin).await?;
+        provider.child = Some(Mutex::new(Some(child)));
+        Ok(provider)
+    }
+
+    /// Asks the plugin to shut down cleanly and, for a spawned plugin,
+    /// reaps the child — killing it after a grace period if it lingers.
     pub async fn shutdown(&self) -> Result<()> {
         let _: m::Empty = self.client.call(m::SHUTDOWN, &m::Empty).await?;
+        let child = self
+            .child
+            .as_ref()
+            .and_then(|slot| slot.lock().expect("child lock").take());
+        if let Some(mut child) = child {
+            match time::timeout(Duration::from_secs(5), child.wait()).await {
+                Ok(_) => {}
+                Err(_) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -163,6 +206,9 @@ struct Client {
     outbound:        mpsc::Sender<Message>,
     next_id:         AtomicU64,
     next_exec:       AtomicU64,
+    /// Set when either transport task ends; every pending and future call
+    /// fails fast instead of waiting on a dead pipe.
+    closed:          AtomicBool,
     pending:         Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>,
     exec_sinks:      Mutex<HashMap<String, OutputSink>>,
     event_callbacks: Mutex<HashMap<String, EventCallback>>,
@@ -174,6 +220,17 @@ impl Client {
         writer: impl AsyncWrite + Unpin + Send + 'static,
     ) -> Arc<Self> {
         let (outbound, mut outbound_rx) = mpsc::channel::<Message>(256);
+        let client = Arc::new(Self {
+            outbound,
+            next_id: AtomicU64::new(1),
+            next_exec: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
+            pending: Mutex::new(HashMap::new()),
+            exec_sinks: Mutex::new(HashMap::new()),
+            event_callbacks: Mutex::new(HashMap::new()),
+        });
+
+        let writer_client = Arc::clone(&client);
         tokio::spawn(async move {
             let mut writer = writer;
             while let Some(message) = outbound_rx.recv().await {
@@ -186,15 +243,7 @@ impl Client {
                 }
             }
             let _ = writer.shutdown().await;
-        });
-
-        let client = Arc::new(Self {
-            outbound,
-            next_id: AtomicU64::new(1),
-            next_exec: AtomicU64::new(1),
-            pending: Mutex::new(HashMap::new()),
-            exec_sinks: Mutex::new(HashMap::new()),
-            event_callbacks: Mutex::new(HashMap::new()),
+            writer_client.mark_closed();
         });
 
         let reader_client = Arc::clone(&client);
@@ -209,17 +258,24 @@ impl Client {
                 };
                 reader_client.route(message).await;
             }
-            // Transport closed: fail everything still pending.
-            let pending: Vec<_> = {
-                let mut pending = reader_client.pending.lock().expect("pending lock");
-                pending.drain().collect()
-            };
-            for (_, sender) in pending {
-                let _ = sender.send(Err(Error::invalid_spec("transport", "connection closed")));
-            }
+            reader_client.mark_closed();
         });
 
         client
+    }
+
+    /// Marks the transport dead and fails everything pending. Called by
+    /// both transport tasks; also re-checked by `call` after registering,
+    /// closing the race where a call lands just after the drain.
+    fn mark_closed(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        let pending: Vec<_> = {
+            let mut pending = self.pending.lock().expect("pending lock");
+            pending.drain().collect()
+        };
+        for (_, sender) in pending {
+            let _ = sender.send(Err(Error::invalid_spec("transport", "connection closed")));
+        }
     }
 
     async fn route(&self, message: Message) {
@@ -283,10 +339,19 @@ impl Client {
             .lock()
             .expect("pending lock")
             .insert(id, sender);
-        self.outbound
+        if self.closed.load(Ordering::SeqCst) {
+            // The transport may have died between the drain and our
+            // registration; drain again so this call cannot hang.
+            self.mark_closed();
+        }
+        if let Err(_send_error) = self
+            .outbound
             .send(Message::request(id, method, params))
             .await
-            .map_err(|_| Error::invalid_spec("transport", "connection closed"))?;
+        {
+            self.pending.lock().expect("pending lock").remove(&id);
+            return Err(Error::invalid_spec("transport", "connection closed"));
+        }
         let value = receiver
             .await
             .map_err(|_| Error::invalid_spec("transport", "connection closed"))??;

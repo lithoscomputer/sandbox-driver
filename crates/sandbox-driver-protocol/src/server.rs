@@ -24,6 +24,21 @@ use crate::wire::{
     CODE_INVALID_REQUEST, CODE_METHOD_NOT_FOUND, Message, WireError, decode_bytes, encode_bytes,
 };
 
+/// Serves `provider` over this process's stdin and stdout until EOF or
+/// `shutdown` — the main loop of a plugin binary:
+///
+/// ```ignore
+/// #[tokio::main]
+/// async fn main() -> sandbox_driver::Result<()> {
+///     serve_stdio(Arc::new(MyProvider::new())).await
+/// }
+/// ```
+///
+/// Stdout belongs to the protocol; a plugin must log to stderr only.
+pub async fn serve_stdio(provider: Arc<dyn SandboxProvider>) -> Result<()> {
+    serve(provider, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
 /// Serves `provider` over the byte streams until EOF or `shutdown`.
 ///
 /// This is the plugin-side main loop: a provider binary calls it with

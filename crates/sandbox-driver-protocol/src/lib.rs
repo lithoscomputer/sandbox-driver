@@ -24,5 +24,5 @@ mod wire;
 pub mod methods;
 
 pub use client::PluginProvider;
-pub use server::serve;
+pub use server::{serve, serve_stdio};
 pub use wire::{Message, WireError, WireErrorData};
