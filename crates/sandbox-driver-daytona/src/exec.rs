@@ -9,7 +9,7 @@ use sandbox_driver::{
 use tokio::sync::OnceCell;
 use tokio::time;
 
-use crate::{DaytonaClient, daytona_error, shell_quote};
+use crate::{DaytonaClient, daytona_error, is_server_timeout, shell_quote};
 
 /// Extra client-side wait beyond the server-side command timeout.
 const TIMEOUT_GRACE: Duration = Duration::from_secs(10);
@@ -97,11 +97,14 @@ impl Exec for DaytonaExec {
         let program = Self::compose(spec);
         let call = process.execute_command(&program, options);
 
+        // A server-side timeout comes back as a 408 error rather than a
+        // response, and a client-side deadline elapses as None; both mean
+        // the command was killed for exceeding its timeout.
         let response = match spec.timeout {
             Some(timeout) => match time::timeout(timeout + TIMEOUT_GRACE, call).await {
-                Ok(outcome) => {
-                    Some(outcome.map_err(|error| daytona_error("executing command", &error))?)
-                }
+                Ok(Ok(response)) => Some(response),
+                Ok(Err(error)) if is_server_timeout(&error) => None,
+                Ok(Err(error)) => return Err(daytona_error("executing command", &error)),
                 Err(_) => None,
             },
             None => Some(

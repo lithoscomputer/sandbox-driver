@@ -71,6 +71,25 @@ pub(crate) fn is_not_found(error: &DaytonaError) -> bool {
     matches!(error, DaytonaError::NotFound { .. })
 }
 
+/// The toolbox reports a command that exceeded its server-side timeout as
+/// a 408.
+pub(crate) fn is_server_timeout(error: &DaytonaError) -> bool {
+    matches!(error, DaytonaError::Api {
+        status_code: 408,
+        ..
+    })
+}
+
+/// A delete or stop racing an in-flight state change: Daytona reports 409
+/// "state change in progress", which for an idempotent operation means the
+/// work is already happening.
+pub(crate) fn is_change_in_progress(error: &DaytonaError) -> bool {
+    matches!(error, DaytonaError::Api {
+        status_code: 409,
+        ..
+    })
+}
+
 pub(crate) fn daytona_error(context: &str, error: &DaytonaError) -> Error {
     let kind = ProviderKind::try_new("daytona").expect("static kind is valid");
     match error {
@@ -584,7 +603,7 @@ impl Sandbox for DaytonaSandbox {
     async fn delete(&self) -> Result<()> {
         let outcome = match self.client.delete(&self.sdk_id).await {
             Ok(()) => Ok(()),
-            Err(error) if is_not_found(&error) => Ok(()),
+            Err(error) if is_not_found(&error) || is_change_in_progress(&error) => Ok(()),
             Err(error) => Err(daytona_error("deleting sandbox", &error)),
         };
         self.emit_action(LifecycleAction::Delete, &outcome).await;
