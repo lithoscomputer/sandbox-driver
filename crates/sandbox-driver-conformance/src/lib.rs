@@ -879,10 +879,24 @@ async fn volume_round_trip(ctx: &Conformance) -> CheckOutcome {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.subsec_nanos())
     });
-    let id = volumes
+    let id = match volumes
         .create(&sandbox_driver::VolumeSpec::new(name.clone()))
         .await
-        .map_err(|error| format!("volume create failed: {error}"))?;
+    {
+        Ok(id) => id,
+        // Capabilities describe the backend, not the credential; a
+        // permission-scoped key skips rather than fails this check.
+        Err(Error::Provider(provider))
+            if provider.code.as_deref() == Some("403")
+                || provider.code.as_deref() == Some("401") =>
+        {
+            return Ok(Some("credential lacks volume permissions".to_owned()));
+        }
+        Err(Error::Auth(_)) => {
+            return Ok(Some("credential lacks volume permissions".to_owned()));
+        }
+        Err(error) => return fail(format!("volume create failed: {error}")),
+    };
 
     // Poll briefly for a settled state; elastic backends are quick.
     let deadline = Instant::now() + Duration::from_secs(120);
