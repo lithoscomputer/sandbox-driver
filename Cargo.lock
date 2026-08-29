@@ -199,12 +199,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandbox-driver-conformance"
+version = "0.1.0"
+dependencies = [
+ "sandbox-driver",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "sandbox-driver-host"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "nix",
  "sandbox-driver",
+ "sandbox-driver-conformance",
  "tokio",
  "tokio-util",
 ]
@@ -216,6 +226,7 @@ dependencies = [
  "async-trait",
  "base64",
  "sandbox-driver",
+ "sandbox-driver-conformance",
  "sandbox-driver-host",
  "serde",
  "serde_json",

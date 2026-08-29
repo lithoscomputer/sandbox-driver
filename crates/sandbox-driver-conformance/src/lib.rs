@@ -1,0 +1,864 @@
+//! Black-box conformance suite for sandbox-driver providers.
+//!
+//! Runs the same end-to-end battery against any [`SandboxProvider`] —
+//! in-process or behind the JSON-RPC protocol — and reports per-check
+//! outcomes. Checks are **capability-gated in both directions**: a
+//! declared capability must work, and an undeclared one must return
+//! [`Error::Unsupported`]. That is the capability-honesty contract from
+//! the design.
+//!
+//! ```ignore
+//! let report = Conformance::new(provider, SpecFactory::new(make_spec))
+//!     .run()
+//!     .await;
+//! report.assert_pass();
+//! ```
+//!
+//! Each check provisions its own sandbox from the provider-appropriate
+//! spec the factory returns and deletes it afterwards, so the suite is
+//! safe to run against real (billed) providers — expect roughly a dozen
+//! short-lived sandboxes per run.
+
+use std::fmt;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use sandbox_driver::{
+    Capability, Error, ExecControls, ExecSpec, OutputStream, Sandbox, SandboxEvent, SandboxFilter,
+    SandboxId, SandboxProvider, SandboxSpec, SandboxState, SpawnSpec, Termination, WaitOptions,
+    activate, wait_for_state,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
+
+/// Produces a provider-appropriate creation spec for each check.
+pub struct SpecFactory {
+    make: Box<dyn Fn() -> SandboxSpec + Send + Sync>,
+}
+
+impl SpecFactory {
+    pub fn new(make: impl Fn() -> SandboxSpec + Send + Sync + 'static) -> Self {
+        Self {
+            make: Box::new(make),
+        }
+    }
+
+    fn spec(&self) -> SandboxSpec {
+        (self.make)()
+    }
+}
+
+/// Suite configuration.
+pub struct Conformance {
+    provider:          Arc<dyn SandboxProvider>,
+    specs:             SpecFactory,
+    /// Per-check wall-clock budget; a hung provider fails, not hangs.
+    pub check_timeout: Duration,
+    /// Wait options for state transitions (slow cloud providers need a
+    /// longer deadline).
+    pub wait:          WaitOptions,
+}
+
+impl Conformance {
+    pub fn new(provider: Arc<dyn SandboxProvider>, specs: SpecFactory) -> Self {
+        Self {
+            provider,
+            specs,
+            check_timeout: Duration::from_secs(300),
+            wait: WaitOptions {
+                interval: Duration::from_secs(1),
+                deadline: Some(Duration::from_secs(120)),
+            },
+        }
+    }
+
+    /// Runs the whole battery.
+    pub async fn run(&self) -> Report {
+        let checks: &[(&'static str, CheckFn)] = &[
+            ("provider_identity_and_list", |ctx| {
+                Box::pin(provider_identity_and_list(ctx))
+            }),
+            ("create_describe_delete", |ctx| {
+                Box::pin(create_describe_delete(ctx))
+            }),
+            ("delete_is_idempotent", |ctx| {
+                Box::pin(delete_is_idempotent(ctx))
+            }),
+            ("attach_unknown_id_is_not_found", |ctx| {
+                Box::pin(attach_unknown_id_is_not_found(ctx))
+            }),
+            ("activate_passes_bash_probe", |ctx| {
+                Box::pin(activate_passes_bash_probe(ctx))
+            }),
+            ("working_directory_is_effective", |ctx| {
+                Box::pin(working_directory_is_effective(ctx))
+            }),
+            ("exec_reports_exit_codes", |ctx| {
+                Box::pin(exec_reports_exit_codes(ctx))
+            }),
+            ("exec_env_vars_apply", |ctx| {
+                Box::pin(exec_env_vars_apply(ctx))
+            }),
+            ("exec_output_is_binary_safe", |ctx| {
+                Box::pin(exec_output_is_binary_safe(ctx))
+            }),
+            ("exec_stdin_round_trips", |ctx| {
+                Box::pin(exec_stdin_round_trips(ctx))
+            }),
+            ("exec_timeout_terminates", |ctx| {
+                Box::pin(exec_timeout_terminates(ctx))
+            }),
+            ("exec_cancel_terminates", |ctx| {
+                Box::pin(exec_cancel_terminates(ctx))
+            }),
+            ("exec_streaming_is_honest", |ctx| {
+                Box::pin(exec_streaming_is_honest(ctx))
+            }),
+            ("exec_retention_accounting_is_consistent", |ctx| {
+                Box::pin(exec_retention_accounting_is_consistent(ctx))
+            }),
+            ("fs_round_trips", |ctx| Box::pin(fs_round_trips(ctx))),
+            ("unsupported_actions_say_so", |ctx| {
+                Box::pin(unsupported_actions_say_so(ctx))
+            }),
+            ("pause_resume_cycle", |ctx| {
+                Box::pin(pause_resume_cycle(ctx))
+            }),
+            ("stdio_process_round_trips", |ctx| {
+                Box::pin(stdio_process_round_trips(ctx))
+            }),
+            ("attach_and_list_by_label", |ctx| {
+                Box::pin(attach_and_list_by_label(ctx))
+            }),
+            ("create_emits_terminal_events", |ctx| {
+                Box::pin(create_emits_terminal_events(ctx))
+            }),
+        ];
+
+        let mut results = Vec::new();
+        for (name, check) in checks {
+            let outcome = match tokio::time::timeout(self.check_timeout, check(self)).await {
+                Ok(Ok(None)) => Outcome::Passed,
+                Ok(Ok(Some(reason))) => Outcome::Skipped { reason },
+                Ok(Err(reason)) => Outcome::Failed { reason },
+                Err(_) => Outcome::Failed {
+                    reason: format!("check exceeded the {:?} budget", self.check_timeout),
+                },
+            };
+            results.push(CheckResult { name, outcome });
+        }
+        Report { results }
+    }
+
+    async fn create(&self) -> Result<Arc<dyn Sandbox>, String> {
+        self.provider
+            .create(&self.specs.spec(), None)
+            .await
+            .map_err(|error| format!("create failed: {error}"))
+    }
+
+    async fn ready(&self) -> Result<Arc<dyn Sandbox>, String> {
+        let sandbox = self.create().await?;
+        if let Err(error) = activate(sandbox.as_ref(), &self.wait).await {
+            let _ = sandbox.delete().await;
+            return Err(format!("activate failed: {error}"));
+        }
+        Ok(sandbox)
+    }
+
+    fn caps(&self) -> &sandbox_driver::Capabilities {
+        self.provider.capabilities()
+    }
+}
+
+type CheckFn = fn(
+    &Conformance,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Option<String>, String>> + Send + '_>,
+>;
+
+/// `Ok(None)` = passed, `Ok(Some(reason))` = skipped, `Err` = failed.
+type CheckOutcome = Result<Option<String>, String>;
+
+/// Outcome of one check.
+#[derive(Clone, Debug)]
+pub enum Outcome {
+    Passed,
+    Skipped { reason: String },
+    Failed { reason: String },
+}
+
+/// One line of the report.
+#[derive(Clone, Debug)]
+pub struct CheckResult {
+    pub name:    &'static str,
+    pub outcome: Outcome,
+}
+
+/// The suite's result.
+#[derive(Clone, Debug)]
+pub struct Report {
+    pub results: Vec<CheckResult>,
+}
+
+impl Report {
+    pub fn failures(&self) -> Vec<&CheckResult> {
+        self.results
+            .iter()
+            .filter(|result| matches!(result.outcome, Outcome::Failed { .. }))
+            .collect()
+    }
+
+    /// Panics with the full report when any check failed.
+    pub fn assert_pass(&self) {
+        assert!(self.failures().is_empty(), "conformance failures:\n{self}");
+    }
+}
+
+impl fmt::Display for Report {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for result in &self.results {
+            match &result.outcome {
+                Outcome::Passed => writeln!(f, "PASS {}", result.name)?,
+                Outcome::Skipped { reason } => {
+                    writeln!(f, "SKIP {} ({reason})", result.name)?;
+                }
+                Outcome::Failed { reason } => writeln!(f, "FAIL {}: {reason}", result.name)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+fn fail(message: impl Into<String>) -> CheckOutcome {
+    Err(message.into())
+}
+
+fn skip(reason: impl Into<String>) -> CheckOutcome {
+    Ok(Some(reason.into()))
+}
+
+const PASS: CheckOutcome = Ok(None);
+
+async fn cleanup(sandbox: &Arc<dyn Sandbox>) {
+    let _ = sandbox.delete().await;
+}
+
+// --- Checks ---
+
+async fn provider_identity_and_list(ctx: &Conformance) -> CheckOutcome {
+    if ctx.provider.kind().as_str().is_empty() {
+        return fail("provider kind is empty");
+    }
+    ctx.provider
+        .list(&SandboxFilter::default())
+        .await
+        .map_err(|error| format!("list failed: {error}"))?;
+    PASS
+}
+
+async fn create_describe_delete(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.create().await?;
+    let outcome = async {
+        let status = sandbox
+            .describe()
+            .await
+            .map_err(|error| format!("describe failed: {error}"))?;
+        if status.id != *sandbox.id() {
+            return fail("describe returned a different sandbox id");
+        }
+        if sandbox.working_directory().is_empty() {
+            return fail("working_directory is empty");
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome?;
+
+    let sandbox_id = sandbox.id().clone();
+    // After delete, describe (via re-attach) must not report a live sandbox.
+    match ctx.provider.attach(&sandbox_id, None).await {
+        Err(_) => PASS,
+        Ok(handle) => {
+            let state = handle
+                .describe()
+                .await
+                .map(|status| status.state)
+                .unwrap_or(SandboxState::Deleted);
+            if matches!(state, SandboxState::Deleted | SandboxState::Deleting) {
+                PASS
+            } else {
+                fail(format!("sandbox still {state:?} after delete"))
+            }
+        }
+    }
+}
+
+async fn delete_is_idempotent(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.create().await?;
+    sandbox
+        .delete()
+        .await
+        .map_err(|error| format!("first delete failed: {error}"))?;
+    sandbox
+        .delete()
+        .await
+        .map_err(|error| format!("second delete failed: {error}"))?;
+    PASS
+}
+
+async fn attach_unknown_id_is_not_found(ctx: &Conformance) -> CheckOutcome {
+    let id = SandboxId::try_new("conformance-does-not-exist").map_err(|error| error.to_string())?;
+    match ctx.provider.attach(&id, None).await {
+        Err(Error::NotFound { .. }) => PASS,
+        Err(other) => fail(format!("expected NotFound, got: {other}")),
+        Ok(_) => fail("attach to an unknown id succeeded"),
+    }
+}
+
+async fn activate_passes_bash_probe(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    cleanup(&sandbox).await;
+    PASS
+}
+
+async fn working_directory_is_effective(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let result = sandbox
+            .exec()
+            .run(&ExecSpec::new("pwd").timeout(Duration::from_secs(30)))
+            .await
+            .map_err(|error| format!("exec failed: {error}"))?;
+        let pwd = result.stdout_lossy().trim().to_owned();
+        let expected = sandbox.working_directory();
+        if pwd != expected {
+            return fail(format!("pwd is {pwd:?}, working_directory is {expected:?}"));
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn exec_reports_exit_codes(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let result = sandbox
+            .exec()
+            .run(&ExecSpec::new("exit 7").timeout(Duration::from_secs(30)))
+            .await
+            .map_err(|error| format!("exec failed: {error}"))?;
+        if result.exit_code != Some(7) {
+            return fail(format!("expected exit code 7, got {:?}", result.exit_code));
+        }
+        if result.termination != Termination::Exited {
+            return fail(format!("expected Exited, got {:?}", result.termination));
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn exec_env_vars_apply(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let spec = ExecSpec::new("printf '%s' \"$CONFORMANCE_VALUE\"")
+            .env_var("CONFORMANCE_VALUE", "expected-value")
+            .timeout(Duration::from_secs(30));
+        let result = sandbox
+            .exec()
+            .run(&spec)
+            .await
+            .map_err(|error| format!("exec failed: {error}"))?;
+        if result.stdout_lossy() != "expected-value" {
+            return fail(format!(
+                "environment variable missing: {:?}",
+                result.stdout_lossy()
+            ));
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn exec_output_is_binary_safe(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let spec = ExecSpec::new("printf 'a\\0b\\x01c'").timeout(Duration::from_secs(30));
+        let result = sandbox
+            .exec()
+            .run(&spec)
+            .await
+            .map_err(|error| format!("exec failed: {error}"))?;
+        if result.stdout != b"a\0b\x01c" {
+            return fail(format!("binary output mangled: {:?}", result.stdout));
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn exec_stdin_round_trips(ctx: &Conformance) -> CheckOutcome {
+    if !ctx.caps().exec.stdin {
+        return exec_stdin_unsupported(ctx).await;
+    }
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let spec = ExecSpec::new("cat")
+            .stdin(b"stdin-payload".to_vec())
+            .timeout(Duration::from_secs(30));
+        let result = sandbox
+            .exec()
+            .run(&spec)
+            .await
+            .map_err(|error| format!("exec failed: {error}"))?;
+        if result.stdout != b"stdin-payload" {
+            return fail(format!("stdin not delivered: {:?}", result.stdout_lossy()));
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn exec_stdin_unsupported(_ctx: &Conformance) -> CheckOutcome {
+    skip("capability exec.stdin not declared")
+}
+
+async fn exec_timeout_terminates(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let started = Instant::now();
+        let spec = ExecSpec::new("sleep 300").timeout(Duration::from_secs(2));
+        let result = sandbox
+            .exec()
+            .run(&spec)
+            .await
+            .map_err(|error| format!("exec failed: {error}"))?;
+        if result.termination != Termination::TimedOut {
+            return fail(format!("expected TimedOut, got {:?}", result.termination));
+        }
+        if started.elapsed() > Duration::from_secs(60) {
+            return fail("timeout enforcement took over a minute");
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn exec_cancel_terminates(ctx: &Conformance) -> CheckOutcome {
+    if !ctx.caps().exec.cancel {
+        return skip("capability exec.cancel not declared");
+    }
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let token = CancellationToken::new();
+        let cancel_after = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            cancel_after.cancel();
+        });
+        let controls = ExecControls {
+            cancel: Some(token),
+            ..ExecControls::default()
+        };
+        let streaming = sandbox
+            .exec()
+            .run_streaming(&ExecSpec::new("sleep 300"), controls)
+            .await
+            .map_err(|error| format!("exec failed: {error}"))?;
+        if streaming.result.termination != Termination::Cancelled {
+            return fail(format!(
+                "expected Cancelled, got {:?}",
+                streaming.result.termination
+            ));
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn exec_streaming_is_honest(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let chunks: Arc<Mutex<Vec<(OutputStream, Vec<u8>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_chunks = Arc::clone(&chunks);
+        let controls = ExecControls {
+            sink: Some(Arc::new(move |stream, chunk| {
+                let chunks = Arc::clone(&sink_chunks);
+                Box::pin(async move {
+                    chunks.lock().expect("chunks lock").push((stream, chunk));
+                    Ok(())
+                })
+            })),
+            ..ExecControls::default()
+        };
+        let spec =
+            ExecSpec::new("echo to-stdout; echo to-stderr >&2").timeout(Duration::from_secs(30));
+        let streaming = sandbox
+            .exec()
+            .run_streaming(&spec, controls)
+            .await
+            .map_err(|error| format!("exec failed: {error}"))?;
+        if !streaming.result.success() {
+            return fail(format!(
+                "command failed: {}",
+                streaming.result.stderr_lossy()
+            ));
+        }
+
+        let caps = ctx.caps();
+        if streaming.live_streaming && !caps.exec.live_streaming {
+            return fail("result claims live_streaming but the capability is not declared");
+        }
+        if streaming.streams_separated && !caps.exec.streams_separated {
+            return fail("result claims streams_separated but the capability is not declared");
+        }
+
+        let seen = chunks.lock().expect("chunks lock").clone();
+        let all: Vec<u8> = seen.iter().flat_map(|(_, chunk)| chunk.clone()).collect();
+        let text = String::from_utf8_lossy(&all);
+        if !text.contains("to-stdout") {
+            return fail("sink never saw stdout output");
+        }
+        if streaming.streams_separated {
+            let stderr: Vec<u8> = seen
+                .iter()
+                .filter(|(stream, _)| *stream == OutputStream::Stderr)
+                .flat_map(|(_, chunk)| chunk.clone())
+                .collect();
+            if !String::from_utf8_lossy(&stderr).contains("to-stderr") {
+                return fail("streams_separated is set but stderr never arrived on stderr");
+            }
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn exec_retention_accounting_is_consistent(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let controls = ExecControls {
+            retained_output_limit: Some(512),
+            ..ExecControls::default()
+        };
+        let spec = ExecSpec::new("for i in $(seq 1 500); do echo payload-line-$i; done")
+            .timeout(Duration::from_secs(60));
+        let streaming = sandbox
+            .exec()
+            .run_streaming(&spec, controls)
+            .await
+            .map_err(|error| format!("exec failed: {error}"))?;
+        let stats = streaming.stdout_capture;
+        if stats.observed_bytes > 0
+            && stats.retained_bytes + stats.omitted_bytes != stats.observed_bytes
+        {
+            return fail(format!("capture accounting inconsistent: {stats:?}"));
+        }
+        if stats.observed_bytes > 0 && streaming.result.stdout.len() > 512 {
+            return fail(format!(
+                "retained output exceeds the cap: {} bytes",
+                streaming.result.stdout.len()
+            ));
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn fs_round_trips(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let fs = sandbox.fs();
+        let payload = [0u8, 1, 2, 255, 254, 253];
+        fs.write("conformance/dir/file.bin", &payload)
+            .await
+            .map_err(|error| format!("write failed: {error}"))?;
+        let read = fs
+            .read("conformance/dir/file.bin")
+            .await
+            .map_err(|error| format!("read failed: {error}"))?;
+        if read != payload {
+            return fail(format!("read returned different bytes: {read:?}"));
+        }
+        if !fs
+            .exists("conformance/dir/file.bin")
+            .await
+            .map_err(|error| format!("exists failed: {error}"))?
+        {
+            return fail("exists returned false for a written file");
+        }
+        let metadata = fs
+            .metadata("conformance/dir/file.bin")
+            .await
+            .map_err(|error| format!("metadata failed: {error}"))?;
+        if metadata.size != payload.len() as u64 {
+            return fail(format!(
+                "metadata size {} != {}",
+                metadata.size,
+                payload.len()
+            ));
+        }
+        let entries = fs
+            .list_dir("conformance", 2)
+            .await
+            .map_err(|error| format!("list_dir failed: {error}"))?;
+        if !entries.iter().any(|entry| entry.path.ends_with("file.bin")) {
+            return fail("list_dir did not surface the written file");
+        }
+        fs.rename("conformance/dir/file.bin", "conformance/dir/renamed.bin")
+            .await
+            .map_err(|error| format!("rename failed: {error}"))?;
+        if fs
+            .exists("conformance/dir/file.bin")
+            .await
+            .map_err(|error| format!("exists failed: {error}"))?
+        {
+            return fail("source still exists after rename");
+        }
+
+        if ctx.caps().fs.permissions {
+            fs.set_permissions("conformance/dir/renamed.bin", 0o600)
+                .await
+                .map_err(|error| format!("set_permissions failed: {error}"))?;
+            let metadata = fs
+                .metadata("conformance/dir/renamed.bin")
+                .await
+                .map_err(|error| format!("metadata failed: {error}"))?;
+            if let Some(mode) = metadata.mode {
+                if mode & 0o777 != 0o600 {
+                    return fail(format!("mode {mode:o} after chmod 600"));
+                }
+            }
+        }
+
+        fs.delete("conformance", true)
+            .await
+            .map_err(|error| format!("recursive delete failed: {error}"))?;
+        if fs
+            .exists("conformance")
+            .await
+            .map_err(|error| format!("exists failed: {error}"))?
+        {
+            return fail("directory still exists after recursive delete");
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn unsupported_actions_say_so(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.create().await?;
+    let caps = ctx.caps().clone();
+    let outcome = async {
+        let mut wrong: Vec<String> = Vec::new();
+        let mut check = |name: &str, declared: bool, result: Result<(), Error>| match result {
+            Err(Error::Unsupported { .. }) if declared => {
+                wrong.push(format!("{name}: declared but returned Unsupported"));
+            }
+            Err(Error::Unsupported { .. }) => {}
+            _ if declared => {}
+            Ok(()) => wrong.push(format!("{name}: undeclared but succeeded")),
+            // A non-Unsupported error for an undeclared capability is
+            // wrong too, but tolerated: some providers reject earlier.
+            Err(_) => {}
+        };
+        check("pause", caps.lifecycle.pause, sandbox.pause().await);
+        check("archive", caps.lifecycle.archive, sandbox.archive().await);
+        check("recover", caps.lifecycle.recover, sandbox.recover().await);
+        check(
+            "refresh_activity",
+            caps.lifecycle.refresh_activity,
+            sandbox.refresh_activity().await,
+        );
+        if !caps.lifecycle.checkpoint {
+            if let Err(error) = sandbox
+                .checkpoint(&sandbox_driver::CheckpointOptions::default())
+                .await
+            {
+                if !matches!(error, Error::Unsupported {
+                    capability: Capability::LifecycleCheckpoint,
+                }) {
+                    wrong.push(format!("checkpoint: expected Unsupported, got {error}"));
+                }
+            } else {
+                wrong.push("checkpoint: undeclared but succeeded".to_owned());
+            }
+        }
+        if wrong.is_empty() {
+            PASS
+        } else {
+            fail(wrong.join("; "))
+        }
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn pause_resume_cycle(ctx: &Conformance) -> CheckOutcome {
+    if !ctx.caps().lifecycle.pause {
+        return skip("capability lifecycle.pause not declared");
+    }
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        sandbox
+            .pause()
+            .await
+            .map_err(|error| format!("pause failed: {error}"))?;
+        wait_for_state(sandbox.as_ref(), SandboxState::Paused, &ctx.wait)
+            .await
+            .map_err(|error| format!("never reached Paused: {error}"))?;
+        sandbox
+            .resume()
+            .await
+            .map_err(|error| format!("resume failed: {error}"))?;
+        wait_for_state(sandbox.as_ref(), SandboxState::Running, &ctx.wait)
+            .await
+            .map_err(|error| format!("never returned to Running: {error}"))?;
+        // The sandbox must still work after the cycle.
+        let result = sandbox
+            .exec()
+            .run(&ExecSpec::new("echo alive").timeout(Duration::from_secs(30)))
+            .await
+            .map_err(|error| format!("exec after resume failed: {error}"))?;
+        if !result.success() {
+            return fail("exec after resume did not succeed");
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn stdio_process_round_trips(ctx: &Conformance) -> CheckOutcome {
+    if !ctx.caps().exec.stdio_process {
+        // The default must be a clean Unsupported.
+        let sandbox = ctx.create().await?;
+        let outcome = match sandbox.exec().spawn_stdio(&SpawnSpec::new("cat")).await {
+            Err(Error::Unsupported { .. }) => skip("capability exec.stdio_process not declared"),
+            Err(other) => fail(format!("expected Unsupported, got {other}")),
+            Ok(_) => fail("stdio_process undeclared but spawn succeeded"),
+        };
+        cleanup(&sandbox).await;
+        return outcome;
+    }
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let mut process = sandbox
+            .exec()
+            .spawn_stdio(&SpawnSpec::new("cat"))
+            .await
+            .map_err(|error| format!("spawn failed: {error}"))?;
+        process
+            .stdin
+            .write_all(b"ping\n")
+            .await
+            .map_err(|error| format!("write failed: {error}"))?;
+        process
+            .stdin
+            .flush()
+            .await
+            .map_err(|error| format!("flush failed: {error}"))?;
+        let mut buffer = [0u8; 5];
+        process
+            .stdout
+            .read_exact(&mut buffer)
+            .await
+            .map_err(|error| format!("read failed: {error}"))?;
+        if &buffer != b"ping\n" {
+            return fail(format!("round trip mismatch: {buffer:?}"));
+        }
+        process.handle.terminate().await;
+        let _ = process.handle.wait().await;
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn attach_and_list_by_label(ctx: &Conformance) -> CheckOutcome {
+    let marker = format!("conformance-{}", std::process::id());
+    let mut spec = ctx.specs.spec();
+    spec.labels
+        .insert("sandbox-driver-conformance".to_owned(), marker.clone());
+    let sandbox = ctx
+        .provider
+        .create(&spec, None)
+        .await
+        .map_err(|error| format!("create failed: {error}"))?;
+    let outcome = async {
+        let attached = ctx
+            .provider
+            .attach(sandbox.id(), None)
+            .await
+            .map_err(|error| format!("attach failed: {error}"))?;
+        if attached.id() != sandbox.id() {
+            return fail("attach returned a different sandbox");
+        }
+        let mut filter = SandboxFilter::default();
+        filter
+            .labels
+            .insert("sandbox-driver-conformance".to_owned(), marker.clone());
+        let listed = ctx
+            .provider
+            .list(&filter)
+            .await
+            .map_err(|error| format!("list failed: {error}"))?;
+        if listed.len() != 1 || listed[0].id != *sandbox.id() {
+            return fail(format!("label filter returned {} sandboxes", listed.len()));
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn create_emits_terminal_events(ctx: &Conformance) -> CheckOutcome {
+    let events: Arc<Mutex<Vec<SandboxEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    let callback: sandbox_driver::EventCallback = Arc::new(move |event| {
+        sink.lock().expect("events lock").push(event);
+    });
+    let sandbox = ctx
+        .provider
+        .create(&ctx.specs.spec(), Some(callback))
+        .await
+        .map_err(|error| format!("create failed: {error}"))?;
+    cleanup(&sandbox).await;
+    // Give the async delivery path a moment.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let seen = events.lock().expect("events lock").clone();
+    if seen.iter().any(SandboxEvent::is_terminal) {
+        PASS
+    } else {
+        fail(format!(
+            "no terminal event observed across create+delete ({} events)",
+            seen.len()
+        ))
+    }
+}

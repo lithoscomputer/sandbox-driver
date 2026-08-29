@@ -147,16 +147,14 @@ impl ServerState {
             .insert(handle.id().as_str().to_owned(), Arc::clone(handle));
     }
 
-    fn event_callback(&self, sandbox_hint: String) -> EventCallback {
+    fn event_callback(&self, sandbox_hint: Arc<Mutex<String>>) -> EventCallback {
         let outbound = self.outbound.clone();
         Arc::new(move |event| {
+            let sandbox_id = sandbox_hint.lock().expect("hint lock").clone();
             let notification = Message::notification(
                 m::HOST_EVENT,
-                serde_json::to_value(m::HostEventNotification {
-                    sandbox_id: sandbox_hint.clone(),
-                    event,
-                })
-                .unwrap_or(Value::Null),
+                serde_json::to_value(m::HostEventNotification { sandbox_id, event })
+                    .unwrap_or(Value::Null),
             );
             // Best-effort: an overflowing notification queue drops the
             // event rather than blocking the provider.
@@ -223,10 +221,13 @@ async fn dispatch(
         }
         m::SANDBOX_CREATE => {
             let request: m::CreateParams = parse(params)?;
-            // The callback needs the id, which exists only after create;
-            // events during create itself are delivered with an empty id.
-            let callback = state.event_callback(String::new());
+            // The id exists only after create: the hint is bound late, so
+            // events during create carry an empty id, everything after
+            // routes correctly.
+            let hint = Arc::new(Mutex::new(String::new()));
+            let callback = state.event_callback(Arc::clone(&hint));
             let handle = state.provider.create(&request.spec, Some(callback)).await?;
+            *hint.lock().expect("hint lock") = handle.id().as_str().to_owned();
             state.remember(&handle);
             let status = handle.describe().await?;
             to_value(&handle_info(&handle, status))
@@ -235,7 +236,7 @@ async fn dispatch(
             let request: m::AttachParams = parse(params)?;
             let sandbox_id = SandboxId::try_new(&request.sandbox_id)
                 .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
-            let callback = state.event_callback(request.sandbox_id.clone());
+            let callback = state.event_callback(Arc::new(Mutex::new(request.sandbox_id.clone())));
             let handle = state.provider.attach(&sandbox_id, Some(callback)).await?;
             state.remember(&handle);
             let status = handle.describe().await?;

@@ -19,4 +19,5 @@ tokio-util.workspace = true
 nix.workspace = true
 
 [dev-dependencies]
+sandbox-driver-conformance.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

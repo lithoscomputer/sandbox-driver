@@ -1,0 +1,15 @@
+[package]
+name = "sandbox-driver-conformance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Black-box conformance suite for sandbox-driver providers"
+
+[lints]
+workspace = true
+
+[dependencies]
+sandbox-driver.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync", "time"] }
+tokio-util.workspace = true

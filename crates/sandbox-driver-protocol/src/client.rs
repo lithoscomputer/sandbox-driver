@@ -57,10 +57,12 @@ impl PluginProvider {
                 ),
             ));
         }
+        let mut capabilities = result.capabilities;
+        mask_wire_capabilities(&mut capabilities);
         Ok(Self {
             client,
             kind: result.provider.kind,
-            capabilities: result.capabilities,
+            capabilities,
         })
     }
 
@@ -70,7 +72,12 @@ impl PluginProvider {
         Ok(())
     }
 
-    fn wrap_handle(&self, info: m::HandleInfo, events: Option<EventCallback>) -> Arc<dyn Sandbox> {
+    fn wrap_handle(
+        &self,
+        mut info: m::HandleInfo,
+        events: Option<EventCallback>,
+    ) -> Arc<dyn Sandbox> {
+        mask_wire_capabilities(&mut info.capabilities);
         let id = info.status.id.clone();
         if let Some(callback) = events {
             self.client
@@ -142,6 +149,13 @@ impl sandbox_driver::SandboxProvider for PluginProvider {
             .await?;
         Ok(result.sandboxes)
     }
+}
+
+/// Removes capabilities protocol v1 cannot deliver through the wire, so
+/// the client never advertises what [`PluginExec::spawn_stdio`] would then
+/// refuse. The stdio side-channel transport lifts this in a later version.
+fn mask_wire_capabilities(capabilities: &mut Capabilities) {
+    capabilities.exec.stdio_process = false;
 }
 
 /// Request/response correlation plus notification routing.

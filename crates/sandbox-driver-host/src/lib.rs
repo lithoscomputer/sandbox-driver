@@ -142,6 +142,12 @@ impl SandboxProvider for HostProvider {
                     "designated path is not a directory",
                 ));
             }
+            let path = tokio_fs::canonicalize(&path).await.map_err(|error| {
+                Error::io(
+                    format!("resolving designated directory {}", path.display()),
+                    error,
+                )
+            })?;
             (path, WorkspaceOwnership::Designated)
         } else {
             let path = env::temp_dir()
@@ -150,6 +156,12 @@ impl SandboxProvider for HostProvider {
             tokio_fs::create_dir_all(&path).await.map_err(|error| {
                 Error::io(
                     format!("creating managed workspace {}", path.display()),
+                    error,
+                )
+            })?;
+            let path = tokio_fs::canonicalize(&path).await.map_err(|error| {
+                Error::io(
+                    format!("resolving managed workspace {}", path.display()),
                     error,
                 )
             })?;
