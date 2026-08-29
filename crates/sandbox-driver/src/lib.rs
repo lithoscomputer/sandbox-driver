@@ -39,6 +39,8 @@
 
 mod access;
 mod capabilities;
+mod capture;
+mod derived;
 mod error;
 mod event;
 mod exec;
@@ -53,6 +55,8 @@ mod sandbox;
 mod search;
 mod spec;
 mod state;
+#[cfg(test)]
+mod test_exec;
 mod wait;
 
 pub use access::{
@@ -63,6 +67,8 @@ pub use capabilities::{
     AccessCaps, Capabilities, Capability, ExecCaps, FsCaps, GitCaps, Isolation, LifecycleCaps,
     LogsCaps, NetworkCaps, PtyCaps, SearchCaps, SnapshotCaps, VolumeCaps,
 };
+pub use capture::OutputCaptureBuffer;
+pub use derived::{DerivedGit, DerivedSearch};
 pub use error::{AuthError, Error, ExecFailure, ProviderError, ResourceKind, Result};
 pub use event::{ErrorReport, EventCallback, EventDispatcher, LifecycleAction, SandboxEvent};
 pub use exec::{

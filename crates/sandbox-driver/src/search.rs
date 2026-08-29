@@ -59,5 +59,6 @@ pub struct WalkOptions {
 pub struct WalkedFile {
     /// Path relative to the walk base.
     pub path: String,
-    pub size: u64,
+    /// `None` when the transport cannot report sizes (BSD find fallback).
+    pub size: Option<u64>,
 }
