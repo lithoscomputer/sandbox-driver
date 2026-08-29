@@ -1,0 +1,7 @@
+/.ai/*
+!/.ai/style-guides.lock
+!/.ai/journal/
+
+/target/
+/dist-release/
+/tmp/

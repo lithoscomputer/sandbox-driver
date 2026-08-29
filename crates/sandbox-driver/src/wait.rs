@@ -1,0 +1,66 @@
+use std::time::Duration;
+
+use tokio::time::{Instant, sleep};
+
+use crate::error::{Error, ProviderError, Result};
+use crate::id::ProviderKind;
+use crate::sandbox::Sandbox;
+use crate::state::{SandboxState, SandboxStatus};
+
+/// Polling configuration for [`wait_for_state`].
+#[derive(Clone, Copy, Debug)]
+pub struct WaitOptions {
+    pub interval: Duration,
+    /// `None` waits without a deadline.
+    pub deadline: Option<Duration>,
+}
+
+impl Default for WaitOptions {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(1),
+            deadline: Some(Duration::from_secs(60)),
+        }
+    }
+}
+
+/// Polls [`Sandbox::describe`] until the sandbox reaches `target`.
+///
+/// The one generic wait loop, replacing per-call hand-written loops:
+/// fails with the provider's `error_reason` when the sandbox enters
+/// [`SandboxState::Error`] (unless `Error` is the target), and with
+/// [`Error::Timeout`] when the deadline passes. `Deleted` counts as
+/// `Stopped` for ephemeral sandboxes that vanish on stop.
+pub async fn wait_for_state(
+    sandbox: &dyn Sandbox,
+    target: SandboxState,
+    options: &WaitOptions,
+) -> Result<SandboxStatus> {
+    let started = Instant::now();
+    loop {
+        let status = sandbox.describe().await?;
+        let reached = status.state == target
+            || (target == SandboxState::Stopped && status.state == SandboxState::Deleted);
+        if reached {
+            return Ok(status);
+        }
+        if status.state == SandboxState::Error {
+            return Err(Error::Provider(ProviderError::new(
+                ProviderKind::try_new("unknown").expect("static kind is valid"),
+                status
+                    .error_reason
+                    .unwrap_or_else(|| "sandbox entered the error state".to_owned()),
+            )));
+        }
+        if let Some(deadline) = options.deadline {
+            let elapsed = started.elapsed();
+            if elapsed >= deadline {
+                return Err(Error::Timeout {
+                    operation: format!("waiting for state {target:?}"),
+                    elapsed,
+                });
+            }
+        }
+        sleep(options.interval).await;
+    }
+}

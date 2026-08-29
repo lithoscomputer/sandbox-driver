@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 2 ]]; then
+  echo "Usage: bin/build-release <target> <version>" >&2
+  exit 2
+fi
+
+target=$1
+version=$2
+binary_name=${RUST_TEMPLATE_BINARY_NAME:?RUST_TEMPLATE_BINARY_NAME is required}
+
+case "$target" in
+  aarch64-apple-darwin | x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu) ;;
+  *)
+    echo "Unsupported release target: $target" >&2
+    exit 2
+    ;;
+esac
+
+host_target=$(rustc -vV | sed -n 's/^host: //p')
+if [[ "$host_target" != "$target" ]]; then
+  echo "Release target $target must be built on its native $target runner; host is $host_target" >&2
+  exit 1
+fi
+
+cargo build --locked --release --target "$target"
+
+archive_name="${binary_name}-${version}-${target}.tar.gz"
+output_dir="dist-release"
+staging_dir=$(mktemp -d)
+
+cleanup() {
+  rm -rf -- "$staging_dir"
+}
+trap cleanup EXIT HUP INT TERM
+
+mkdir -p "$output_dir"
+cp "target/$target/release/$binary_name" "$staging_dir/$binary_name"
+tar -C "$staging_dir" -czf "$output_dir/$archive_name" "$binary_name"
+
+(
+  cd "$output_dir"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$archive_name" > "$archive_name.sha256"
+  else
+    shasum -a 256 "$archive_name" > "$archive_name.sha256"
+  fi
+)
+
+echo "$output_dir/$archive_name"
+echo "$output_dir/$archive_name.sha256"
