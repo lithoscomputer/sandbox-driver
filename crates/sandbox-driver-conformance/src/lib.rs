@@ -19,9 +19,11 @@
 //! safe to run against real (billed) providers — expect roughly a dozen
 //! short-lived sandboxes per run.
 
-use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use std::{fmt, process};
 
 use sandbox_driver::{
     Capability, Error, ExecControls, ExecSpec, OutputStream, Sandbox, SandboxEvent, SandboxFilter,
@@ -29,7 +31,10 @@ use sandbox_driver::{
     activate, wait_for_state,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time;
 use tokio_util::sync::CancellationToken;
+
+type SeenChunks = Arc<Mutex<Vec<(OutputStream, Vec<u8>)>>>;
 
 /// Produces a provider-appropriate creation spec for each check.
 pub struct SpecFactory {
@@ -137,7 +142,7 @@ impl Conformance {
 
         let mut results = Vec::new();
         for (name, check) in checks {
-            let outcome = match tokio::time::timeout(self.check_timeout, check(self)).await {
+            let outcome = match time::timeout(self.check_timeout, check(self)).await {
                 Ok(Ok(None)) => Outcome::Passed,
                 Ok(Ok(Some(reason))) => Outcome::Skipped { reason },
                 Ok(Err(reason)) => Outcome::Failed { reason },
@@ -171,11 +176,8 @@ impl Conformance {
     }
 }
 
-type CheckFn = fn(
-    &Conformance,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<Option<String>, String>> + Send + '_>,
->;
+type CheckFn =
+    fn(&Conformance) -> Pin<Box<dyn Future<Output = Result<Option<String>, String>> + Send + '_>>;
 
 /// `Ok(None)` = passed, `Ok(Some(reason))` = skipped, `Err` = failed.
 type CheckOutcome = Result<Option<String>, String>;
@@ -234,10 +236,6 @@ fn fail(message: impl Into<String>) -> CheckOutcome {
     Err(message.into())
 }
 
-fn skip(reason: impl Into<String>) -> CheckOutcome {
-    Ok(Some(reason.into()))
-}
-
 const PASS: CheckOutcome = Ok(None);
 
 async fn cleanup(sandbox: &Arc<dyn Sandbox>) {
@@ -284,8 +282,7 @@ async fn create_describe_delete(ctx: &Conformance) -> CheckOutcome {
             let state = handle
                 .describe()
                 .await
-                .map(|status| status.state)
-                .unwrap_or(SandboxState::Deleted);
+                .map_or(SandboxState::Deleted, |status| status.state);
             if matches!(state, SandboxState::Deleted | SandboxState::Deleting) {
                 PASS
             } else {
@@ -409,7 +406,7 @@ async fn exec_output_is_binary_safe(ctx: &Conformance) -> CheckOutcome {
 
 async fn exec_stdin_round_trips(ctx: &Conformance) -> CheckOutcome {
     if !ctx.caps().exec.stdin {
-        return exec_stdin_unsupported(ctx).await;
+        return Ok(Some("capability exec.stdin not declared".to_owned()));
     }
     let sandbox = ctx.ready().await?;
     let outcome = async {
@@ -429,10 +426,6 @@ async fn exec_stdin_round_trips(ctx: &Conformance) -> CheckOutcome {
     .await;
     cleanup(&sandbox).await;
     outcome
-}
-
-async fn exec_stdin_unsupported(_ctx: &Conformance) -> CheckOutcome {
-    skip("capability exec.stdin not declared")
 }
 
 async fn exec_timeout_terminates(ctx: &Conformance) -> CheckOutcome {
@@ -460,14 +453,14 @@ async fn exec_timeout_terminates(ctx: &Conformance) -> CheckOutcome {
 
 async fn exec_cancel_terminates(ctx: &Conformance) -> CheckOutcome {
     if !ctx.caps().exec.cancel {
-        return skip("capability exec.cancel not declared");
+        return Ok(Some("capability exec.cancel not declared".to_owned()));
     }
     let sandbox = ctx.ready().await?;
     let outcome = async {
         let token = CancellationToken::new();
         let cancel_after = token.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            time::sleep(Duration::from_millis(500)).await;
             cancel_after.cancel();
         });
         let controls = ExecControls {
@@ -495,7 +488,7 @@ async fn exec_cancel_terminates(ctx: &Conformance) -> CheckOutcome {
 async fn exec_streaming_is_honest(ctx: &Conformance) -> CheckOutcome {
     let sandbox = ctx.ready().await?;
     let outcome = async {
-        let chunks: Arc<Mutex<Vec<(OutputStream, Vec<u8>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let chunks: SeenChunks = Arc::new(Mutex::new(Vec::new()));
         let sink_chunks = Arc::clone(&chunks);
         let controls = ExecControls {
             sink: Some(Arc::new(move |stream, chunk| {
@@ -719,7 +712,7 @@ async fn unsupported_actions_say_so(ctx: &Conformance) -> CheckOutcome {
 
 async fn pause_resume_cycle(ctx: &Conformance) -> CheckOutcome {
     if !ctx.caps().lifecycle.pause {
-        return skip("capability lifecycle.pause not declared");
+        return Ok(Some("capability lifecycle.pause not declared".to_owned()));
     }
     let sandbox = ctx.ready().await?;
     let outcome = async {
@@ -758,7 +751,9 @@ async fn stdio_process_round_trips(ctx: &Conformance) -> CheckOutcome {
         // The default must be a clean Unsupported.
         let sandbox = ctx.create().await?;
         let outcome = match sandbox.exec().spawn_stdio(&SpawnSpec::new("cat")).await {
-            Err(Error::Unsupported { .. }) => skip("capability exec.stdio_process not declared"),
+            Err(Error::Unsupported { .. }) => Ok(Some(
+                "capability exec.stdio_process not declared".to_owned(),
+            )),
             Err(other) => fail(format!("expected Unsupported, got {other}")),
             Ok(_) => fail("stdio_process undeclared but spawn succeeded"),
         };
@@ -801,7 +796,7 @@ async fn stdio_process_round_trips(ctx: &Conformance) -> CheckOutcome {
 }
 
 async fn attach_and_list_by_label(ctx: &Conformance) -> CheckOutcome {
-    let marker = format!("conformance-{}", std::process::id());
+    let marker = format!("conformance-{}", process::id());
     let mut spec = ctx.specs.spec();
     spec.labels
         .insert("sandbox-driver-conformance".to_owned(), marker.clone());
@@ -851,7 +846,7 @@ async fn create_emits_terminal_events(ctx: &Conformance) -> CheckOutcome {
         .map_err(|error| format!("create failed: {error}"))?;
     cleanup(&sandbox).await;
     // Give the async delivery path a moment.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    time::sleep(Duration::from_millis(200)).await;
     let seen = events.lock().expect("events lock").clone();
     if seen.iter().any(SandboxEvent::is_terminal) {
         PASS

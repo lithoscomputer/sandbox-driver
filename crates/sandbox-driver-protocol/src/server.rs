@@ -227,7 +227,10 @@ async fn dispatch(
             let hint = Arc::new(Mutex::new(String::new()));
             let callback = state.event_callback(Arc::clone(&hint));
             let handle = state.provider.create(&request.spec, Some(callback)).await?;
-            *hint.lock().expect("hint lock") = handle.id().as_str().to_owned();
+            handle
+                .id()
+                .as_str()
+                .clone_into(&mut hint.lock().expect("hint lock"));
             state.remember(&handle);
             let status = handle.describe().await?;
             to_value(&handle_info(&handle, status))
