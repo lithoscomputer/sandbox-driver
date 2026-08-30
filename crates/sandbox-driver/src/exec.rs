@@ -215,6 +215,18 @@ pub struct CaptureStats {
     pub omitted_bytes:  usize,
 }
 
+impl CaptureStats {
+    /// Accounting for a fully retained buffer: everything observed was
+    /// kept.
+    pub fn complete(bytes: usize) -> Self {
+        Self {
+            observed_bytes: bytes,
+            retained_bytes: bytes,
+            omitted_bytes:  0,
+        }
+    }
+}
+
 /// Result of a streaming run, with honesty flags: degradations (combined
 /// output, buffered replay) are reported, not hidden.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -232,14 +244,19 @@ pub struct ExecStreamingResult {
 impl ExecStreamingResult {
     /// Wraps a buffered result with the honesty flags at their degraded
     /// defaults (`streams_separated: false`, `live_streaming: false`);
-    /// providers set the flags they actually deliver.
+    /// providers set the flags they actually deliver. Capture stats
+    /// start as fully-retained accounting of the wrapped buffers — a
+    /// provider that truncated at the source overrides them — so
+    /// `observed_bytes: 0` can never sit beside non-empty output.
     pub fn new(result: ExecResult) -> Self {
+        let stdout_capture = CaptureStats::complete(result.stdout.len());
+        let stderr_capture = CaptureStats::complete(result.stderr.len());
         Self {
             result,
             streams_separated: false,
             live_streaming: false,
-            stdout_capture: CaptureStats::default(),
-            stderr_capture: CaptureStats::default(),
+            stdout_capture,
+            stderr_capture,
         }
     }
 }
