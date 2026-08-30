@@ -216,9 +216,13 @@ impl DockerExec {
         });
     }
 
-    async fn exit_code(&self, exec_id: &str) -> Option<i32> {
-        let inspect = self.docker.inspect_exec(exec_id).await.ok()?;
-        inspect.exit_code.and_then(|code| i32::try_from(code).ok())
+    async fn exit_code(&self, exec_id: &str) -> Result<Option<i32>> {
+        let inspect = self
+            .docker
+            .inspect_exec(exec_id)
+            .await
+            .map_err(|error| docker_error("inspecting exec", &error))?;
+        Ok(inspect.exit_code.and_then(|code| i32::try_from(code).ok()))
     }
 }
 
@@ -289,6 +293,7 @@ impl Exec for DockerExec {
         let mut termination = Termination::Exited;
         let mut kill_fired = false;
         let mut drain_deadline: Option<Instant> = None;
+        let mut stream_error: Option<DockerApiError> = None;
         loop {
             let cancel = controls.cancel.clone();
             let cancelled = async {
@@ -318,7 +323,14 @@ impl Exec for DockerExec {
 
             tokio::select! {
                 chunk = output.next() => match chunk {
-                    None | Some(Err(_)) => break,
+                    None => break,
+                    // A transport failure mid-stream means output is
+                    // incomplete; it must surface as an error, never as
+                    // a clean exit with truncated output.
+                    Some(Err(error)) => {
+                        stream_error = Some(error);
+                        break;
+                    }
                     Some(Ok(LogOutput::StdOut { message } | LogOutput::Console { message })) => {
                         stdout_capture.push(&message);
                         if let Some(sink) = sink {
@@ -363,7 +375,10 @@ impl Exec for DockerExec {
             }
         }
 
-        let exit_code = self.exit_code(&exec.id).await;
+        if let Some(error) = stream_error {
+            return Err(docker_error("reading exec output", &error));
+        }
+        let exit_code = self.exit_code(&exec.id).await?;
         let (stdout_bytes, stdout_stats) = stdout_capture.into_parts();
         let (stderr_bytes, stderr_stats) = stderr_capture.into_parts();
         let mut result = ExecResult::new(termination, exit_code, started.elapsed());
@@ -419,15 +434,25 @@ impl Exec for DockerExec {
         let tail = stderr_tail.clone();
         tokio::spawn(async move {
             let mut stdout_writer = stdout_writer;
-            while let Some(Ok(chunk)) = output.next().await {
-                match chunk {
-                    LogOutput::StdOut { message } | LogOutput::Console { message } => {
+            loop {
+                match output.next().await {
+                    None => break,
+                    // Make a transport failure visible in the diagnostic
+                    // tail instead of ending the stream silently.
+                    Some(Err(error)) => {
+                        tail.push(
+                            format!("sandbox-driver: stdio output stream error: {error}\n")
+                                .as_bytes(),
+                        );
+                        break;
+                    }
+                    Some(Ok(LogOutput::StdOut { message } | LogOutput::Console { message })) => {
                         if stdout_writer.write_all(&message).await.is_err() {
                             break;
                         }
                     }
-                    LogOutput::StdErr { message } => tail.push(&message),
-                    LogOutput::StdIn { .. } => {}
+                    Some(Ok(LogOutput::StdErr { message })) => tail.push(&message),
+                    Some(Ok(LogOutput::StdIn { .. })) => {}
                 }
             }
             let _ = stdout_writer.shutdown().await;
