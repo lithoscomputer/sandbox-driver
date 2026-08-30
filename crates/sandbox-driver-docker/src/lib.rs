@@ -75,8 +75,12 @@ impl DockerProvider {
         reference: &str,
         dispatcher: Option<&EventDispatcher>,
     ) -> Result<()> {
-        if self.docker.inspect_image(reference).await.is_ok() {
-            return Ok(());
+        match self.docker.inspect_image(reference).await {
+            Ok(_) => return Ok(()),
+            // Only a definitive "not present" justifies a pull; a daemon
+            // or transport failure must surface as what it is.
+            Err(error) if is_not_found(&error) => {}
+            Err(error) => return Err(docker_error("inspecting image", &error)),
         }
         if let Some(dispatcher) = dispatcher {
             dispatcher
@@ -86,11 +90,9 @@ impl DockerProvider {
                 })
                 .await;
         }
-        let options = CreateImageOptions {
-            from_image: reference.to_owned(),
-            ..Default::default()
-        };
-        let mut stream = self.docker.create_image(Some(options), None, None);
+        let mut stream = self
+            .docker
+            .create_image(Some(pull_options(reference)), None, None);
         while let Some(progress) = stream.next().await {
             progress.map_err(|error| docker_error("pulling image", &error))?;
         }
@@ -138,6 +140,29 @@ impl DockerProvider {
             fs,
             dispatcher: events.map(EventDispatcher::new),
         })
+    }
+}
+
+/// Splits an image reference for the pull API. An empty tag pulls every
+/// tag of the repository, so bare references default to `latest`; digest
+/// references pass through whole.
+fn pull_options(reference: &str) -> CreateImageOptions<'static, String> {
+    if reference.contains('@') {
+        return CreateImageOptions {
+            from_image: reference.to_owned(),
+            ..Default::default()
+        };
+    }
+    // A colon only marks a tag when the remainder has no `/` — otherwise
+    // it is a registry port (`registry:5000/img`).
+    let (repo, tag) = match reference.rsplit_once(':') {
+        Some((repo, tag)) if !tag.contains('/') => (repo.to_owned(), tag.to_owned()),
+        _ => (reference.to_owned(), "latest".to_owned()),
+    };
+    CreateImageOptions {
+        from_image: repo,
+        tag,
+        ..Default::default()
     }
 }
 
@@ -571,5 +596,38 @@ impl Sandbox for DockerSandbox {
 
     fn fs(&self) -> &dyn Filesystem {
         &self.fs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pull_options_default_a_bare_reference_to_latest() {
+        let options = pull_options("ubuntu");
+        assert_eq!(options.from_image, "ubuntu");
+        assert_eq!(options.tag, "latest");
+    }
+
+    #[test]
+    fn pull_options_split_an_explicit_tag() {
+        let options = pull_options("debian:stable-slim");
+        assert_eq!(options.from_image, "debian");
+        assert_eq!(options.tag, "stable-slim");
+    }
+
+    #[test]
+    fn pull_options_treat_a_registry_port_as_untagged() {
+        let options = pull_options("registry:5000/img");
+        assert_eq!(options.from_image, "registry:5000/img");
+        assert_eq!(options.tag, "latest");
+    }
+
+    #[test]
+    fn pull_options_pass_digest_references_through() {
+        let options = pull_options("img@sha256:abc123");
+        assert_eq!(options.from_image, "img@sha256:abc123");
+        assert_eq!(options.tag, "");
     }
 }
