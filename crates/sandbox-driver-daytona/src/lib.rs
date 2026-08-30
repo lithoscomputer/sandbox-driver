@@ -76,6 +76,11 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 const TRANSITION_BUDGET: Duration = Duration::from_secs(120);
 const TRANSITION_POLL: Duration = Duration::from_secs(1);
 
+/// Items requested per page when listing sandboxes or snapshots. The
+/// paginated endpoints truncate an unpaged request to their own default
+/// page size, so listings must walk `total_pages` explicitly.
+const LIST_PAGE_SIZE: i32 = 100;
+
 pub(crate) type DaytonaClient = Arc<Client>;
 
 pub(crate) fn shell_quote(value: &str) -> String {
@@ -597,12 +602,23 @@ impl SandboxProvider for DaytonaProvider {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         labels.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
-        let page = self
-            .client
-            .list(Some(&labels), None, None)
-            .await
-            .map_err(|error| daytona_error("listing sandboxes", &error))?;
-        page.items.iter().map(status_from_sdk).collect()
+        let mut statuses = Vec::new();
+        let mut page_number: i32 = 1;
+        loop {
+            let page = self
+                .client
+                .list(Some(&labels), Some(page_number), Some(LIST_PAGE_SIZE))
+                .await
+                .map_err(|error| daytona_error("listing sandboxes", &error))?;
+            for item in &page.items {
+                statuses.push(status_from_sdk(item)?);
+            }
+            if page.total_pages <= i64::from(page_number) {
+                break;
+            }
+            page_number += 1;
+        }
+        Ok(statuses)
     }
 
     fn snapshots(&self) -> Option<&dyn SnapshotProvider> {
@@ -999,25 +1015,32 @@ impl SnapshotProvider for DaytonaSnapshots {
     }
 
     async fn list(&self, filter: &SnapshotFilter) -> Result<Vec<SnapshotStatus>> {
-        let page = self
-            .client
-            .snapshot
-            .list(None, None)
-            .await
-            .map_err(|error| daytona_error("listing snapshots", &error))?;
         let mut statuses = Vec::new();
-        for dto in page.items {
-            if let Some(name) = &filter.name {
-                if dto.name != *name {
-                    continue;
+        let mut page_number: i32 = 1;
+        loop {
+            let page = self
+                .client
+                .snapshot
+                .list(Some(page_number), Some(LIST_PAGE_SIZE))
+                .await
+                .map_err(|error| daytona_error("listing snapshots", &error))?;
+            for dto in page.items {
+                if let Some(name) = &filter.name {
+                    if dto.name != *name {
+                        continue;
+                    }
                 }
+                let id = SnapshotId::try_new(dto.id)
+                    .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))?;
+                let mut status = SnapshotStatus::new(id, map_snapshot_state(dto.state));
+                status.name = Some(dto.name);
+                status.error_reason.clone_from(&dto.error_reason);
+                statuses.push(status);
             }
-            let id = SnapshotId::try_new(dto.id)
-                .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))?;
-            let mut status = SnapshotStatus::new(id, map_snapshot_state(dto.state));
-            status.name = Some(dto.name);
-            status.error_reason.clone_from(&dto.error_reason);
-            statuses.push(status);
+            if page.total_pages <= f64::from(page_number) {
+                break;
+            }
+            page_number += 1;
         }
         Ok(statuses)
     }
