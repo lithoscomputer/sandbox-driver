@@ -22,6 +22,11 @@ pub trait Filesystem: Send + Sync {
     async fn write(&self, path: &str, content: &[u8]) -> Result<()>;
 
     /// Deletes a file or directory (recursively when `recursive`).
+    ///
+    /// Idempotent: deleting a path that does not exist succeeds, so
+    /// retry and cleanup paths need no not-found guard. Callers that
+    /// must distinguish "was present" check [`Filesystem::exists`]
+    /// first.
     async fn delete(&self, path: &str, recursive: bool) -> Result<()>;
 
     async fn exists(&self, path: &str) -> Result<bool>;
@@ -29,6 +34,11 @@ pub trait Filesystem: Send + Sync {
     async fn metadata(&self, path: &str) -> Result<FileMetadata>;
 
     /// Lists a directory to the given depth (`1` = immediate children).
+    ///
+    /// Entries are sorted lexicographically by full relative path — a
+    /// flat order, not a tree order: a directory's children need not
+    /// directly follow it (`foo-bar` sorts between `foo` and `foo/x`).
+    /// Consumers rendering trees group by path themselves.
     async fn list_dir(&self, path: &str, depth: usize) -> Result<Vec<DirEntry>>;
 
     async fn create_dir(&self, path: &str) -> Result<()>;

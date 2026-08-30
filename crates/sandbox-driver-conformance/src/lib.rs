@@ -837,6 +837,14 @@ async fn fs_round_trips(ctx: &Conformance) -> CheckOutcome {
         {
             return fail("directory still exists after recursive delete");
         }
+        // Delete is idempotent by contract: an already-deleted (or
+        // never-existing) path succeeds.
+        fs.delete("conformance", true)
+            .await
+            .map_err(|error| format!("repeated delete failed: {error}"))?;
+        fs.delete("conformance-never-existed", false)
+            .await
+            .map_err(|error| format!("delete of a missing path failed: {error}"))?;
         PASS
     }
     .await;
