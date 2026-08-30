@@ -161,7 +161,11 @@ impl Exec for DaytonaExec {
 
         if let Some(sink) = &controls.sink {
             if !stdout.is_empty() {
-                let _ = sink(OutputStream::Stdout, stdout.clone()).await;
+                // The buffered transport delivers after completion, so
+                // there is nothing left to cancel — but a failed sink
+                // must surface: the caller would otherwise believe the
+                // output was delivered.
+                sink(OutputStream::Stdout, stdout.clone()).await?;
             }
         }
         let mut capture = OutputCaptureBuffer::new(controls.retained_output_limit);
