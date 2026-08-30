@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-use std::{env, future};
+use std::{env, future, io};
 
 use async_trait::async_trait;
 #[cfg(unix)]
@@ -72,6 +73,7 @@ fn inherited_var_is_sensitive(key: &str) -> bool {
 pub struct HostExec {
     working_dir: PathBuf,
     base_env:    BTreeMap<String, String>,
+    bash_path:   OnceLock<PathBuf>,
 }
 
 impl HostExec {
@@ -79,7 +81,25 @@ impl HostExec {
         Self {
             working_dir,
             base_env,
+            bash_path: OnceLock::new(),
         }
+    }
+
+    /// Resolves, then remembers, the Bash this sandbox runs commands
+    /// with. Every spawn goes through here so a spec-provided `PATH`
+    /// cannot make spawning fail and a single sandbox can never split
+    /// across two interpreters.
+    fn bash(&self) -> Result<PathBuf> {
+        if let Some(path) = self.bash_path.get() {
+            return Ok(path.clone());
+        }
+        let resolved = resolve_bash_on_path().ok_or_else(|| {
+            Error::io(
+                "resolving bash",
+                io::Error::new(io::ErrorKind::NotFound, "no `bash` on PATH"),
+            )
+        })?;
+        Ok(self.bash_path.get_or_init(|| resolved).clone())
     }
 
     fn resolve_dir(&self, dir: Option<&str>) -> PathBuf {
@@ -101,8 +121,8 @@ impl HostExec {
         program: &str,
         working_dir: Option<&str>,
         env: &BTreeMap<String, String>,
-    ) -> Command {
-        let mut command = Command::new("bash");
+    ) -> Result<Command> {
+        let mut command = Command::new(self.bash()?);
         command.arg("-c").arg(program);
         command.current_dir(self.resolve_dir(working_dir));
         command.env_clear();
@@ -123,8 +143,15 @@ impl HostExec {
         #[cfg(unix)]
         command.process_group(0);
         command.kill_on_drop(true);
-        command
+        Ok(command)
     }
+}
+
+fn resolve_bash_on_path() -> Option<PathBuf> {
+    let paths = env::var_os("PATH")?;
+    env::split_paths(&paths)
+        .map(|dir| dir.join("bash"))
+        .find(|candidate| candidate.is_file())
 }
 
 #[cfg(unix)]
@@ -195,7 +222,7 @@ impl Exec for HostExec {
         controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
         let started = Instant::now();
-        let mut command = self.command(&spec.command, spec.working_dir.as_deref(), &spec.env);
+        let mut command = self.command(&spec.command, spec.working_dir.as_deref(), &spec.env)?;
         command.stdin(if spec.stdin.is_some() {
             Stdio::piped()
         } else {
@@ -313,7 +340,7 @@ impl Exec for HostExec {
 
     async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
         let program = format!("exec {}", spec.command);
-        let mut command = self.command(&program, spec.working_dir.as_deref(), &spec.env);
+        let mut command = self.command(&program, spec.working_dir.as_deref(), &spec.env)?;
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());

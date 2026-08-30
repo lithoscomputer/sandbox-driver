@@ -150,6 +150,23 @@ async fn exec_never_sources_bash_env() {
 }
 
 #[tokio::test]
+async fn exec_survives_a_hermetic_spec_path() {
+    let provider = HostProvider::new();
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+
+    // Bash is resolved through the worker's PATH once and cached, so a
+    // hermetic PATH in spec env must not break spawning.
+    let spec = ExecSpec::new("echo ok")
+        .env_var("PATH", "/nonexistent")
+        .timeout(Duration::from_secs(10));
+    let result = sandbox.exec().run(&spec).await.expect("exec");
+    assert!(result.success(), "stderr: {}", result.stderr_lossy());
+    assert_eq!(result.stdout_lossy(), "ok\n");
+
+    sandbox.delete().await.expect("delete");
+}
+
+#[tokio::test]
 async fn exec_timeout_kills_the_process_tree() {
     let provider = HostProvider::new();
     let sandbox = provider.create(&host_spec(), None).await.expect("create");
