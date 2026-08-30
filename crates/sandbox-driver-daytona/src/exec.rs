@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use std::{mem, process};
 
 use async_trait::async_trait;
@@ -64,13 +64,11 @@ impl StdinFile {
             .fs()
             .await
             .map_err(|error| daytona_error("connecting to the toolbox", &error))?;
-        // Nanosecond nonce plus host pid: unique enough that a stale
-        // file from a crashed driver can never feed a later command.
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        let path = format!("/tmp/.sandbox-driver-stdin-{}-{nonce}", process::id());
+        // Random nonce plus host pid: unique even across concurrent
+        // execs in one process, so a stale file from a crashed driver
+        // can never feed a later command.
+        let nonce: u64 = rand::random();
+        let path = format!("/tmp/.sandbox-driver-stdin-{}-{nonce:016x}", process::id());
         fs.upload_file_bytes(&path, bytes)
             .await
             .map_err(|error| daytona_error("uploading exec stdin", &error))?;

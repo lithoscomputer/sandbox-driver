@@ -1692,6 +1692,7 @@ dependencies = [
  "async-trait",
  "daytona-api-client",
  "daytona-sdk",
+ "rand 0.10.2",
  "sandbox-driver",
  "sandbox-driver-conformance",
  "sandbox-driver-protocol",

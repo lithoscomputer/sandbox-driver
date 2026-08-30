@@ -9,7 +9,7 @@
 //! session transport.
 
 use std::future::pending;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use std::{mem, process};
 
 use daytona_sdk::{
@@ -44,13 +44,12 @@ impl Session {
             .process()
             .await
             .map_err(|error| daytona_error("connecting to the toolbox", &error))?;
-        // Nanosecond nonce plus host pid: a session id can never collide
-        // with one from a crashed or concurrent driver.
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        let id = format!("sandbox-driver-{}-{nonce}", process::id());
+        // Random nonce plus host pid: a session id can never collide
+        // with one from a crashed or concurrent driver — including two
+        // concurrent execs in one process on a coarse-clock platform,
+        // which a time-based nonce does not rule out.
+        let nonce: u64 = rand::random();
+        let id = format!("sandbox-driver-{}-{nonce:016x}", process::id());
         process
             .create_session(&id)
             .await

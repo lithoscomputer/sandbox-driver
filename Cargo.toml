@@ -17,6 +17,7 @@ daytona-sdk = { git = "https://github.com/brynary/daytona-sdk-rust", rev = "f86e
 futures-util = "0.3"
 globset = "0.4"
 nix = { version = "0.30", features = ["signal"] }
+rand = "0.10"
 sandbox-driver = { path = "crates/sandbox-driver" }
 sandbox-driver-conformance = { path = "crates/sandbox-driver-conformance" }
 sandbox-driver-host = { path = "crates/sandbox-driver-host" }
