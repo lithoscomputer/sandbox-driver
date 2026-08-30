@@ -72,7 +72,13 @@ impl VolumeMount {
     }
 }
 
-/// Idle and lifetime timers. `None` leaves the provider default in place.
+/// Idle and lifetime timers. `None` leaves the provider default in
+/// place; `Duration::ZERO` is the explicit "never".
+///
+/// Provider defaults can be short: Daytona auto-stops after **15 idle
+/// minutes**, less than a single long build or inference call. A
+/// caller running long commands sets `auto_stop_after_idle` explicitly
+/// rather than inheriting that default (fabro uses 120 minutes).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct LifecycleTimers {
