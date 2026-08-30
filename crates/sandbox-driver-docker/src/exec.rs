@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{future, io, process};
 
 use async_trait::async_trait;
@@ -21,8 +21,16 @@ use tokio::time;
 /// The container-side interpreter the Bash contract requires.
 const CONTAINER_BASH: &str = "/bin/bash";
 const BASH_ENV_VAR: &str = "BASH_ENV";
-/// Grace period for draining output after a kill.
+/// Grace period for draining output after a stop request. Must exceed
+/// the watcher's poll interval plus [`TERM_GRACE_SECONDS`].
 const KILL_DRAIN_GRACE: Duration = Duration::from_secs(10);
+/// The in-container watcher's poll interval for the stop file.
+const STOP_POLL_SLEEP_SECONDS: &str = "0.1";
+/// Grace between the watcher's SIGTERM and SIGKILL so processes can run
+/// traps, flush output, and release locks. The wrapper's `wait` returns
+/// as soon as the process exits, so a generous grace costs nothing on
+/// the normal path.
+const TERM_GRACE_SECONDS: &str = "2";
 
 pub(crate) fn docker_error(context: &str, error: &DockerApiError) -> Error {
     let kind = ProviderKind::try_new("docker").expect("static kind is valid");
@@ -75,9 +83,12 @@ fn shell_quote(value: &str) -> String {
 /// Command execution inside one container.
 ///
 /// Docker cannot kill an exec instance, so every command runs under a
-/// wrapper that puts it in its own session and records the process-group
-/// id in a pid file; timeout and cancellation kill the group through a
-/// second exec. The wrapper's `wait` forwards the child's exit code.
+/// wrapper that puts it in its own session and pairs it with an
+/// in-container watcher; timeout and cancellation request a stop by
+/// creating a stop file through a second exec, and the watcher kills
+/// the process group (SIGTERM, grace, SIGKILL) whenever the stop lands
+/// — even before the command starts. The wrapper's `wait` forwards the
+/// child's exit code.
 pub struct DockerExec {
     docker:       Docker,
     container_id: String,
@@ -114,44 +125,84 @@ impl DockerExec {
         entries
     }
 
-    fn pidfile(&self) -> String {
+    /// Allocates a unique stop-file/pid-file pair for one exec. The
+    /// nanosecond nonce keeps paths from colliding across driver
+    /// restarts (containers outlive drivers, host pids recycle, and the
+    /// counter restarts at zero), so a stale control file can never
+    /// misdirect a stop.
+    fn control_paths(&self) -> (String, String) {
         let count = self.exec_counter.fetch_add(1, Ordering::Relaxed);
-        format!("/tmp/.sandbox-driver/exec-{}-{count}.pid", process::id())
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let prefix = format!(
+            "/tmp/.sandbox-driver/exec-{}-{nonce}-{count}",
+            process::id()
+        );
+        (format!("{prefix}.stop"), format!("{prefix}.pid"))
     }
 
-    /// Wraps a user command so its process group is recorded and killable.
-    fn wrapped(user_command: &str, pidfile: &str, forward_stdin: bool) -> String {
+    /// Wraps a user command so a stop request is honored at any point.
+    ///
+    /// An in-container watcher polls for the stop file, so a stop that
+    /// lands before the pid file exists — or before the command starts
+    /// at all — still takes effect. The watcher SIGTERMs the process
+    /// group, waits [`TERM_GRACE_SECONDS`] for a graceful exit, then
+    /// SIGKILLs. Control files are cleared before the command starts
+    /// and removed on exit.
+    fn wrapped(user_command: &str, stop_file: &str, pid_file: &str, forward_stdin: bool) -> String {
         let quoted_cmd = shell_quote(user_command);
-        let quoted_pidfile = shell_quote(pidfile);
-        if forward_stdin {
-            format!(
-                "mkdir -p /tmp/.sandbox-driver\n\
-                 exec 3<&0\n\
-                 setsid {CONTAINER_BASH} -c {quoted_cmd} <&3 &\n\
-                 SD_PID=$!\n\
-                 exec 3<&-\n\
-                 printf '%s' \"$SD_PID\" > {quoted_pidfile}\n\
-                 wait \"$SD_PID\""
-            )
+        let stop_file = shell_quote(stop_file);
+        let pid_file = shell_quote(pid_file);
+        let (save_stdin, stdin_redirect, close_stdin) = if forward_stdin {
+            ("exec 3<&0\n", "<&3", "exec 3<&-\n")
         } else {
-            format!(
-                "mkdir -p /tmp/.sandbox-driver\n\
-                 setsid {CONTAINER_BASH} -c {quoted_cmd} < /dev/null &\n\
-                 SD_PID=$!\n\
-                 printf '%s' \"$SD_PID\" > {quoted_pidfile}\n\
-                 wait \"$SD_PID\""
-            )
-        }
+            ("", "< /dev/null", "")
+        };
+        format!(
+            "mkdir -p /tmp/.sandbox-driver\n\
+             if ! command -v setsid >/dev/null 2>&1; then\n\
+               echo 'sandbox-driver: the container image must provide setsid' >&2\n\
+               exit 127\n\
+             fi\n\
+             stop_file={stop_file}\n\
+             pid_file={pid_file}\n\
+             {save_stdin}rm -f \"$pid_file\"\n\
+             if [ -e \"$stop_file\" ]; then\n\
+               rm -f \"$stop_file\"\n\
+               exit 143\n\
+             fi\n\
+             (\n\
+               while [ ! -e \"$stop_file\" ]; do sleep {STOP_POLL_SLEEP_SECONDS}; done\n\
+               while [ ! -s \"$pid_file\" ]; do sleep {STOP_POLL_SLEEP_SECONDS}; done\n\
+               child=$(cat \"$pid_file\")\n\
+               kill -TERM \"-$child\" 2>/dev/null || kill -TERM \"$child\" 2>/dev/null || true\n\
+               sleep {TERM_GRACE_SECONDS}\n\
+               kill -KILL \"-$child\" 2>/dev/null || kill -KILL \"$child\" 2>/dev/null || true\n\
+             ) & watcher=$!\n\
+             setsid {CONTAINER_BASH} -c {quoted_cmd} {stdin_redirect} &\n\
+             child=$!\n\
+             {close_stdin}printf '%s' \"$child\" > \"$pid_file\"\n\
+             wait \"$child\"\n\
+             status=$?\n\
+             kill \"$watcher\" 2>/dev/null || true\n\
+             wait \"$watcher\" 2>/dev/null || true\n\
+             rm -f \"$stop_file\" \"$pid_file\"\n\
+             exit \"$status\""
+        )
     }
 
-    /// Kills the recorded process group, best-effort and detached.
-    fn spawn_kill(&self, pidfile: String) {
+    /// Requests a stop, best-effort and detached. Creating the stop
+    /// file triggers the in-container watcher; a stop that arrives
+    /// before the command starts is honored by the wrapper's pre-check.
+    fn spawn_stop(&self, stop_file: String) {
         let docker = self.docker.clone();
         let container_id = self.container_id.clone();
         tokio::spawn(async move {
             let command = format!(
-                "if [ -f {pf} ]; then kill -KILL -\"$(cat {pf})\" 2>/dev/null; fi",
-                pf = shell_quote(&pidfile)
+                "mkdir -p /tmp/.sandbox-driver && : > {}",
+                shell_quote(&stop_file)
             );
             let options = CreateExecOptions {
                 cmd: Some(vec![CONTAINER_BASH.to_owned(), "-c".to_owned(), command]),
@@ -184,9 +235,9 @@ impl Exec for DockerExec {
         controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
         let started = Instant::now();
-        let pidfile = self.pidfile();
+        let (stop_file, pid_file) = self.control_paths();
         let has_stdin = spec.stdin.is_some();
-        let wrapper = Self::wrapped(&spec.command, &pidfile, has_stdin);
+        let wrapper = Self::wrapped(&spec.command, &stop_file, &pid_file, has_stdin);
 
         let working_dir = spec
             .working_dir
@@ -277,7 +328,7 @@ impl Exec for DockerExec {
                                 termination = Termination::Cancelled;
                                 kill_fired = true;
                                 drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                                self.spawn_kill(pidfile.clone());
+                                self.spawn_stop(stop_file.clone());
                             }
                         }
                     }
@@ -290,7 +341,7 @@ impl Exec for DockerExec {
                                 termination = Termination::Cancelled;
                                 kill_fired = true;
                                 drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                                self.spawn_kill(pidfile.clone());
+                                self.spawn_stop(stop_file.clone());
                             }
                         }
                     }
@@ -300,13 +351,13 @@ impl Exec for DockerExec {
                     termination = Termination::Cancelled;
                     kill_fired = true;
                     drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                    self.spawn_kill(pidfile.clone());
+                    self.spawn_stop(stop_file.clone());
                 }
                 () = timeout => {
                     termination = Termination::TimedOut;
                     kill_fired = true;
                     drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                    self.spawn_kill(pidfile.clone());
+                    self.spawn_stop(stop_file.clone());
                 }
                 () = drain_timeout => break,
             }
@@ -327,8 +378,8 @@ impl Exec for DockerExec {
     }
 
     async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
-        let pidfile = self.pidfile();
-        let wrapper = Self::wrapped(&spec.command, &pidfile, true);
+        let (stop_file, pid_file) = self.control_paths();
+        let wrapper = Self::wrapped(&spec.command, &stop_file, &pid_file, true);
         let working_dir = spec
             .working_dir
             .clone()
@@ -390,7 +441,7 @@ impl Exec for DockerExec {
                 self.base_env.clone(),
             ),
             exec_id: exec.id,
-            pidfile,
+            stop_file,
         };
         Ok(StdioProcess {
             stdin: Box::pin(input),
@@ -402,15 +453,15 @@ impl Exec for DockerExec {
 }
 
 struct DockerStdioHandle {
-    exec:    DockerExec,
-    exec_id: String,
-    pidfile: String,
+    exec:      DockerExec,
+    exec_id:   String,
+    stop_file: String,
 }
 
 #[async_trait]
 impl StdioProcessHandle for DockerStdioHandle {
     async fn terminate(&self) {
-        self.exec.spawn_kill(self.pidfile.clone());
+        self.exec.spawn_stop(self.stop_file.clone());
     }
 
     async fn wait(&self) -> (Termination, Option<i32>) {

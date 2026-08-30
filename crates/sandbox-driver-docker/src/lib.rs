@@ -7,7 +7,9 @@
 //! The container's data plane is the exec-derived [`DerivedFs`] — Docker
 //! has no file API worth preferring over exec — so `Capabilities::fs`
 //! reports `native: false`. Every image must provide `/bin/bash` (the
-//! Bash contract) and a Linux userland with `stat`, `find`, and `base64`.
+//! Bash contract) and a Linux userland with `stat`, `find`, `base64`,
+//! and `setsid` (kill semantics need a separate session; an image
+//! without it fails every exec with a clear message).
 //!
 //! # Runtime behavior
 //!
