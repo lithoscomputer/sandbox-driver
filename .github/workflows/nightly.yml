@@ -36,6 +36,10 @@ jobs:
         with:
           version: 2026.6.11
           install_args: --locked --jobs=1
+          # The tool cache captures mise's state but not the rustup
+          # toolchains, so a restored cache skips component installs and
+          # clippy/rustfmt go missing on the second run.
+          cache: false
 
       - name: Restore Rust build cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
