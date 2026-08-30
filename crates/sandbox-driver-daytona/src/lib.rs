@@ -42,6 +42,7 @@ use sandbox_driver::{
     SnapshotSpec, SnapshotState, SnapshotStatus, SshAccess, VolumeCaps, VolumeId, VolumeProvider,
     VolumeSpec, VolumeState, VolumeStatus,
 };
+use tokio::time;
 
 pub use crate::access::DaytonaAccess;
 pub use crate::exec::DaytonaExec;
@@ -50,6 +51,10 @@ pub use crate::fs::DaytonaFs;
 const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
 const FALLBACK_WORKING_DIR: &str = "/home/daytona";
 const CREATE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Budget for waiting out an in-flight Daytona lifecycle transition
+/// (for example an auto-stop racing a reactivation).
+const TRANSITION_BUDGET: Duration = Duration::from_secs(120);
+const TRANSITION_POLL: Duration = Duration::from_secs(1);
 
 pub(crate) type DaytonaClient = Arc<Client>;
 
@@ -80,14 +85,19 @@ pub(crate) fn is_server_timeout(error: &DaytonaError) -> bool {
     })
 }
 
-/// A delete or stop racing an in-flight state change: Daytona reports 409
-/// "state change in progress", which for an idempotent operation means the
-/// work is already happening.
-pub(crate) fn is_change_in_progress(error: &DaytonaError) -> bool {
-    matches!(error, DaytonaError::Api {
-        status_code: 409,
-        ..
-    })
+/// A lifecycle action racing an in-flight state change: Daytona rejects
+/// it with "Sandbox state change in progress" — HTTP 400 in observed
+/// traffic (409 accepted defensively). For an idempotent action that
+/// means wait for the transition to settle and re-check, never fail.
+pub(crate) fn is_state_change_in_progress(error: &DaytonaError) -> bool {
+    matches!(
+        error,
+        DaytonaError::Api {
+            status_code: 400 | 409,
+            message,
+            ..
+        } if message.to_lowercase().contains("state change in progress")
+    )
 }
 
 pub(crate) fn daytona_error(context: &str, error: &DaytonaError) -> Error {
@@ -515,6 +525,90 @@ impl DaytonaSandbox {
             .map_err(|error| daytona_error("fetching sandbox", &error))
     }
 
+    /// Polls until the sandbox settles in a stable state, bounded by
+    /// [`TRANSITION_BUDGET`]. A sandbox that disappears mid-wait
+    /// reports `Deleted`.
+    async fn wait_for_stable_state(&self, operation: &str) -> Result<SandboxState> {
+        let started = Instant::now();
+        loop {
+            let state = match self.client.get(&self.sdk_id).await {
+                Ok(sdk) => map_state(sdk.state),
+                Err(error) if is_not_found(&error) => return Ok(SandboxState::Deleted),
+                Err(error) => return Err(daytona_error("fetching sandbox", &error)),
+            };
+            if state.is_stable() {
+                return Ok(state);
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= TRANSITION_BUDGET {
+                return Err(Error::Timeout {
+                    operation: operation.to_owned(),
+                    elapsed,
+                });
+            }
+            time::sleep(TRANSITION_POLL).await;
+        }
+    }
+
+    async fn start_inner(&self) -> Result<()> {
+        match self.client.start(&self.sdk_id).await {
+            Ok(_) => Ok(()),
+            Err(error) if is_state_change_in_progress(&error) => {
+                match self.wait_for_stable_state("starting sandbox").await? {
+                    SandboxState::Running => Ok(()),
+                    _ => self
+                        .client
+                        .start(&self.sdk_id)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| daytona_error("starting sandbox", &error)),
+                }
+            }
+            Err(error) => Err(daytona_error("starting sandbox", &error)),
+        }
+    }
+
+    async fn stop_inner(&self) -> Result<()> {
+        match self.client.stop(&self.sdk_id).await {
+            Ok(_) => Ok(()),
+            // Ephemeral sandboxes destroy themselves on stop.
+            Err(error) if is_not_found(&error) => Ok(()),
+            // The in-flight transition may be the stop itself (an
+            // auto-stop that fired first).
+            Err(error) if is_state_change_in_progress(&error) => {
+                match self.wait_for_stable_state("stopping sandbox").await? {
+                    SandboxState::Stopped | SandboxState::Archived | SandboxState::Deleted => {
+                        Ok(())
+                    }
+                    _ => match self.client.stop(&self.sdk_id).await {
+                        Ok(_) => Ok(()),
+                        Err(error) if is_not_found(&error) => Ok(()),
+                        Err(error) => Err(daytona_error("stopping sandbox", &error)),
+                    },
+                }
+            }
+            Err(error) => Err(daytona_error("stopping sandbox", &error)),
+        }
+    }
+
+    async fn delete_inner(&self) -> Result<()> {
+        match self.client.delete(&self.sdk_id).await {
+            Ok(()) => Ok(()),
+            Err(error) if is_not_found(&error) => Ok(()),
+            Err(error) if is_state_change_in_progress(&error) => {
+                match self.wait_for_stable_state("deleting sandbox").await? {
+                    SandboxState::Deleted => Ok(()),
+                    _ => match self.client.delete(&self.sdk_id).await {
+                        Ok(()) => Ok(()),
+                        Err(error) if is_not_found(&error) => Ok(()),
+                        Err(error) => Err(daytona_error("deleting sandbox", &error)),
+                    },
+                }
+            }
+            Err(error) => Err(daytona_error("deleting sandbox", &error)),
+        }
+    }
+
     async fn emit_action(&self, action: LifecycleAction, outcome: &Result<()>) {
         let Some(dispatcher) = &self.dispatcher else {
             return;
@@ -578,33 +672,19 @@ impl Sandbox for DaytonaSandbox {
     }
 
     async fn start(&self) -> Result<()> {
-        let outcome = self
-            .client
-            .start(&self.sdk_id)
-            .await
-            .map(|_| ())
-            .map_err(|error| daytona_error("starting sandbox", &error));
+        let outcome = self.start_inner().await;
         self.emit_action(LifecycleAction::Start, &outcome).await;
         outcome
     }
 
     async fn stop(&self) -> Result<()> {
-        let outcome = match self.client.stop(&self.sdk_id).await {
-            Ok(_) => Ok(()),
-            // Ephemeral sandboxes destroy themselves on stop.
-            Err(error) if is_not_found(&error) => Ok(()),
-            Err(error) => Err(daytona_error("stopping sandbox", &error)),
-        };
+        let outcome = self.stop_inner().await;
         self.emit_action(LifecycleAction::Stop, &outcome).await;
         outcome
     }
 
     async fn delete(&self) -> Result<()> {
-        let outcome = match self.client.delete(&self.sdk_id).await {
-            Ok(()) => Ok(()),
-            Err(error) if is_not_found(&error) || is_change_in_progress(&error) => Ok(()),
-            Err(error) => Err(daytona_error("deleting sandbox", &error)),
-        };
+        let outcome = self.delete_inner().await;
         self.emit_action(LifecycleAction::Delete, &outcome).await;
         outcome
     }
@@ -925,7 +1005,35 @@ impl VolumeProvider for DaytonaVolumes {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap as StdHashMap;
+
     use super::*;
+
+    fn api_error(status_code: u16, message: &str) -> DaytonaError {
+        DaytonaError::Api {
+            status_code,
+            message: message.to_owned(),
+            headers: StdHashMap::new(),
+        }
+    }
+
+    #[test]
+    fn state_change_in_progress_matches_the_observed_rejection() {
+        // Real Daytona traffic reports this class as HTTP 400.
+        assert!(is_state_change_in_progress(&api_error(
+            400,
+            "Sandbox state change in progress"
+        )));
+        assert!(is_state_change_in_progress(&api_error(
+            409,
+            "State change in progress"
+        )));
+        assert!(!is_state_change_in_progress(&api_error(400, "Bad request")));
+        assert!(!is_state_change_in_progress(&api_error(
+            409,
+            "Name conflict"
+        )));
+    }
 
     #[test]
     fn minutes_round_up_to_at_least_one() {
