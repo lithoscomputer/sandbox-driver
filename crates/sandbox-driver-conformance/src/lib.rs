@@ -122,6 +122,9 @@ impl Conformance {
             ("exec_retention_accounting_is_consistent", |ctx| {
                 Box::pin(exec_retention_accounting_is_consistent(ctx))
             }),
+            ("concurrent_streams_do_not_starve_each_other", |ctx| {
+                Box::pin(concurrent_streams_do_not_starve_each_other(ctx))
+            }),
             ("fs_round_trips", |ctx| Box::pin(fs_round_trips(ctx))),
             ("unsupported_actions_say_so", |ctx| {
                 Box::pin(unsupported_actions_say_so(ctx))
@@ -576,6 +579,144 @@ async fn exec_retention_accounting_is_consistent(ctx: &Conformance) -> CheckOutc
             ));
         }
         PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+/// One slow consumer of one stream must not stall other execs on the
+/// same sandbox: while a deliberately slow sink drains a steady stream,
+/// a second exec and a `describe` must both complete promptly, and each
+/// sink must see only its own exec's output, in order.
+async fn concurrent_streams_do_not_starve_each_other(ctx: &Conformance) -> CheckOutcome {
+    if !ctx.caps().exec.live_streaming {
+        return Ok(Some(
+            "capability exec.live_streaming not declared".to_owned(),
+        ));
+    }
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        // Slow stream: a line every 50ms, consumed at 600ms/chunk, so a
+        // shared-pipe client accumulates a deep backlog quickly.
+        let slow_chunks: SeenChunks = Arc::new(Mutex::new(Vec::new()));
+        let slow_sink_chunks = Arc::clone(&slow_chunks);
+        let slow_controls = ExecControls {
+            sink: Some(Arc::new(move |stream, chunk| {
+                let chunks = Arc::clone(&slow_sink_chunks);
+                Box::pin(async move {
+                    time::sleep(Duration::from_millis(600)).await;
+                    chunks.lock().expect("chunks lock").push((stream, chunk));
+                    Ok(())
+                })
+            })),
+            ..ExecControls::default()
+        };
+        let slow_spec = ExecSpec::new("for i in $(seq 1 20); do echo slow-$i; sleep 0.05; done")
+            .timeout(Duration::from_secs(60));
+        let slow_exec = sandbox.exec();
+        let mut slow_task = std::pin::pin!(slow_exec.run_streaming(&slow_spec, slow_controls));
+        let mut slow_done = None;
+
+        // Let the slow stream start producing before racing it.
+        tokio::select! {
+            outcome = &mut slow_task => {
+                slow_done = Some(outcome);
+            }
+            () = time::sleep(Duration::from_millis(700)) => {}
+        }
+        if slow_done.is_some() {
+            return fail("slow exec finished before the race began".to_owned());
+        }
+
+        // Fast exec with its own sink, plus a describe, both timed.
+        let fast_chunks: SeenChunks = Arc::new(Mutex::new(Vec::new()));
+        let fast_sink_chunks = Arc::clone(&fast_chunks);
+        let fast_controls = ExecControls {
+            sink: Some(Arc::new(move |stream, chunk| {
+                let chunks = Arc::clone(&fast_sink_chunks);
+                Box::pin(async move {
+                    chunks.lock().expect("chunks lock").push((stream, chunk));
+                    Ok(())
+                })
+            })),
+            ..ExecControls::default()
+        };
+        let fast_spec = ExecSpec::new("echo fast-done").timeout(Duration::from_secs(30));
+        let race_started = Instant::now();
+        let mut fast_and_describe = std::pin::pin!(async {
+            tokio::join!(
+                sandbox.exec().run_streaming(&fast_spec, fast_controls),
+                sandbox.describe(),
+            )
+        });
+        // Race the fast pair against the still-flowing slow stream,
+        // continuing to poll the slow stream so its chunks keep moving.
+        let (fast, described) = loop {
+            tokio::select! {
+                outcome = &mut fast_and_describe => break outcome,
+                slow = &mut slow_task, if slow_done.is_none() => {
+                    slow_done = Some(slow);
+                }
+            }
+        };
+        let raced = race_started.elapsed();
+        let fast = fast.map_err(|error| format!("fast exec failed: {error}"))?;
+        described.map_err(|error| format!("describe during streaming failed: {error}"))?;
+        if !fast.result.success() {
+            return fail("fast exec did not succeed".to_owned());
+        }
+        if raced > Duration::from_secs(4) {
+            return fail(format!(
+                "a slow consumer starved concurrent calls: fast exec + describe took {raced:?}"
+            ));
+        }
+
+        // Cross-contamination and ordering.
+        let fast_seen: Vec<u8> = fast_chunks
+            .lock()
+            .expect("chunks lock")
+            .iter()
+            .flat_map(|(_, chunk)| chunk.clone())
+            .collect();
+        let fast_text = String::from_utf8_lossy(&fast_seen);
+        if !fast_text.contains("fast-done") || fast_text.contains("slow-") {
+            return fail(format!("fast sink saw wrong output: {fast_text:?}"));
+        }
+
+        // Drain the slow exec to completion and verify its stream.
+        let slow = match slow_done {
+            Some(slow) => slow,
+            None => slow_task.await,
+        }
+        .map_err(|error| format!("slow exec failed: {error}"))?;
+        if !slow.result.success() {
+            return fail("slow exec did not succeed".to_owned());
+        }
+        let slow_seen: Vec<u8> = slow_chunks
+            .lock()
+            .expect("chunks lock")
+            .iter()
+            .flat_map(|(_, chunk)| chunk.clone())
+            .collect();
+        let slow_text = String::from_utf8_lossy(&slow_seen);
+        if slow_text.contains("fast-done") {
+            return fail("slow sink saw the fast exec's output".to_owned());
+        }
+        let mut last = 0u32;
+        for line in slow_text.lines().filter(|line| line.starts_with("slow-")) {
+            let Ok(number) = line.trim_start_matches("slow-").parse::<u32>() else {
+                continue;
+            };
+            if number <= last {
+                return fail(format!("slow stream out of order at {line}"));
+            }
+            last = number;
+        }
+        if last != 20 {
+            return fail(format!("slow stream incomplete: last line slow-{last}"));
+        }
+        Ok(None)
     }
     .await;
     cleanup(&sandbox).await;

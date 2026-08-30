@@ -12,11 +12,11 @@ use async_trait::async_trait;
 use sandbox_driver::{
     Capabilities, Capability, CheckpointId, CheckpointOptions, DirEntry, Error, EventCallback,
     Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, FileMetadata, Filesystem,
-    ForkOptions, LifecycleTimers, NetworkPolicy, OutputSink, PlatformInfo, PreviewUrl, PreviewUrls,
-    ProviderKind, Resources, Result, Sandbox, SandboxFilter, SandboxId, SandboxSnapshotOptions,
-    SandboxSpec, SandboxStatus, SnapshotFilter, SnapshotId, SnapshotProvider, SnapshotSpec,
-    SnapshotStatus, SpawnSpec, SshAccess, SshAccessInfo, StdioProcess, VolumeId, VolumeProvider,
-    VolumeSpec, VolumeStatus,
+    ForkOptions, LifecycleTimers, NetworkPolicy, OutputStream, PlatformInfo, PreviewUrl,
+    PreviewUrls, ProviderKind, Resources, Result, Sandbox, SandboxFilter, SandboxId,
+    SandboxSnapshotOptions, SandboxSpec, SandboxStatus, SnapshotFilter, SnapshotId,
+    SnapshotProvider, SnapshotSpec, SnapshotStatus, SpawnSpec, SshAccess, SshAccessInfo,
+    StdioProcess, VolumeId, VolumeProvider, VolumeSpec, VolumeStatus,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -389,7 +389,20 @@ fn mask_wire_capabilities(capabilities: &mut Capabilities) {
     capabilities.access.vpn = false;
 }
 
+/// One in-flight chunk of streamed exec output.
+type ExecChunk = (OutputStream, Vec<u8>);
+
+/// Chunks buffered per exec before the reader backpressures. Deep enough
+/// that a slow consumer of one stream cannot stall unrelated responses in
+/// any realistic run; full-queue blocking is the documented residual
+/// coupling of a single shared pipe (the side-channel transport lifts it).
+const EXEC_STREAM_QUEUE: usize = 1024;
+
 /// Request/response correlation plus notification routing.
+///
+/// The reader task never awaits consumer code: exec output is handed to a
+/// per-exec ordered queue drained by a pump task that owns the caller's
+/// sink, so one slow consumer delays only its own stream.
 struct Client {
     outbound:        mpsc::Sender<Message>,
     next_id:         AtomicU64,
@@ -398,7 +411,7 @@ struct Client {
     /// fails fast instead of waiting on a dead pipe.
     closed:          AtomicBool,
     pending:         Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>,
-    exec_sinks:      Mutex<HashMap<String, OutputSink>>,
+    exec_streams:    Mutex<HashMap<String, mpsc::Sender<ExecChunk>>>,
     event_callbacks: Mutex<HashMap<String, EventCallback>>,
 }
 
@@ -414,7 +427,7 @@ impl Client {
             next_exec: AtomicU64::new(1),
             closed: AtomicBool::new(false),
             pending: Mutex::new(HashMap::new()),
-            exec_sinks: Mutex::new(HashMap::new()),
+            exec_streams: Mutex::new(HashMap::new()),
             event_callbacks: Mutex::new(HashMap::new()),
         });
 
@@ -489,14 +502,16 @@ impl Client {
                 else {
                     return;
                 };
-                let sink = self
-                    .exec_sinks
+                let queue = self
+                    .exec_streams
                     .lock()
-                    .expect("exec sinks lock")
+                    .expect("exec streams lock")
                     .get(&notification.exec_id)
                     .cloned();
-                if let (Some(sink), Ok(chunk)) = (sink, decode_bytes(&notification.data_b64)) {
-                    let _ = sink(notification.stream, chunk).await;
+                if let (Some(queue), Ok(chunk)) = (queue, decode_bytes(&notification.data_b64)) {
+                    // A send failure means the exec already resolved and
+                    // unregistered; dropping the late chunk is correct.
+                    let _ = queue.send((notification.stream, chunk)).await;
                 }
             }
             m::HOST_EVENT => {
@@ -799,13 +814,21 @@ impl Exec for SandboxExec {
             self.sandbox_id.as_str(),
             self.client.next_exec.fetch_add(1, Ordering::Relaxed)
         );
-        if let Some(sink) = controls.sink.clone() {
+        // The caller's sink runs in a pump task fed by a per-exec ordered
+        // queue, never in the shared reader task.
+        let pump = controls.sink.clone().map(|sink| {
+            let (queue, mut receiver) = mpsc::channel::<ExecChunk>(EXEC_STREAM_QUEUE);
             self.client
-                .exec_sinks
+                .exec_streams
                 .lock()
-                .expect("exec sinks lock")
-                .insert(exec_id.clone(), sink);
-        }
+                .expect("exec streams lock")
+                .insert(exec_id.clone(), queue);
+            tokio::spawn(async move {
+                while let Some((stream, chunk)) = receiver.recv().await {
+                    let _ = sink(stream, chunk).await;
+                }
+            })
+        });
         // Forward cancellation as an exec/cancel request.
         let cancel_task = controls.cancel.clone().map(|token| {
             let client = Arc::clone(&self.client);
@@ -829,10 +852,15 @@ impl Exec for SandboxExec {
             .await;
 
         self.client
-            .exec_sinks
+            .exec_streams
             .lock()
-            .expect("exec sinks lock")
+            .expect("exec streams lock")
             .remove(&exec_id);
+        if let Some(pump) = pump {
+            // The queue sender is gone; the pump drains what remains and
+            // ends, so every chunk is delivered before the result is.
+            let _ = pump.await;
+        }
         if let Some(task) = cancel_task {
             task.abort();
         }
