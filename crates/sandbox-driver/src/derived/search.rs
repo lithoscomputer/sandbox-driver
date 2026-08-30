@@ -6,7 +6,7 @@ use tokio::sync::OnceCell;
 
 use crate::derived::shell_quote;
 use crate::error::{Error, ExecFailure, Result};
-use crate::exec::{Exec, ExecResult, ExecSpec};
+use crate::exec::{Exec, ExecResult, ExecSpec, Termination};
 use crate::search::{GrepMatch, GrepOptions, Search, WalkOptions, WalkedFile};
 
 const GREP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -45,7 +45,12 @@ impl<'e> DerivedSearch<'e> {
     }
 }
 
-/// Runs a command where exit code 1 means "no matches" rather than failure.
+/// Exit code when SIGPIPE ends the producer because `head` already has
+/// everything it needs — a successful, truncated-at-the-source run.
+const SIGPIPE_EXIT: i32 = 141;
+
+/// Runs a command where exit code 1 means "no matches" rather than
+/// failure, and 141 means the output cap cut the producer short.
 async fn run_match_command(
     exec: &dyn Exec,
     label: &str,
@@ -54,7 +59,9 @@ async fn run_match_command(
 ) -> Result<Option<ExecResult>> {
     let spec = ExecSpec::new(command).timeout(timeout);
     let result = exec.run(&spec).await?;
-    if result.success() {
+    let truncated_at_source =
+        result.termination == Termination::Exited && result.exit_code == Some(SIGPIPE_EXIT);
+    if result.success() || truncated_at_source {
         return Ok(Some(result));
     }
     if result.exit_code == Some(1) {
@@ -77,10 +84,17 @@ impl Search for DerivedSearch<'_> {
         path: &str,
         options: &GrepOptions,
     ) -> Result<Vec<GrepMatch>> {
-        let command = if self.ripgrep_available().await {
-            let mut cmd = String::from("rg --line-number --no-heading --no-messages");
+        // `--null` / `-Z` separate the path with NUL, so a `:` in a file
+        // name cannot corrupt the parse; `-I` keeps binary notices out
+        // of grep output (ripgrep skips binary files by default).
+        let mut command = if self.ripgrep_available().await {
+            let mut cmd = String::from("rg --line-number --no-heading --no-messages --null");
             if options.case_insensitive {
                 cmd.push_str(" -i");
+            }
+            if let Some(max) = options.max_matches {
+                cmd.push_str(" -m ");
+                cmd.push_str(&max.to_string());
             }
             if let Some(include) = &options.include {
                 cmd.push_str(" --glob ");
@@ -92,9 +106,15 @@ impl Search for DerivedSearch<'_> {
             cmd.push_str(&shell_quote(path));
             cmd
         } else {
-            let mut cmd = String::from("grep -rn");
+            // `--null` (not `-Z`, which BSD grep reads as zgrep mode)
+            // works on both GNU and BSD grep.
+            let mut cmd = String::from("grep -rnI --null");
             if options.case_insensitive {
                 cmd.push_str(" -i");
+            }
+            if let Some(max) = options.max_matches {
+                cmd.push_str(" -m ");
+                cmd.push_str(&max.to_string());
             }
             if let Some(include) = &options.include {
                 cmd.push_str(" --include=");
@@ -106,6 +126,12 @@ impl Search for DerivedSearch<'_> {
             cmd.push_str(&shell_quote(path));
             cmd
         };
+        // `-m` bounds matches per file; `head` bounds the total at the
+        // source so a broad pattern cannot buffer unbounded output.
+        // Under pipefail, `head` closing the pipe surfaces as 141.
+        if let Some(max) = options.max_matches {
+            command = format!("set -o pipefail\n{command} | head -n {max}");
+        }
 
         let Some(result) = run_match_command(self.exec, "grep", command, GREP_TIMEOUT).await?
         else {
@@ -115,14 +141,20 @@ impl Search for DerivedSearch<'_> {
         let text = result.stdout_lossy();
         let mut matches = Vec::new();
         for line in text.lines() {
-            let mut parts = line.splitn(3, ':');
-            let (Some(file), Some(number), Some(content)) =
-                (parts.next(), parts.next(), parts.next())
-            else {
-                continue;
-            };
-            let Ok(line_number) = number.parse::<u64>() else {
-                continue;
+            let parsed = line.split_once('\0').and_then(|(file, rest)| {
+                let (number, content) = rest.split_once(':')?;
+                Some((file, number.parse::<u64>().ok()?, content))
+            });
+            // An unparseable line means wrong results, not skippable
+            // noise — surface it instead of silently dropping matches.
+            let Some((file, line_number, content)) = parsed else {
+                return Err(Error::Exec(ExecFailure::new(
+                    "grep output parse",
+                    result.termination,
+                    result.exit_code,
+                    result.stdout.clone(),
+                    result.stderr.clone(),
+                )));
             };
             matches.push(GrepMatch {
                 path: file.to_owned(),
@@ -252,7 +284,7 @@ mod tests {
     async fn grep_prefers_ripgrep_and_parses_matches() {
         let exec = ScriptedExec::new(vec![
             ScriptedExec::ok(""), // rg probe succeeds
-            ScriptedExec::ok("src/a.rs:3:let x = 1;\nsrc/b.rs:10:fn main() {}\n"),
+            ScriptedExec::ok("src/a.rs\x003:let x = 1;\nwith:colon.rs\x0010:fn main() {}\n"),
         ]);
         let search = DerivedSearch::new(&exec);
         let matches = search
@@ -262,10 +294,47 @@ mod tests {
         assert_eq!(matches.len(), 2);
         assert_eq!(matches[0].path, "src/a.rs");
         assert_eq!(matches[0].line_number, 3);
+        // The NUL separator keeps a `:` in a file name unambiguous.
+        assert_eq!(matches[1].path, "with:colon.rs");
+        assert_eq!(matches[1].line_number, 10);
         let commands = exec.commands();
         assert!(commands[0].contains("command -v rg"));
         assert!(commands[1].starts_with("rg --line-number --no-heading"));
+        assert!(commands[1].contains("--null"));
         assert!(commands[1].contains("-e 'x' -- '.'"));
+    }
+
+    #[tokio::test]
+    async fn grep_bounds_matches_at_the_source() {
+        let exec = ScriptedExec::new(vec![
+            ScriptedExec::ok(""), // rg probe succeeds
+            ScriptedExec::ok("src/a.rs\x003:let x = 1;\n"),
+        ]);
+        let search = DerivedSearch::new(&exec);
+        let options = GrepOptions {
+            max_matches: Some(100),
+            ..GrepOptions::default()
+        };
+        let matches = search.grep("x", ".", &options).await.expect("grep");
+        assert_eq!(matches.len(), 1);
+        let command = &exec.commands()[1];
+        assert!(command.starts_with("set -o pipefail\n"), "cmd: {command}");
+        assert!(command.contains(" -m 100"), "cmd: {command}");
+        assert!(command.ends_with("| head -n 100"), "cmd: {command}");
+    }
+
+    #[tokio::test]
+    async fn grep_surfaces_unparseable_output_instead_of_dropping_it() {
+        let exec = ScriptedExec::new(vec![
+            ScriptedExec::ok(""), // rg probe succeeds
+            ScriptedExec::ok("Binary file blob matches\n"),
+        ]);
+        let search = DerivedSearch::new(&exec);
+        let error = search
+            .grep("x", ".", &GrepOptions::default())
+            .await
+            .expect_err("unparseable output is an error");
+        assert!(error.to_string().contains("grep output parse"));
     }
 
     #[tokio::test]
