@@ -25,6 +25,11 @@ pub(crate) const BASH_ENV_VAR: &str = "BASH_ENV";
 /// Grace period for draining output after a stop request. Must exceed
 /// the watcher's poll interval plus [`TERM_GRACE_SECONDS`].
 const KILL_DRAIN_GRACE: Duration = Duration::from_secs(10);
+/// Bound on retrying transient `inspect_exec` failures in stdio `wait`
+/// before giving up with `Termination::Unknown`: an end that was never
+/// observed is reported only when the daemon stays unreachable for the
+/// whole window.
+const WAIT_INSPECT_RETRY: Duration = Duration::from_secs(10);
 /// The in-container watcher's poll interval for the stop file.
 const STOP_POLL_SLEEP_SECONDS: &str = "0.1";
 /// Grace between the watcher's SIGTERM and SIGKILL so processes can run
@@ -559,16 +564,30 @@ impl StdioProcessHandle for DockerStdioHandle {
     }
 
     async fn wait(&self) -> (Termination, Option<i32>) {
+        let mut errors_since: Option<Instant> = None;
+        let mut retry_delay = Duration::from_millis(100);
         loop {
             match self.exec.docker.inspect_exec(&self.exec_id).await {
                 Ok(inspect) if inspect.running == Some(true) => {
+                    errors_since = None;
+                    retry_delay = Duration::from_millis(100);
                     time::sleep(Duration::from_millis(100)).await;
                 }
                 Ok(inspect) => {
                     let code = inspect.exit_code.and_then(|code| i32::try_from(code).ok());
                     return (Termination::Exited, code);
                 }
-                Err(_) => return (Termination::Unknown, None),
+                // A transient daemon hiccup must not report an end that
+                // was never observed; give up with `Unknown` only after
+                // the daemon has been unreachable for the whole bound.
+                Err(_) => {
+                    let since = *errors_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= WAIT_INSPECT_RETRY {
+                        return (Termination::Unknown, None);
+                    }
+                    time::sleep(retry_delay).await;
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(1));
+                }
             }
         }
     }
