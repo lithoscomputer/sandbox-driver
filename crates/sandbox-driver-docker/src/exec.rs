@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::pin::Pin;
 use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -15,7 +16,7 @@ use sandbox_driver::{
     OutputSink, OutputStream, ProviderError, ProviderKind, Result, SpawnSpec, StderrTail,
     StdioProcess, StdioProcessHandle, Termination,
 };
-use tokio::io::{AsyncWriteExt, duplex};
+use tokio::io::{AsyncWrite, AsyncWriteExt, duplex};
 use tokio::time;
 
 /// The container-side interpreter the Bash contract requires.
@@ -64,6 +65,33 @@ pub(crate) fn tolerate_not_modified(
         Err(error) if is_not_modified(&error) || is_not_found(&error) => Ok(()),
         Err(error) => Err(docker_error(context, &error)),
     }
+}
+
+/// Writes stdin then closes it for EOF. A command that stops reading its
+/// input (`head -1`) disconnecting the pipe is normal; any other failure
+/// means the command saw truncated input and must not pass silently.
+async fn write_stdin(mut input: Pin<Box<dyn AsyncWrite + Send>>, bytes: Vec<u8>) -> Result<()> {
+    fn is_disconnect(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            io::ErrorKind::BrokenPipe
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+        )
+    }
+    if let Err(error) = input.write_all(&bytes).await {
+        if is_disconnect(&error) {
+            return Ok(());
+        }
+        return Err(Error::io("writing exec stdin", error));
+    }
+    if let Err(error) = input.shutdown().await {
+        if is_disconnect(&error) {
+            return Ok(());
+        }
+        return Err(Error::io("closing exec stdin", error));
+    }
+    Ok(())
 }
 
 pub(crate) fn shell_quote(value: &str) -> String {
@@ -267,24 +295,18 @@ impl Exec for DockerExec {
             .start_exec(&exec.id, None::<StartExecOptions>)
             .await
             .map_err(|error| docker_error("starting exec", &error))?;
-        let StartExecResults::Attached {
-            mut output,
-            mut input,
-        } = start
-        else {
+        let StartExecResults::Attached { mut output, input } = start else {
             return Err(docker_error("starting exec", &DockerApiError::IOError {
                 err: io::Error::other("exec started detached"),
             }));
         };
 
-        if let Some(bytes) = spec.stdin.clone() {
-            tokio::spawn(async move {
-                let _ = input.write_all(&bytes).await;
-                let _ = input.shutdown().await;
-            });
+        let stdin_task = if let Some(bytes) = spec.stdin.clone() {
+            Some(tokio::spawn(write_stdin(input, bytes)))
         } else {
             drop(input);
-        }
+            None
+        };
 
         let mut stdout_capture = OutputCaptureBuffer::new(controls.retained_output_limit);
         let mut stderr_capture = OutputCaptureBuffer::new(controls.retained_output_limit);
@@ -375,6 +397,21 @@ impl Exec for DockerExec {
             }
         }
 
+        if let Some(stdin_task) = stdin_task {
+            // The command is done, so unwritten stdin bytes are
+            // unwanted; abort instead of joining unbounded.
+            stdin_task.abort();
+            match stdin_task.await {
+                Ok(result) => result?,
+                Err(join_error) if join_error.is_cancelled() => {}
+                Err(join_error) => {
+                    return Err(Error::io(
+                        "exec stdin writer task",
+                        io::Error::other(join_error),
+                    ));
+                }
+            }
+        }
         if let Some(error) = stream_error {
             return Err(docker_error("reading exec output", &error));
         }
