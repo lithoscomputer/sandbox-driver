@@ -3,21 +3,26 @@
 ## Project purpose
 
 This repository is `sandbox-driver`: a Rust library for driving sandboxes
-(manage sandboxes, snapshots, and volumes) across providers. Initial
-providers are Daytona, Docker, and Host; more arrive later through a
-JSON-RPC plugin protocol. Fabro is the first consumer.
+(manage sandboxes, snapshots, and volumes) across providers. Reference
+providers are Host, Docker, and Daytona; additional providers ship as
+plugin binaries speaking a JSON-RPC protocol. Fabro is the first
+consumer.
 
 Authoritative documents:
 
-- `.ai/plans/sandbox-driver-trait-design.md` — the Rust interface design
-  (resource model, lifecycle actions, facets, capability discovery).
-- The prior JSON-RPC plugin plan in
-  `~/p/fabro-sh/fabro-3/.ai/plans/sandbox-provider-plugins.md` informs the
-  upcoming protocol crate.
+- `docs/design.md` — the Rust interface design: resource model,
+  lifecycle actions, facets, capability discovery, and what stays out of
+  this library.
+- `docs/protocol.md` — the normative plugin wire protocol (version 1),
+  written for implementers in any language. The golden tests in
+  `crates/sandbox-driver-protocol` pin its shapes; a golden-test failure
+  is a wire break to redesign, not re-pin.
+- `crates/sandbox-driver-conformance` — the black-box suite defining
+  provider correctness; every provider, in-process or plugin, must pass
+  it.
 
-The workspace layout is `crates/sandbox-driver` (core traits and types)
-with `sandbox-driver-{protocol,host,docker,daytona}` siblings added as
-they are built.
+The workspace is `crates/sandbox-driver` (core traits and types) plus
+`sandbox-driver-{conformance,host,docker,daytona,protocol,host-plugin}`.
 
 ## Rust style
 
