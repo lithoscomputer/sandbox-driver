@@ -140,7 +140,14 @@ impl Git for DerivedGit<'_> {
         if let Some(branch) = &options.branch {
             args.push("--branch".into());
             args.push(branch.clone());
+            // git implies --single-branch only under --depth; without
+            // it a branch clone would still fetch every other branch.
+            args.push("--single-branch".into());
         }
+        args.push("--no-tags".into());
+        // End option parsing so a URL or path starting with `-` cannot
+        // be read as a flag.
+        args.push("--".into());
         let url = options
             .credentials
             .as_ref()
@@ -439,6 +446,29 @@ mod tests {
         assert!(
             push.contains("'push' '--set-upstream' 'origin' 'main'"),
             "push: {push}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clone_stays_single_branch_without_tags() {
+        let exec = ScriptedExec::new(vec![ScriptedExec::ok("")]);
+        let git = DerivedGit::new(&exec);
+        let options = GitCloneOptions {
+            branch:      Some("main".to_owned()),
+            commit:      None,
+            depth:       None,
+            credentials: None,
+        };
+        git.clone_repo("https://github.com/org/repo.git", "/dst", &options)
+            .await
+            .expect("clone succeeds");
+        let command = &exec.commands()[0];
+        // Without --depth, git only fetches one branch under an explicit
+        // --single-branch; --no-tags and the -- separator complete the
+        // pinned shape.
+        assert!(
+            command.contains("'--branch' 'main' '--single-branch' '--no-tags' '--'"),
+            "clone: {command}"
         );
     }
 
