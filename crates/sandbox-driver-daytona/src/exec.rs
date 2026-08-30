@@ -69,6 +69,17 @@ impl DaytonaExec {
             .await
     }
 
+    /// Resolves a relative working directory against the sandbox
+    /// working directory, matching the fs facet — the toolbox daemon
+    /// would otherwise resolve it against its own cwd.
+    fn resolve_dir(&self, dir: Option<&str>) -> String {
+        match dir {
+            None => self.working_dir.clone(),
+            Some(dir) if dir.starts_with('/') => dir.to_owned(),
+            Some(dir) => format!("{}/{}", self.working_dir.trim_end_matches('/'), dir),
+        }
+    }
+
     fn compose(spec: &ExecSpec) -> String {
         let mut program = String::from("unset BASH_ENV\n");
         for (key, value) in &spec.env {
@@ -115,11 +126,7 @@ impl Exec for DaytonaExec {
         let started = Instant::now();
         let process = self.process().await?;
         let options = ExecuteCommandOptions {
-            cwd:     Some(
-                spec.working_dir
-                    .clone()
-                    .unwrap_or_else(|| self.working_dir.clone()),
-            ),
+            cwd:     Some(self.resolve_dir(spec.working_dir.as_deref())),
             env:     None,
             timeout: Some(wire_timeout(spec.timeout)),
         };
