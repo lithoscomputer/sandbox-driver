@@ -14,7 +14,8 @@ async-trait.workspace = true
 bollard.workspace = true
 futures-util.workspace = true
 sandbox-driver.workspace = true
-tokio = { workspace = true, features = ["rt"] }
+tar.workspace = true
+tokio = { workspace = true, features = ["fs", "rt"] }
 tokio-util.workspace = true
 
 [dev-dependencies]

@@ -4,9 +4,11 @@
 //! isolation (`Isolation::Container`). The Docker socket is
 //! host-root-equivalent, so this provider is host-trusted by definition.
 //!
-//! The container's data plane is the exec-derived [`DerivedFs`] — Docker
-//! has no file API worth preferring over exec — so `Capabilities::fs`
-//! reports `native: false`. Every image must provide `/bin/bash` (the
+//! The container's data plane is hybrid: file content moves through
+//! the daemon's archive API (single-call transfers of any size, reads
+//! that work on stopped containers), while metadata operations stay
+//! exec-derived — so `Capabilities::fs` still reports `native: false`.
+//! Every image must provide `/bin/bash` (the
 //! Bash contract) and a Linux userland with `stat`, `find`, `base64`,
 //! and `setsid` (kill semantics need a separate session; an image
 //! without it fails every exec with a clear message).
@@ -21,6 +23,7 @@
 //! restarts.
 
 mod exec;
+mod fs;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -36,16 +39,17 @@ use bollard::image::CreateImageOptions;
 use bollard::models::{ContainerInspectResponse, ContainerStateStatusEnum, HostConfig};
 use futures_util::StreamExt;
 use sandbox_driver::{
-    Capabilities, DerivedFs, Error, ErrorReport, EventCallback, EventDispatcher, Exec, ExecSpec,
-    Filesystem, Isolation, LifecycleAction, NetworkPolicy, PlatformInfo, ProviderKind,
-    ResourceKind, Result, Sandbox, SandboxEvent, SandboxFilter, SandboxId, SandboxProvider,
-    SandboxSource, SandboxSpec, SandboxState, SandboxStatus,
+    Capabilities, Error, ErrorReport, EventCallback, EventDispatcher, Exec, ExecSpec, Filesystem,
+    Isolation, LifecycleAction, NetworkPolicy, PlatformInfo, ProviderKind, ResourceKind, Result,
+    Sandbox, SandboxEvent, SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec,
+    SandboxState, SandboxStatus,
 };
 
 pub use crate::exec::DockerExec;
 use crate::exec::{
     BASH_ENV_VAR, docker_error, is_not_found, is_not_modified, shell_quote, tolerate_not_modified,
 };
+use crate::fs::DockerFs;
 
 const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
 const DEFAULT_WORKING_DIRECTORY: &str = "/workspace";
@@ -132,7 +136,12 @@ impl DockerProvider {
             working_dir.clone(),
             env,
         ));
-        let fs = DerivedFs::new(Arc::clone(&exec) as Arc<dyn Exec>);
+        let fs = DockerFs::new(
+            self.docker.clone(),
+            container_id.clone(),
+            working_dir.clone(),
+            Arc::clone(&exec) as Arc<dyn Exec>,
+        );
         Arc::new(DockerSandbox {
             id: SandboxId::try_new(container_id).expect("container id is a valid sandbox id"),
             capabilities: self.capabilities.clone(),
@@ -459,7 +468,7 @@ pub struct DockerSandbox {
     working_dir:  String,
     labels:       BTreeMap<String, String>,
     exec:         Arc<DockerExec>,
-    fs:           DerivedFs,
+    fs:           DockerFs,
     dispatcher:   Option<EventDispatcher>,
 }
 
