@@ -183,6 +183,9 @@ async fn terminate_process_group(child: &mut Child) {
 enum PumpEnd {
     Eof,
     SinkError,
+    /// A transport failure mid-stream: output is incomplete, which must
+    /// surface as an error, never as a clean exit with truncated output.
+    ReadError(io::Error),
 }
 
 /// Reads one output stream to EOF, feeding the capture buffer and sink.
@@ -195,7 +198,8 @@ async fn pump_stream(
     let mut buffer = [0u8; 8192];
     loop {
         match reader.read(&mut buffer).await {
-            Ok(0) | Err(_) => return PumpEnd::Eof,
+            Ok(0) => return PumpEnd::Eof,
+            Err(error) => return PumpEnd::ReadError(error),
             Ok(read) => {
                 let chunk = &buffer[..read];
                 capture.push(chunk);
@@ -259,6 +263,7 @@ impl Exec for HostExec {
         // daemonizing child) is still bounded by the timeout. Remaining
         // output is drained after the process ends, bounded by
         // `DRAIN_GRACE`.
+        let mut read_error: Option<io::Error> = None;
         let (termination, status) = {
             let mut pumps = pin!(async {
                 tokio::join!(
@@ -286,9 +291,14 @@ impl Exec for HostExec {
                 tokio::select! {
                     (out_end, err_end) = &mut pumps, if !pumps_done => {
                         pumps_done = true;
-                        if matches!(out_end, PumpEnd::SinkError)
-                            || matches!(err_end, PumpEnd::SinkError)
-                        {
+                        let sink_error = matches!(out_end, PumpEnd::SinkError)
+                            || matches!(err_end, PumpEnd::SinkError);
+                        for end in [out_end, err_end] {
+                            if let PumpEnd::ReadError(error) = end {
+                                read_error.get_or_insert(error);
+                            }
+                        }
+                        if sink_error || read_error.is_some() {
                             terminate_process_group(&mut child).await;
                             break (Termination::Cancelled, None);
                         }
@@ -318,10 +328,19 @@ impl Exec for HostExec {
                     .map_err(|error| Error::io("waiting for exec process", error))?,
             };
             if !pumps_done {
-                let _ = time::timeout(DRAIN_GRACE, &mut pumps).await;
+                if let Ok((out_end, err_end)) = time::timeout(DRAIN_GRACE, &mut pumps).await {
+                    for end in [out_end, err_end] {
+                        if let PumpEnd::ReadError(error) = end {
+                            read_error.get_or_insert(error);
+                        }
+                    }
+                }
             }
             (termination, status)
         };
+        if let Some(error) = read_error {
+            return Err(Error::io("reading exec output", error));
+        }
         let exit_code = status.code();
 
         let (stdout_bytes, stdout_stats) = stdout_capture.into_parts();
