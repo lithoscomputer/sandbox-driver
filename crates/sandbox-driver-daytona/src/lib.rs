@@ -30,6 +30,7 @@ mod exec;
 mod fs;
 
 use std::collections::{BTreeMap, HashMap};
+use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -59,6 +60,13 @@ pub use crate::fs::DaytonaFs;
 const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
 const FALLBACK_WORKING_DIR: &str = "/home/daytona";
 const CREATE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Dockerfile sources build the image during create; real builds exceed
+/// shorter budgets (fabro-sandbox landed on 30 minutes).
+const DOCKERFILE_CREATE_TIMEOUT: Duration = Duration::from_secs(1800);
+const CREATE_POLL: Duration = Duration::from_secs(2);
+/// Upper bound on cleanup calls (deletes) so a stalled REST call cannot
+/// block cancellation or failure paths indefinitely.
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Budget for waiting out an in-flight Daytona lifecycle transition
 /// (for example an auto-stop racing a reactivation).
 const TRANSITION_BUDGET: Duration = Duration::from_secs(120);
@@ -231,6 +239,80 @@ impl DaytonaProvider {
             },
             client,
         })
+    }
+
+    /// Creates the sandbox and waits for it to start under `budget`,
+    /// deleting the half-created (and billed) sandbox when the wait
+    /// fails so nothing is silently leaked.
+    async fn create_inner(
+        &self,
+        params: CreateParams,
+        budget: Duration,
+    ) -> Result<daytona_sdk::Sandbox> {
+        let options = CreateSandboxOptions {
+            timeout:        Some(budget),
+            wait_for_start: false,
+            log_sender:     None,
+        };
+        let created = self
+            .client
+            .create(params, options)
+            .await
+            .map_err(|error| daytona_error("creating sandbox", &error))?;
+        let sdk_id = created.id.clone();
+        match self.wait_for_started(&sdk_id, budget).await {
+            Ok(sdk) => Ok(sdk),
+            Err(error) => Err(self.cleanup_failed_create(&sdk_id, error).await),
+        }
+    }
+
+    async fn wait_for_started(
+        &self,
+        sdk_id: &str,
+        budget: Duration,
+    ) -> Result<daytona_sdk::Sandbox> {
+        let started = Instant::now();
+        loop {
+            let sdk = self
+                .client
+                .get(sdk_id)
+                .await
+                .map_err(|error| daytona_error("fetching created sandbox", &error))?;
+            match map_state(sdk.state) {
+                SandboxState::Running => return Ok(sdk),
+                SandboxState::Error => {
+                    return Err(Error::Provider(ProviderError::new(
+                        self.kind.clone(),
+                        sdk.error_reason
+                            .unwrap_or_else(|| "sandbox entered the error state".to_owned()),
+                    )));
+                }
+                _ => {}
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= budget {
+                return Err(Error::Timeout {
+                    operation: "creating sandbox".to_owned(),
+                    elapsed,
+                });
+            }
+            time::sleep(CREATE_POLL).await;
+        }
+    }
+
+    /// Best-effort delete of a sandbox left behind by a failed create,
+    /// bounded by [`CLEANUP_TIMEOUT`]. When the delete itself fails, the
+    /// id is surfaced in the returned error so the caller can clean up
+    /// later.
+    async fn cleanup_failed_create(&self, sdk_id: &str, cause: Error) -> Error {
+        match time::timeout(CLEANUP_TIMEOUT, self.client.delete(sdk_id)).await {
+            Ok(Ok(())) => cause,
+            Ok(Err(error)) if is_not_found(&error) => cause,
+            _ => Error::Provider(ProviderError::new(
+                self.kind.clone(),
+                format!("{cause}; the failed create left sandbox {sdk_id} behind"),
+            )),
+        }
     }
 
     async fn handle(
@@ -430,24 +512,23 @@ impl SandboxProvider for DaytonaProvider {
                 .await;
         }
         let started = Instant::now();
-        let options = CreateSandboxOptions {
-            timeout:        Some(CREATE_TIMEOUT),
-            wait_for_start: true,
-            log_sender:     None,
+        let budget = if matches!(spec.source, SandboxSource::Dockerfile { .. }) {
+            DOCKERFILE_CREATE_TIMEOUT
+        } else {
+            CREATE_TIMEOUT
         };
-        let created = match self.client.create(params, options).await {
+        let created = match self.create_inner(params, budget).await {
             Ok(created) => created,
             Err(error) => {
-                let mapped = daytona_error("creating sandbox", &error);
                 if let Some(dispatcher) = &dispatcher {
                     dispatcher
                         .emit(SandboxEvent::ActionFailed {
                             action: LifecycleAction::Create,
-                            error:  ErrorReport::from(&mapped),
+                            error:  ErrorReport::from(&error),
                         })
                         .await;
                 }
-                return Err(mapped);
+                return Err(error);
             }
         };
         let handle = self.handle(created, None).await?;
@@ -604,14 +685,26 @@ impl DaytonaSandbox {
         }
     }
 
+    /// One bounded delete call: a stalled REST call cannot block a
+    /// cleanup path indefinitely.
+    async fn delete_once(&self) -> Result<StdResult<(), DaytonaError>> {
+        match time::timeout(CLEANUP_TIMEOUT, self.client.delete(&self.sdk_id)).await {
+            Ok(result) => Ok(result),
+            Err(_) => Err(Error::Timeout {
+                operation: "deleting sandbox".to_owned(),
+                elapsed:   CLEANUP_TIMEOUT,
+            }),
+        }
+    }
+
     async fn delete_inner(&self) -> Result<()> {
-        match self.client.delete(&self.sdk_id).await {
+        match self.delete_once().await? {
             Ok(()) => Ok(()),
             Err(error) if is_not_found(&error) => Ok(()),
             Err(error) if is_state_change_in_progress(&error) => {
                 match self.wait_for_stable_state("deleting sandbox").await? {
                     SandboxState::Deleted => Ok(()),
-                    _ => match self.client.delete(&self.sdk_id).await {
+                    _ => match self.delete_once().await? {
                         Ok(()) => Ok(()),
                         Err(error) if is_not_found(&error) => Ok(()),
                         Err(error) => Err(daytona_error("deleting sandbox", &error)),
