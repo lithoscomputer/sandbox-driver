@@ -41,6 +41,12 @@ pub trait Exec: Send + Sync {
     /// read loop. Output beyond `controls.retained_output_limit` is still
     /// drained (and counted in [`CaptureStats::omitted_bytes`]), never left
     /// to block the process. A sink error cancels the execution.
+    ///
+    /// A provider that does not support stdin or cancellation must reject
+    /// a call that supplies them with [`Error::Unsupported`]
+    /// (`exec.stdin` / `exec.cancel`) — never run the command with the
+    /// input silently dropped. Capability preflight is the supported way
+    /// to avoid the error.
     async fn run_streaming(
         &self,
         spec: &ExecSpec,

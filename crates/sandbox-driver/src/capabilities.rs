@@ -42,6 +42,10 @@ pub enum Capability {
     LifecycleUpdateNetwork,
     #[serde(rename = "lifecycle.snapshot_sandbox")]
     LifecycleSnapshotSandbox,
+    #[serde(rename = "exec.stdin")]
+    ExecStdin,
+    #[serde(rename = "exec.cancel")]
+    ExecCancel,
     #[serde(rename = "exec.stdio_process")]
     ExecStdioProcess,
     #[serde(rename = "fs.upload")]

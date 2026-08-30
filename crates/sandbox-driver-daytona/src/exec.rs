@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use daytona_sdk::{ExecuteCommandOptions, ProcessService};
 use sandbox_driver::{
-    Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputCaptureBuffer,
-    OutputStream, Result, Termination,
+    Capability, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
+    OutputCaptureBuffer, OutputStream, Result, Termination,
 };
 use tokio::sync::OnceCell;
 use tokio::time;
@@ -83,6 +83,14 @@ impl Exec for DaytonaExec {
         spec: &ExecSpec,
         controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
+        // Unsupported inputs must fail fast, never run the command with
+        // stdin dropped or a cancel token silently ignored.
+        if spec.stdin.is_some() {
+            return Err(Error::unsupported(Capability::ExecStdin));
+        }
+        if controls.cancel.is_some() {
+            return Err(Error::unsupported(Capability::ExecCancel));
+        }
         let started = Instant::now();
         let process = self.process().await?;
         let options = ExecuteCommandOptions {
