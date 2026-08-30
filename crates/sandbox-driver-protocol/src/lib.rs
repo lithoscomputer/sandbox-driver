@@ -22,11 +22,13 @@
 //! not here.
 
 mod client;
+pub mod discovery;
 mod server;
 mod wire;
 
 pub mod methods;
 
 pub use client::PluginProvider;
+pub use discovery::{PluginConfig, PluginLaunch, file_sha256, launch_plugin};
 pub use server::{serve, serve_stdio};
 pub use wire::{Message, WireError, WireErrorData};

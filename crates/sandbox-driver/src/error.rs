@@ -20,6 +20,8 @@ pub enum ResourceKind {
     Snapshot,
     Volume,
     Checkpoint,
+    /// A plugin binary, in discovery errors.
+    Plugin,
 }
 
 /// The crate's boundary error.
