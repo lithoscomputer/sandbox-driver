@@ -1,3 +1,4 @@
+use std::error::Error as StdError;
 use std::result::Result as StdResult;
 use std::time::Duration;
 use std::{fmt, io};
@@ -149,7 +150,7 @@ impl fmt::Display for ExecFailure {
     }
 }
 
-impl std::error::Error for ExecFailure {}
+impl StdError for ExecFailure {}
 
 impl ExecFailure {
     /// A bounded diagnosis matched from stderr — static text only, so
