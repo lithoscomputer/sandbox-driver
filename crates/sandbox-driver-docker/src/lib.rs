@@ -432,11 +432,18 @@ impl SandboxProvider for DockerProvider {
         let mut statuses = Vec::new();
         for container in containers {
             let Some(id) = container.id else { continue };
-            if let Ok(inspect) = self.inspect(&id).await {
-                let sandbox_id = SandboxId::try_new(id)
-                    .map_err(|error| Error::invalid_spec("id", error.to_string()))?;
-                statuses.push(status_from_inspect(sandbox_id, &inspect));
-            }
+            // A container deleted between list and inspect is a benign
+            // race; any other inspect failure must not silently shrink
+            // the listing — a reconciler would treat the missing
+            // sandbox as gone.
+            let inspect = match self.inspect(&id).await {
+                Ok(inspect) => inspect,
+                Err(Error::NotFound { .. }) => continue,
+                Err(error) => return Err(error),
+            };
+            let sandbox_id = SandboxId::try_new(id)
+                .map_err(|error| Error::invalid_spec("id", error.to_string()))?;
+            statuses.push(status_from_inspect(sandbox_id, &inspect));
         }
         Ok(statuses)
     }
