@@ -21,7 +21,12 @@ pub struct PtySize {
 
 impl Default for PtySize {
     fn default() -> Self {
-        Self { rows: 24, cols: 80 }
+        // fabro's terminal default: modern TUIs render poorly at the
+        // historical 80x24.
+        Self {
+            rows: 32,
+            cols: 120,
+        }
     }
 }
 
