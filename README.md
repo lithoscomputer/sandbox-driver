@@ -16,7 +16,8 @@ Host and Docker pass conformance locally (Docker needs a daemon); the
 Daytona suite runs live with `DAYTONA_API_KEY` set. The protocol crate
 re-runs the same suite through the wire.
 
-See `.ai/plans/sandbox-driver-trait-design.md` for the interface design.
+See `.ai/plans/sandbox-driver-trait-design.md` for the interface design
+and `docs/protocol.md` for the normative plugin wire protocol.
 
 ## Setup
 

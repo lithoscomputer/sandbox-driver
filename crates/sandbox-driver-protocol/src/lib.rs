@@ -17,6 +17,9 @@
 //! access facets, and `host/credentials` — the client masks all of
 //! these out of the capabilities it reports.
 //!
+//! The normative wire specification is `docs/protocol.md` at the
+//! repository root; the golden tests in this crate pin its shapes.
+//!
 //! Transport trust — checksums, environment scrubbing, deny-by-default
 //! discovery — is host policy and lives with the embedding application,
 //! not here.
