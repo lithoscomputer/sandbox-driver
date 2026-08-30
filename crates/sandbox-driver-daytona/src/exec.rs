@@ -121,26 +121,18 @@ impl Exec for DaytonaExec {
             ),
         };
 
+        // A response is a completed command, whatever its exit code and
+        // however close to the deadline it arrived — classifying a
+        // genuine failure as TimedOut would trip retry-on-timeout logic
+        // on non-idempotent commands. Timeouts are only ever the 408 or
+        // client-deadline paths above.
         let (termination, exit_code, stdout) = match response {
             None => (Termination::TimedOut, None, Vec::new()),
-            Some(response) => {
-                let elapsed = started.elapsed();
-                // The server kills timed-out commands but reports only an
-                // exit code; classify by elapsed time and failure.
-                let timed_out = spec
-                    .timeout
-                    .is_some_and(|timeout| elapsed >= timeout && response.exit_code != 0);
-                let termination = if timed_out {
-                    Termination::TimedOut
-                } else {
-                    Termination::Exited
-                };
-                (
-                    termination,
-                    Some(response.exit_code),
-                    response.result.into_bytes(),
-                )
-            }
+            Some(response) => (
+                Termination::Exited,
+                Some(response.exit_code),
+                response.result.into_bytes(),
+            ),
         };
 
         if let Some(sink) = &controls.sink {
