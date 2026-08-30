@@ -845,12 +845,11 @@ async fn search_greps_directories_and_single_files(ctx: &Conformance) -> CheckOu
             .await
             .map_err(|error| format!("write failed: {error}"))?;
         let derived;
-        let search: &dyn Search = match sandbox.search() {
-            Some(native) => native,
-            None => {
-                derived = DerivedSearch::new(sandbox.exec());
-                &derived
-            }
+        let search: &dyn Search = if let Some(native) = sandbox.search() {
+            native
+        } else {
+            derived = DerivedSearch::new(sandbox.exec());
+            &derived
         };
         for path in ["conformance-grep", "conformance-grep/needle.txt"] {
             let matches = search
