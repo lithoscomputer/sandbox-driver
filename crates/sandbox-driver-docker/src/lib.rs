@@ -14,8 +14,9 @@
 //! # Runtime behavior
 //!
 //! Async on Tokio; the caller owns the runtime. Spawned tasks: stream
-//! demux and stdin writers scoped to a running exec, and detached
-//! best-effort kill requests on cancellation. Docker itself is the
+//! demux and stdin writers scoped to a running exec, and kill requests
+//! on cancellation that run from `/` and fail loudly when the stop
+//! cannot be requested. Docker itself is the
 //! sandbox registry — handles re-attach by container id across process
 //! restarts.
 

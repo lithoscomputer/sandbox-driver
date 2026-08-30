@@ -221,27 +221,52 @@ impl DockerExec {
         )
     }
 
-    /// Requests a stop, best-effort and detached. Creating the stop
-    /// file triggers the in-container watcher; a stop that arrives
-    /// before the command starts is honored by the wrapper's pre-check.
-    fn spawn_stop(&self, stop_file: String) {
-        let docker = self.docker.clone();
-        let container_id = self.container_id.clone();
-        tokio::spawn(async move {
-            let command = format!(
-                "mkdir -p /tmp/.sandbox-driver && : > {}",
-                shell_quote(&stop_file)
-            );
-            let options = CreateExecOptions {
-                cmd: Some(vec![CONTAINER_BASH.to_owned(), "-c".to_owned(), command]),
-                attach_stdout: Some(false),
-                attach_stderr: Some(false),
-                ..Default::default()
-            };
-            if let Ok(exec) = docker.create_exec(&container_id, options).await {
-                let _ = docker.start_exec(&exec.id, None::<StartExecOptions>).await;
+    /// Requests a stop by creating the stop file the in-container
+    /// watcher polls for; a stop that arrives before the command starts
+    /// is honored by the wrapper's pre-check. Runs from `/` — the exec
+    /// being stopped may have removed the working directory the
+    /// container would otherwise start this one in — with a blank
+    /// `BASH_ENV`, and reports failure: a stop that could not be
+    /// requested must never masquerade as a kill.
+    async fn request_stop(&self, stop_file: &str) -> Result<()> {
+        let command = format!(
+            "mkdir -p /tmp/.sandbox-driver && : > {}",
+            shell_quote(stop_file)
+        );
+        let options = CreateExecOptions {
+            cmd: Some(vec![CONTAINER_BASH.to_owned(), "-c".to_owned(), command]),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            tty: Some(false),
+            working_dir: Some("/".to_owned()),
+            env: Some(vec![format!("{BASH_ENV_VAR}=")]),
+            ..Default::default()
+        };
+        let exec = self
+            .docker
+            .create_exec(&self.container_id, options)
+            .await
+            .map_err(|error| docker_error("creating stop-request exec", &error))?;
+        let start = self
+            .docker
+            .start_exec(&exec.id, None::<StartExecOptions>)
+            .await
+            .map_err(|error| docker_error("starting stop-request exec", &error))?;
+        if let StartExecResults::Attached { mut output, .. } = start {
+            // Drain to completion so the exit code below is final.
+            while let Some(chunk) = output.next().await {
+                if chunk.is_err() {
+                    break;
+                }
             }
-        });
+        }
+        match self.exit_code(&exec.id).await? {
+            None | Some(0) => Ok(()),
+            Some(code) => Err(Error::io(
+                "requesting exec stop",
+                io::Error::other(format!("stop request exited {code}")),
+            )),
+        }
     }
 
     async fn exit_code(&self, exec_id: &str) -> Result<Option<i32>> {
@@ -362,7 +387,7 @@ impl Exec for DockerExec {
                                 termination = Termination::Cancelled;
                                 kill_fired = true;
                                 drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                                self.spawn_stop(stop_file.clone());
+                                self.request_stop(&stop_file).await?;
                             }
                         }
                     }
@@ -375,7 +400,7 @@ impl Exec for DockerExec {
                                 termination = Termination::Cancelled;
                                 kill_fired = true;
                                 drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                                self.spawn_stop(stop_file.clone());
+                                self.request_stop(&stop_file).await?;
                             }
                         }
                     }
@@ -385,13 +410,13 @@ impl Exec for DockerExec {
                     termination = Termination::Cancelled;
                     kill_fired = true;
                     drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                    self.spawn_stop(stop_file.clone());
+                    self.request_stop(&stop_file).await?;
                 }
                 () = timeout => {
                     termination = Termination::TimedOut;
                     kill_fired = true;
                     drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                    self.spawn_stop(stop_file.clone());
+                    self.request_stop(&stop_file).await?;
                 }
                 () = drain_timeout => break,
             }
@@ -523,7 +548,9 @@ struct DockerStdioHandle {
 #[async_trait]
 impl StdioProcessHandle for DockerStdioHandle {
     async fn terminate(&self) {
-        self.exec.spawn_stop(self.stop_file.clone());
+        // The trait offers no error channel; awaiting at least keeps
+        // the request ordered before any caller-side cleanup.
+        let _ = self.exec.request_stop(&self.stop_file).await;
     }
 
     async fn wait(&self) -> (Termination, Option<i32>) {
