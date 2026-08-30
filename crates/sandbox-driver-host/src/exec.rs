@@ -268,10 +268,10 @@ impl Exec for HostExec {
 
         // Write-then-EOF, concurrently with output pumping so a large
         // write cannot deadlock against a full output pipe.
-        let stdin_task = spec
+        let stdin_task = child
             .stdin
-            .clone()
-            .and_then(|bytes| child.stdin.take().map(|stdin| (stdin, bytes)))
+            .take()
+            .zip(spec.stdin.clone())
             .map(|(stdin, bytes)| tokio::spawn(write_stdin(stdin, bytes)));
 
         let stdout = child.stdout.take().expect("stdout was piped");
