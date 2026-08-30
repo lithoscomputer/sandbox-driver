@@ -149,9 +149,32 @@ impl HostExec {
 
 fn resolve_bash_on_path() -> Option<PathBuf> {
     let paths = env::var_os("PATH")?;
-    env::split_paths(&paths)
-        .map(|dir| dir.join("bash"))
-        .find(|candidate| candidate.is_file())
+    // Windows resolves executables through PATHEXT (`bash.exe`), so the
+    // bare name alone would never match a Git Bash install.
+    #[cfg(windows)]
+    let extensions: Vec<String> = env::var_os("PATHEXT")
+        .map(|value| {
+            value
+                .to_string_lossy()
+                .split(';')
+                .map(str::to_ascii_lowercase)
+                .collect()
+        })
+        .unwrap_or_else(|| vec![".exe".to_owned(), ".cmd".to_owned(), ".bat".to_owned()]);
+    for dir in env::split_paths(&paths) {
+        let candidate = dir.join("bash");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        for extension in &extensions {
+            let candidate = dir.join(format!("bash{extension}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(unix)]
