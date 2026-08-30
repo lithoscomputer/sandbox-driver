@@ -94,6 +94,60 @@ async fn exec_honors_env_working_dir_and_stdin() {
     sandbox.delete().await.expect("delete");
 }
 
+#[expect(
+    unsafe_code,
+    reason = "the inherited-env filter is only observable by mutating the test process \
+              environment; Nextest runs each test in its own process"
+)]
+#[tokio::test]
+async fn exec_filters_inherited_secrets_but_trusts_spec_env() {
+    // SAFETY: no other thread reads the environment at this point.
+    unsafe { env::set_var("SD_TEST_WORKER_TOKEN", "worker-secret") };
+
+    let provider = HostProvider::new();
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+
+    let spec = ExecSpec::new(
+        "echo \"${SD_TEST_WORKER_TOKEN:-absent} ${SPEC_DEPLOY_TOKEN:-absent} ${HOME:+home}\"",
+    )
+    .env_var("SPEC_DEPLOY_TOKEN", "explicit")
+    .timeout(Duration::from_secs(10));
+    let result = sandbox.exec().run(&spec).await.expect("exec");
+    assert!(result.success(), "stderr: {}", result.stderr_lossy());
+    assert_eq!(result.stdout_lossy().trim(), "absent explicit home");
+
+    sandbox.delete().await.expect("delete");
+}
+
+#[expect(
+    unsafe_code,
+    reason = "the inherited BASH_ENV drop is only observable by mutating the test process \
+              environment; Nextest runs each test in its own process"
+)]
+#[tokio::test]
+async fn exec_never_sources_bash_env() {
+    let provider = HostProvider::new();
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+    sandbox
+        .fs()
+        .write("startup.sh", b"echo startup-ran\n")
+        .await
+        .expect("write");
+    let startup = format!("{}/startup.sh", sandbox.working_directory());
+    // SAFETY: no other thread reads the environment at this point.
+    unsafe { env::set_var("BASH_ENV", &startup) };
+
+    // Both the inherited and the spec-provided BASH_ENV must be dropped.
+    let spec = ExecSpec::new("echo ok")
+        .env_var("BASH_ENV", &startup)
+        .timeout(Duration::from_secs(10));
+    let result = sandbox.exec().run(&spec).await.expect("exec");
+    assert!(result.success(), "stderr: {}", result.stderr_lossy());
+    assert_eq!(result.stdout_lossy(), "ok\n");
+
+    sandbox.delete().await.expect("delete");
+}
+
 #[tokio::test]
 async fn exec_timeout_kills_the_process_tree() {
     let provider = HostProvider::new();

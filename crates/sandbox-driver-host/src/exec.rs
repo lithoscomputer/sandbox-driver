@@ -4,7 +4,7 @@ use std::pin::pin;
 use std::process::Stdio;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use std::{future, mem};
+use std::{env, future, mem};
 
 use async_trait::async_trait;
 #[cfg(unix)]
@@ -30,13 +30,45 @@ const DRAIN_GRACE: Duration = Duration::from_secs(10);
 /// behind otherwise).
 const TERM_GRACE: Duration = Duration::from_secs(2);
 
+/// Inherited variables always kept, even when their name matches a
+/// secret suffix.
+const ENV_SAFELIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "SHELL",
+    "LANG",
+    "TERM",
+    "TMPDIR",
+    "GOPATH",
+    "CARGO_HOME",
+    "NVM_DIR",
+];
+
+/// Fail-closed filter for inherited environment variables: anything whose
+/// name looks like a secret never reaches a sandboxed command. Explicit
+/// spec env is the deliberate channel for secrets and is not filtered.
+fn inherited_var_is_sensitive(key: &str) -> bool {
+    if ENV_SAFELIST.contains(&key) {
+        return false;
+    }
+    let lower = key.to_lowercase();
+    lower.ends_with("_api_key")
+        || lower.ends_with("_secret")
+        || lower.ends_with("_token")
+        || lower.ends_with("_password")
+        || lower.ends_with("_credential")
+}
+
 /// Command execution on the local machine.
 ///
 /// Implements the Bash contract: every command runs as `bash -c <command>`
 /// with `bash` resolved through the caller's `PATH` (NixOS has no
-/// `/bin/bash`), no login mode, no option changes, and `BASH_ENV` removed.
-/// Processes run in their own process group so cancellation and timeouts
-/// kill the whole tree.
+/// `/bin/bash`), no login mode, no option changes, and `BASH_ENV` removed
+/// — including from spec-provided env. The parent environment is cleared
+/// and rebuilt through a fail-closed secret filter, so ambient worker
+/// credentials never reach sandboxed commands. Processes run in their own
+/// process group so cancellation and timeouts kill the whole tree.
 pub struct HostExec {
     working_dir: PathBuf,
     base_env:    BTreeMap<String, String>,
@@ -73,12 +105,20 @@ impl HostExec {
         let mut command = Command::new("bash");
         command.arg("-c").arg(program);
         command.current_dir(self.resolve_dir(working_dir));
-        command.env_remove(BASH_ENV_VAR);
-        for (key, value) in &self.base_env {
-            command.env(key, value);
+        command.env_clear();
+        for (key, value) in env::vars_os() {
+            // Keys that are not UTF-8 cannot be checked, so fail closed.
+            let Some(key_str) = key.to_str() else {
+                continue;
+            };
+            if key_str != BASH_ENV_VAR && !inherited_var_is_sensitive(key_str) {
+                command.env(&key, &value);
+            }
         }
-        for (key, value) in env {
-            command.env(key, value);
+        for (key, value) in self.base_env.iter().chain(env) {
+            if key != BASH_ENV_VAR {
+                command.env(key, value);
+            }
         }
         #[cfg(unix)]
         command.process_group(0);
