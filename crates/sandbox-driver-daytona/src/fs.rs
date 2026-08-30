@@ -84,17 +84,24 @@ impl Filesystem for DaytonaFs {
 
     async fn write(&self, path: &str, content: &[u8]) -> Result<()> {
         let full = self.resolve(path);
-        if let Some((parent, _)) = full.rsplit_once('/') {
-            if !parent.is_empty() {
-                self.service()
-                    .await?
-                    .create_folder(parent, Some("0755"))
-                    .await
-                    .map_err(|error| daytona_error("creating parent directory", &error))?;
+        let service = self.service().await?;
+        // Upload first: the common case has an existing parent, and
+        // some toolbox versions error on creating one that exists. On
+        // failure, create the parent (best-effort — the retried upload
+        // is the arbiter) and try once more.
+        match service.upload_file_bytes(&full, content).await {
+            Ok(()) => return Ok(()),
+            Err(first_error) => {
+                let Some((parent, _)) = full.rsplit_once('/') else {
+                    return Err(daytona_error("writing file", &first_error));
+                };
+                if parent.is_empty() {
+                    return Err(daytona_error("writing file", &first_error));
+                }
+                let _ = service.create_folder(parent, Some("0755")).await;
             }
         }
-        self.service()
-            .await?
+        service
             .upload_file_bytes(&full, content)
             .await
             .map_err(|error| daytona_error("writing file", &error))
