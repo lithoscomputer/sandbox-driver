@@ -110,7 +110,7 @@ pub struct LifecycleTimers {
 }
 ```
 
-Timer semantics: an unset timer inherits the provider's default — Daytona's server-side auto-stop default is **15 idle minutes**, shorter than a single long inference call, so callers running long commands set it explicitly. `Duration::ZERO` is the explicit "never": it disables the timer where the provider supports disabling (Daytona's wire `0`).
+Timer semantics: an unset timer inherits the provider's default — Daytona's server-side auto-stop default is **15 idle minutes**, shorter than a single long inference call, so callers running long commands set it explicitly. `Duration::ZERO` is the explicit "never": it disables the timer where the provider supports disabling. Daytona encodes that per timer — `0` for auto-stop, `-1` for auto-delete (whose wire `0` means delete-on-stop and is reserved for the ephemeral flag), and `0` for auto-archive, which Daytona reads as "the maximum interval" rather than disabled.
 
 ## Sandbox features (facets)
 

@@ -16,8 +16,12 @@
 //! Unset timers inherit Daytona's server defaults — notably auto-stop
 //! after **15 idle minutes**, which is shorter than a single long
 //! inference call. Callers that run long commands should set
-//! `timers.auto_stop_after_idle` explicitly; `Duration::ZERO` disables a
-//! timer entirely (Daytona's wire semantics for `0`).
+//! `timers.auto_stop_after_idle` explicitly. `Duration::ZERO` is the
+//! explicit "never", encoded per timer: wire `0` disables auto-stop;
+//! auto-delete crosses as `-1` (its wire `0` means delete immediately
+//! on stop and is reserved for the ephemeral flag); auto-archive
+//! crosses as `0`, which Daytona reads as "the maximum interval" — the
+//! closest the API comes to disabling it.
 //!
 //! # Configuration
 //!
@@ -197,15 +201,27 @@ fn to_u64(value: f64) -> Option<u64> {
     (value.is_finite() && value >= 0.0 && value < u64::MAX as f64).then(|| value.round() as u64)
 }
 
-/// Converts a timer duration to Daytona's minute intervals. On the wire
-/// `0` disables the timer, so `Duration::ZERO` passes through as the
-/// explicit "never" and every other duration rounds up to at least one
-/// minute.
+/// Converts a timer duration to Daytona's whole-minute intervals,
+/// rounding up so a sub-minute timer never truncates away. Wire `0`
+/// (from `Duration::ZERO`) is deliberate and timer-specific: it
+/// disables auto-stop, and defers auto-archive to Daytona's maximum
+/// interval — the closest the API comes to disabling it.
 fn minutes(duration: Duration) -> i32 {
     if duration.is_zero() {
         return 0;
     }
     i32::try_from(duration.as_secs().div_ceil(60)).unwrap_or(i32::MAX)
+}
+
+/// Auto-delete has inverted zero semantics on the wire: `0` means
+/// "delete immediately upon stopping" (the ephemeral encoding, sent
+/// only via the spec flag) and a negative value disables — so
+/// `Duration::ZERO`, the crate-wide explicit "never", crosses as `-1`.
+fn auto_delete_minutes(duration: Duration) -> i32 {
+    if duration.is_zero() {
+        return -1;
+    }
+    minutes(duration)
 }
 
 fn gigabytes(mb: u64) -> i32 {
@@ -430,7 +446,7 @@ fn base_params(spec: &SandboxSpec) -> Result<SandboxBaseParams> {
         auto_delete_interval: spec
             .timers
             .auto_delete_after_stop
-            .map(minutes)
+            .map(auto_delete_minutes)
             .or(if spec.ephemeral { Some(0) } else { None }),
         volumes: (!spec.volumes.is_empty()).then(|| {
             spec.volumes
@@ -867,7 +883,7 @@ impl Sandbox for DaytonaSandbox {
                 .map_err(|error| daytona_error("setting auto-archive", &error))?;
         }
         if let Some(delete) = timers.auto_delete_after_stop {
-            sdk.set_auto_delete_interval(minutes(delete))
+            sdk.set_auto_delete_interval(auto_delete_minutes(delete))
                 .await
                 .map_err(|error| daytona_error("setting auto-delete", &error))?;
         }
@@ -1149,8 +1165,18 @@ mod tests {
 
     #[test]
     fn minutes_pass_zero_through_as_disabled() {
-        // On the Daytona wire, 0 disables the timer entirely.
+        // Wire 0 disables auto-stop and defers auto-archive to the
+        // maximum interval.
         assert_eq!(minutes(Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn auto_delete_zero_crosses_as_negative_disabled() {
+        // Wire 0 means "delete immediately upon stopping"; disabled is
+        // a negative value. Mapping ZERO to 0 would turn "never
+        // auto-delete" into destroying the sandbox on every stop.
+        assert_eq!(auto_delete_minutes(Duration::ZERO), -1);
+        assert_eq!(auto_delete_minutes(Duration::from_secs(90)), 2);
     }
 
     #[test]
