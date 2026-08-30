@@ -262,9 +262,11 @@ impl Search for DerivedSearch<'_> {
 /// resolve to directories, never symlinks — so segments accumulate
 /// verbatim.
 fn symlink_guard(base: &str) -> String {
+    use std::fmt::Write;
+
     let mut guard = String::new();
     if base.starts_with('/') {
-        guard.push_str(&format!(" && [ ! -L {} ]", shell_quote(base)));
+        let _ = write!(guard, " && [ ! -L {} ]", shell_quote(base));
         return guard;
     }
     let mut prefix = String::new();
@@ -273,7 +275,7 @@ fn symlink_guard(base: &str) -> String {
             prefix.push('/');
         }
         prefix.push_str(segment);
-        guard.push_str(&format!(" && [ ! -L {} ]", shell_quote(&prefix)));
+        let _ = write!(guard, " && [ ! -L {} ]", shell_quote(&prefix));
     }
     guard
 }
