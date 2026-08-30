@@ -42,7 +42,7 @@ use sandbox_driver::{
 };
 
 pub use crate::exec::DockerExec;
-use crate::exec::{docker_error, is_not_found, tolerate_not_modified};
+use crate::exec::{BASH_ENV_VAR, docker_error, is_not_found, shell_quote, tolerate_not_modified};
 
 const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
 const DEFAULT_WORKING_DIRECTORY: &str = "/workspace";
@@ -306,20 +306,28 @@ impl SandboxProvider for DockerProvider {
                 .map(|cores| i64::from(cores) * 100_000),
             ..Default::default()
         };
+        // Blank BASH_ENV at the container level too: an image (or spec)
+        // startup file would otherwise run inside the init command below
+        // and can kill the container the moment it starts.
+        let mut env_entries: Vec<String> = spec
+            .env
+            .iter()
+            .filter(|(key, _)| key.as_str() != BASH_ENV_VAR)
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        env_entries.push(format!("{BASH_ENV_VAR}="));
         let config = Config {
             image: Some(reference.clone()),
             cmd: Some(vec![
                 "/bin/bash".to_owned(),
                 "-c".to_owned(),
-                format!("mkdir -p '{working_dir}' && exec sleep infinity"),
+                format!(
+                    "mkdir -p {} && exec sleep infinity",
+                    shell_quote(&working_dir)
+                ),
             ]),
             working_dir: Some(working_dir.clone()),
-            env: Some(
-                spec.env
-                    .iter()
-                    .map(|(key, value)| format!("{key}={value}"))
-                    .collect(),
-            ),
+            env: Some(env_entries),
             labels: Some(labels),
             host_config: Some(host_config),
             ..Default::default()

@@ -20,7 +20,7 @@ use tokio::time;
 
 /// The container-side interpreter the Bash contract requires.
 const CONTAINER_BASH: &str = "/bin/bash";
-const BASH_ENV_VAR: &str = "BASH_ENV";
+pub(crate) const BASH_ENV_VAR: &str = "BASH_ENV";
 /// Grace period for draining output after a stop request. Must exceed
 /// the watcher's poll interval plus [`TERM_GRACE_SECONDS`].
 const KILL_DRAIN_GRACE: Duration = Duration::from_secs(10);
@@ -66,7 +66,7 @@ pub(crate) fn tolerate_not_modified(
     }
 }
 
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     let mut quoted = String::with_capacity(value.len() + 2);
     quoted.push('\'');
     for c in value.chars() {
