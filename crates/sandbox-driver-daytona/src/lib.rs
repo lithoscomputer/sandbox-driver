@@ -9,7 +9,8 @@
 //! fork, checkpoints, live-sandbox snapshots, and runtime network updates
 //! are not declared and return `Unsupported`. Exec is buffered through
 //! the toolbox and reports `live_streaming: false` /
-//! `streams_separated: false` honestly.
+//! `streams_separated: false` honestly; stdin is delivered through a
+//! temp-file redirection inside the sandbox.
 //!
 //! # Lifecycle timers
 //!
@@ -378,6 +379,7 @@ fn daytona_capabilities() -> Capabilities {
     caps.lifecycle.refresh_activity = true;
     caps.lifecycle.timers = true;
     caps.lifecycle.labels = true;
+    caps.exec.stdin = true;
     caps.fs.native = true;
     caps.fs.upload = true;
     caps.fs.download = true;
