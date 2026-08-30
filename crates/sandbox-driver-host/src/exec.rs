@@ -15,7 +15,7 @@ use sandbox_driver::{
     Termination,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::watch;
 use tokio::time;
 
@@ -180,6 +180,33 @@ async fn terminate_process_group(child: &mut Child) {
     }
 }
 
+/// Writes stdin then closes it for EOF. A command that stops reading its
+/// input (`head -1`) disconnecting the pipe is normal; any other failure
+/// means the command saw truncated input and must not pass silently.
+async fn write_stdin(mut stdin: ChildStdin, bytes: Vec<u8>) -> Result<()> {
+    fn is_disconnect(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            io::ErrorKind::BrokenPipe
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+        )
+    }
+    if let Err(error) = stdin.write_all(&bytes).await {
+        if is_disconnect(&error) {
+            return Ok(());
+        }
+        return Err(Error::io("writing exec stdin", error));
+    }
+    if let Err(error) = stdin.shutdown().await {
+        if is_disconnect(&error) {
+            return Ok(());
+        }
+        return Err(Error::io("closing exec stdin", error));
+    }
+    Ok(())
+}
+
 enum PumpEnd {
     Eof,
     SinkError,
@@ -239,17 +266,13 @@ impl Exec for HostExec {
             .spawn()
             .map_err(|error| Error::io("spawning bash for exec", error))?;
 
-        if let Some(bytes) = spec.stdin.clone() {
-            if let Some(mut stdin) = child.stdin.take() {
-                // Write-then-EOF, concurrently with output pumping so a
-                // large write cannot deadlock against a full output pipe.
-                // A broken pipe (`head -1`) is normal.
-                tokio::spawn(async move {
-                    let _ = stdin.write_all(&bytes).await;
-                    let _ = stdin.shutdown().await;
-                });
-            }
-        }
+        // Write-then-EOF, concurrently with output pumping so a large
+        // write cannot deadlock against a full output pipe.
+        let stdin_task = spec
+            .stdin
+            .clone()
+            .and_then(|bytes| child.stdin.take().map(|stdin| (stdin, bytes)))
+            .map(|(stdin, bytes)| tokio::spawn(write_stdin(stdin, bytes)));
 
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
@@ -338,6 +361,23 @@ impl Exec for HostExec {
             }
             (termination, status)
         };
+        if let Some(stdin_task) = stdin_task {
+            // The process is gone, so unwritten stdin bytes are unwanted.
+            // Abort instead of joining unbounded: a backgrounded
+            // grandchild that inherited the pipe could otherwise block
+            // the writer forever.
+            stdin_task.abort();
+            match stdin_task.await {
+                Ok(result) => result?,
+                Err(join_error) if join_error.is_cancelled() => {}
+                Err(join_error) => {
+                    return Err(Error::io(
+                        "exec stdin writer task",
+                        io::Error::other(join_error),
+                    ));
+                }
+            }
+        }
         if let Some(error) = read_error {
             return Err(Error::io("reading exec output", error));
         }
