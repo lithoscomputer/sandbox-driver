@@ -14,6 +14,19 @@ use crate::{DaytonaClient, daytona_error, is_server_timeout, shell_quote};
 /// Extra client-side wait beyond the server-side command timeout.
 const TIMEOUT_GRACE: Duration = Duration::from_secs(10);
 
+/// The server-side timeout sent when the spec has none. Omitting the
+/// field does not mean "no deadline" — the toolbox applies its own
+/// 10-second default and kills the command — so an untimed spec must
+/// cross the wire as an explicit, effectively unbounded timeout. One
+/// year fits comfortably in the API's `i32` seconds.
+const UNBOUNDED_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// The server-side timeout for a spec: its own, or the unbounded
+/// stand-in — never an omitted field.
+fn wire_timeout(spec_timeout: Option<Duration>) -> Duration {
+    spec_timeout.unwrap_or(UNBOUNDED_TIMEOUT)
+}
+
 /// Buffered command execution through the Daytona toolbox.
 ///
 /// Honesty flags are load-bearing here: the toolbox `execute` API returns
@@ -100,7 +113,7 @@ impl Exec for DaytonaExec {
                     .unwrap_or_else(|| self.working_dir.clone()),
             ),
             env:     None,
-            timeout: spec.timeout,
+            timeout: Some(wire_timeout(spec.timeout)),
         };
         let program = Self::compose(spec);
         let call = process.execute_command(&program, options);
@@ -115,10 +128,13 @@ impl Exec for DaytonaExec {
                 Ok(Err(error)) => return Err(daytona_error("executing command", &error)),
                 Err(_) => None,
             },
-            None => Some(
-                call.await
-                    .map_err(|error| daytona_error("executing command", &error))?,
-            ),
+            None => match call.await {
+                Ok(response) => Some(response),
+                // The unbounded stand-in is still finite server-side, so
+                // its expiry is a timeout kill, not a provider failure.
+                Err(error) if is_server_timeout(&error) => None,
+                Err(error) => return Err(daytona_error("executing command", &error)),
+            },
         };
 
         // A response is a completed command, whatever its exit code and
@@ -151,5 +167,28 @@ impl Exec for DaytonaExec {
         streaming.live_streaming = false;
         streaming.stdout_capture = stats;
         Ok(streaming)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn untimed_specs_send_the_unbounded_timeout_explicitly() {
+        // An omitted field would let the toolbox kill the command at its
+        // 10-second default.
+        assert_eq!(wire_timeout(None), UNBOUNDED_TIMEOUT);
+        assert_eq!(
+            wire_timeout(Some(Duration::from_secs(30))),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn unbounded_timeout_survives_the_wire_conversion() {
+        // The SDK converts with `as_secs() as i32`; a value past i32::MAX
+        // would truncate into garbage.
+        assert!(i32::try_from(UNBOUNDED_TIMEOUT.as_secs()).is_ok());
     }
 }
