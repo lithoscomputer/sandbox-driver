@@ -572,9 +572,15 @@ impl Sandbox for DockerSandbox {
     }
 
     async fn stop(&self) -> Result<()> {
+        // Managed containers run the driver's own `sleep infinity` init
+        // as PID1, which never installs a SIGTERM handler and (as PID1)
+        // never receives the default disposition — so any stop grace is
+        // waited out in full, buying nothing. Workload processes get
+        // their SIGTERM-grace-SIGKILL sequence from the exec watcher,
+        // not from `docker stop`. Keep the grace at fabro's 1 second.
         let outcome = tolerate_not_modified(
             self.docker
-                .stop_container(self.id.as_str(), Some(StopContainerOptions { t: 10 }))
+                .stop_container(self.id.as_str(), Some(StopContainerOptions { t: 1 }))
                 .await,
             "stopping container",
         );
