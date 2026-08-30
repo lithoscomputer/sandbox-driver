@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::{env, fs, process};
+use std::{env, fs};
 
 use sandbox_driver::{Error, ProviderKind, ResourceKind, Result, SandboxProvider as _};
 use sha2::{Digest, Sha256};
