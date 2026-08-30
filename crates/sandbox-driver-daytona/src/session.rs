@@ -88,10 +88,11 @@ impl Session {
         Ok(command.exit_code)
     }
 
-    /// Best-effort final log fetch; `None` on any failure — the caller
-    /// falls back to what the stream delivered.
+    /// Best-effort final log fetch; `None` on any failure or after
+    /// `close` — the caller falls back to what the stream delivered.
     pub(crate) async fn fetch_logs(&self, command_id: &str) -> Option<SessionCommandLogsResult> {
-        self.service()
+        self.process
+            .as_ref()?
             .get_session_command_logs(&self.id, command_id)
             .await
             .ok()
@@ -291,6 +292,15 @@ mod tests {
         assert_eq!(suffix_offset(&mut seen, b"abcdefghij"), 8);
         assert_eq!(suffix_offset(&mut seen, b"abcdefgh"), 8);
         assert_eq!(suffix_offset(&mut seen, b"abcd"), 4);
+    }
+
+    #[tokio::test]
+    async fn fetch_logs_after_close_is_none() {
+        let session = Session {
+            process: None,
+            id:      "closed".to_owned(),
+        };
+        assert!(session.fetch_logs("cmd").await.is_none());
     }
 
     #[test]
