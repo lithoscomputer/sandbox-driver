@@ -1,6 +1,6 @@
-use std::io;
 use std::result::Result as StdResult;
 use std::time::Duration;
+use std::{fmt, io};
 
 use crate::capabilities::Capability;
 use crate::event::LifecycleAction;
@@ -126,8 +126,7 @@ impl AuthError {
 /// A failed command execution, with bounded classified metadata in
 /// `Display` and raw output behind explicit accessors so callers control
 /// exposure. Secret redaction is the caller's responsibility.
-#[derive(Debug, thiserror::Error)]
-#[error("command {label:?} failed ({termination:?}, exit code {exit_code:?})")]
+#[derive(Debug)]
 pub struct ExecFailure {
     label:       String,
     termination: Termination,
@@ -136,7 +135,40 @@ pub struct ExecFailure {
     stderr:      Vec<u8>,
 }
 
+impl fmt::Display for ExecFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "command {:?} failed ({:?}, exit code {:?})",
+            self.label, self.termination, self.exit_code
+        )?;
+        if let Some(hint) = self.hint() {
+            write!(f, " — hint: {hint}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ExecFailure {}
+
 impl ExecFailure {
+    /// A bounded diagnosis matched from stderr — static text only, so
+    /// the redaction boundary holds: raw output never enters `Display`.
+    /// Only provider-agnostic classes live here; fabro keeps its
+    /// git-push classifications caller-side.
+    fn hint(&self) -> Option<&'static str> {
+        let stderr = String::from_utf8_lossy(&self.stderr).to_ascii_lowercase();
+        if stderr.contains("could not resolve host") || stderr.contains("network is unreachable") {
+            Some("network failure inside the sandbox — check DNS / egress")
+        } else if stderr.contains("not a git repository")
+            || stderr.contains("does not appear to be a git repository")
+        {
+            Some("no git repository at the working directory")
+        } else {
+            None
+        }
+    }
+
     pub fn new(
         label: impl Into<String>,
         termination: Termination,
@@ -234,5 +266,20 @@ mod tests {
             "raw output must stay behind accessors: {rendered}"
         );
         assert_eq!(failure.stdout(), b"secret stdout");
+    }
+
+    #[test]
+    fn exec_failure_display_carries_a_static_hint_only() {
+        let failure = ExecFailure::new(
+            "git clone",
+            Termination::Exited,
+            Some(128),
+            Vec::new(),
+            b"fatal: could not resolve host: github.com/secret-org".to_vec(),
+        );
+        let rendered = failure.to_string();
+        assert!(rendered.contains("hint: network failure"), "{rendered}");
+        // The hint is classification, never quoted stderr.
+        assert!(!rendered.contains("secret-org"), "{rendered}");
     }
 }
