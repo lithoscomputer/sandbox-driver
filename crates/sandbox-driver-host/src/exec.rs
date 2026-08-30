@@ -2,9 +2,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::process::Stdio;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use std::{env, future, mem};
+use std::{env, future};
 
 use async_trait::async_trait;
 #[cfg(unix)]
@@ -16,6 +15,7 @@ use sandbox_driver::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
+use tokio::sync::watch;
 use tokio::time;
 
 /// The variable the Bash contract requires stripping before every run.
@@ -135,13 +135,6 @@ fn signal_process_group(child: &Child, signal: Signal) {
         let pgid = Pid::from_raw(i32::try_from(pid).unwrap_or_default());
         let _ = killpg(pgid, signal);
     }
-}
-
-fn kill_process_group(child: &Child) {
-    #[cfg(unix)]
-    signal_process_group(child, Signal::SIGKILL);
-    #[cfg(not(unix))]
-    let _ = child;
 }
 
 /// Sends SIGTERM to the process group, waits [`TERM_GRACE`] for a
@@ -350,32 +343,55 @@ impl Exec for HostExec {
             stdin: Box::pin(stdin),
             stdout: Box::pin(stdout),
             stderr_tail,
-            handle: Box::new(HostStdioHandle {
-                state: Mutex::new(StdioState::Running(child)),
-            }),
+            handle: Box::new(HostStdioHandle::supervise(child)),
         })
     }
 }
 
-enum StdioState {
-    Running(Child),
-    Finished(Termination, Option<i32>),
-    Waiting,
-}
+type StdioOutcome = (Termination, Option<i32>);
 
+/// Owns the child through a supervisor task so `terminate` works at any
+/// time — including while another task is blocked in `wait`.
 struct HostStdioHandle {
-    state: Mutex<StdioState>,
+    terminate_tx: watch::Sender<bool>,
+    outcome_rx:   watch::Receiver<Option<StdioOutcome>>,
 }
 
 impl HostStdioHandle {
-    fn take_child(&self) -> Option<Child> {
-        let mut state = self.state.lock().expect("stdio state lock");
-        match mem::replace(&mut *state, StdioState::Waiting) {
-            StdioState::Running(child) => Some(child),
-            other => {
-                *state = other;
-                None
-            }
+    fn supervise(mut child: Child) -> Self {
+        let (terminate_tx, mut terminate_rx) = watch::channel(false);
+        let (outcome_tx, outcome_rx) = watch::channel(None);
+        tokio::spawn(async move {
+            let outcome = tokio::select! {
+                status = child.wait() => match status {
+                    Ok(status) => (Termination::Exited, status.code()),
+                    Err(_) => (Termination::Unknown, None),
+                },
+                () = async {
+                    // A dropped handle means terminate can never be
+                    // requested; keep waiting for the natural exit.
+                    if terminate_rx.wait_for(|requested| *requested).await.is_err() {
+                        future::pending::<()>().await;
+                    }
+                } => {
+                    terminate_process_group(&mut child).await;
+                    let code = child.wait().await.ok().and_then(|status| status.code());
+                    (Termination::Cancelled, code)
+                }
+            };
+            let _ = outcome_tx.send(Some(outcome));
+        });
+        Self {
+            terminate_tx,
+            outcome_rx,
+        }
+    }
+
+    async fn outcome(&self) -> StdioOutcome {
+        let mut outcome_rx = self.outcome_rx.clone();
+        match outcome_rx.wait_for(Option::is_some).await {
+            Ok(outcome) => (*outcome).expect("guarded by wait_for"),
+            Err(_) => (Termination::Unknown, None),
         }
     }
 }
@@ -383,32 +399,13 @@ impl HostStdioHandle {
 #[async_trait]
 impl StdioProcessHandle for HostStdioHandle {
     async fn terminate(&self) {
-        let state = self.state.lock().expect("stdio state lock");
-        if let StdioState::Running(child) = &*state {
-            kill_process_group(child);
-        }
+        let _ = self.terminate_tx.send(true);
+        // Return only after the process is reaped, so callers can clean
+        // up (delete the workspace, say) without racing a live process.
+        let _ = self.outcome().await;
     }
 
     async fn wait(&self) -> (Termination, Option<i32>) {
-        if let Some(mut child) = self.take_child() {
-            let outcome = child.wait().await;
-            let (termination, code) = match outcome {
-                Ok(status) => (Termination::Exited, status.code()),
-                Err(_) => (Termination::Unknown, None),
-            };
-            *self.state.lock().expect("stdio state lock") = StdioState::Finished(termination, code);
-            return (termination, code);
-        }
-        // Another waiter owns the child or it already finished; poll the
-        // recorded outcome.
-        loop {
-            {
-                let state = self.state.lock().expect("stdio state lock");
-                if let StdioState::Finished(termination, code) = &*state {
-                    return (*termination, *code);
-                }
-            }
-            time::sleep(Duration::from_millis(20)).await;
-        }
+        self.outcome().await
     }
 }

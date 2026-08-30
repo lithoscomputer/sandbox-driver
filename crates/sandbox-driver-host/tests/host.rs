@@ -10,7 +10,8 @@ use std::{env, process};
 use sandbox_driver::{
     DerivedGit, DerivedSearch, Error, ExecControls, ExecSpec, Git, GitCommitOptions, GrepOptions,
     OutputStream, SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec, Search,
-    SpawnSpec, Termination, WaitOptions, WalkOptions, WorkspaceOwnership, activate,
+    SpawnSpec, StdioProcessHandle, Termination, WaitOptions, WalkOptions, WorkspaceOwnership,
+    activate,
 };
 use sandbox_driver_host::HostProvider;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -296,7 +297,33 @@ async fn spawn_stdio_round_trips_lines() {
 
     process.handle.terminate().await;
     let (termination, _code) = process.handle.wait().await;
-    assert_eq!(termination, Termination::Exited);
+    assert_eq!(termination, Termination::Cancelled);
+
+    sandbox.delete().await.expect("delete");
+}
+
+#[tokio::test]
+async fn spawn_stdio_terminate_interrupts_an_inflight_wait() {
+    let provider = HostProvider::new();
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+
+    let process = sandbox
+        .exec()
+        .spawn_stdio(&SpawnSpec::new("sleep 30"))
+        .await
+        .expect("spawn");
+    let handle: Arc<dyn StdioProcessHandle> = Arc::from(process.handle);
+    let waiter = {
+        let handle = Arc::clone(&handle);
+        tokio::spawn(async move { handle.wait().await })
+    };
+    time::sleep(Duration::from_millis(100)).await;
+
+    let started = Instant::now();
+    handle.terminate().await;
+    let (termination, _code) = waiter.await.expect("waiter");
+    assert_eq!(termination, Termination::Cancelled);
+    assert!(started.elapsed() < Duration::from_secs(10));
 
     sandbox.delete().await.expect("delete");
 }
