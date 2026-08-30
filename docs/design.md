@@ -140,7 +140,7 @@ Notes:
 - **Search and Git ship as derived implementations** over `Exec` in this crate — fabro's experience shows `glob` was *never* overridden by any provider and git-via-exec is what both remote providers actually do. A provider with a native API can override per method.
 - **Git here is plumbing only.** Fabro's credential machinery (`refresh_push_credentials`, `push_token_source`, `git_push_ref` retry/lease engine, `setup_git` intent, clone orchestration and repo layout) stays in fabro, layered on `Exec` + `Git`. Those 6 of fabro's 34 methods do not move into this crate.
 - **`Vnc` and `Vpn` are reserved facets**: defined in the capability schema now so the wire protocol doesn't break when a provider adds them, but no trait methods beyond "get connection info" in v1.
-- Daytona's **LSP, code interpreter, computer-use input automation, and command sessions** are out of scope for v1 — real surfaces, but no consumer yet. The capability schema reserves names for them.
+- Daytona's **LSP, code interpreter, and computer-use input automation** are out of scope for v1 — real surfaces, but no consumer yet. The capability schema reserves names for them. Command sessions were originally deferred with them, but the Daytona provider now uses them internally as the transport for streaming, cancellation, and partial-output-on-timeout execs (plain buffered runs keep the cheaper one-shot endpoint); sessions remain unexposed as an API surface.
 
 ## Capability discovery
 

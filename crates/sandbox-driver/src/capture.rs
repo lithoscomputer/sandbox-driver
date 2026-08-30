@@ -60,6 +60,29 @@ impl OutputCaptureBuffer {
         }
     }
 
+    /// The accounting so far, without consuming the buffer.
+    pub fn stats(&self) -> CaptureStats {
+        CaptureStats {
+            observed_bytes: self.observed,
+            retained_bytes: self.head.len() + self.tail.len(),
+            omitted_bytes:  self.omitted,
+        }
+    }
+
+    /// The retained head and tail as slices. Takes `&mut` so the rolling
+    /// tail can be made contiguous in place.
+    pub fn retained_slices(&mut self) -> (&[u8], &[u8]) {
+        (&self.head, self.tail.make_contiguous())
+    }
+
+    /// Copies out the retained bytes (head then tail) without consuming
+    /// the buffer.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = self.head.clone();
+        bytes.extend(&self.tail);
+        bytes
+    }
+
     /// The retained bytes (head then tail) and the accounting.
     pub fn into_parts(self) -> (Vec<u8>, CaptureStats) {
         let mut bytes = self.head;

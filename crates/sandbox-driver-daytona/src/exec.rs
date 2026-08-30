@@ -1,17 +1,27 @@
+use std::collections::BTreeMap;
+use std::result::Result as StdResult;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{mem, process};
 
 use async_trait::async_trait;
-use daytona_sdk::{ExecuteCommandOptions, FileSystemService, ProcessService};
+use daytona_sdk::{DaytonaError, ExecuteCommandOptions, FileSystemService, ProcessService};
 use sandbox_driver::{
-    Capability, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
-    OutputCaptureBuffer, OutputStream, Result, Termination,
+    Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputCaptureBuffer, OutputSink,
+    OutputStream, Result, Termination,
 };
 use tokio::runtime::Handle;
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex, OnceCell};
 use tokio::time;
+use tokio_util::sync::CancellationToken;
 
+use crate::session::{Session, missing_suffix, wait_for_completion};
 use crate::{DaytonaClient, daytona_error, is_server_timeout, shell_quote};
+
+/// Bound on waiting for the log stream to close after the command has
+/// its outcome; a stream that will not end is abandoned.
+const STREAM_DRAIN_GRACE: Duration = Duration::from_secs(10);
 
 /// Extra client-side wait beyond the server-side command timeout.
 const TIMEOUT_GRACE: Duration = Duration::from_secs(10);
@@ -94,13 +104,17 @@ impl Drop for StdinFile {
     }
 }
 
-/// Buffered command execution through the Daytona toolbox.
+/// Command execution through the Daytona toolbox, on two transports.
 ///
-/// Honesty flags are load-bearing here: the toolbox `execute` API returns
-/// combined output after completion, so results report
-/// `streams_separated: false` and `live_streaming: false`, and stderr is
-/// always empty. The Bash contract is enforced by wrapping every command
-/// in `exec /bin/bash -c …` with `BASH_ENV` unset; environment variables
+/// A plain run uses the one-shot `execute` endpoint: combined output
+/// after completion (`streams_separated: false`, `live_streaming:
+/// false`, stderr empty) at one API call. A run with a sink or cancel
+/// token uses a command session instead: logs stream live with
+/// server-side stdout/stderr separation, cancellation and timeouts
+/// kill the command by deleting its session, and partial output
+/// survives a timeout via a final log fetch. On both transports the
+/// Bash contract is enforced by wrapping the command in
+/// `/bin/bash -c …` with `BASH_ENV` blanked; environment variables
 /// cross as `export` statements because the API's `envs` field is not
 /// reliably applied.
 pub struct DaytonaExec {
@@ -187,11 +201,23 @@ impl Exec for DaytonaExec {
         spec: &ExecSpec,
         controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
-        // Unsupported controls must fail fast, never run the command
-        // with a cancel token silently ignored.
-        if controls.cancel.is_some() {
-            return Err(Error::unsupported(Capability::ExecCancel));
+        // Sessions cost three extra API calls, so plain buffered runs —
+        // every derived fs/search/git operation — keep the one-shot
+        // endpoint; only a sink or cancel token needs the session
+        // transport.
+        if controls.sink.is_some() || controls.cancel.is_some() {
+            return self.run_session(spec, controls).await;
         }
+        self.run_buffered(spec, &controls).await
+    }
+}
+
+impl DaytonaExec {
+    async fn run_buffered(
+        &self,
+        spec: &ExecSpec,
+        controls: &ExecControls,
+    ) -> Result<ExecStreamingResult> {
         let started = Instant::now();
         let process = self.process().await?;
         let mut stdin_file = match &spec.stdin {
@@ -266,6 +292,265 @@ impl Exec for DaytonaExec {
         streaming.stdout_capture = stats;
         Ok(streaming)
     }
+
+    /// Streaming/cancellable execution through a command session.
+    ///
+    /// The command runs asynchronously in a dedicated session; logs
+    /// follow live with server-side stream separation; the status poll
+    /// races the timeout and the cancel token; and a non-natural end
+    /// kills the command by deleting the session. Partial output on
+    /// timeout/cancel comes from a final log fetch, deduplicated
+    /// against what the stream already delivered.
+    async fn run_session(
+        &self,
+        spec: &ExecSpec,
+        controls: ExecControls,
+    ) -> Result<ExecStreamingResult> {
+        let started = Instant::now();
+        let sandbox = self
+            .client
+            .get(&self.sandbox_id)
+            .await
+            .map_err(|error| daytona_error("fetching sandbox", &error))?;
+
+        let mut stdin_file = match &spec.stdin {
+            Some(bytes) => Some(StdinFile::create(&self.client, &self.sandbox_id, bytes).await?),
+            None => None,
+        };
+
+        let command = match &stdin_file {
+            Some(file) => format!("(\n{}\n) < {}", spec.command, shell_quote(&file.path)),
+            None => spec.command.clone(),
+        };
+        let cwd = self.resolve_dir(spec.working_dir.as_deref());
+        let program = wrap_session_script(&build_session_script(&cwd, &spec.env, &command));
+
+        let mut session = match Session::create(&sandbox).await {
+            Ok(session) => session,
+            Err(error) => {
+                close_stdin(&mut stdin_file).await;
+                return Err(error);
+            }
+        };
+        let session_exec = match session.execute(&program).await {
+            Ok(result) => result,
+            Err(error) => {
+                session.close().await;
+                close_stdin(&mut stdin_file).await;
+                return Err(error);
+            }
+        };
+        let command_id = session_exec.cmd_id.clone();
+
+        // The stream task needs its own service and 'static state.
+        let stream_process = match sandbox.process().await {
+            Ok(process) => process,
+            Err(error) => {
+                session.close().await;
+                close_stdin(&mut stdin_file).await;
+                return Err(daytona_error("connecting to the toolbox", &error));
+            }
+        };
+        let stdout_seen = Arc::new(Mutex::new(OutputCaptureBuffer::new(
+            controls.retained_output_limit,
+        )));
+        let stderr_seen = Arc::new(Mutex::new(OutputCaptureBuffer::new(
+            controls.retained_output_limit,
+        )));
+        let saw_live = Arc::new(AtomicBool::new(false));
+        // A failing sink cancels the execution (the core contract); the
+        // token routes the failure into the wait loop below.
+        let sink_failed = CancellationToken::new();
+
+        let mut stream_task = tokio::spawn({
+            let session_id = session.id().to_owned();
+            let command_id = command_id.clone();
+            let stdout = StreamSide {
+                stream:      OutputStream::Stdout,
+                seen:        Arc::clone(&stdout_seen),
+                saw_live:    Arc::clone(&saw_live),
+                sink:        controls.sink.clone(),
+                sink_failed: sink_failed.clone(),
+            };
+            let stderr = StreamSide {
+                stream:      OutputStream::Stderr,
+                seen:        Arc::clone(&stderr_seen),
+                saw_live:    Arc::clone(&saw_live),
+                sink:        controls.sink.clone(),
+                sink_failed: sink_failed.clone(),
+            };
+            async move {
+                stream_process
+                    .get_session_command_logs_stream(
+                        &session_id,
+                        &command_id,
+                        move |chunk| stdout.clone().deliver(chunk),
+                        move |chunk| stderr.clone().deliver(chunk),
+                    )
+                    .await
+            }
+        });
+
+        let outcome = match wait_for_completion(
+            &session,
+            &command_id,
+            session_exec.exit_code,
+            spec.timeout,
+            controls.cancel.clone(),
+            sink_failed.clone(),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                stream_task.abort();
+                session.close().await;
+                close_stdin(&mut stdin_file).await;
+                return Err(error);
+            }
+        };
+
+        // A non-natural end must actively kill the command: deleting
+        // the session terminates it and closes the log stream.
+        if outcome.termination != Termination::Exited {
+            session.close().await;
+        }
+
+        let stream_clean = match time::timeout(STREAM_DRAIN_GRACE, &mut stream_task).await {
+            Ok(Ok(Ok(()))) => true,
+            Ok(_) => false,
+            Err(_elapsed) => {
+                stream_task.abort();
+                false
+            }
+        };
+
+        let final_logs = match outcome.final_logs {
+            Some(logs) => Some(logs),
+            None => session.fetch_logs(&command_id).await,
+        };
+        session.close().await;
+        close_stdin(&mut stdin_file).await;
+
+        // The stream and the final fetch overlap arbitrarily; append
+        // only what the stream missed, to the buffers and the sink.
+        let mut logs_separated = false;
+        if let Some(logs) = &final_logs {
+            logs_separated = logs.streams_separated;
+            for (buffer, stream, bytes) in [
+                (&stdout_seen, OutputStream::Stdout, logs.stdout.as_bytes()),
+                (&stderr_seen, OutputStream::Stderr, logs.stderr.as_bytes()),
+            ] {
+                let missing = {
+                    let mut seen = buffer.lock().await;
+                    let missing = missing_suffix(&mut seen, bytes);
+                    seen.push(&missing);
+                    missing
+                };
+                if !missing.is_empty() && !sink_failed.is_cancelled() {
+                    if let Some(sink) = &controls.sink {
+                        sink(stream, missing).await?;
+                    }
+                }
+            }
+        }
+
+        let (stdout_bytes, stdout_stats) = mem::replace(
+            &mut *stdout_seen.lock().await,
+            OutputCaptureBuffer::new(None),
+        )
+        .into_parts();
+        let (stderr_bytes, stderr_stats) = mem::replace(
+            &mut *stderr_seen.lock().await,
+            OutputCaptureBuffer::new(None),
+        )
+        .into_parts();
+
+        let termination = if sink_failed.is_cancelled() {
+            Termination::Cancelled
+        } else {
+            outcome.termination
+        };
+        // Exit codes are meaningful only for natural exits.
+        let exit_code = (termination == Termination::Exited)
+            .then_some(outcome.exit_code)
+            .flatten();
+        let mut result = ExecResult::new(termination, exit_code, started.elapsed());
+        result.stdout = stdout_bytes;
+        result.stderr = stderr_bytes;
+        let mut streaming = ExecStreamingResult::new(result);
+        streaming.live_streaming = stream_clean || saw_live.load(Ordering::Relaxed);
+        streaming.streams_separated = stream_clean || logs_separated;
+        streaming.stdout_capture = stdout_stats;
+        streaming.stderr_capture = stderr_stats;
+        Ok(streaming)
+    }
+}
+
+async fn close_stdin(file: &mut Option<StdinFile>) {
+    if let Some(file) = file.as_mut() {
+        file.close().await;
+    }
+}
+
+/// Shared state for one side (stdout or stderr) of the log stream.
+#[derive(Clone)]
+struct StreamSide {
+    stream:      OutputStream,
+    seen:        Arc<Mutex<OutputCaptureBuffer>>,
+    saw_live:    Arc<AtomicBool>,
+    sink:        Option<OutputSink>,
+    sink_failed: CancellationToken,
+}
+
+impl StreamSide {
+    async fn deliver(self, chunk: String) -> StdResult<(), DaytonaError> {
+        let bytes = chunk.into_bytes();
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.saw_live.store(true, Ordering::Relaxed);
+        self.seen.lock().await.push(&bytes);
+        if let Some(sink) = &self.sink {
+            if sink(self.stream, bytes).await.is_err() {
+                // Cancels the execution via the wait loop; ending the
+                // stream here stops further deliveries immediately.
+                self.sink_failed.cancel();
+                return Err(DaytonaError::general("output sink failed"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Bash source run inside the session's `/bin/bash -c`: pin the working
+/// directory, blank `BASH_ENV` (overriding any caller value), export
+/// the spec env with both halves quoted, then run the command in a
+/// subshell so its exit status is the script's.
+fn build_session_script(cwd: &str, env: &BTreeMap<String, String>, command: &str) -> String {
+    let mut lines = vec![format!("cd {} || exit $?", shell_quote(cwd))];
+    lines.push("export BASH_ENV=''".to_owned());
+    for (key, value) in env {
+        if key == "BASH_ENV" {
+            continue;
+        }
+        lines.push(format!(
+            "export {}={}",
+            shell_quote(key),
+            shell_quote(value)
+        ));
+    }
+    lines.push("(".to_owned());
+    lines.push(command.to_owned());
+    lines.push(")".to_owned());
+    lines.join("\n")
+}
+
+/// The command handed to the session: one quoted `/bin/bash -c` so the
+/// caller's source stays inert until Bash evaluates it, and the session
+/// shell resumes afterwards to drain logs and record the exit code.
+fn wrap_session_script(script: &str) -> String {
+    format!("/bin/bash -c {}", shell_quote(script))
 }
 
 #[cfg(test)]

@@ -7,10 +7,12 @@
 //! Protocol v1 scope, wrapped-SDK surface only: archive, resize, recover,
 //! refresh-activity, timers, and labels are supported; pause/resume,
 //! fork, checkpoints, live-sandbox snapshots, and runtime network updates
-//! are not declared and return `Unsupported`. Exec is buffered through
-//! the toolbox and reports `live_streaming: false` /
-//! `streams_separated: false` honestly; stdin is delivered through a
-//! temp-file redirection inside the sandbox.
+//! are not declared and return `Unsupported`. Plain execs run buffered
+//! through the toolbox's one-shot endpoint; a sink or cancel token
+//! routes through a command session, which streams logs live with
+//! separated stdout/stderr, kills on cancel/timeout by deleting the
+//! session, and preserves partial output on timeout. Stdin is delivered
+//! through a temp-file redirection inside the sandbox on both paths.
 //!
 //! # Lifecycle timers
 //!
@@ -33,6 +35,7 @@
 mod access;
 mod exec;
 mod fs;
+mod session;
 
 use std::collections::{BTreeMap, HashMap};
 use std::result::Result as StdResult;
@@ -380,6 +383,9 @@ fn daytona_capabilities() -> Capabilities {
     caps.lifecycle.timers = true;
     caps.lifecycle.labels = true;
     caps.exec.stdin = true;
+    caps.exec.cancel = true;
+    caps.exec.live_streaming = true;
+    caps.exec.streams_separated = true;
     caps.fs.native = true;
     caps.fs.upload = true;
     caps.fs.download = true;
