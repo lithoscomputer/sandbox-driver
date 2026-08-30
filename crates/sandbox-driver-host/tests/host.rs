@@ -109,6 +109,23 @@ async fn exec_timeout_kills_the_process_tree() {
 }
 
 #[tokio::test]
+async fn exec_timeout_fires_after_output_streams_close() {
+    let provider = HostProvider::new();
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+
+    // `exec >/dev/null 2>&1` drops the pipe write ends, so both output
+    // streams reach EOF while the process keeps running — the shape of
+    // any daemonizing command. The timeout must still fire.
+    let spec = ExecSpec::new("exec >/dev/null 2>&1; sleep 30").timeout(Duration::from_millis(300));
+    let started = Instant::now();
+    let result = sandbox.exec().run(&spec).await.expect("exec resolves");
+    assert_eq!(result.termination, Termination::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(10));
+
+    sandbox.delete().await.expect("delete");
+}
+
+#[tokio::test]
 async fn exec_cancellation_resolves_with_cancelled() {
     let provider = HostProvider::new();
     let sandbox = provider.create(&host_spec(), None).await.expect("create");

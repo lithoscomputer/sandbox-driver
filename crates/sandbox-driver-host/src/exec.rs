@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::pin::pin;
 use std::process::Stdio;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -17,6 +18,10 @@ use tokio::time;
 
 /// The variable the Bash contract requires stripping before every run.
 const BASH_ENV_VAR: &str = "BASH_ENV";
+
+/// Bound on draining remaining output after the process has ended, so a
+/// backgrounded grandchild holding the pipes cannot stall the call.
+const DRAIN_GRACE: Duration = Duration::from_secs(10);
 
 /// Command execution on the local machine.
 ///
@@ -160,49 +165,75 @@ impl Exec for HostExec {
         let mut stderr_capture = OutputCaptureBuffer::new(controls.retained_output_limit);
         let sink = controls.sink.as_ref();
 
-        let pumps = async {
-            tokio::join!(
-                pump_stream(stdout, OutputStream::Stdout, &mut stdout_capture, sink),
-                pump_stream(stderr, OutputStream::Stderr, &mut stderr_capture, sink),
-            )
-        };
+        // The process, the cancel token, and the timeout race until the
+        // process ends; the pumps run alongside without gating any of
+        // them, so a command that closes its own stdout/stderr (a
+        // daemonizing child) is still bounded by the timeout. Remaining
+        // output is drained after the process ends, bounded by
+        // `DRAIN_GRACE`.
+        let (termination, status) = {
+            let mut pumps = pin!(async {
+                tokio::join!(
+                    pump_stream(stdout, OutputStream::Stdout, &mut stdout_capture, sink),
+                    pump_stream(stderr, OutputStream::Stderr, &mut stderr_capture, sink),
+                )
+            });
+            let mut pumps_done = false;
 
-        let cancel = controls.cancel.clone();
-        let cancelled = async {
-            match &cancel {
-                Some(token) => token.cancelled().await,
-                None => future::pending().await,
-            }
-        };
-        let timeout = async {
-            match spec.timeout {
-                Some(timeout) => time::sleep(timeout).await,
-                None => future::pending().await,
-            }
-        };
-
-        let mut termination = Termination::Exited;
-        tokio::select! {
-            (out_end, err_end) = pumps => {
-                if matches!(out_end, PumpEnd::SinkError) || matches!(err_end, PumpEnd::SinkError) {
-                    termination = Termination::Cancelled;
-                    kill_process_group(&child);
+            let cancel = controls.cancel.clone();
+            let mut cancelled = pin!(async {
+                match &cancel {
+                    Some(token) => token.cancelled().await,
+                    None => future::pending().await,
                 }
-            }
-            () = cancelled => {
-                termination = Termination::Cancelled;
-                kill_process_group(&child);
-            }
-            () = timeout => {
-                termination = Termination::TimedOut;
-                kill_process_group(&child);
-            }
-        }
+            });
+            let mut timeout = pin!(async {
+                match spec.timeout {
+                    Some(timeout) => time::sleep(timeout).await,
+                    None => future::pending().await,
+                }
+            });
 
-        let status = child
-            .wait()
-            .await
-            .map_err(|error| Error::io("waiting for exec process", error))?;
+            let (termination, status) = loop {
+                tokio::select! {
+                    (out_end, err_end) = &mut pumps, if !pumps_done => {
+                        pumps_done = true;
+                        if matches!(out_end, PumpEnd::SinkError)
+                            || matches!(err_end, PumpEnd::SinkError)
+                        {
+                            kill_process_group(&child);
+                            break (Termination::Cancelled, None);
+                        }
+                    }
+                    wait_result = child.wait() => {
+                        let status = wait_result.map_err(|error| {
+                            Error::io("waiting for exec process", error)
+                        })?;
+                        break (Termination::Exited, Some(status));
+                    }
+                    () = &mut cancelled => {
+                        kill_process_group(&child);
+                        break (Termination::Cancelled, None);
+                    }
+                    () = &mut timeout => {
+                        kill_process_group(&child);
+                        break (Termination::TimedOut, None);
+                    }
+                }
+            };
+
+            let status = match status {
+                Some(status) => status,
+                None => child
+                    .wait()
+                    .await
+                    .map_err(|error| Error::io("waiting for exec process", error))?,
+            };
+            if !pumps_done {
+                let _ = time::timeout(DRAIN_GRACE, &mut pumps).await;
+            }
+            (termination, status)
+        };
         let exit_code = status.code();
 
         let (stdout_bytes, stdout_stats) = stdout_capture.into_parts();
