@@ -72,6 +72,12 @@ impl DaytonaExec {
     fn compose(spec: &ExecSpec) -> String {
         let mut program = String::from("unset BASH_ENV\n");
         for (key, value) in &spec.env {
+            // The unset above runs first, so a spec-provided BASH_ENV
+            // would re-arm startup-file injection into the inner bash;
+            // the exec contract strips it on every transport.
+            if key == "BASH_ENV" {
+                continue;
+            }
             program.push_str("export ");
             program.push_str(key);
             program.push('=');
@@ -173,6 +179,14 @@ impl Exec for DaytonaExec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compose_strips_a_spec_provided_bash_env() {
+        let spec = ExecSpec::new("true").env_var("BASH_ENV", "/tmp/startup");
+        let program = DaytonaExec::compose(&spec);
+        assert!(program.starts_with("unset BASH_ENV\n"));
+        assert!(!program.contains("export BASH_ENV"));
+    }
 
     #[test]
     fn untimed_specs_send_the_unbounded_timeout_explicitly() {
