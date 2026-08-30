@@ -91,7 +91,13 @@ fn authed_url(url: &str, credentials: &GitCredentials) -> Option<String> {
     if scheme != "http" && scheme != "https" {
         return None;
     }
-    let rest = rest.split_once('@').map_or(rest, |(_, host)| host);
+    // Existing userinfo ends at the last `@` inside the authority only —
+    // an `@` in the path (`/org/repo@v2.git`) is part of the path.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let rest = match rest[..authority_end].rfind('@') {
+        Some(at) => &rest[at + 1..],
+        None => rest,
+    };
     Some(format!(
         "{scheme}://{}:{}@{rest}",
         encode_userinfo(&credentials.username),
@@ -328,6 +334,16 @@ mod tests {
         let url = authed_url("https://old@github.com/org/repo.git", &credentials).expect("url");
         assert!(url.contains("github.com/org/repo.git"));
         assert!(!url.contains("old@"));
+    }
+
+    #[test]
+    fn authed_url_keeps_an_at_sign_in_the_path() {
+        let credentials = GitCredentials::new("user", "pass");
+        let url =
+            authed_url("https://gitlab.com/org/repo@v2.git", &credentials).expect("https url");
+        assert_eq!(url, "https://user:pass@gitlab.com/org/repo@v2.git");
+        let url = authed_url("https://old@gitlab.com/org/repo@v2.git", &credentials).expect("url");
+        assert_eq!(url, "https://user:pass@gitlab.com/org/repo@v2.git");
     }
 
     #[test]
