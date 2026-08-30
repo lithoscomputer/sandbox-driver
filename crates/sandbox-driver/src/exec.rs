@@ -285,6 +285,21 @@ impl SpawnSpec {
 ///
 /// Stderr is not a stream: it is a bounded rolling tail intended for
 /// diagnostics on unexpected exit.
+///
+/// There is no cancel token: the handle is the one lifecycle channel.
+/// A caller with a `CancellationToken` wires it to
+/// [`StdioProcessHandle::terminate`] itself:
+///
+/// ```ignore
+/// tokio::select! {
+///     () = token.cancelled() => process.handle.terminate().await,
+///     outcome = process.handle.wait() => { /* natural exit */ }
+/// }
+/// ```
+///
+/// Dropping the handle does **not** stop the process — it runs to its
+/// natural exit — so a caller that abandons the handle without
+/// `terminate` leaks the workload.
 pub struct StdioProcess {
     pub stdin:       Pin<Box<dyn AsyncWrite + Send>>,
     pub stdout:      Pin<Box<dyn AsyncRead + Send>>,
