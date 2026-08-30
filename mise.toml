@@ -6,7 +6,7 @@ lockfile_platforms = ["macos-arm64", "linux-x64", "linux-arm64"]
 minimum_release_age = "24h"
 
 [env]
-RUST_TEMPLATE_BINARY_NAME = "sandbox-driver"
+RUST_TEMPLATE_BINARY_NAME = "sandbox-driver-host-plugin"
 
 [tools]
 "cargo:cargo-nextest" = { version = "0.9.140", locked = true }
