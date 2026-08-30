@@ -43,7 +43,9 @@ use sandbox_driver::{
 };
 
 pub use crate::exec::DockerExec;
-use crate::exec::{BASH_ENV_VAR, docker_error, is_not_found, shell_quote, tolerate_not_modified};
+use crate::exec::{
+    BASH_ENV_VAR, docker_error, is_not_found, is_not_modified, shell_quote, tolerate_not_modified,
+};
 
 const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
 const DEFAULT_WORKING_DIRECTORY: &str = "/workspace";
@@ -548,12 +550,22 @@ impl Sandbox for DockerSandbox {
                 .await
                 .map_err(|error| docker_error("unpausing container", &error))
         } else {
-            tolerate_not_modified(
-                self.docker
-                    .start_container(self.id.as_str(), None::<StartContainerOptions<String>>)
-                    .await,
-                "starting container",
-            )
+            // Already-running (304) is success; a vanished container is
+            // not — start's postcondition is a running sandbox, so 404
+            // must surface, unlike stop/delete where gone is the goal.
+            match self
+                .docker
+                .start_container(self.id.as_str(), None::<StartContainerOptions<String>>)
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(error) if is_not_modified(&error) => Ok(()),
+                Err(error) if is_not_found(&error) => Err(Error::NotFound {
+                    resource: ResourceKind::Sandbox,
+                    id:       self.id.as_str().to_owned(),
+                }),
+                Err(error) => Err(docker_error("starting container", &error)),
+            }
         };
         self.emit_action(LifecycleAction::Start, &outcome).await;
         outcome

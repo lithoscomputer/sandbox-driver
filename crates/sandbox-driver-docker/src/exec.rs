@@ -49,7 +49,7 @@ pub(crate) fn is_not_found(error: &DockerApiError) -> bool {
     })
 }
 
-fn is_not_modified(error: &DockerApiError) -> bool {
+pub(crate) fn is_not_modified(error: &DockerApiError) -> bool {
     matches!(error, DockerApiError::DockerResponseServerError {
         status_code: 304,
         ..
