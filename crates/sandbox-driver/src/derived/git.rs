@@ -60,16 +60,20 @@ impl<'e> DerivedGit<'e> {
         )))
     }
 
-    /// The remote URL to use for one network operation, with credentials
-    /// embedded when the remote is http(s).
-    async fn network_remote(
+    /// A per-call config value (`url.<authed>.insteadOf=<plain>`) that
+    /// embeds credentials for one network operation via `-c`. The
+    /// command still addresses the remote by name, so upstream and
+    /// remote-tracking bookkeeping stay on the named remote and the
+    /// credentialed URL is never written into the repository
+    /// configuration. `None` when the remote is not http(s).
+    async fn credential_rewrite(
         &self,
         repo: &str,
         remote: &str,
         credentials: Option<&GitCredentials>,
-    ) -> Result<String> {
+    ) -> Result<Option<String>> {
         let Some(credentials) = credentials else {
-            return Ok(remote.to_owned());
+            return Ok(None);
         };
         let url = self
             .run(
@@ -81,7 +85,7 @@ impl<'e> DerivedGit<'e> {
             .await?
             .stdout_lossy();
         let url = url.trim();
-        Ok(authed_url(url, credentials).unwrap_or_else(|| remote.to_owned()))
+        Ok(authed_url(url, credentials).map(|authed| format!("url.{authed}.insteadOf={url}")))
     }
 }
 
@@ -207,14 +211,19 @@ impl Git for DerivedGit<'_> {
 
     async fn push(&self, repo_path: &str, options: &GitPushOptions) -> Result<()> {
         let remote = options.remote.as_deref().unwrap_or("origin");
-        let target = self
-            .network_remote(repo_path, remote, options.credentials.as_ref())
-            .await?;
-        let mut args: Vec<String> = vec!["push".into()];
+        let mut args: Vec<String> = Vec::new();
+        if let Some(rewrite) = self
+            .credential_rewrite(repo_path, remote, options.credentials.as_ref())
+            .await?
+        {
+            args.push("-c".into());
+            args.push(rewrite);
+        }
+        args.push("push".into());
         if options.set_upstream {
             args.push("--set-upstream".into());
         }
-        args.push(target);
+        args.push(remote.to_owned());
         if let Some(branch) = &options.branch {
             args.push(branch.clone());
         }
@@ -224,16 +233,18 @@ impl Git for DerivedGit<'_> {
     }
 
     async fn pull(&self, repo_path: &str, credentials: Option<&GitCredentials>) -> Result<()> {
-        let target = self
-            .network_remote(repo_path, "origin", credentials)
+        let mut args: Vec<String> = Vec::new();
+        if let Some(rewrite) = self
+            .credential_rewrite(repo_path, "origin", credentials)
+            .await?
+        {
+            args.push("-c".into());
+            args.push(rewrite);
+        }
+        args.push("pull".into());
+        args.push("origin".into());
+        self.run("git pull", Some(repo_path), &args, NETWORK_TIMEOUT)
             .await?;
-        self.run(
-            "git pull",
-            Some(repo_path),
-            &["pull".into(), target],
-            NETWORK_TIMEOUT,
-        )
-        .await?;
         Ok(())
     }
 
@@ -364,6 +375,39 @@ mod tests {
             "src/lib.rs".to_owned(),
             "notes.txt".to_owned()
         ]);
+    }
+
+    #[tokio::test]
+    async fn push_addresses_the_remote_by_name_with_a_per_call_rewrite() {
+        let exec = ScriptedExec::new(vec![
+            ScriptedExec::ok("https://github.com/org/repo.git\n"),
+            ScriptedExec::ok(""),
+        ]);
+        let git = DerivedGit::new(&exec);
+        let options = GitPushOptions {
+            remote:       None,
+            branch:       Some("main".to_owned()),
+            set_upstream: true,
+            credentials:  Some(GitCredentials::new("user", "pass")),
+        };
+        git.push("/repo", &options).await.expect("push succeeds");
+
+        let commands = exec.commands();
+        assert!(commands[0].contains("'remote' 'get-url' 'origin'"));
+        // Credentials travel only in the per-call insteadOf rewrite; the
+        // push target stays the remote name, so --set-upstream can never
+        // write a credentialed URL into .git/config.
+        let push = &commands[1];
+        assert!(
+            push.contains(
+                "'-c' 'url.https://user:pass@github.com/org/repo.git.insteadOf=https://github.com/org/repo.git'"
+            ),
+            "push: {push}"
+        );
+        assert!(
+            push.contains("'push' '--set-upstream' 'origin' 'main'"),
+            "push: {push}"
+        );
     }
 
     #[tokio::test]
