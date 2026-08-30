@@ -245,6 +245,12 @@ fn plain_suffix_offset(seen: &[u8], final_bytes: &[u8]) -> usize {
     if final_bytes.starts_with(seen) {
         return seen.len();
     }
+    // The stream ahead of the snapshot: on timeout/cancel the final
+    // fetch is taken eagerly while the stream keeps draining past it,
+    // so the snapshot holds nothing new.
+    if seen.starts_with(final_bytes) {
+        return final_bytes.len();
+    }
     let max_overlap = seen.len().min(final_bytes.len());
     for overlap in (1..=max_overlap).rev() {
         if seen[seen.len() - overlap..] == final_bytes[..overlap] {
@@ -265,6 +271,16 @@ mod tests {
         assert_eq!(plain_suffix_offset(b"xabc", b"abcdef"), 3);
         assert_eq!(plain_suffix_offset(b"abc", b"def"), 0);
         assert_eq!(plain_suffix_offset(b"", b"abc"), 0);
+        // The stream delivered more than the final snapshot.
+        assert_eq!(plain_suffix_offset(b"abcdef", b"abc"), 3);
+        assert_eq!(plain_suffix_offset(b"abc", b""), 0);
+    }
+
+    #[test]
+    fn missing_suffix_is_empty_when_stream_is_ahead_of_snapshot() {
+        let mut seen = OutputCaptureBuffer::new(None);
+        seen.push(b"A B C");
+        assert!(missing_suffix(&mut seen, b"A B").is_empty());
     }
 
     #[test]
