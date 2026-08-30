@@ -278,6 +278,21 @@ async fn create_describe_delete(ctx: &Conformance) -> CheckOutcome {
         if sandbox.working_directory().is_empty() {
             return fail("working_directory is empty");
         }
+        let platform = sandbox
+            .platform_info()
+            .await
+            .map_err(|error| format!("platform_info failed: {error}"))?;
+        if platform.os.is_empty() || platform.os != platform.os.to_lowercase() {
+            return fail(format!("platform os {:?} is not lowercase", platform.os));
+        }
+        // A kernel release ("6.8.0-…") in the arch field is the classic
+        // uname field-order mixup; real architectures have no dots.
+        if platform.arch.is_empty() || platform.arch.contains('.') {
+            return fail(format!(
+                "platform arch {:?} does not look like an architecture",
+                platform.arch
+            ));
+        }
         PASS
     }
     .await;

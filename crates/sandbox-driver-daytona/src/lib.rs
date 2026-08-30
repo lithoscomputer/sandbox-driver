@@ -797,15 +797,17 @@ impl Sandbox for DaytonaSandbox {
     }
 
     async fn platform_info(&self) -> Result<PlatformInfo> {
+        // uname prints its fields in canonical order — sysname, release,
+        // machine — regardless of flag order.
         let result = self
             .exec
-            .run(&ExecSpec::new("uname -s -m -r").timeout(Duration::from_secs(60)))
+            .run(&ExecSpec::new("uname -s -r -m").timeout(Duration::from_secs(60)))
             .await?;
         let text = result.stdout_lossy();
         let mut parts = text.split_whitespace();
         let os = parts.next().unwrap_or("linux").to_lowercase();
-        let arch = parts.next().unwrap_or("").to_owned();
         let version = parts.next().unwrap_or("").to_owned();
+        let arch = parts.next().unwrap_or("").to_owned();
         Ok(PlatformInfo::new(os, arch, version))
     }
 
