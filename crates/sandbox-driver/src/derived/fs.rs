@@ -11,9 +11,11 @@ use crate::exec::{Exec, ExecResult, ExecSpec};
 use crate::fs::{DirEntry, FileKind, FileMetadata, Filesystem};
 
 const FS_TIMEOUT: Duration = Duration::from_secs(60);
-/// Raw bytes per write command; base64 expands 4/3 and command strings
-/// have platform limits.
-const WRITE_CHUNK_BYTES: usize = 512 * 1024;
+/// Raw bytes per write command. The base64 payload (4/3 expansion, so
+/// ~87KB per chunk) travels inside a single `bash -c` argument, and
+/// Linux caps one execve argument at `MAX_ARG_STRLEN` (128KiB) — the
+/// chunk must leave room for that plus provider wrapper overhead.
+const WRITE_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Exec-derived [`Filesystem`] for providers without a native file API.
 ///

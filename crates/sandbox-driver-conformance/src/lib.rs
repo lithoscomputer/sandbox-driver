@@ -745,6 +745,26 @@ async fn fs_round_trips(ctx: &Conformance) -> CheckOutcome {
         {
             return fail("exists returned false for a written file");
         }
+        // A multi-hundred-KB write spans several chunks on exec-derived
+        // filesystems and would overflow a single command argument if
+        // sent whole (Linux caps one execve argument at 128KiB).
+        let large: Vec<u8> = (0..300 * 1024)
+            .map(|index: usize| u8::try_from(index % 251).expect("< 256"))
+            .collect();
+        fs.write("conformance/dir/large.bin", &large)
+            .await
+            .map_err(|error| format!("large write failed: {error}"))?;
+        let read = fs
+            .read("conformance/dir/large.bin")
+            .await
+            .map_err(|error| format!("large read failed: {error}"))?;
+        if read != large {
+            return fail(format!(
+                "large write round trip returned {} bytes, expected {}",
+                read.len(),
+                large.len()
+            ));
+        }
         let metadata = fs
             .metadata("conformance/dir/file.bin")
             .await
