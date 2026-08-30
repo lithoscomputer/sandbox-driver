@@ -16,7 +16,7 @@ A library for driving sandboxes. Initial providers: **Daytona**, **Docker**, **H
 - **Docker isolates filesystem and processes but shares the host kernel**, and the Docker socket is host-root-equivalent — the Docker provider is host-trusted by definition.
 - **Daytona and boxd are VM-backed**; their isolation is the vendor's guarantee, reported as declared.
 
-Trust flows as in the fabro plugin plan: **a provider — in-process or JSON-RPC plugin — is inside the trust domain of every sandbox it drives.** It has full exec, so it can read anything the workload can; per-call credential injection is not a defense against that. What the library does enforce is the *host-side* boundary: a provider receives only the secrets explicitly passed in a spec or fetched per-call through the host callback interface — never ambient environment or vault contents — so one provider's compromise does not expose another's credentials. Transport-level trust for plugins (checksum pinning, scrubbed environment, deny-by-default discovery) is host policy, specified in the protocol document, not this trait.
+Trust flows as in the fabro plugin plan: **a provider — in-process or JSON-RPC plugin — is inside the trust domain of every sandbox it drives.** It has full exec, so it can read anything the workload can; per-call credential injection is not a defense against that. What the library does enforce is the *host-side* boundary: a provider receives only the secrets explicitly passed in a spec or fetched per-call through the host callback interface — never ambient environment or vault contents — so one provider's compromise does not expose another's credentials. Transport-level trust for plugins (checksum pinning, scrubbed environment, deny-by-default discovery) is host policy, specified in the protocol document, not this trait. The in-process Host provider applies the same posture to its own ambient environment: it clears the process env for every sandboxed command and rebuilds it through a fail-closed secret filter (safelist plus secret-name suffixes), so worker credentials never reach sandboxed code — explicit spec env is the one trusted channel for secrets.
 
 The default network policy is the provider's default (Docker: bridge; Daytona: allow-all); a closed sandbox requires an explicit `NetworkPolicy::Block` in the spec. The capability schema records which network modes a provider supports so callers can preflight the strictness they need.
 
@@ -109,6 +109,8 @@ pub struct LifecycleTimers {
     pub ttl: Option<Duration>,                     // wall clock since create
 }
 ```
+
+Timer semantics: an unset timer inherits the provider's default — Daytona's server-side auto-stop default is **15 idle minutes**, shorter than a single long inference call, so callers running long commands set it explicitly. `Duration::ZERO` is the explicit "never": it disables the timer where the provider supports disabling (Daytona's wire `0`).
 
 ## Sandbox features (facets)
 
@@ -273,7 +275,7 @@ Carried over from fabro **verbatim, as normative spec text**, because it is the 
 
 `ExecSpec` is a plain owned serializable value — command, timeout, working dir, env vars, optional stdin bytes (write-then-EOF) — and is exactly what crosses the JSON-RPC boundary. Process-local control objects travel separately in `ExecControls`: the cancellation token, the async output sink, and the retention cap (head+tail with `omitted_bytes` accounting — fabro's `OutputCaptureBuffer` moves here). On the wire, controls map to negotiated IDs — a host-generated `execId` routes `exec/output` notifications and `exec/cancel` — never to serialized fields, and buffered `run` carries no streaming controls at all.
 
-Control contracts, normative: cancellation resolves the call normally with `termination: Cancelled` after a best-effort process-group kill. The output sink is awaited per chunk — a slow consumer backpressures the read loop rather than growing an unbounded buffer; output beyond the retention cap is still drained (and counted in `omitted_bytes`), never left to block the process. A sink that returns an error cancels the exec and reports it as such. `ExecResult` keeps `streams_separated` and `live_streaming` honesty flags — Daytona's combined-output and log-polling degradations are *reported*, not hidden.
+Control contracts, normative: cancellation resolves the call normally with `termination: Cancelled` after a best-effort process-group kill — SIGTERM to the group, a short grace so traps run and locks release (a killed `git` otherwise leaves `.git/index.lock`), then SIGKILL. A provider that does not support stdin or cancellation rejects a call that supplies them with `Unsupported` (`exec.stdin` / `exec.cancel`) — never runs the command with the input silently dropped. The output sink is awaited per chunk — a slow consumer backpressures the read loop rather than growing an unbounded buffer; output beyond the retention cap is still drained (and counted in `omitted_bytes`), never left to block the process. A sink that returns an error cancels the exec and reports it as such. `ExecResult` keeps `streams_separated` and `live_streaming` honesty flags — Daytona's combined-output and log-polling degradations are *reported*, not hidden.
 
 `StdioProcess` keeps fabro's shape: `AsyncWrite` stdin, `AsyncRead` stdout, bounded stderr tail collector, and a handle with `terminate()`/`wait()`. This is the facet the JSON-RPC side-channel transport exists for.
 
@@ -376,7 +378,7 @@ The `Exec` variant preserves fabro's redaction boundary: `Display` shows bounded
 - Git credentials and push machinery: `refresh_push_credentials`, `push_token_source`, `git_push_ref` (lease/retry engine), `setup_git` intents, `resume_setup_commands`, `origin_url`.
 - Clone orchestration: clone-source decisions, repo layout (`/repos/<owner>/<repo>` + symlink), pinned revisions, clone depth, clone events.
 - Content-addressed snapshot naming (HMAC of manifest).
-- Output redaction policy (this crate sanitizes terminal control sequences; secret redaction is the caller's).
+- Output redaction and sanitization policy: raw exec output may contain terminal control sequences; both escape stripping and secret redaction are the caller's.
 - Fabro's run lifecycle: `initialize`-then-probe sequencing, cleanup scope guards, `--preserve-sandbox`, reconnect. These consume the crate's core + wait helper.
 
 Each of these is implementable over `Exec`/`Git`/core — the fabro survey confirmed both remote providers already implement them via exec today.
@@ -417,3 +419,4 @@ Each of these is implementable over `Exec`/`Git`/core — the fabro survey confi
 6. **`Logs` is follow-style streams only** in v1; historical querying is a later capability.
 7. **Workspace layout**: `crates/sandbox-driver` (core: types + traits + derived impls + wait helper), with `sandbox-driver-{protocol,host,docker,daytona}` siblings added as they are built.
 8. **VNC/VPN v1 surface is "get connection info" only**; VPN join configuration is create-time spec, status via the facet.
+9. **The Docker image contract requires `setsid`** alongside bash, `stat`, `find`, and `base64` — reliable kill semantics need a separate session, and an image without it fails every exec with a clear message rather than degrading silently.
