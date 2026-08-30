@@ -314,6 +314,7 @@ impl Exec for HostExec {
         // output is drained after the process ends, bounded by
         // `DRAIN_GRACE`.
         let mut read_error: Option<io::Error> = None;
+        let mut drain_truncated = false;
         let (termination, status) = {
             let mut pumps = pin!(async {
                 tokio::join!(
@@ -378,12 +379,17 @@ impl Exec for HostExec {
                     .map_err(|error| Error::io("waiting for exec process", error))?,
             };
             if !pumps_done {
-                if let Ok((out_end, err_end)) = time::timeout(DRAIN_GRACE, &mut pumps).await {
-                    for end in [out_end, err_end] {
-                        if let PumpEnd::ReadError(error) = end {
-                            read_error.get_or_insert(error);
+                match time::timeout(DRAIN_GRACE, &mut pumps).await {
+                    Ok((out_end, err_end)) => {
+                        for end in [out_end, err_end] {
+                            if let PumpEnd::ReadError(error) = end {
+                                read_error.get_or_insert(error);
+                            }
                         }
                     }
+                    // Unread bytes were abandoned with the pipes: the
+                    // capture stats must say the accounting is short.
+                    Err(_elapsed) => drain_truncated = true,
                 }
             }
             (termination, status)
@@ -410,8 +416,12 @@ impl Exec for HostExec {
         }
         let exit_code = status.code();
 
-        let (stdout_bytes, stdout_stats) = stdout_capture.into_parts();
-        let (stderr_bytes, stderr_stats) = stderr_capture.into_parts();
+        let (stdout_bytes, mut stdout_stats) = stdout_capture.into_parts();
+        let (stderr_bytes, mut stderr_stats) = stderr_capture.into_parts();
+        if drain_truncated {
+            stdout_stats.truncated = true;
+            stderr_stats.truncated = true;
+        }
         let mut result = ExecResult::new(termination, exit_code, started.elapsed());
         result.stdout = stdout_bytes;
         result.stderr = stderr_bytes;

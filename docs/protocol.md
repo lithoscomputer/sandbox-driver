@@ -390,7 +390,8 @@ host → {"id":8,"method":"exec/cancel","params":{"exec_id":"x1"}}          (opt
 plugin → {"id":8,"result":{}}
 plugin → {"id":7,"result":{"result":{…,"termination":"cancelled"},
            "streams_separated":true,"live_streaming":true,
-           "stdout_capture":{"observed_bytes":…,"retained_bytes":…,"omitted_bytes":…},
+           "stdout_capture":{"observed_bytes":…,"retained_bytes":…,"omitted_bytes":…,
+                             "truncated":false},
            "stderr_capture":{…}}}
 ```
 
@@ -412,6 +413,9 @@ Rules:
   returned in the result (a stable head plus rolling tail); the full
   stream must still be drained and emitted as notifications, with
   accounting such that `retained + omitted = observed` per stream.
+  `truncated` (optional, default `false`; added within v1) means bytes
+  were lost *beyond* that accounting — the provider abandoned an
+  unfinished drain — so the counts undercount the real output.
 - **Backpressure and isolation.** A plugin must not buffer output
   unboundedly: when the transport cannot keep up, it must stall the
   producing process (pipe backpressure), never drop output. Both sides

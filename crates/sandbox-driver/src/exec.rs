@@ -213,6 +213,13 @@ pub struct CaptureStats {
     pub observed_bytes: usize,
     pub retained_bytes: usize,
     pub omitted_bytes:  usize,
+    /// Bytes were lost *beyond* this accounting: the provider could not
+    /// finish draining the stream (a post-exit drain bound expired), so
+    /// `observed_bytes` and `omitted_bytes` undercount the real output.
+    /// Retention-cap omission is not truncation — `omitted_bytes`
+    /// already counts it.
+    #[serde(default)]
+    pub truncated:      bool,
 }
 
 impl CaptureStats {
@@ -223,6 +230,7 @@ impl CaptureStats {
             observed_bytes: bytes,
             retained_bytes: bytes,
             omitted_bytes:  0,
+            truncated:      false,
         }
     }
 }
@@ -391,6 +399,15 @@ mod tests {
         assert_eq!(tail.to_string_lossy(), "…23456789");
         tail.push(b"AB");
         assert_eq!(tail.to_string_lossy(), "…456789AB");
+    }
+
+    #[test]
+    fn capture_stats_truncated_is_additive_on_the_wire() {
+        // A v1 payload without the field must decode, defaulting false.
+        let old = r#"{"observed_bytes":3,"retained_bytes":3,"omitted_bytes":0}"#;
+        let stats: CaptureStats = serde_json::from_str(old).expect("old shape decodes");
+        assert!(!stats.truncated);
+        assert!(!CaptureStats::complete(3).truncated);
     }
 
     #[test]

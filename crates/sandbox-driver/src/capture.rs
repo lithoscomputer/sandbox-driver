@@ -66,6 +66,7 @@ impl OutputCaptureBuffer {
             observed_bytes: self.observed,
             retained_bytes: self.head.len() + self.tail.len(),
             omitted_bytes:  self.omitted,
+            truncated:      false,
         }
     }
 
@@ -91,6 +92,7 @@ impl OutputCaptureBuffer {
             observed_bytes: self.observed,
             retained_bytes: bytes.len(),
             omitted_bytes:  self.omitted,
+            truncated:      false,
         };
         (bytes, stats)
     }
