@@ -556,13 +556,16 @@ impl SandboxProvider for DaytonaProvider {
         let handle = match outcome {
             Ok(handle) => handle,
             Err(error) => {
-                if let Some(dispatcher) = &dispatcher {
+                if let Some(dispatcher) = dispatcher {
                     dispatcher
                         .emit(SandboxEvent::ActionFailed {
                             action: LifecycleAction::Create,
                             error:  ErrorReport::from(&error),
                         })
                         .await;
+                    // Join delivery: a failed create's events must be
+                    // observable when the call returns.
+                    dispatcher.shutdown().await;
                 }
                 return Err(error);
             }

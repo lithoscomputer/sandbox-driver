@@ -176,13 +176,16 @@ impl SandboxProvider for HostProvider {
         let (workspace, ownership) = match outcome {
             Ok(parts) => parts,
             Err(error) => {
-                if let Some(dispatcher) = &dispatcher {
+                if let Some(dispatcher) = dispatcher {
                     dispatcher
                         .emit(SandboxEvent::ActionFailed {
                             action: LifecycleAction::Create,
                             error:  ErrorReport::from(&error),
                         })
                         .await;
+                    // Join delivery: a failed create's events must be
+                    // observable when the call returns.
+                    dispatcher.shutdown().await;
                 }
                 return Err(error);
             }
