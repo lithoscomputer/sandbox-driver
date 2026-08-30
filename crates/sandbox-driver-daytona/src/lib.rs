@@ -792,6 +792,19 @@ impl DaytonaSandbox {
                 Ok(()) => return Ok(()),
                 Err(error) if is_not_found(&error) => return Ok(()),
                 Err(error) if is_state_change_in_progress(&error) => {
+                    // A delete racing an in-flight destroy is already
+                    // satisfied: the accepted delete also returns while
+                    // destruction still runs, so a rejected repeat must
+                    // not wait out a slow destroy (observed >2 minutes
+                    // live) for the same outcome.
+                    let state = match self.client.get(&self.sdk_id).await {
+                        Ok(sdk) => map_state(sdk.state),
+                        Err(error) if is_not_found(&error) => return Ok(()),
+                        Err(error) => return Err(daytona_error("fetching sandbox", &error)),
+                    };
+                    if matches!(state, SandboxState::Deleting | SandboxState::Deleted) {
+                        return Ok(());
+                    }
                     match self
                         .wait_for_stable_state("deleting sandbox", started)
                         .await?
