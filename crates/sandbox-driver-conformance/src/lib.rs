@@ -26,9 +26,9 @@ use std::time::{Duration, Instant};
 use std::{fmt, process};
 
 use sandbox_driver::{
-    Capability, Error, ExecControls, ExecSpec, OutputStream, Sandbox, SandboxEvent, SandboxFilter,
-    SandboxId, SandboxProvider, SandboxSpec, SandboxState, SpawnSpec, Termination, WaitOptions,
-    activate, wait_for_state,
+    Capability, DerivedSearch, Error, ExecControls, ExecSpec, GrepOptions, OutputStream, Sandbox,
+    SandboxEvent, SandboxFilter, SandboxId, SandboxProvider, SandboxSpec, SandboxState, Search,
+    SpawnSpec, Termination, WaitOptions, activate, wait_for_state,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time;
@@ -126,6 +126,9 @@ impl Conformance {
                 Box::pin(concurrent_streams_do_not_starve_each_other(ctx))
             }),
             ("fs_round_trips", |ctx| Box::pin(fs_round_trips(ctx))),
+            ("search_greps_directories_and_single_files", |ctx| {
+                Box::pin(search_greps_directories_and_single_files(ctx))
+            }),
             ("unsupported_actions_say_so", |ctx| {
                 Box::pin(unsupported_actions_say_so(ctx))
             }),
@@ -818,6 +821,51 @@ async fn fs_round_trips(ctx: &Conformance) -> CheckOutcome {
             .map_err(|error| format!("exists failed: {error}"))?
         {
             return fail("directory still exists after recursive delete");
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+/// Grep must return matches whether the target is a directory or a
+/// single file — tools like ripgrep omit the file name for a lone file
+/// operand, and a provider (or the derived implementation) must not let
+/// that change the result shape.
+async fn search_greps_directories_and_single_files(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        sandbox
+            .fs()
+            .write(
+                "conformance-grep/needle.txt",
+                b"alpha needle beta\nplain line\n",
+            )
+            .await
+            .map_err(|error| format!("write failed: {error}"))?;
+        let derived;
+        let search: &dyn Search = match sandbox.search() {
+            Some(native) => native,
+            None => {
+                derived = DerivedSearch::new(sandbox.exec());
+                &derived
+            }
+        };
+        for path in ["conformance-grep", "conformance-grep/needle.txt"] {
+            let matches = search
+                .grep("needle", path, &GrepOptions::default())
+                .await
+                .map_err(|error| format!("grep of {path} failed: {error}"))?;
+            if matches.len() != 1 {
+                return fail(format!(
+                    "grep of {path} returned {} matches, expected 1",
+                    matches.len()
+                ));
+            }
+            if matches[0].line_number != 1 || !matches[0].line.contains("needle") {
+                return fail(format!("grep of {path} returned {:?}", matches[0]));
+            }
         }
         PASS
     }

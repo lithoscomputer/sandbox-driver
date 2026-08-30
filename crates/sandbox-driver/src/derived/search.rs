@@ -86,9 +86,11 @@ impl Search for DerivedSearch<'_> {
     ) -> Result<Vec<GrepMatch>> {
         // `--null` / `-Z` separate the path with NUL, so a `:` in a file
         // name cannot corrupt the parse; `-I` keeps binary notices out
-        // of grep output (ripgrep skips binary files by default).
+        // of grep output (ripgrep skips binary files by default); `-H`
+        // forces the file name even for a single-file path, which both
+        // tools otherwise omit — and the parse requires.
         let mut command = if self.ripgrep_available().await {
-            let mut cmd = String::from("rg --line-number --no-heading --no-messages --null");
+            let mut cmd = String::from("rg -H --line-number --no-heading --no-messages --null");
             if options.case_insensitive {
                 cmd.push_str(" -i");
             }
@@ -108,7 +110,7 @@ impl Search for DerivedSearch<'_> {
         } else {
             // `--null` (not `-Z`, which BSD grep reads as zgrep mode)
             // works on both GNU and BSD grep.
-            let mut cmd = String::from("grep -rnI --null");
+            let mut cmd = String::from("grep -rnIH --null");
             if options.case_insensitive {
                 cmd.push_str(" -i");
             }
@@ -299,7 +301,9 @@ mod tests {
         assert_eq!(matches[1].line_number, 10);
         let commands = exec.commands();
         assert!(commands[0].contains("command -v rg"));
-        assert!(commands[1].starts_with("rg --line-number --no-heading"));
+        // Without `-H` both tools omit the path (and the NUL) when the
+        // target is a single file, and the parse fails.
+        assert!(commands[1].starts_with("rg -H --line-number --no-heading"));
         assert!(commands[1].contains("--null"));
         assert!(commands[1].contains("-e 'x' -- '.'"));
     }
@@ -349,7 +353,7 @@ mod tests {
             .await
             .expect("empty");
         assert!(matches.is_empty());
-        assert!(exec.commands()[1].starts_with("grep -rn"));
+        assert!(exec.commands()[1].starts_with("grep -rnIH"));
     }
 
     #[tokio::test]
