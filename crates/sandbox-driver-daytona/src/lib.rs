@@ -660,10 +660,14 @@ impl DaytonaSandbox {
     }
 
     /// Polls until the sandbox settles in a stable state, bounded by
-    /// [`TRANSITION_BUDGET`]. A sandbox that disappears mid-wait
+    /// [`TRANSITION_BUDGET`] from the caller's `started` so waits and
+    /// retries share one budget. A sandbox that disappears mid-wait
     /// reports `Deleted`.
-    async fn wait_for_stable_state(&self, operation: &str) -> Result<SandboxState> {
-        let started = Instant::now();
+    async fn wait_for_stable_state(
+        &self,
+        operation: &str,
+        started: Instant,
+    ) -> Result<SandboxState> {
         loop {
             let state = match self.client.get(&self.sdk_id).await {
                 Ok(sdk) => map_state(sdk.state),
@@ -684,44 +688,67 @@ impl DaytonaSandbox {
         }
     }
 
+    /// Budget check between lifecycle retries, with one poll interval
+    /// of pause so repeated rejections cannot spin.
+    async fn transition_retry_pause(&self, operation: &str, started: Instant) -> Result<()> {
+        let elapsed = started.elapsed();
+        if elapsed >= TRANSITION_BUDGET {
+            return Err(Error::Timeout {
+                operation: operation.to_owned(),
+                elapsed,
+            });
+        }
+        time::sleep(TRANSITION_POLL).await;
+        Ok(())
+    }
+
     async fn start_inner(&self) -> Result<()> {
-        match self.client.start(&self.sdk_id).await {
-            Ok(_) => Ok(()),
-            Err(error) if is_state_change_in_progress(&error) => {
-                match self.wait_for_stable_state("starting sandbox").await? {
-                    SandboxState::Running => Ok(()),
-                    _ => self
-                        .client
-                        .start(&self.sdk_id)
-                        .await
-                        .map(|_| ())
-                        .map_err(|error| daytona_error("starting sandbox", &error)),
+        let started = Instant::now();
+        loop {
+            match self.client.start(&self.sdk_id).await {
+                Ok(_) => return Ok(()),
+                // Another actor's transition is in flight: wait it out
+                // and retry until the budget runs out.
+                Err(error) if is_state_change_in_progress(&error) => {
+                    let state = self
+                        .wait_for_stable_state("starting sandbox", started)
+                        .await?;
+                    if state == SandboxState::Running {
+                        return Ok(());
+                    }
+                    self.transition_retry_pause("starting sandbox", started)
+                        .await?;
                 }
+                Err(error) => return Err(daytona_error("starting sandbox", &error)),
             }
-            Err(error) => Err(daytona_error("starting sandbox", &error)),
         }
     }
 
     async fn stop_inner(&self) -> Result<()> {
-        match self.client.stop(&self.sdk_id).await {
-            Ok(_) => Ok(()),
-            // Ephemeral sandboxes destroy themselves on stop.
-            Err(error) if is_not_found(&error) => Ok(()),
-            // The in-flight transition may be the stop itself (an
-            // auto-stop that fired first).
-            Err(error) if is_state_change_in_progress(&error) => {
-                match self.wait_for_stable_state("stopping sandbox").await? {
-                    SandboxState::Stopped | SandboxState::Archived | SandboxState::Deleted => {
-                        Ok(())
+        let started = Instant::now();
+        loop {
+            match self.client.stop(&self.sdk_id).await {
+                Ok(_) => return Ok(()),
+                // Ephemeral sandboxes destroy themselves on stop.
+                Err(error) if is_not_found(&error) => return Ok(()),
+                // The in-flight transition may be the stop itself (an
+                // auto-stop that fired first).
+                Err(error) if is_state_change_in_progress(&error) => {
+                    match self
+                        .wait_for_stable_state("stopping sandbox", started)
+                        .await?
+                    {
+                        SandboxState::Stopped | SandboxState::Archived | SandboxState::Deleted => {
+                            return Ok(());
+                        }
+                        _ => {
+                            self.transition_retry_pause("stopping sandbox", started)
+                                .await?;
+                        }
                     }
-                    _ => match self.client.stop(&self.sdk_id).await {
-                        Ok(_) => Ok(()),
-                        Err(error) if is_not_found(&error) => Ok(()),
-                        Err(error) => Err(daytona_error("stopping sandbox", &error)),
-                    },
                 }
+                Err(error) => return Err(daytona_error("stopping sandbox", &error)),
             }
-            Err(error) => Err(daytona_error("stopping sandbox", &error)),
         }
     }
 
@@ -738,20 +765,25 @@ impl DaytonaSandbox {
     }
 
     async fn delete_inner(&self) -> Result<()> {
-        match self.delete_once().await? {
-            Ok(()) => Ok(()),
-            Err(error) if is_not_found(&error) => Ok(()),
-            Err(error) if is_state_change_in_progress(&error) => {
-                match self.wait_for_stable_state("deleting sandbox").await? {
-                    SandboxState::Deleted => Ok(()),
-                    _ => match self.delete_once().await? {
-                        Ok(()) => Ok(()),
-                        Err(error) if is_not_found(&error) => Ok(()),
-                        Err(error) => Err(daytona_error("deleting sandbox", &error)),
-                    },
+        let started = Instant::now();
+        loop {
+            match self.delete_once().await? {
+                Ok(()) => return Ok(()),
+                Err(error) if is_not_found(&error) => return Ok(()),
+                Err(error) if is_state_change_in_progress(&error) => {
+                    match self
+                        .wait_for_stable_state("deleting sandbox", started)
+                        .await?
+                    {
+                        SandboxState::Deleted => return Ok(()),
+                        _ => {
+                            self.transition_retry_pause("deleting sandbox", started)
+                                .await?;
+                        }
+                    }
                 }
+                Err(error) => return Err(daytona_error("deleting sandbox", &error)),
             }
-            Err(error) => Err(daytona_error("deleting sandbox", &error)),
         }
     }
 
