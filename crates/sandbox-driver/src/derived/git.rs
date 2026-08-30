@@ -257,11 +257,17 @@ impl Git for DerivedGit<'_> {
     }
 
     async fn branches(&self, repo_path: &str) -> Result<GitBranches> {
+        // `for-each-ref` lists only real branches; `git branch` would
+        // emit a "(HEAD detached at …)" pseudo-entry in detached state.
         let list = self
             .run(
-                "git branch",
+                "git for-each-ref",
                 Some(repo_path),
-                &["branch".into(), "--format=%(refname:short)".into()],
+                &[
+                    "for-each-ref".into(),
+                    "--format=%(refname:short)".into(),
+                    "refs/heads".into(),
+                ],
                 GIT_TIMEOUT,
             )
             .await?
