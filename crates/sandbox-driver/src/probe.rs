@@ -10,7 +10,8 @@ use crate::wait::{WaitOptions, wait_for_stable_state, wait_for_state};
 /// facet on a fresh sandbox and after every resume, before reporting the
 /// sandbox usable. Fails when `BASH_ENV` is set, Bash is missing, the
 /// shell is a login shell, or POSIX mode is active. Success requires exit
-/// 0 and stdout exactly `fabro-bash-ready`.
+/// 0 and stdout `fabro-bash-ready` — surrounding whitespace tolerated,
+/// because exec transports pad or normalize output.
 pub const BASH_PROBE_SCRIPT: &str = r#"
 if [ -n "${BASH_ENV:-}" ]; then echo "probe: BASH_ENV is set" >&2; exit 1; fi
 if [ -z "${BASH_VERSION:-}" ]; then echo "probe: not running under bash" >&2; exit 1; fi
@@ -20,7 +21,7 @@ printf 'fabro-bash-ready'
 "#;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-const PROBE_OK_OUTPUT: &[u8] = b"fabro-bash-ready";
+const PROBE_OK_MARKER: &str = "fabro-bash-ready";
 
 /// A failed bash probe. The raw output stays behind [`ExecFailure`]'s
 /// accessors.
@@ -35,7 +36,7 @@ pub struct ProbeFailure {
 pub async fn run_bash_probe(exec: &dyn Exec) -> Result<()> {
     let spec = ExecSpec::new(BASH_PROBE_SCRIPT).timeout(PROBE_TIMEOUT);
     let result = exec.run(&spec).await?;
-    if result.success() && result.stdout == PROBE_OK_OUTPUT {
+    if result.success() && result.stdout_lossy().trim() == PROBE_OK_MARKER {
         return Ok(());
     }
     Err(Error::Exec(ExecFailure::new(
