@@ -815,10 +815,9 @@ impl Sandbox for DaytonaSandbox {
     }
 
     async fn refresh_activity(&self) -> Result<()> {
-        // The SDK's refresh_activity sends a literal `null` body that the
-        // server rejects ("Invalid JSON in request body"); until
-        // daytona-sdk-rust passes an UpdateLastActivity value, a trivial
-        // exec is genuine activity and resets the same timers.
+        // A trivial exec is genuine activity and resets the idle timers.
+        // (The pinned SDK's update_last_activity now sends a valid body;
+        // the exec keeps this path independent of that endpoint.)
         let spec = ExecSpec::new("true").timeout(Duration::from_secs(30));
         let result = self.exec.run(&spec).await?;
         if result.success() {
