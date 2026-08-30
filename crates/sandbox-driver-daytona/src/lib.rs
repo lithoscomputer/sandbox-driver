@@ -248,7 +248,6 @@ impl DaytonaProvider {
 fn daytona_capabilities() -> Capabilities {
     let mut caps = Capabilities::minimal(Isolation::Vm);
     caps.lifecycle.archive = true;
-    caps.lifecycle.resize = true;
     caps.lifecycle.recover = true;
     caps.lifecycle.refresh_activity = true;
     caps.lifecycle.timers = true;
@@ -630,10 +629,20 @@ impl Sandbox for DaytonaSandbox {
     }
 
     async fn refresh_activity(&self) -> Result<()> {
-        let sdk = self.sdk().await?;
-        sdk.refresh_activity()
-            .await
-            .map_err(|error| daytona_error("refreshing activity", &error))
+        // The SDK's refresh_activity sends a literal `null` body that the
+        // server rejects ("Invalid JSON in request body"); until
+        // daytona-sdk-rust passes an UpdateLastActivity value, a trivial
+        // exec is genuine activity and resets the same timers.
+        let spec = ExecSpec::new("true").timeout(Duration::from_secs(30));
+        let result = self.exec.run(&spec).await?;
+        if result.success() {
+            Ok(())
+        } else {
+            Err(Error::invalid_spec(
+                "refresh_activity",
+                "keepalive command failed",
+            ))
+        }
     }
 
     async fn resize(&self, resources: &Resources) -> Result<()> {
@@ -816,7 +825,15 @@ impl SnapshotProvider for DaytonaSnapshots {
         match self.client.snapshot.delete(id.as_str()).await {
             Ok(()) => Ok(()),
             Err(error) if is_not_found(&error) => Ok(()),
-            Err(error) => Err(daytona_error("deleting snapshot", &error)),
+            Err(error) => {
+                // Same asynchronous-deletion idempotency as volumes.
+                if let Ok(dto) = self.client.snapshot.get(id.as_str()).await {
+                    if map_snapshot_state(dto.state) == SnapshotState::Deleting {
+                        return Ok(());
+                    }
+                }
+                Err(daytona_error("deleting snapshot", &error))
+            }
         }
     }
 }
@@ -888,7 +905,20 @@ impl VolumeProvider for DaytonaVolumes {
         match self.client.volume.delete(id.as_str()).await {
             Ok(()) => Ok(()),
             Err(error) if is_not_found(&error) => Ok(()),
-            Err(error) => Err(daytona_error("deleting volume", &error)),
+            Err(error) => {
+                // Deletion is asynchronous: a repeat delete while the
+                // first is processing is rejected. Idempotency means
+                // checking whether deletion is already underway.
+                if let Ok(dto) = self.client.volume.get(id.as_str()).await {
+                    if matches!(
+                        map_volume_state(dto.state),
+                        VolumeState::Deleting | VolumeState::Deleted
+                    ) {
+                        return Ok(());
+                    }
+                }
+                Err(daytona_error("deleting volume", &error))
+            }
         }
     }
 }
