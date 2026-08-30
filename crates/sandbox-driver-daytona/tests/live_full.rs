@@ -171,12 +171,19 @@ async fn stop_resize_archive_restore_lifecycle() {
             }
         }
 
-        // Archive, then restore via start.
+        // Archive, then restore via start. Archiving copies the
+        // filesystem to object storage and exceeds the generic wait
+        // live (a 300s wait timed out on 2026-08-30), so it gets its
+        // own budget.
         sandbox
             .archive()
             .await
             .map_err(|error| format!("archive: {error}"))?;
-        wait_for_state(sandbox.as_ref(), SandboxState::Archived, &wait())
+        let archive_wait = WaitOptions {
+            interval: Duration::from_secs(2),
+            deadline: Some(Duration::from_secs(900)),
+        };
+        wait_for_state(sandbox.as_ref(), SandboxState::Archived, &archive_wait)
             .await
             .map_err(|error| format!("waiting for Archived: {error}"))?;
         sandbox
