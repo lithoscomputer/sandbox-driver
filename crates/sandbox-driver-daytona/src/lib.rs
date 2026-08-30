@@ -11,6 +11,14 @@
 //! the toolbox and reports `live_streaming: false` /
 //! `streams_separated: false` honestly.
 //!
+//! # Lifecycle timers
+//!
+//! Unset timers inherit Daytona's server defaults — notably auto-stop
+//! after **15 idle minutes**, which is shorter than a single long
+//! inference call. Callers that run long commands should set
+//! `timers.auto_stop_after_idle` explicitly; `Duration::ZERO` disables a
+//! timer entirely (Daytona's wire semantics for `0`).
+//!
 //! # Configuration
 //!
 //! [`DaytonaProvider::connect`] uses the SDK's environment configuration:
@@ -181,10 +189,15 @@ fn to_u64(value: f64) -> Option<u64> {
     (value.is_finite() && value >= 0.0 && value < u64::MAX as f64).then(|| value.round() as u64)
 }
 
+/// Converts a timer duration to Daytona's minute intervals. On the wire
+/// `0` disables the timer, so `Duration::ZERO` passes through as the
+/// explicit "never" and every other duration rounds up to at least one
+/// minute.
 fn minutes(duration: Duration) -> i32 {
-    i32::try_from(duration.as_secs() / 60)
-        .unwrap_or(i32::MAX)
-        .max(1)
+    if duration.is_zero() {
+        return 0;
+    }
+    i32::try_from(duration.as_secs().div_ceil(60)).unwrap_or(i32::MAX)
 }
 
 fn gigabytes(mb: u64) -> i32 {
@@ -1039,6 +1052,13 @@ mod tests {
     fn minutes_round_up_to_at_least_one() {
         assert_eq!(minutes(Duration::from_secs(30)), 1);
         assert_eq!(minutes(Duration::from_secs(120)), 2);
+        assert_eq!(minutes(Duration::from_secs(150)), 3);
+    }
+
+    #[test]
+    fn minutes_pass_zero_through_as_disabled() {
+        // On the Daytona wire, 0 disables the timer entirely.
+        assert_eq!(minutes(Duration::ZERO), 0);
     }
 
     #[test]
