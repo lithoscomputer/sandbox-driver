@@ -323,7 +323,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 [[package]]
 name = "daytona-api-client"
 version = "0.1.0"
-source = "git+https://github.com/brynary/daytona-sdk-rust?rev=be2c7b7272740d47c023cac8abc9f63c1a51a511#be2c7b7272740d47c023cac8abc9f63c1a51a511"
+source = "git+https://github.com/brynary/daytona-sdk-rust?rev=f86e645e9372d7ad4cf645dd3e7b1249ac20cdb1#f86e645e9372d7ad4cf645dd3e7b1249ac20cdb1"
 dependencies = [
  "reqwest",
  "reqwest-middleware",
@@ -337,7 +337,7 @@ dependencies = [
 [[package]]
 name = "daytona-sdk"
 version = "0.1.0"
-source = "git+https://github.com/brynary/daytona-sdk-rust?rev=be2c7b7272740d47c023cac8abc9f63c1a51a511#be2c7b7272740d47c023cac8abc9f63c1a51a511"
+source = "git+https://github.com/brynary/daytona-sdk-rust?rev=f86e645e9372d7ad4cf645dd3e7b1249ac20cdb1#f86e645e9372d7ad4cf645dd3e7b1249ac20cdb1"
 dependencies = [
  "daytona-api-client",
  "daytona-toolbox-client",
@@ -357,7 +357,7 @@ dependencies = [
 [[package]]
 name = "daytona-toolbox-client"
 version = "0.1.0"
-source = "git+https://github.com/brynary/daytona-sdk-rust?rev=be2c7b7272740d47c023cac8abc9f63c1a51a511#be2c7b7272740d47c023cac8abc9f63c1a51a511"
+source = "git+https://github.com/brynary/daytona-sdk-rust?rev=f86e645e9372d7ad4cf645dd3e7b1249ac20cdb1#f86e645e9372d7ad4cf645dd3e7b1249ac20cdb1"
 dependencies = [
  "reqwest",
  "reqwest-middleware",
