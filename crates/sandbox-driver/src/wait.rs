@@ -19,7 +19,9 @@ impl Default for WaitOptions {
     fn default() -> Self {
         Self {
             interval: Duration::from_secs(1),
-            deadline: Some(Duration::from_secs(60)),
+            // fabro's state-change budget: a Daytona resume from
+            // archive or a cold start can take well over a minute.
+            deadline: Some(Duration::from_secs(120)),
         }
     }
 }
