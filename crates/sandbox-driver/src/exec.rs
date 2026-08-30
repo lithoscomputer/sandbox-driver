@@ -169,6 +169,11 @@ pub enum Termination {
 pub struct ExecResult {
     pub stdout:      Vec<u8>,
     pub stderr:      Vec<u8>,
+    /// Meaningful only when `termination` is [`Termination::Exited`].
+    /// A timed-out or cancelled run may still carry a code the provider
+    /// happened to observe (a trapped SIGTERM exiting 0, a kill
+    /// wrapper's 143) — never treat `Some(0)` alone as success; use
+    /// [`ExecResult::success`], which checks the termination.
     pub exit_code:   Option<i32>,
     pub termination: Termination,
     pub duration:    Duration,
