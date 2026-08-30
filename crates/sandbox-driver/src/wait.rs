@@ -31,6 +31,32 @@ impl Default for WaitOptions {
 /// [`SandboxState::Error`] (unless `Error` is the target), and with
 /// [`Error::Timeout`] when the deadline passes. `Deleted` counts as
 /// `Stopped` for ephemeral sandboxes that vanish on stop.
+/// Polls [`Sandbox::describe`] until the state settles (per
+/// [`SandboxState::is_stable`]). Unlike [`wait_for_state`], `Error` is a
+/// valid outcome — the caller decides what to do with the settled state.
+pub async fn wait_for_stable_state(
+    sandbox: &dyn Sandbox,
+    options: &WaitOptions,
+) -> Result<SandboxStatus> {
+    let started = Instant::now();
+    loop {
+        let status = sandbox.describe().await?;
+        if status.state.is_stable() {
+            return Ok(status);
+        }
+        if let Some(deadline) = options.deadline {
+            let elapsed = started.elapsed();
+            if elapsed >= deadline {
+                return Err(Error::Timeout {
+                    operation: "waiting for a stable state".to_owned(),
+                    elapsed,
+                });
+            }
+        }
+        sleep(options.interval).await;
+    }
+}
+
 pub async fn wait_for_state(
     sandbox: &dyn Sandbox,
     target: SandboxState,

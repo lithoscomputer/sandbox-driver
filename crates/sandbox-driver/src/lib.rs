@@ -96,4 +96,4 @@ pub use spec::{
     VolumeMount,
 };
 pub use state::{SandboxState, SandboxStatus};
-pub use wait::{WaitOptions, wait_for_state};
+pub use wait::{WaitOptions, wait_for_stable_state, wait_for_state};

@@ -4,7 +4,7 @@ use crate::error::{Error, ExecFailure, Result};
 use crate::exec::{Exec, ExecSpec};
 use crate::sandbox::Sandbox;
 use crate::state::SandboxState;
-use crate::wait::{WaitOptions, wait_for_state};
+use crate::wait::{WaitOptions, wait_for_stable_state, wait_for_state};
 
 /// Bash contract probe, carried over from fabro. Run through the exec
 /// facet on a fresh sandbox and after every resume, before reporting the
@@ -54,9 +54,18 @@ pub async fn run_bash_probe(exec: &dyn Exec) -> Result<()> {
 /// per provider. Idempotent: a running sandbox only gets the probe.
 pub async fn activate(sandbox: &dyn Sandbox, wait: &WaitOptions) -> Result<()> {
     let status = sandbox.describe().await?;
-    match status.state {
+    // Wait out an in-flight transition (an auto-stop racing this
+    // activation, say) instead of acting on a moving state: `Stopping`
+    // settles into `Stopped` and gets a start, `Starting` into
+    // `Running` and only the probe.
+    let state = if status.state.is_stable() {
+        status.state
+    } else {
+        wait_for_stable_state(sandbox, wait).await?.state
+    };
+    match state {
         SandboxState::Running => {}
-        SandboxState::Paused | SandboxState::Pausing => {
+        SandboxState::Paused => {
             sandbox.resume().await?;
             wait_for_state(sandbox, SandboxState::Running, wait).await?;
         }
