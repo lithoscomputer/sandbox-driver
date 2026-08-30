@@ -704,6 +704,18 @@ impl DaytonaSandbox {
 
     async fn start_inner(&self) -> Result<()> {
         let started = Instant::now();
+        // Start is documented as a no-op on a running sandbox; Daytona
+        // rejects a start POST on one, so check first (as fabro did).
+        // The check can race another actor — the loop below still
+        // handles every non-Running answer.
+        let current = self
+            .client
+            .get(&self.sdk_id)
+            .await
+            .map_err(|error| daytona_error("fetching sandbox", &error))?;
+        if map_state(current.state) == SandboxState::Running {
+            return Ok(());
+        }
         loop {
             match self.client.start(&self.sdk_id).await {
                 Ok(_) => return Ok(()),
