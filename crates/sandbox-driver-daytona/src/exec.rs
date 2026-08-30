@@ -78,8 +78,10 @@ impl DaytonaExec {
             if key == "BASH_ENV" {
                 continue;
             }
+            // Quote the key as well as the value: a malformed key must
+            // corrupt nothing but its own export.
             program.push_str("export ");
-            program.push_str(key);
+            program.push_str(&shell_quote(key));
             program.push('=');
             program.push_str(&shell_quote(value));
             program.push('\n');
@@ -186,6 +188,15 @@ mod tests {
         let program = DaytonaExec::compose(&spec);
         assert!(program.starts_with("unset BASH_ENV\n"));
         assert!(!program.contains("export BASH_ENV"));
+    }
+
+    #[test]
+    fn compose_quotes_env_keys_and_values() {
+        let spec = ExecSpec::new("true").env_var("X;injected", "a b");
+        let program = DaytonaExec::compose(&spec);
+        // A metacharacter in a key corrupts only its own export instead
+        // of splicing extra shell before the command.
+        assert!(program.contains("export 'X;injected'='a b'\n"), "{program}");
     }
 
     #[test]
