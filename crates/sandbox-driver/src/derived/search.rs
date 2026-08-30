@@ -163,7 +163,9 @@ impl Search for DerivedSearch<'_> {
         if options.exclude_dirs.is_empty() {
             expr.push_str(" -type f");
         } else {
-            expr.push_str(" \\(");
+            // The prune is guarded by -type d so a regular *file* named
+            // like an excluded directory still shows up in results.
+            expr.push_str(" \\( -type d \\(");
             for (index, dir) in options.exclude_dirs.iter().enumerate() {
                 if index > 0 {
                     expr.push_str(" -o");
@@ -171,24 +173,31 @@ impl Search for DerivedSearch<'_> {
                 expr.push_str(" -name ");
                 expr.push_str(&shell_quote(dir));
             }
-            expr.push_str(" \\) -prune -o -type f");
+            expr.push_str(" \\) -prune \\) -o -type f");
         }
+
+        // A missing root is an empty walk, not an error — callers glob
+        // for directories that may not exist. The guard runs in the
+        // command (not via working_dir) so a missing base cannot fail
+        // the exec itself.
+        let guarded = |find: &str| {
+            format!(
+                "if [ -d {base} ]; then cd {base} && {find}; fi",
+                base = shell_quote(base)
+            )
+        };
 
         // GNU find first: sizes come along. `-printf` is missing from BSD
         // find, which fails and triggers the portable fallback.
-        let gnu = format!("{expr} -printf '%s\\0%P\\0'");
-        let spec = ExecSpec::new(gnu)
-            .timeout(WALK_TIMEOUT)
-            .working_dir(base.to_owned());
+        let gnu = guarded(&format!("{expr} -printf '%s\\0%P\\0'"));
+        let spec = ExecSpec::new(gnu).timeout(WALK_TIMEOUT);
         let result = self.exec.run(&spec).await?;
         if result.success() {
             return Ok(parse_gnu_walk(&result.stdout));
         }
 
-        let posix = format!("{expr} -print0");
-        let spec = ExecSpec::new(posix)
-            .timeout(WALK_TIMEOUT)
-            .working_dir(base.to_owned());
+        let posix = guarded(&format!("{expr} -print0"));
+        let spec = ExecSpec::new(posix).timeout(WALK_TIMEOUT);
         let result = self.exec.run(&spec).await?;
         if !result.success() {
             return Err(Error::Exec(ExecFailure::new(
@@ -306,6 +315,28 @@ mod tests {
             .expect("walk");
         assert_eq!(files[0].path, "src/main.rs");
         assert_eq!(files[0].size, None);
-        assert!(exec.commands()[1].ends_with("-print0"));
+        assert!(exec.commands()[1].contains("-print0"));
+    }
+
+    #[tokio::test]
+    async fn walk_guards_the_root_and_prunes_only_directories() {
+        let exec = ScriptedExec::new(vec![ScriptedExec::ok("")]);
+        let search = DerivedSearch::new(&exec);
+        let options = WalkOptions {
+            exclude_dirs: vec!["node_modules".to_owned()],
+            ..WalkOptions::default()
+        };
+        let files = search.walk("/missing", &options).await.expect("walk");
+        assert!(files.is_empty());
+
+        let command = &exec.commands()[0];
+        assert!(
+            command.starts_with("if [ -d '/missing' ]; then cd '/missing' && "),
+            "command: {command}"
+        );
+        assert!(
+            command.contains("\\( -type d \\( -name 'node_modules' \\) -prune \\) -o -type f"),
+            "command: {command}"
+        );
     }
 }

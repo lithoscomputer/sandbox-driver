@@ -413,6 +413,34 @@ async fn derived_search_works_over_host_exec() {
     let paths = search.glob("src/*.rs", ".").await.expect("glob");
     assert_eq!(paths.len(), 2);
 
+    // A missing root is an empty result, not an error.
+    let missing = search
+        .walk("does-not-exist", &WalkOptions::default())
+        .await
+        .expect("walk of a missing root");
+    assert!(missing.is_empty());
+    let missing = search
+        .glob("*.rs", "does-not-exist")
+        .await
+        .expect("glob under a missing root");
+    assert!(missing.is_empty());
+
+    // Excluding a directory name must not hide a regular file with
+    // that name.
+    fs.write("node_modules", b"a file, not a directory\n")
+        .await
+        .expect("write");
+    let options = {
+        let mut options = WalkOptions::default();
+        options.exclude_dirs.push("node_modules".to_owned());
+        options
+    };
+    let files = search.walk(".", &options).await.expect("walk");
+    assert!(
+        files.iter().any(|file| file.path == "node_modules"),
+        "files: {files:?}"
+    );
+
     sandbox.delete().await.expect("delete");
 }
 
