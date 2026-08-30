@@ -546,8 +546,15 @@ impl SandboxProvider for DaytonaProvider {
         } else {
             CREATE_TIMEOUT
         };
-        let created = match self.create_inner(params, budget).await {
-            Ok(created) => created,
+        // Every failure after ActionStarted must pair with ActionFailed;
+        // the fallible section funnels through one outcome.
+        let outcome = async {
+            let created = self.create_inner(params, budget).await?;
+            self.handle(created, None).await
+        }
+        .await;
+        let handle = match outcome {
+            Ok(handle) => handle,
             Err(error) => {
                 if let Some(dispatcher) = &dispatcher {
                     dispatcher
@@ -560,7 +567,6 @@ impl SandboxProvider for DaytonaProvider {
                 return Err(error);
             }
         };
-        let handle = self.handle(created, None).await?;
         if let Some(dispatcher) = dispatcher {
             dispatcher
                 .emit(SandboxEvent::ActionCompleted {

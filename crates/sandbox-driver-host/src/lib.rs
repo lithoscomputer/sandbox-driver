@@ -30,10 +30,10 @@ use std::{env, io, process};
 
 use async_trait::async_trait;
 use sandbox_driver::{
-    Capabilities, Error, EventCallback, EventDispatcher, Exec, ExecSpec, Filesystem, Isolation,
-    LifecycleAction, PlatformInfo, ProviderKind, ResourceKind, Result, Sandbox, SandboxEvent,
-    SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec, SandboxState,
-    SandboxStatus, WorkspaceOwnership,
+    Capabilities, Error, ErrorReport, EventCallback, EventDispatcher, Exec, ExecSpec, Filesystem,
+    Isolation, LifecycleAction, PlatformInfo, ProviderKind, ResourceKind, Result, Sandbox,
+    SandboxEvent, SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec,
+    SandboxState, SandboxStatus, WorkspaceOwnership,
 };
 use tokio::fs as tokio_fs;
 
@@ -128,44 +128,64 @@ impl SandboxProvider for HostProvider {
         let started = Instant::now();
 
         let id = self.next_id();
-        let (workspace, ownership) = if let Some(path) = &spec.working_directory {
-            let path = PathBuf::from(path.as_str());
-            let metadata = tokio_fs::metadata(&path).await.map_err(|error| {
-                Error::io(
-                    format!("designated directory {} is not usable", path.display()),
-                    error,
-                )
-            })?;
-            if !metadata.is_dir() {
-                return Err(Error::invalid_spec(
-                    "working_directory",
-                    "designated path is not a directory",
-                ));
+        // Every failure after ActionStarted must pair with ActionFailed;
+        // the fallible section funnels through one outcome.
+        let outcome = async {
+            let (workspace, ownership) = if let Some(path) = &spec.working_directory {
+                let path = PathBuf::from(path.as_str());
+                let metadata = tokio_fs::metadata(&path).await.map_err(|error| {
+                    Error::io(
+                        format!("designated directory {} is not usable", path.display()),
+                        error,
+                    )
+                })?;
+                if !metadata.is_dir() {
+                    return Err(Error::invalid_spec(
+                        "working_directory",
+                        "designated path is not a directory",
+                    ));
+                }
+                let path = tokio_fs::canonicalize(&path).await.map_err(|error| {
+                    Error::io(
+                        format!("resolving designated directory {}", path.display()),
+                        error,
+                    )
+                })?;
+                (path, WorkspaceOwnership::Designated)
+            } else {
+                let path = env::temp_dir()
+                    .join("sandbox-driver-host")
+                    .join(id.as_str());
+                tokio_fs::create_dir_all(&path).await.map_err(|error| {
+                    Error::io(
+                        format!("creating managed workspace {}", path.display()),
+                        error,
+                    )
+                })?;
+                let path = tokio_fs::canonicalize(&path).await.map_err(|error| {
+                    Error::io(
+                        format!("resolving managed workspace {}", path.display()),
+                        error,
+                    )
+                })?;
+                (path, WorkspaceOwnership::Managed)
+            };
+            Ok::<_, Error>((workspace, ownership))
+        }
+        .await;
+        let (workspace, ownership) = match outcome {
+            Ok(parts) => parts,
+            Err(error) => {
+                if let Some(dispatcher) = &dispatcher {
+                    dispatcher
+                        .emit(SandboxEvent::ActionFailed {
+                            action: LifecycleAction::Create,
+                            error:  ErrorReport::from(&error),
+                        })
+                        .await;
+                }
+                return Err(error);
             }
-            let path = tokio_fs::canonicalize(&path).await.map_err(|error| {
-                Error::io(
-                    format!("resolving designated directory {}", path.display()),
-                    error,
-                )
-            })?;
-            (path, WorkspaceOwnership::Designated)
-        } else {
-            let path = env::temp_dir()
-                .join("sandbox-driver-host")
-                .join(id.as_str());
-            tokio_fs::create_dir_all(&path).await.map_err(|error| {
-                Error::io(
-                    format!("creating managed workspace {}", path.display()),
-                    error,
-                )
-            })?;
-            let path = tokio_fs::canonicalize(&path).await.map_err(|error| {
-                Error::io(
-                    format!("resolving managed workspace {}", path.display()),
-                    error,
-                )
-            })?;
-            (path, WorkspaceOwnership::Managed)
         };
 
         let sandbox = Arc::new(HostSandbox::new(

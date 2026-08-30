@@ -292,74 +292,94 @@ impl SandboxProvider for DockerProvider {
                 .await;
         }
         let started = Instant::now();
-        self.ensure_image(reference, dispatcher.as_ref()).await?;
+        // Every failure after ActionStarted must pair with ActionFailed;
+        // the fallible section funnels through one outcome.
+        let outcome = async {
+            self.ensure_image(reference, dispatcher.as_ref()).await?;
 
-        let working_dir = spec
-            .working_directory
-            .clone()
-            .unwrap_or_else(|| DEFAULT_WORKING_DIRECTORY.to_owned());
-        let mut labels: HashMap<String, String> = spec
-            .labels
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        labels.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
+            let working_dir = spec
+                .working_directory
+                .clone()
+                .unwrap_or_else(|| DEFAULT_WORKING_DIRECTORY.to_owned());
+            let mut labels: HashMap<String, String> = spec
+                .labels
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            labels.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
 
-        let host_config = HostConfig {
-            network_mode: network,
-            memory: spec
-                .resources
-                .memory_mb
-                .and_then(|mb| i64::try_from(mb).ok())
-                .map(|mb| mb * 1024 * 1024),
-            cpu_quota: spec
-                .resources
-                .cpu_cores
-                .map(|cores| i64::from(cores) * 100_000),
-            ..Default::default()
+            let host_config = HostConfig {
+                network_mode: network,
+                memory: spec
+                    .resources
+                    .memory_mb
+                    .and_then(|mb| i64::try_from(mb).ok())
+                    .map(|mb| mb * 1024 * 1024),
+                cpu_quota: spec
+                    .resources
+                    .cpu_cores
+                    .map(|cores| i64::from(cores) * 100_000),
+                ..Default::default()
+            };
+            // Blank BASH_ENV at the container level too: an image (or spec)
+            // startup file would otherwise run inside the init command below
+            // and can kill the container the moment it starts.
+            let mut env_entries: Vec<String> = spec
+                .env
+                .iter()
+                .filter(|(key, _)| key.as_str() != BASH_ENV_VAR)
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect();
+            env_entries.push(format!("{BASH_ENV_VAR}="));
+            let config = Config {
+                image: Some(reference.clone()),
+                cmd: Some(vec![
+                    "/bin/bash".to_owned(),
+                    "-c".to_owned(),
+                    format!(
+                        "mkdir -p {} && exec sleep infinity",
+                        shell_quote(&working_dir)
+                    ),
+                ]),
+                working_dir: Some(working_dir.clone()),
+                env: Some(env_entries),
+                labels: Some(labels),
+                host_config: Some(host_config),
+                ..Default::default()
+            };
+            let options = spec.name.clone().map(|name| CreateContainerOptions {
+                name,
+                platform: None,
+            });
+            let created = self
+                .docker
+                .create_container(options, config)
+                .await
+                .map_err(|error| docker_error("creating container", &error))?;
+            self.docker
+                .start_container(&created.id, None::<StartContainerOptions<String>>)
+                .await
+                .map_err(|error| docker_error("starting container", &error))?;
+            Ok::<_, Error>((created.id, working_dir))
+        }
+        .await;
+        let (container_id, working_dir) = match outcome {
+            Ok(parts) => parts,
+            Err(error) => {
+                if let Some(dispatcher) = &dispatcher {
+                    dispatcher
+                        .emit(SandboxEvent::ActionFailed {
+                            action: LifecycleAction::Create,
+                            error:  ErrorReport::from(&error),
+                        })
+                        .await;
+                }
+                return Err(error);
+            }
         };
-        // Blank BASH_ENV at the container level too: an image (or spec)
-        // startup file would otherwise run inside the init command below
-        // and can kill the container the moment it starts.
-        let mut env_entries: Vec<String> = spec
-            .env
-            .iter()
-            .filter(|(key, _)| key.as_str() != BASH_ENV_VAR)
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect();
-        env_entries.push(format!("{BASH_ENV_VAR}="));
-        let config = Config {
-            image: Some(reference.clone()),
-            cmd: Some(vec![
-                "/bin/bash".to_owned(),
-                "-c".to_owned(),
-                format!(
-                    "mkdir -p {} && exec sleep infinity",
-                    shell_quote(&working_dir)
-                ),
-            ]),
-            working_dir: Some(working_dir.clone()),
-            env: Some(env_entries),
-            labels: Some(labels),
-            host_config: Some(host_config),
-            ..Default::default()
-        };
-        let options = spec.name.clone().map(|name| CreateContainerOptions {
-            name,
-            platform: None,
-        });
-        let created = self
-            .docker
-            .create_container(options, config)
-            .await
-            .map_err(|error| docker_error("creating container", &error))?;
-        self.docker
-            .start_container(&created.id, None::<StartContainerOptions<String>>)
-            .await
-            .map_err(|error| docker_error("starting container", &error))?;
 
         let handle = self.handle(
-            created.id,
+            container_id,
             working_dir,
             spec.labels.clone(),
             spec.env.clone(),
