@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use std::{future, mem};
 
 use async_trait::async_trait;
+#[cfg(unix)]
+use nix::sys::signal::Signal;
 use sandbox_driver::{
     Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputCaptureBuffer,
     OutputSink, OutputStream, Result, SpawnSpec, StderrTail, StdioProcess, StdioProcessHandle,
@@ -22,6 +24,11 @@ const BASH_ENV_VAR: &str = "BASH_ENV";
 /// Bound on draining remaining output after the process has ended, so a
 /// backgrounded grandchild holding the pipes cannot stall the call.
 const DRAIN_GRACE: Duration = Duration::from_secs(10);
+
+/// Grace between SIGTERM and SIGKILL so processes can run traps, flush
+/// output, and release locks (a killed `git` leaves `.git/index.lock`
+/// behind otherwise).
+const TERM_GRACE: Duration = Duration::from_secs(2);
 
 /// Command execution on the local machine.
 ///
@@ -80,16 +87,37 @@ impl HostExec {
     }
 }
 
-fn kill_process_group(child: &Child) {
-    #[cfg(unix)]
+#[cfg(unix)]
+fn signal_process_group(child: &Child, signal: Signal) {
     if let Some(pid) = child.id() {
-        use nix::sys::signal::{Signal, killpg};
+        use nix::sys::signal::killpg;
         use nix::unistd::Pid;
         let pgid = Pid::from_raw(i32::try_from(pid).unwrap_or_default());
-        let _ = killpg(pgid, Signal::SIGKILL);
+        let _ = killpg(pgid, signal);
     }
+}
+
+fn kill_process_group(child: &Child) {
+    #[cfg(unix)]
+    signal_process_group(child, Signal::SIGKILL);
     #[cfg(not(unix))]
     let _ = child;
+}
+
+/// Sends SIGTERM to the process group, waits [`TERM_GRACE`] for a
+/// graceful exit, then SIGKILLs the group.
+async fn terminate_process_group(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        signal_process_group(child, Signal::SIGTERM);
+        if time::timeout(TERM_GRACE, child.wait()).await.is_err() {
+            signal_process_group(child, Signal::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill().await;
+    }
 }
 
 enum PumpEnd {
@@ -201,7 +229,7 @@ impl Exec for HostExec {
                         if matches!(out_end, PumpEnd::SinkError)
                             || matches!(err_end, PumpEnd::SinkError)
                         {
-                            kill_process_group(&child);
+                            terminate_process_group(&mut child).await;
                             break (Termination::Cancelled, None);
                         }
                     }
@@ -212,11 +240,11 @@ impl Exec for HostExec {
                         break (Termination::Exited, Some(status));
                     }
                     () = &mut cancelled => {
-                        kill_process_group(&child);
+                        terminate_process_group(&mut child).await;
                         break (Termination::Cancelled, None);
                     }
                     () = &mut timeout => {
-                        kill_process_group(&child);
+                        terminate_process_group(&mut child).await;
                         break (Termination::TimedOut, None);
                     }
                 }

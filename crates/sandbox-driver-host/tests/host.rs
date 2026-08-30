@@ -109,6 +109,26 @@ async fn exec_timeout_kills_the_process_tree() {
 }
 
 #[tokio::test]
+async fn exec_timeout_lets_the_process_run_its_term_trap() {
+    let provider = HostProvider::new();
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+
+    // `wait` (unlike a foreground `sleep`) lets bash handle the trap as
+    // soon as SIGTERM arrives.
+    let spec = ExecSpec::new("trap 'echo cleaned >&2; exit 0' TERM; sleep 30 & wait")
+        .timeout(Duration::from_millis(300));
+    let result = sandbox.exec().run(&spec).await.expect("exec resolves");
+    assert_eq!(result.termination, Termination::TimedOut);
+    assert!(
+        result.stderr_lossy().contains("cleaned"),
+        "the TERM trap must run before SIGKILL; stderr: {}",
+        result.stderr_lossy()
+    );
+
+    sandbox.delete().await.expect("delete");
+}
+
+#[tokio::test]
 async fn exec_timeout_fires_after_output_streams_close() {
     let provider = HostProvider::new();
     let sandbox = provider.create(&host_spec(), None).await.expect("create");
