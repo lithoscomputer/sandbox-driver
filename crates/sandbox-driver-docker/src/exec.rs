@@ -153,6 +153,17 @@ impl DockerExec {
         entries
     }
 
+    /// Resolves a relative working directory against the sandbox
+    /// working directory, matching the fs facet — Docker rejects a
+    /// relative exec `Cwd` outright.
+    fn resolve_dir(&self, dir: Option<&str>) -> String {
+        match dir {
+            None => self.working_dir.clone(),
+            Some(dir) if dir.starts_with('/') => dir.to_owned(),
+            Some(dir) => format!("{}/{}", self.working_dir.trim_end_matches('/'), dir),
+        }
+    }
+
     /// Allocates a unique stop-file/pid-file pair for one exec. The
     /// nanosecond nonce keeps paths from colliding across driver
     /// restarts (containers outlive drivers, host pids recycle, and the
@@ -296,10 +307,7 @@ impl Exec for DockerExec {
         let has_stdin = spec.stdin.is_some();
         let wrapper = Self::wrapped(&spec.command, &stop_file, &pid_file, has_stdin);
 
-        let working_dir = spec
-            .working_dir
-            .clone()
-            .unwrap_or_else(|| self.working_dir.clone());
+        let working_dir = self.resolve_dir(spec.working_dir.as_deref());
         let options = CreateExecOptions {
             attach_stdin: Some(has_stdin),
             attach_stdout: Some(true),
@@ -457,10 +465,7 @@ impl Exec for DockerExec {
     async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
         let (stop_file, pid_file) = self.control_paths();
         let wrapper = Self::wrapped(&spec.command, &stop_file, &pid_file, true);
-        let working_dir = spec
-            .working_dir
-            .clone()
-            .unwrap_or_else(|| self.working_dir.clone());
+        let working_dir = self.resolve_dir(spec.working_dir.as_deref());
         let options = CreateExecOptions {
             attach_stdin: Some(true),
             attach_stdout: Some(true),

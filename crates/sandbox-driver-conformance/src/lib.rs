@@ -98,6 +98,9 @@ impl Conformance {
             ("working_directory_is_effective", |ctx| {
                 Box::pin(working_directory_is_effective(ctx))
             }),
+            ("relative_working_dir_resolves", |ctx| {
+                Box::pin(relative_working_dir_resolves(ctx))
+            }),
             ("exec_reports_exit_codes", |ctx| {
                 Box::pin(exec_reports_exit_codes(ctx))
             }),
@@ -357,6 +360,43 @@ async fn working_directory_is_effective(ctx: &Conformance) -> CheckOutcome {
         let expected = sandbox.working_directory();
         if pwd != expected {
             return fail(format!("pwd is {pwd:?}, working_directory is {expected:?}"));
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+/// A relative exec `working_dir` resolves against the sandbox working
+/// directory on every provider.
+async fn relative_working_dir_resolves(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let mkdir = sandbox
+            .exec()
+            .run(&ExecSpec::new("mkdir -p cwd-probe").timeout(Duration::from_secs(30)))
+            .await
+            .map_err(|error| format!("mkdir failed: {error}"))?;
+        if !mkdir.success() {
+            return fail(format!("mkdir failed: {}", mkdir.stderr_lossy()));
+        }
+        let result = sandbox
+            .exec()
+            .run(
+                &ExecSpec::new("pwd")
+                    .working_dir("cwd-probe")
+                    .timeout(Duration::from_secs(30)),
+            )
+            .await
+            .map_err(|error| format!("exec failed: {error}"))?;
+        let pwd = result.stdout_lossy().trim().to_owned();
+        let expected = format!(
+            "{}/cwd-probe",
+            sandbox.working_directory().trim_end_matches('/')
+        );
+        if pwd != expected {
+            return fail(format!("pwd is {pwd:?}, expected {expected:?}"));
         }
         PASS
     }
