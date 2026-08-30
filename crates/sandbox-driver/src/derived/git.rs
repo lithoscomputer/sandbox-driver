@@ -163,11 +163,19 @@ impl Git for DerivedGit<'_> {
     }
 
     async fn status(&self, repo_path: &str) -> Result<GitStatus> {
+        // `-z` delimits entries with NUL and keeps paths verbatim —
+        // without it git C-quotes special-character paths and a newline
+        // in a path corrupts adjacent entries.
         let result = self
             .run(
                 "git status",
                 Some(repo_path),
-                &["status".into(), "--porcelain=v2".into(), "--branch".into()],
+                &[
+                    "status".into(),
+                    "--porcelain=v2".into(),
+                    "-z".into(),
+                    "--branch".into(),
+                ],
                 GIT_TIMEOUT,
             )
             .await?;
@@ -286,6 +294,9 @@ impl Git for DerivedGit<'_> {
     }
 }
 
+/// Parses `git status --porcelain=v2 -z --branch` output: entries are
+/// NUL-separated with verbatim paths, and a rename/copy entry is
+/// followed by one extra NUL-separated field (the original path).
 fn parse_status_v2(output: &str) -> GitStatus {
     let mut status = GitStatus {
         current_branch: None,
@@ -294,14 +305,15 @@ fn parse_status_v2(output: &str) -> GitStatus {
         behind:         0,
         dirty_paths:    Vec::new(),
     };
-    for line in output.lines() {
-        if let Some(head) = line.strip_prefix("# branch.head ") {
+    let mut entries = output.split('\0');
+    while let Some(entry) = entries.next() {
+        if let Some(head) = entry.strip_prefix("# branch.head ") {
             if head == "(detached)" {
                 status.detached = true;
             } else {
                 status.current_branch = Some(head.to_owned());
             }
-        } else if let Some(ab) = line.strip_prefix("# branch.ab ") {
+        } else if let Some(ab) = entry.strip_prefix("# branch.ab ") {
             for part in ab.split_whitespace() {
                 if let Some(ahead) = part.strip_prefix('+') {
                     status.ahead = ahead.parse().unwrap_or(0);
@@ -309,18 +321,25 @@ fn parse_status_v2(output: &str) -> GitStatus {
                     status.behind = behind.parse().unwrap_or(0);
                 }
             }
-        } else if let Some(entry) = line.strip_prefix("1 ") {
+        } else if let Some(entry) = entry.strip_prefix("1 ") {
             // 8 fixed fields after the marker, then the path.
             if let Some(path) = entry.splitn(8, ' ').nth(7) {
                 status.dirty_paths.push(path.to_owned());
             }
-        } else if let Some(entry) = line.strip_prefix("2 ") {
-            // Rename/copy: path then tab then original path.
+        } else if let Some(entry) = entry.strip_prefix("2 ") {
+            // Rename/copy: 9 fields, the new path, then the original
+            // path as its own NUL-separated field.
             if let Some(path) = entry.splitn(9, ' ').nth(8) {
-                let path = path.split('\t').next().unwrap_or(path);
                 status.dirty_paths.push(path.to_owned());
             }
-        } else if let Some(path) = line.strip_prefix("? ") {
+            let _original_path = entries.next();
+        } else if let Some(entry) = entry.strip_prefix("u ") {
+            // Unmerged (conflict): 10 fields, then the path. A repo
+            // mid-merge must not pass a "workspace clean" check.
+            if let Some(path) = entry.splitn(10, ' ').nth(9) {
+                status.dirty_paths.push(path.to_owned());
+            }
+        } else if let Some(path) = entry.strip_prefix("? ") {
             status.dirty_paths.push(path.to_owned());
         }
     }
@@ -359,13 +378,18 @@ mod tests {
 
     #[test]
     fn parses_porcelain_v2_status() {
+        // `-z` output, shapes verified against live git: a rename entry
+        // is followed by the original path as its own NUL field, and
+        // special-character paths arrive verbatim, not C-quoted.
         let status = parse_status_v2(concat!(
-            "# branch.oid 1234\n",
-            "# branch.head main\n",
-            "# branch.upstream origin/main\n",
-            "# branch.ab +2 -1\n",
-            "1 .M N... 100644 100644 100644 aaaa bbbb src/lib.rs\n",
-            "? notes.txt\n",
+            "# branch.oid 1234\0",
+            "# branch.head main\0",
+            "# branch.upstream origin/main\0",
+            "# branch.ab +2 -1\0",
+            "1 .M N... 100644 100644 100644 aaaa bbbb src/lib.rs\0",
+            "2 RM N... 100644 100644 100644 aaaa bbbb R100 new.txt\0old.txt\0",
+            "u UU N... 100644 100644 100644 100644 aaaa bbbb cccc conflicted.rs\0",
+            "? na\u{ef}ve notes.txt\0",
         ));
         assert_eq!(status.current_branch.as_deref(), Some("main"));
         assert!(!status.detached);
@@ -373,7 +397,9 @@ mod tests {
         assert_eq!(status.behind, 1);
         assert_eq!(status.dirty_paths, vec![
             "src/lib.rs".to_owned(),
-            "notes.txt".to_owned()
+            "new.txt".to_owned(),
+            "conflicted.rs".to_owned(),
+            "na\u{ef}ve notes.txt".to_owned(),
         ]);
     }
 
