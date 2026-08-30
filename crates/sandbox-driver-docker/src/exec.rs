@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::result::Result as StdResult;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{future, io, process};
 
@@ -539,6 +539,7 @@ impl Exec for DockerExec {
             ),
             exec_id: exec.id,
             stop_file,
+            stop_requested: AtomicBool::new(false),
         };
         Ok(StdioProcess {
             stdin: Box::pin(input),
@@ -550,14 +551,21 @@ impl Exec for DockerExec {
 }
 
 struct DockerStdioHandle {
-    exec:      DockerExec,
-    exec_id:   String,
-    stop_file: String,
+    exec:           DockerExec,
+    exec_id:        String,
+    stop_file:      String,
+    /// At most one stop request per handle: a repeat call, or one after
+    /// the wrapper already consumed the stop file, would spawn a fresh
+    /// exec and leave a stray stop file behind.
+    stop_requested: AtomicBool,
 }
 
 #[async_trait]
 impl StdioProcessHandle for DockerStdioHandle {
     async fn terminate(&self) {
+        if self.stop_requested.swap(true, Ordering::SeqCst) {
+            return;
+        }
         // The trait offers no error channel; awaiting at least keeps
         // the request ordered before any caller-side cleanup.
         let _ = self.exec.request_stop(&self.stop_file).await;
