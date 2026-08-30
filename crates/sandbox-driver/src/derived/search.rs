@@ -188,6 +188,12 @@ impl Search for DerivedSearch<'_> {
         Ok(paths)
     }
 
+    /// Refuses to walk through a symlink in the sandbox-controlled part
+    /// of the traversal root. A relative base resolves inside the
+    /// sandbox working directory, so every accumulated prefix is
+    /// checked; for an absolute base only the path itself is checked —
+    /// its ancestors (macOS `/var` → `/private/var`, say) are
+    /// legitimately symlinked and outside sandbox control.
     async fn walk(&self, base: &str, options: &WalkOptions) -> Result<Vec<WalkedFile>> {
         let mut expr = String::from("find -H .");
         if let Some(depth) = options.max_depth {
@@ -213,10 +219,13 @@ impl Search for DerivedSearch<'_> {
         // A missing root is an empty walk, not an error — callers glob
         // for directories that may not exist. The guard runs in the
         // command (not via working_dir) so a missing base cannot fail
-        // the exec itself.
+        // the exec itself. The symlink checks refuse a symlinked
+        // traversal root: a sandboxed process could otherwise redirect
+        // an output-collection walk at an arbitrary tree.
+        let symlink_guard = symlink_guard(base);
         let guarded = |find: &str| {
             format!(
-                "if [ -d {base} ]; then cd {base} && {find}; fi",
+                "if [ -d {base} ]{symlink_guard}; then cd {base} && {find}; fi",
                 base = shell_quote(base)
             )
         };
@@ -244,6 +253,29 @@ impl Search for DerivedSearch<'_> {
         }
         Ok(parse_posix_walk(&result.stdout))
     }
+}
+
+/// Builds the ` && [ ! -L … ]` checks that refuse a symlinked walk
+/// root. Relative bases are checked per accumulated prefix (each lives
+/// inside the sandbox working directory); absolute bases are checked
+/// whole. A prefix ending in `.` or `..` passes trivially — those
+/// resolve to directories, never symlinks — so segments accumulate
+/// verbatim.
+fn symlink_guard(base: &str) -> String {
+    let mut guard = String::new();
+    if base.starts_with('/') {
+        guard.push_str(&format!(" && [ ! -L {} ]", shell_quote(base)));
+        return guard;
+    }
+    let mut prefix = String::new();
+    for segment in base.split('/').filter(|segment| !segment.is_empty()) {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(segment);
+        guard.push_str(&format!(" && [ ! -L {} ]", shell_quote(&prefix)));
+    }
+    guard
 }
 
 fn parse_gnu_walk(stdout: &[u8]) -> Vec<WalkedFile> {
@@ -357,6 +389,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn walk_refuses_symlinked_roots_per_component() {
+        let exec = ScriptedExec::new(vec![ScriptedExec::ok("")]);
+        let search = DerivedSearch::new(&exec);
+        let files = search
+            .walk(".ai/output", &WalkOptions::default())
+            .await
+            .expect("walk");
+        assert!(files.is_empty());
+        // Every sandbox-controlled prefix is refused as a symlink, so a
+        // sandboxed process cannot redirect the walk at another tree.
+        let command = &exec.commands()[0];
+        assert!(
+            command.starts_with(
+                "if [ -d '.ai/output' ] && [ ! -L '.ai' ] && [ ! -L '.ai/output' ]; then "
+            ),
+            "command: {command}"
+        );
+    }
+
+    #[tokio::test]
     async fn walk_parses_gnu_output_and_glob_filters() {
         let exec = ScriptedExec::new(vec![
             ScriptedExec::ok_bytes(b"14\x00src/main.rs\x00230\x00README.md\x00".to_vec()),
@@ -404,7 +456,8 @@ mod tests {
 
         let command = &exec.commands()[0];
         assert!(
-            command.starts_with("if [ -d '/missing' ]; then cd '/missing' && "),
+            command
+                .starts_with("if [ -d '/missing' ] && [ ! -L '/missing' ]; then cd '/missing' && "),
             "command: {command}"
         );
         assert!(
