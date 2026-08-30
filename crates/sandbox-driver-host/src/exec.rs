@@ -182,8 +182,12 @@ fn signal_process_group(child: &Child, signal: Signal) {
     if let Some(pid) = child.id() {
         use nix::sys::signal::killpg;
         use nix::unistd::Pid;
-        let pgid = Pid::from_raw(i32::try_from(pid).unwrap_or_default());
-        let _ = killpg(pgid, signal);
+        // A pid that does not fit i32 must skip the kill entirely: a
+        // zero pgid would signal the caller's own process group.
+        let Ok(pid) = i32::try_from(pid) else {
+            return;
+        };
+        let _ = killpg(Pid::from_raw(pid), signal);
     }
 }
 
