@@ -13,8 +13,8 @@ anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"
 bollard = "0.18"
-daytona-api-client = { git = "https://github.com/brynary/daytona-sdk-rust", rev = "e4e17ad9856baf6fa80368c5697033c1c8e1a6c8", package = "daytona-api-client" }
-daytona-sdk = { git = "https://github.com/brynary/daytona-sdk-rust", rev = "e4e17ad9856baf6fa80368c5697033c1c8e1a6c8", package = "daytona-sdk" }
+daytona-api-client = { git = "https://github.com/brynary/daytona-sdk-rust", rev = "7de0d4ce7cede28d4f46bc58aafc8cb9210c122d", package = "daytona-api-client" }
+daytona-sdk = { git = "https://github.com/brynary/daytona-sdk-rust", rev = "7de0d4ce7cede28d4f46bc58aafc8cb9210c122d", package = "daytona-sdk" }
 futures-util = "0.3"
 globset = "0.4"
 nix = { version = "0.30", features = ["signal"] }
