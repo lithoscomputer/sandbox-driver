@@ -17,7 +17,8 @@
 //! `host/credentials` remain deferred.
 //!
 //! The normative wire specification is `docs/protocol.md` at the
-//! repository root; the golden tests in this crate pin its shapes.
+//! repository root; the compatibility tests in this crate verify its
+//! encodings and tolerance rules.
 //!
 //! Transport trust — checksums, environment scrubbing, deny-by-default
 //! discovery — is host policy and lives with the embedding application,

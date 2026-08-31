@@ -16,7 +16,7 @@
 //!
 //! Each check provisions its own sandbox from the provider-appropriate
 //! spec the factory returns and deletes it afterwards, so the suite is
-//! safe to run against real (billed) providers — expect roughly a dozen
+//! safe to run against real (billed) providers — expect roughly three dozen
 //! short-lived sandboxes per run.
 
 use std::collections::BTreeMap;
@@ -30,7 +30,8 @@ use sandbox_driver::{
     Capability, DerivedSearch, DerivedServices, Error, ExecControls, ExecSpec, GrepOptions,
     HealthStatus, NetworkPolicy, OutputSanitization, OutputStream, PtyOptions, PtySize, Resources,
     Sandbox, SandboxEvent, SandboxFilter, SandboxId, SandboxProvider, SandboxSpec, SandboxState,
-    Search, ServiceSpec, Services, SpawnSpec, Termination, WaitOptions, activate, wait_for_state,
+    Search, ServiceSpec, Services, SnapshotMode, SpawnSpec, Termination, WaitOptions, activate,
+    wait_for_state,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time;
@@ -143,6 +144,12 @@ impl Conformance {
             ("pause_resume_cycle", |ctx| {
                 Box::pin(pause_resume_cycle(ctx))
             }),
+            ("fork_preserves_live_process_state", |ctx| {
+                Box::pin(fork_preserves_live_process_state(ctx))
+            }),
+            ("snapshot_modes_are_honest", |ctx| {
+                Box::pin(snapshot_modes_are_honest(ctx))
+            }),
             ("stdio_process_round_trips", |ctx| {
                 Box::pin(stdio_process_round_trips(ctx))
             }),
@@ -157,6 +164,9 @@ impl Conformance {
             }),
             ("services_match_capabilities", |ctx| {
                 Box::pin(services_match_capabilities(ctx))
+            }),
+            ("ssh_access_matches_capabilities", |ctx| {
+                Box::pin(ssh_access_matches_capabilities(ctx))
             }),
             ("exec_rejects_undeclared_stdin_and_cancel", |ctx| {
                 Box::pin(exec_rejects_undeclared_stdin_and_cancel(ctx))
@@ -1099,20 +1109,6 @@ async fn unsupported_actions_say_so(ctx: &Conformance) -> CheckOutcome {
         );
         // Handle-producing verbs are exercised only in the undeclared
         // direction: expect a clean Unsupported, never a real resource.
-        if !caps.lifecycle.checkpoint {
-            if let Err(error) = sandbox
-                .checkpoint(&sandbox_driver::CheckpointOptions::default())
-                .await
-            {
-                if !matches!(error, Error::Unsupported {
-                    capability: Capability::LifecycleCheckpoint,
-                }) {
-                    wrong.push(format!("checkpoint: expected Unsupported, got {error}"));
-                }
-            } else {
-                wrong.push("checkpoint: undeclared but succeeded".to_owned());
-            }
-        }
         if !caps.lifecycle.fork {
             match sandbox.fork(&sandbox_driver::ForkOptions::default()).await {
                 Err(Error::Unsupported { .. }) => {}
@@ -1187,6 +1183,149 @@ async fn pause_resume_cycle(ctx: &Conformance) -> CheckOutcome {
     .await;
     cleanup(&sandbox).await;
     outcome
+}
+
+async fn fork_preserves_live_process_state(ctx: &Conformance) -> CheckOutcome {
+    if !ctx.caps().lifecycle.fork {
+        return Ok(Some("capability lifecycle.fork not declared".to_owned()));
+    }
+    let sandbox = ctx.ready().await?;
+    if !sandbox.capabilities().lifecycle.fork {
+        cleanup(&sandbox).await;
+        return Ok(Some(
+            "lifecycle.fork masked for this sandbox's class".to_owned(),
+        ));
+    }
+
+    let prepare = sandbox
+        .exec()
+        .run(
+            &ExecSpec::new(
+                "printf preserved > /tmp/sandbox-driver-fork-marker; \
+                 nohup sh -c 'echo $$ > /tmp/sandbox-driver-fork-pid; \
+                 while :; do sleep 1; done' </dev/null >/dev/null 2>&1 & \
+                 for i in 1 2 3 4 5; do test -s /tmp/sandbox-driver-fork-pid && break; sleep 1; done; \
+                 cat /tmp/sandbox-driver-fork-pid",
+            )
+            .timeout(Duration::from_secs(30)),
+        )
+        .await;
+    let source_pid = match prepare {
+        Ok(result) if result.success() => result.stdout_lossy().trim().to_owned(),
+        Ok(result) => {
+            cleanup(&sandbox).await;
+            return fail(format!(
+                "fork process setup failed: {}",
+                result.stderr_lossy()
+            ));
+        }
+        Err(error) => {
+            cleanup(&sandbox).await;
+            return fail(format!("fork process setup failed: {error}"));
+        }
+    };
+
+    let forked = match sandbox.fork(&sandbox_driver::ForkOptions::default()).await {
+        Ok(forked) => forked,
+        Err(error) => {
+            cleanup(&sandbox).await;
+            return fail(format!("fork failed: {error}"));
+        }
+    };
+    let outcome = async {
+        let status = forked
+            .describe()
+            .await
+            .map_err(|error| format!("describing fork failed: {error}"))?;
+        if status.state != SandboxState::Running {
+            return fail(format!("fork returned in state {:?}", status.state));
+        }
+        let result = forked
+            .exec()
+            .run(
+                &ExecSpec::new(
+                    "pid=$(cat /tmp/sandbox-driver-fork-pid); \
+                     kill -0 \"$pid\"; printf '%s ' \"$pid\"; \
+                     cat /tmp/sandbox-driver-fork-marker",
+                )
+                .timeout(Duration::from_secs(30)),
+            )
+            .await
+            .map_err(|error| format!("checking forked process failed: {error}"))?;
+        if !result.success() {
+            return fail(format!(
+                "forked process is not running: {}",
+                result.stderr_lossy()
+            ));
+        }
+        let expected = format!("{source_pid} preserved");
+        if result.stdout_lossy().trim() != expected {
+            return fail(format!(
+                "fork did not preserve PID and filesystem: got {:?}, expected {expected:?}",
+                result.stdout_lossy().trim()
+            ));
+        }
+        PASS
+    }
+    .await;
+    cleanup(&forked).await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn snapshot_modes_are_honest(ctx: &Conformance) -> CheckOutcome {
+    if !ctx.caps().lifecycle.snapshot_sandbox {
+        return Ok(Some(
+            "capability lifecycle.snapshot_sandbox not declared".to_owned(),
+        ));
+    }
+    let sandbox = ctx.ready().await?;
+    let snapshot_caps = sandbox.capabilities().snapshots.clone().unwrap_or_default();
+    let modes = [
+        (
+            SnapshotMode::Filesystem,
+            snapshot_caps.filesystem_from_sandbox,
+            Capability::SnapshotsFilesystem,
+        ),
+        (
+            SnapshotMode::LiveProcessState,
+            snapshot_caps.live_process_state_from_sandbox,
+            Capability::SnapshotsLiveProcessState,
+        ),
+    ];
+    let mut checked = false;
+    let mut failure = None;
+    for (mode, declared, capability) in modes {
+        if declared {
+            continue;
+        }
+        checked = true;
+        let mut options = sandbox_driver::SandboxSnapshotOptions::default();
+        options.mode = mode;
+        match sandbox.snapshot(&options).await {
+            Err(Error::Unsupported { capability: actual }) if actual == capability => {}
+            Err(error) => {
+                failure = Some(format!(
+                    "{mode:?}: expected Unsupported({capability}), got {error}"
+                ));
+                break;
+            }
+            Ok(id) => {
+                failure = Some(format!(
+                    "undeclared snapshot mode {mode:?} created snapshot {id}"
+                ));
+                break;
+            }
+        }
+    }
+    cleanup(&sandbox).await;
+    if let Some(failure) = failure {
+        fail(failure)
+    } else if checked {
+        PASS
+    } else {
+        Ok(Some("all sandbox snapshot modes are declared".to_owned()))
+    }
 }
 
 async fn stdio_process_round_trips(ctx: &Conformance) -> CheckOutcome {
@@ -1392,6 +1531,67 @@ async fn services_match_capabilities(ctx: &Conformance) -> CheckOutcome {
     } else {
         fail(wrong.join("; "))
     }
+}
+
+async fn ssh_access_matches_capabilities(ctx: &Conformance) -> CheckOutcome {
+    if !ctx.caps().access.ssh {
+        return Ok(Some("capability access.ssh not declared".to_owned()));
+    }
+    let sandbox = ctx.ready().await?;
+    let caps = sandbox.capabilities().access.clone();
+    let Some(ssh) = sandbox.ssh() else {
+        cleanup(&sandbox).await;
+        return fail("access.ssh is declared but the SSH facet is absent");
+    };
+
+    let outcome = async {
+        let access = if caps.ssh_ttl {
+            ssh.ssh_access(Some(Duration::from_secs(120)))
+                .await
+                .map_err(|error| format!("TTL SSH access failed: {error}"))?
+        } else {
+            match ssh.ssh_access(Some(Duration::from_secs(120))).await {
+                Err(Error::Unsupported {
+                    capability: Capability::SshTtl,
+                }) => {}
+                Err(error) => {
+                    return fail(format!(
+                        "undeclared SSH TTL: expected Unsupported(access.ssh.ttl), got {error}"
+                    ));
+                }
+                Ok(_) => return fail("undeclared SSH TTL was accepted"),
+            }
+            ssh.ssh_access(None)
+                .await
+                .map_err(|error| format!("SSH access without TTL failed: {error}"))?
+        };
+
+        if access.command.trim().is_empty() {
+            return fail("SSH access returned an empty command");
+        }
+        if caps.ssh_revoke {
+            let Some(token) = access.token.as_deref() else {
+                return fail("access.ssh.revoke is declared but SSH access returned no token");
+            };
+            ssh.revoke_ssh_access(token)
+                .await
+                .map_err(|error| format!("SSH revoke failed: {error}"))?;
+            PASS
+        } else {
+            match ssh.revoke_ssh_access("sandbox-driver-conformance").await {
+                Err(Error::Unsupported {
+                    capability: Capability::SshRevoke,
+                }) => PASS,
+                Err(error) => fail(format!(
+                    "undeclared SSH revoke: expected Unsupported(access.ssh.revoke), got {error}"
+                )),
+                Ok(()) => fail("undeclared SSH revoke succeeded"),
+            }
+        }
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
 }
 
 async fn volume_round_trip(ctx: &Conformance) -> CheckOutcome {

@@ -6,7 +6,7 @@ A library for driving sandboxes. Initial providers: **Daytona**, **Docker**, **H
 
 - **fabro** — the de-facto trait: filesystem, exec (buffered / streaming / bidirectional stdio), grep/glob/walk, lifecycle, preview URLs, SSH, auto-stop, events, the Bash contract and probe, plus a git/credential surface we deliberately leave above this crate.
 - **Daytona** (docs + `daytona-sdk-rust`) — the richest provider: pause/resume distinct from stop/start, archive, fork with ancestry, live-sandbox snapshots including memory, TTL and four auto-intervals, snapshots and volumes as first-class resources, per-region toolbox daemon (fs/git/process/PTY/LSP/computer-use), preview links with signed URLs, SSH tokens, network block/allow lists. The normalized interface includes resize, but the current Daytona API and SDK do not expose a working resize operation.
-- **boxd** (deferred) — pause/resume/hibernate, **fork with memory+disk in milliseconds**, **checkpoints (rewind in place)**, snapshots as named images, HTTPS proxies per machine, VM-to-VM private networking. Included now only to make sure the lifecycle vocabulary doesn't need reshaping later.
+- **boxd** (deferred) — considered only where its behavior overlaps the normalized interface. Boxd-only capabilities are not included yet.
 
 ## Security and trust boundary
 
@@ -79,10 +79,9 @@ The full vocabulary. **Core** actions are required of every provider. Everything
 | `delete` | Destroy; idempotent (unknown ID succeeds) | core | ✔ (cleanup) | ✔ | ✔ | ✔ |
 | `pause` / `resume` | Freeze with memory kept; distinct from stop | opt | — | ✔ (`docker pause`) | ✔ (VM classes; per-sandbox caps narrow it, resume = Daytona's start) | ✔ (hibernate) |
 | `archive` | Stopped → cold storage; `start` restores | opt | — | — | ✔ (container class; per-sandbox caps mask it on VM/android/windows) | — |
-| `fork` | Clone a sandbox (disk, optionally memory) → new sandbox | opt | — | — | ✔ (VM classes) | ✔ |
-| `checkpoint` / `restore` | Save a rewind point; rewind the **same sandbox** in place | opt | — | — | — | ✔ |
+| `fork` | Clone a Running sandbox → new Running sandbox; preserve filesystem, memory, running processes, and PIDs | opt | — | — | ✔ (VM classes) | ✔ |
 | `resize` | Change cpu/memory/disk | opt | — | \~ (`docker update`, cpu/mem only) | —² | ? |
-| `snapshot_sandbox` | Snapshot a live sandbox (optionally incl. memory) → SnapshotProvider | opt | — | \~ (`docker commit`) | ✔ (memory not exposed by the SDK) | ✔ |
+| `snapshot_sandbox` | Capture a sandbox in `Filesystem` or `LiveProcessState` mode → SnapshotProvider | opt | — | \~ (`docker commit`) | ✔ (cold/hot) | ✔ |
 | `recover` | Provider-assisted recovery from Error state | opt | — | — | — | — |
 | `undelete` | Restore a deleted sandbox within the recovery window; provider-level (a deleted sandbox cannot be attached), returns a fresh handle | opt | — | — | ✔ (24h, Daytona's "recover") | — |
 | `refresh_activity` | Keepalive; reset idle timers | opt | no-op | no-op | ✔ | ? |
@@ -101,7 +100,9 @@ Deliberate merges:
 - **`activate` (fabro) is not a provider action.** It is a provided convenience: "ensure running" = describe → start if stopped/archived, or resume if paused → wait → run the health probe. Lives in the library, implemented once over the core.
 - **`restore` from archive is implicit in `start`** (Daytona's model); no separate verb.
 - **Ephemeral is a first-class spec flag**, not `auto_delete_interval == 0` — Daytona's encoding leaks into every wait loop (`stop` tolerating NotFound); we translate the flag per provider instead.
-- **`checkpoint`/`restore` are identity-preserving.** `restore_checkpoint` rewinds the *same* sandbox — same ID, same handle — in place. Daytona cannot do that: its nearest neighbor (live snapshot + fork) produces a *new* sandbox, so it is reported honestly as the separate `snapshot_sandbox` and `fork` capabilities, never as checkpointing. The verb is in the vocabulary now (boxd needs it) so adding boxd later is additive.
+- **Fork has one meaning.** The source and result are Running. The clone preserves filesystem state, memory, running processes, and process IDs. There is no disk-only fork option.
+- **Sandbox snapshots have explicit modes.** `Filesystem` captures persistent files without live process state. `LiveProcessState` also captures memory, running processes, and process IDs. Daytona maps these modes to its cold (`includeMemory: false`, source Stopped) and hot (`includeMemory: true`, source Running) snapshots.
+- **Checkpoint and in-place restore are not public operations.** They are Boxd-only today. They can be added when Boxd work starts and a consumer needs them.
 - **Host workspace ownership.** A Host sandbox is either a **designated** caller-owned directory or a **managed** temporary workspace the library created; the distinction is set in the spec and visible in `SandboxStatus`. `delete` removes managed workspaces only — on a designated directory it releases the handle and never touches caller data.
 
 ### Timers
@@ -133,7 +134,7 @@ Per-sandbox functionality is grouped into small **facet traits** (per the style 
 | `Pty` | create/resize/kill + bidirectional byte stream (fabro's `TerminalSession`) | ✔ | ✔ (exec+tty) | ✔ (websocket) | ✔ (console) |
 | `Logs` | Provider-side logs: build/provision logs, entrypoint output, sandbox event log; streaming follow | — | ✔ (container logs) | ✔ | ? |
 | `PreviewUrls` | port → `{ url, headers }`; signed expiring URLs; revocation | \~ (localhost) | future (port map) | ✔ | ✔ (HTTPS proxies) |
-| `SshAccess` | Mint/revoke time-limited SSH access; returns ready-to-run command | — | — | ✔ | ✔ |
+| `SshAccess` | Return a ready-to-run SSH command; optional exact TTL and token revocation are separate capabilities | — | — | ✔ | ✔ |
 | `ShellCommand` | A local command string that opens a shell (Docker's `docker exec -it …`) — distinct from real SSH | trivial | ✔ | — | — |
 | `WebTerminal` | URL to a browser terminal | — | — | ✔ | ✔ |
 | `Vnc` | Desktop viewing: connection URL/credentials | — | — | ✔ (Computer Use + signed noVNC URL) | — |
@@ -156,22 +157,22 @@ Notes:
 Two complementary mechanisms, by design:
 
 1. **Typed accessors** — `fn pty(&self) -> Option<&dyn Pty>`: absence is unrepresentable-misuse at compile time for in-process consumers.
-2. **Serializable `Capabilities`** — a data structure for preflight checks, `Unsupported` error payloads, and the JSON-RPC `initialize` handshake. Fine-grained flags live here (`exec.live_streaming`, `exec.streams_separated`, `fs.native`, `lifecycle.pause`, `snapshots.include_memory`, `network.modes`, …).
+2. **Serializable `Capabilities`** — a data structure for preflight checks, `Unsupported` error payloads, and the JSON-RPC `initialize` handshake. Fine-grained flags live here (`exec.live_streaming`, `exec.streams_separated`, `fs.native`, `lifecycle.pause`, `snapshots.live_process_state_from_sandbox`, `network.modes`, …).
 
 ```rust
 #[non_exhaustive]
 pub struct Capabilities {
     pub isolation: Isolation,         // none | container | vm — declared by the provider, never assumed
-    pub lifecycle: LifecycleCaps,     // pause, archive, fork, checkpoint, resize, recover, undelete, timers…
+    pub lifecycle: LifecycleCaps,     // pause, archive, fork, resize, recover, undelete, timers…
     pub exec: ExecCaps,               // live_streaming, streams_separated, stdin, cancel, stdio_process
     pub fs: FsCaps,                   // native, upload, download, permissions
     pub git: GitCaps,
     pub services: ServiceCaps,        // background services; native flag, derived otherwise
     pub pty: Option<PtyCaps>,
     pub logs: Option<LogsCaps>,
-    pub access: AccessCaps,           // preview_urls { signed }, ssh, shell_command, web_terminal, vnc
+    pub access: AccessCaps,           // preview_urls { signed }, ssh { ttl, revoke }, shell_command, web_terminal, vnc
     pub network: NetworkCaps,         // modes: block_all, allow_all, cidr_allow_list, domain_allow_list, proxy
-    pub snapshots: Option<SnapshotCaps>,  // sources: image, dockerfile, live_sandbox, memory; activation
+    pub snapshots: Option<SnapshotCaps>,  // image, dockerfile, filesystem/live-process sandbox modes; activation
     pub volumes: Option<VolumeCaps>,
 }
 ```
@@ -182,7 +183,7 @@ Capabilities are **negotiated metadata, not live state**. They are captured once
 
 ### Wire compatibility
 
-The protocol crate owns wire compatibility; domain types never absorb a wire break. The `initialize` handshake negotiates a protocol version and capability set. Readers ignore unknown optional object fields and return a structured protocol error for unknown required semantics. Enums define stable string values and an unknown-value policy. Durations, timestamps, paths, and byte payloads use explicit wire formats. Provider configuration carries a provider kind and schema version and is validated at the provider boundary. In v1 the wire DTOs may share their serde shape with core domain types, pinned by golden-file tests in the protocol crate and by `#[serde(other)]` unknown-variant fallbacks on state enums; when a shape needs to diverge, the protocol crate grows a dedicated DTO and conversion — core types are never broken for wire reasons.
+The protocol crate owns wire compatibility; domain types never absorb a wire break. The `initialize` handshake negotiates a protocol version and capability set. Readers ignore unknown optional object fields and return a structured protocol error for unknown required semantics. Enums define stable string values and an unknown-value policy. Durations, timestamps, paths, and byte payloads use explicit wire formats. Provider configuration carries a provider kind and schema version and is validated at the provider boundary. In v1 the wire DTOs may share their serde shape with core domain types, verified by behavioral compatibility tests in the protocol crate (era-JSON decoding, per-field encoding checks, `#[serde(default)]` field tolerance) and by `#[serde(other)]` unknown-variant fallbacks on state enums; when a shape needs to diverge, the protocol crate grows a dedicated DTO and conversion — core types are never broken for wire reasons.
 
 ## The traits
 
@@ -239,8 +240,6 @@ pub trait Sandbox: Send + Sync {
     async fn resume(&self) -> Result<(), Error>;
     async fn archive(&self) -> Result<(), Error>;
     async fn fork(&self, opts: &ForkOptions) -> Result<Arc<dyn Sandbox>, Error>;
-    async fn checkpoint(&self, opts: &CheckpointOptions) -> Result<CheckpointId, Error>;
-    async fn restore_checkpoint(&self, id: &CheckpointId) -> Result<(), Error>;
     async fn resize(&self, resources: &Resources) -> Result<(), Error>;
     async fn snapshot(&self, opts: &SandboxSnapshotOptions) -> Result<SnapshotId, Error>;
     async fn refresh_activity(&self) -> Result<(), Error>;
@@ -270,7 +269,7 @@ pub trait Sandbox: Send + Sync {
 }
 ```
 
-Why lifecycle verbs are flat methods rather than one `perform(Action)` method: callers read naturally, signatures differ (`fork` returns a handle, `checkpoint` returns an ID), and the JSON-RPC mapping is one method per verb either way. The `Unsupported` error plus capability flags carries the optionality.
+Why lifecycle verbs are flat methods rather than one `perform(Action)` method: callers read naturally, signatures differ (`fork` returns a handle and `snapshot` returns an ID), and the JSON-RPC mapping is one method per verb either way. The `Unsupported` error plus capability flags carries the optionality.
 
 ### Exec (and the Bash contract)
 
@@ -305,7 +304,7 @@ Control contracts, normative: cancellation resolves the call normally with `term
 #[async_trait]
 pub trait SnapshotProvider: Send + Sync {
     async fn create(&self, spec: &SnapshotSpec) -> Result<SnapshotId, Error>;
-        // SnapshotSource::Image(ref) | Dockerfile { content, context } | Sandbox { id, include_memory }
+        // SnapshotSource::Image(ref) | Dockerfile { content } | Sandbox { id, mode }
     async fn get(&self, id: &SnapshotId) -> Result<SnapshotStatus, Error>;   // states: building, active, error…
     async fn list(&self, filter: &SnapshotFilter) -> Result<Vec<SnapshotStatus>, Error>;
     async fn delete(&self, id: &SnapshotId) -> Result<(), Error>;

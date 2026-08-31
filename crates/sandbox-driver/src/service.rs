@@ -45,7 +45,9 @@ pub trait Services: Send + Sync {
 pub struct ServiceSpec {
     /// Bash source, under the [`crate::Exec`] command contract.
     pub command:     String,
+    #[serde(default)]
     pub working_dir: Option<String>,
+    #[serde(default)]
     pub env:         BTreeMap<String, String>,
 }
 
@@ -79,6 +81,7 @@ pub struct ServiceStatus {
     pub running:   bool,
     /// Exit code, when the service has ended and the provider observed
     /// one.
+    #[serde(default)]
     pub exit_code: Option<i32>,
 }
 

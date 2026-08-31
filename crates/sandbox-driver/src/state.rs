@@ -60,17 +60,26 @@ pub struct SandboxStatus {
     pub id:                  SandboxId,
     pub state:               SandboxState,
     /// Provider's raw state string, e.g. Daytona's `"pulling_snapshot"`.
+    #[serde(default)]
     pub provider_state:      String,
+    #[serde(default)]
     pub error_reason:        Option<String>,
+    #[serde(default)]
     pub resources:           Option<Resources>,
+    #[serde(default)]
     pub labels:              BTreeMap<String, String>,
     /// Snapshot or image the sandbox was created from, when known.
+    #[serde(default)]
     pub source:              Option<String>,
     /// Host provider only: who owns the workspace directory.
+    #[serde(default)]
     pub workspace_ownership: Option<WorkspaceOwnership>,
     /// Provider console page for this sandbox, when the provider has one.
+    #[serde(default)]
     pub web_url:             Option<String>,
+    #[serde(default)]
     pub created_at:          Option<SystemTime>,
+    #[serde(default)]
     pub updated_at:          Option<SystemTime>,
 }
 

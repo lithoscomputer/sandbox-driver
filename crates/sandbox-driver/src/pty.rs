@@ -33,6 +33,7 @@ impl Default for PtySize {
 /// Options for [`Pty::open`].
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[non_exhaustive]
+#[serde(default)]
 pub struct PtyOptions {
     pub size:        PtySize,
     pub working_dir: Option<String>,

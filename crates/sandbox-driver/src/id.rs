@@ -99,11 +99,6 @@ id_newtype!(
     "volume id"
 );
 id_newtype!(
-    /// Provider-scoped checkpoint identifier.
-    CheckpointId,
-    "checkpoint id"
-);
-id_newtype!(
     /// Sandbox-scoped background-service identifier.
     ServiceId,
     "service id"

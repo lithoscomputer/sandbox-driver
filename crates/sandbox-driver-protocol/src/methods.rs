@@ -1,7 +1,7 @@
 //! Method names and parameter/result DTOs.
 //!
 //! Wire DTOs may share their serde shape with core domain types in v1;
-//! those shapes are pinned by the golden-file tests in `tests/golden.rs`.
+//! their compatibility rules are verified by `tests/compat.rs`.
 //! Byte payloads always cross as base64 strings. Divergence, when a shape
 //! must evolve, is absorbed here — never by breaking core types.
 
@@ -9,10 +9,11 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use sandbox_driver::{
-    Capabilities, CaptureStats, CheckpointOptions, DirEntry, ExecResult, ExecSpec, FileMetadata,
-    ForkOptions, LifecycleTimers, LogSource, NetworkPolicy, OutputSanitization, PlatformInfo,
-    ProviderKind, PtyOptions, PtySize, Resources, SandboxEvent, SandboxFilter,
-    SandboxSnapshotOptions, SandboxSpec, SandboxStatus, SpawnSpec, Termination, VncConnection,
+    Capabilities, CaptureStats, DirEntry, Error, ExecResult, ExecSpec, FileMetadata, ForkOptions,
+    LifecycleTimers, LogSource, NetworkPolicy, OutputSanitization, PlatformInfo, ProviderKind,
+    PtyOptions, PtySize, Resources, SandboxEvent, SandboxFilter, SandboxId, SandboxSnapshotOptions,
+    SandboxSpec, SandboxStatus, SnapshotMode, SnapshotSource, SnapshotSpec, SpawnSpec, Termination,
+    VncConnection,
 };
 use serde::{Deserialize, Serialize};
 
@@ -166,24 +167,42 @@ pub struct PlatformInfoResult {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ForkParams {
     pub sandbox_id: String,
-    pub options:    ForkOptions,
+    pub options:    ForkOptionsDto,
 }
 
+/// Protocol-v1 fork options. The public API no longer makes memory
+/// optional, so new callers always send `include_memory: true`.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CheckpointParams {
-    pub sandbox_id: String,
-    pub options:    CheckpointOptions,
+pub struct ForkOptionsDto {
+    #[serde(default)]
+    pub name:           Option<String>,
+    #[serde(default)]
+    pub include_memory: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CheckpointResult {
-    pub checkpoint_id: String,
+impl From<&ForkOptions> for ForkOptionsDto {
+    fn from(options: &ForkOptions) -> Self {
+        Self {
+            name:           options.name.clone(),
+            include_memory: true,
+        }
+    }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RestoreCheckpointParams {
-    pub sandbox_id:    String,
-    pub checkpoint_id: String,
+impl TryFrom<ForkOptionsDto> for ForkOptions {
+    type Error = Error;
+
+    fn try_from(options: ForkOptionsDto) -> Result<Self, Self::Error> {
+        if !options.include_memory {
+            return Err(Error::invalid_spec(
+                "include_memory",
+                "fork must preserve memory and running processes",
+            ));
+        }
+        let mut result = Self::default();
+        result.name = options.name;
+        Ok(result)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -195,7 +214,39 @@ pub struct ResizeParams {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SnapshotParams {
     pub sandbox_id: String,
-    pub options:    SandboxSnapshotOptions,
+    pub options:    SandboxSnapshotOptionsDto,
+}
+
+/// Protocol-v1 snapshot options. `include_memory` maps to the normalized
+/// snapshot mode.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SandboxSnapshotOptionsDto {
+    #[serde(default)]
+    pub name:           Option<String>,
+    #[serde(default)]
+    pub include_memory: bool,
+}
+
+impl From<&SandboxSnapshotOptions> for SandboxSnapshotOptionsDto {
+    fn from(options: &SandboxSnapshotOptions) -> Self {
+        Self {
+            name:           options.name.clone(),
+            include_memory: options.mode == SnapshotMode::LiveProcessState,
+        }
+    }
+}
+
+impl From<SandboxSnapshotOptionsDto> for SandboxSnapshotOptions {
+    fn from(options: SandboxSnapshotOptionsDto) -> Self {
+        let mut result = Self::default();
+        result.name = options.name;
+        result.mode = if options.include_memory {
+            SnapshotMode::LiveProcessState
+        } else {
+            SnapshotMode::Filesystem
+        };
+        result
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -516,7 +567,83 @@ pub struct HostLogNotification {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SnapshotCreateParams {
-    pub spec: sandbox_driver::SnapshotSpec,
+    pub spec: SnapshotSpecDto,
+}
+
+/// Protocol-v1 snapshot creation shape.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SnapshotSpecDto {
+    #[serde(default)]
+    pub name:            Option<String>,
+    pub source:          SnapshotSourceDto,
+    #[serde(default)]
+    pub resources:       Resources,
+    #[serde(default)]
+    pub provider_config: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotSourceDto {
+    Image {
+        reference: String,
+    },
+    Dockerfile {
+        content: String,
+    },
+    Sandbox {
+        id:             SandboxId,
+        #[serde(default)]
+        include_memory: bool,
+    },
+}
+
+impl TryFrom<&SnapshotSpec> for SnapshotSpecDto {
+    type Error = Error;
+
+    fn try_from(spec: &SnapshotSpec) -> Result<Self, Self::Error> {
+        let source = match &spec.source {
+            SnapshotSource::Image { reference } => SnapshotSourceDto::Image {
+                reference: reference.clone(),
+            },
+            SnapshotSource::Dockerfile { content } => SnapshotSourceDto::Dockerfile {
+                content: content.clone(),
+            },
+            SnapshotSource::Sandbox { id, mode } => SnapshotSourceDto::Sandbox {
+                id:             id.clone(),
+                include_memory: *mode == SnapshotMode::LiveProcessState,
+            },
+            _ => return Err(Error::invalid_spec("source", "unsupported snapshot source")),
+        };
+        Ok(Self {
+            name: spec.name.clone(),
+            source,
+            resources: spec.resources,
+            provider_config: spec.provider_config.clone(),
+        })
+    }
+}
+
+impl From<SnapshotSpecDto> for SnapshotSpec {
+    fn from(spec: SnapshotSpecDto) -> Self {
+        let source = match spec.source {
+            SnapshotSourceDto::Image { reference } => SnapshotSource::Image { reference },
+            SnapshotSourceDto::Dockerfile { content } => SnapshotSource::Dockerfile { content },
+            SnapshotSourceDto::Sandbox { id, include_memory } => SnapshotSource::Sandbox {
+                id,
+                mode: if include_memory {
+                    SnapshotMode::LiveProcessState
+                } else {
+                    SnapshotMode::Filesystem
+                },
+            },
+        };
+        let mut result = Self::new(source);
+        result.name = spec.name;
+        result.resources = spec.resources;
+        result.provider_config = spec.provider_config;
+        result
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

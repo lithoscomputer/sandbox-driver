@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sandbox_driver::{
-    Capability, CheckpointId, Error, EventCallback, ExecControls, LogSink, OutputSink, Result,
-    Sandbox, SandboxId, SandboxProvider, SandboxStatus, SnapshotId, StderrTail, StdioProcessHandle,
+    Capability, Error, EventCallback, ExecControls, LogSink, OutputSink, Result, Sandbox,
+    SandboxId, SandboxProvider, SandboxStatus, SnapshotId, StderrTail, StdioProcessHandle,
     VolumeId,
 };
 use serde::Serialize;
@@ -469,26 +469,11 @@ async fn dispatch(
         m::SANDBOX_FORK => {
             let request: m::ForkParams = parse(params)?;
             let handle = state.sandbox(&request.sandbox_id).await?;
-            let forked = handle.fork(&request.options).await?;
+            let options = request.options.try_into()?;
+            let forked = handle.fork(&options).await?;
             state.remember(&forked);
             let status = forked.describe().await?;
             to_value(&handle_info(&forked, status))
-        }
-        m::SANDBOX_CHECKPOINT => {
-            let request: m::CheckpointParams = parse(params)?;
-            let handle = state.sandbox(&request.sandbox_id).await?;
-            let checkpoint = handle.checkpoint(&request.options).await?;
-            to_value(&m::CheckpointResult {
-                checkpoint_id: checkpoint.as_str().to_owned(),
-            })
-        }
-        m::SANDBOX_RESTORE_CHECKPOINT => {
-            let request: m::RestoreCheckpointParams = parse(params)?;
-            let handle = state.sandbox(&request.sandbox_id).await?;
-            let checkpoint = CheckpointId::try_new(&request.checkpoint_id)
-                .map_err(|error| Error::invalid_spec("checkpoint_id", error.to_string()))?;
-            handle.restore_checkpoint(&checkpoint).await?;
-            to_value(&m::Empty)
         }
         m::SANDBOX_RESIZE => {
             let request: m::ResizeParams = parse(params)?;
@@ -501,10 +486,11 @@ async fn dispatch(
         }
         m::SANDBOX_SNAPSHOT => {
             let request: m::SnapshotParams = parse(params)?;
+            let options = request.options.into();
             let snapshot = state
                 .sandbox(&request.sandbox_id)
                 .await?
-                .snapshot(&request.options)
+                .snapshot(&options)
                 .await?;
             to_value(&m::SnapshotResult {
                 snapshot_id: snapshot.as_str().to_owned(),
@@ -887,6 +873,7 @@ async fn dispatch(
         }
         m::SNAPSHOT_CREATE => {
             let request: m::SnapshotCreateParams = parse(params)?;
+            let spec = request.spec.into();
             let service =
                 state
                     .provider
@@ -894,7 +881,7 @@ async fn dispatch(
                     .ok_or(DispatchError::App(Error::unsupported(
                         Capability::Snapshots,
                     )))?;
-            let id = service.create(&request.spec).await?;
+            let id = service.create(&spec).await?;
             to_value(&m::SnapshotIdResult {
                 snapshot_id: id.as_str().to_owned(),
             })
@@ -1031,17 +1018,23 @@ async fn dispatch(
         m::ACCESS_SSH_CREATE => {
             let request: m::SshCreateParams = parse(params)?;
             let handle = state.sandbox(&request.sandbox_id).await?;
+            if request.ttl_ms.is_some() && !handle.capabilities().access.ssh_ttl {
+                return Err(Error::unsupported(Capability::SshTtl).into());
+            }
             let facet = handle
                 .ssh()
                 .ok_or(DispatchError::App(Error::unsupported(Capability::Ssh)))?;
             let access = facet
-                .create_ssh_access(request.ttl_ms.map(Duration::from_millis))
+                .ssh_access(request.ttl_ms.map(Duration::from_millis))
                 .await?;
             to_value(&m::SshCreateResult { access })
         }
         m::ACCESS_SSH_REVOKE => {
             let request: m::SshRevokeParams = parse(params)?;
             let handle = state.sandbox(&request.sandbox_id).await?;
+            if !handle.capabilities().access.ssh_revoke {
+                return Err(Error::unsupported(Capability::SshRevoke).into());
+            }
             let facet = handle
                 .ssh()
                 .ok_or(DispatchError::App(Error::unsupported(Capability::Ssh)))?;

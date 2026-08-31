@@ -21,6 +21,7 @@ pub enum SandboxSource {
 /// Requested compute resources. Units are explicit in the field names;
 /// `None` means provider default.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct Resources {
     pub cpu_cores: Option<u32>,
@@ -51,8 +52,8 @@ pub enum NetworkPolicy {
     },
 }
 
-/// A volume attached at sandbox create time (the only attach point —
-/// no provider in scope supports runtime attach).
+/// A volume attached at sandbox create time, the portable attach point.
+/// Provider-specific runtime attachment remains outside this interface.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct VolumeMount {
@@ -80,6 +81,7 @@ impl VolumeMount {
 /// caller running long commands sets `auto_stop_after_idle` explicitly
 /// rather than inheriting that default (fabro uses 120 minutes).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct LifecycleTimers {
     pub auto_stop_after_idle:    Option<Duration>,
@@ -134,25 +136,38 @@ impl PlatformInfo {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct SandboxSpec {
+    #[serde(default)]
     pub name:              Option<String>,
     pub source:            SandboxSource,
+    #[serde(default)]
     pub resources:         Resources,
+    #[serde(default)]
     pub env:               BTreeMap<String, String>,
+    #[serde(default)]
     pub labels:            BTreeMap<String, String>,
+    #[serde(default)]
     pub user:              Option<String>,
     /// For the Host provider: `Some(path)` designates a caller-owned
     /// directory that `delete` must never remove; `None` asks for a
     /// managed temporary workspace.
+    #[serde(default)]
     pub working_directory: Option<String>,
+    #[serde(default)]
     pub network:           NetworkPolicy,
+    #[serde(default)]
     pub volumes:           Vec<VolumeMount>,
+    #[serde(default)]
     pub timers:            LifecycleTimers,
     /// First-class ephemeral flag; providers translate to their encoding
     /// (Daytona: `auto_delete_interval == 0`).
+    #[serde(default)]
     pub ephemeral:         bool,
+    #[serde(default)]
     pub public:            Option<bool>,
+    #[serde(default)]
     pub region:            Option<String>,
     /// Provider-specific options, documented by each provider's schema.
+    #[serde(default)]
     pub provider_config:   serde_json::Value,
 }
 

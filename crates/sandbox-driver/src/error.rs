@@ -20,9 +20,12 @@ pub enum ResourceKind {
     Sandbox,
     Snapshot,
     Volume,
-    Checkpoint,
     /// A plugin binary, in discovery errors.
     Plugin,
+    /// A resource kind sent by a protocol peer that this version does not
+    /// model.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The crate's boundary error.

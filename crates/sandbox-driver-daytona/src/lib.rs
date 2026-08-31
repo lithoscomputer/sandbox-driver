@@ -8,8 +8,8 @@
 //! within 24 hours of deletion), refresh-activity, all five timers (TTL
 //! and auto-pause included), labels, runtime network updates, and — on
 //! VM sandbox classes, narrowed per sandbox — pause/resume, fork, and
-//! sandbox-to-snapshot. Checkpoints remain unsupported (Daytona has no
-//! identity-preserving rewind). The PTY facet rides the toolbox
+//! sandbox-to-snapshot with filesystem and live-process-state modes. The
+//! PTY facet rides the toolbox
 //! WebSocket; `spawn_stdio` rides command sessions and is UTF-8-only
 //! (see the stdio module). The outbound proxy is `provider_config`
 //! (`{"outbound_proxy_url": …}`), composing with a domain allow list as
@@ -55,12 +55,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use daytona_api_client::apis::{Error as ApiError, api_keys_api, snapshots_api};
+use daytona_api_client::apis::{Error as ApiError, api_keys_api, sandbox_api, snapshots_api};
 use daytona_api_client::models::api_key_list::Permissions;
 use daytona_api_client::models::sandbox::SandboxClass;
 use daytona_api_client::models::{
-    SnapshotState as ApiSnapshotState, UpdateSandboxNetworkSettings, VolumeDto,
-    VolumeState as ApiVolumeState,
+    CreateSandboxSnapshot, SnapshotState as ApiSnapshotState, UpdateSandboxNetworkSettings,
+    VolumeDto, VolumeState as ApiVolumeState,
 };
 use daytona_sdk::{
     Client, CreateParams, CreateSandboxOptions, CreateSnapshotParams, DaytonaError, DockerImage,
@@ -72,9 +72,9 @@ use sandbox_driver::{
     Logs, LogsCaps, NetworkPolicy, PlatformInfo, PreviewUrls, ProviderError, ProviderHealth,
     ProviderKind, Pty, PtyCaps, ResourceKind, Resources, Result, Sandbox, SandboxEvent,
     SandboxFilter, SandboxId, SandboxProvider, SandboxSnapshotOptions, SandboxSource, SandboxSpec,
-    SandboxState, SandboxStatus, SnapshotCaps, SnapshotFilter, SnapshotId, SnapshotProvider,
-    SnapshotSource, SnapshotSpec, SnapshotState, SnapshotStatus, SshAccess, Vnc, VolumeCaps,
-    VolumeId, VolumeProvider, VolumeSpec, VolumeState, VolumeStatus, WebTerminal,
+    SandboxState, SandboxStatus, SnapshotCaps, SnapshotFilter, SnapshotId, SnapshotMode,
+    SnapshotProvider, SnapshotSource, SnapshotSpec, SnapshotState, SnapshotStatus, SshAccess, Vnc,
+    VolumeCaps, VolumeId, VolumeProvider, VolumeSpec, VolumeState, VolumeStatus, WebTerminal,
 };
 use tokio::time;
 
@@ -245,6 +245,94 @@ fn map_state(state: Option<daytona_sdk::SandboxState>) -> SandboxState {
             Ds::Unknown | Ds::UnknownDefaultOpenApi => SandboxState::Unknown,
         },
     }
+}
+
+fn generated_snapshot_name() -> String {
+    format!(
+        "sandbox-driver-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs())
+    )
+}
+
+async fn create_sandbox_snapshot(
+    client: &DaytonaClient,
+    sandbox_id: &str,
+    name: &str,
+    mode: SnapshotMode,
+) -> Result<()> {
+    let sdk = client
+        .get(sandbox_id)
+        .await
+        .map_err(|error| daytona_error("fetching sandbox for snapshot", &error))?;
+    let current = map_state(sdk.state);
+    let required = match mode {
+        SnapshotMode::Filesystem => SandboxState::Stopped,
+        SnapshotMode::LiveProcessState => SandboxState::Running,
+        _ => {
+            return Err(Error::invalid_spec(
+                "mode",
+                "unsupported sandbox snapshot mode",
+            ));
+        }
+    };
+    if current != required {
+        return Err(Error::InvalidState {
+            current,
+            action: LifecycleAction::SnapshotSandbox,
+        });
+    }
+
+    let request = CreateSandboxSnapshot {
+        name:           name.to_owned(),
+        include_memory: Some(mode == SnapshotMode::LiveProcessState),
+    };
+    sandbox_api::create_sandbox_snapshot(
+        client.api_configuration(),
+        sandbox_id,
+        request,
+        client.organization_id(),
+    )
+    .await
+    .map_err(|error| generated_error("snapshotting sandbox", &error))?;
+
+    let started = Instant::now();
+    loop {
+        let sdk = client
+            .get(sandbox_id)
+            .await
+            .map_err(|error| daytona_error("waiting for sandbox snapshot", &error))?;
+        match map_state(sdk.state) {
+            SandboxState::Snapshotting => {}
+            SandboxState::Error => {
+                return Err(Error::Provider(ProviderError::new(
+                    ProviderKind::try_new("daytona").expect("static kind is valid"),
+                    sdk.error_reason
+                        .unwrap_or_else(|| "sandbox snapshot failed".to_owned()),
+                )));
+            }
+            _ => return Ok(()),
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= CREATE_TIMEOUT {
+            return Err(Error::Timeout {
+                operation: "snapshotting sandbox".to_owned(),
+                elapsed,
+            });
+        }
+        time::sleep(TRANSITION_POLL).await;
+    }
+}
+
+async fn created_snapshot_id(client: &DaytonaClient, name: &str) -> Result<SnapshotId> {
+    let dto = client
+        .snapshot
+        .get(name)
+        .await
+        .map_err(|error| daytona_error("fetching created snapshot", &error))?;
+    SnapshotId::try_new(dto.id)
+        .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))
 }
 
 fn status_from_sdk(
@@ -495,6 +583,8 @@ fn daytona_capabilities() -> Capabilities {
     caps.access.preview_urls = true;
     caps.access.signed_preview_urls = true;
     caps.access.ssh = true;
+    caps.access.ssh_ttl = true;
+    caps.access.ssh_revoke = true;
     caps.access.web_terminal = true;
     caps.access.vnc = true;
     caps.network.allow_all = true;
@@ -505,9 +595,8 @@ fn daytona_capabilities() -> Capabilities {
         let mut snapshots = SnapshotCaps::default();
         snapshots.from_image = true;
         snapshots.from_dockerfile = true;
-        // Live-sandbox snapshots use Sandbox::snapshot. The provider
-        // snapshot service accepts image and Dockerfile sources only.
-        snapshots.from_sandbox = false;
+        snapshots.filesystem_from_sandbox = true;
+        snapshots.live_process_state_from_sandbox = true;
         snapshots.build_logs = true;
         snapshots.activation = true;
         snapshots
@@ -532,6 +621,9 @@ fn narrowed_capabilities(base: &Capabilities, class: Option<SandboxClass>) -> Ca
     if matches!(class, Some(SandboxClass::CONTAINER | SandboxClass::ANDROID)) {
         caps.lifecycle.pause = false;
         caps.lifecycle.fork = false;
+        if let Some(snapshots) = &mut caps.snapshots {
+            snapshots.live_process_state_from_sandbox = false;
+        }
     }
     if matches!(
         class,
@@ -620,6 +712,7 @@ fn base_params(spec: &SandboxSpec) -> Result<SandboxBaseParams> {
         ),
         labels: Some(labels),
         public: spec.public,
+        target: spec.region.clone(),
         auto_stop_interval: spec.timers.auto_stop_after_idle.map(minutes),
         auto_pause_interval: spec.timers.auto_pause_after_idle.map(minutes),
         auto_archive_interval: spec.timers.auto_archive_after_stop.map(minutes),
@@ -1196,17 +1289,25 @@ impl Sandbox for DaytonaSandbox {
         if !self.capabilities.lifecycle.fork {
             return Err(Error::unsupported(Capability::LifecycleFork));
         }
-        if options.include_memory {
-            return Err(Error::invalid_spec(
-                "include_memory",
-                "daytona fork does not take a memory option",
-            ));
-        }
         let sdk = self.sdk().await?;
+        let current = map_state(sdk.state);
+        if current != SandboxState::Running {
+            return Err(Error::InvalidState {
+                current,
+                action: LifecycleAction::Fork,
+            });
+        }
         let forked = sdk
             .fork_with_timeout(options.name.as_deref(), CREATE_TIMEOUT)
             .await
             .map_err(|error| daytona_error("forking sandbox", &error))?;
+        let child_state = map_state(forked.state);
+        if child_state != SandboxState::Running {
+            return Err(Error::InvalidState {
+                current: child_state,
+                action:  LifecycleAction::Fork,
+            });
+        }
         // The child shares the parent's class, so the parent's (already
         // narrowed) capability set is the right base.
         Ok(build_handle(&self.client, &self.capabilities, forked, None).await?)
@@ -1216,36 +1317,33 @@ impl Sandbox for DaytonaSandbox {
         if !self.capabilities.lifecycle.snapshot_sandbox {
             return Err(Error::unsupported(Capability::LifecycleSnapshotSandbox));
         }
-        if options.include_memory {
-            // On the wire upstream, but exposed by no reference SDK.
-            return Err(Error::unsupported(Capability::SnapshotsIncludeMemory));
+        let snapshot_caps = self
+            .capabilities
+            .snapshots
+            .as_ref()
+            .ok_or_else(|| Error::unsupported(Capability::Snapshots))?;
+        let mode_capability = match options.mode {
+            SnapshotMode::Filesystem if snapshot_caps.filesystem_from_sandbox => None,
+            SnapshotMode::Filesystem => Some(Capability::SnapshotsFilesystem),
+            SnapshotMode::LiveProcessState if snapshot_caps.live_process_state_from_sandbox => None,
+            SnapshotMode::LiveProcessState => Some(Capability::SnapshotsLiveProcessState),
+            _ => {
+                return Err(Error::invalid_spec(
+                    "mode",
+                    "unsupported sandbox snapshot mode",
+                ));
+            }
+        };
+        if let Some(capability) = mode_capability {
+            return Err(Error::unsupported(capability));
         }
-        let name = options.name.clone().unwrap_or_else(|| {
-            format!(
-                "sandbox-driver-{}",
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |elapsed| elapsed.as_secs())
-            )
-        });
-        let outcome = async {
-            let mut sdk = self.sdk().await?;
-            sdk.create_snapshot_with_timeout(&name, CREATE_TIMEOUT)
-                .await
-                .map_err(|error| daytona_error("snapshotting sandbox", &error))
-        }
-        .await;
+        let name = options.name.clone().unwrap_or_else(generated_snapshot_name);
+        let outcome =
+            create_sandbox_snapshot(&self.client, &self.sdk_id, &name, options.mode).await;
         self.emit_action(LifecycleAction::SnapshotSandbox, &outcome)
             .await;
         outcome?;
-        let dto = self
-            .client
-            .snapshot
-            .get(&name)
-            .await
-            .map_err(|error| daytona_error("fetching created snapshot", &error))?;
-        SnapshotId::try_new(dto.id)
-            .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))
+        created_snapshot_id(&self.client, &name).await
     }
 
     async fn update_network(&self, policy: &NetworkPolicy) -> Result<()> {
@@ -1417,27 +1515,30 @@ struct DaytonaSnapshots {
 #[async_trait]
 impl SnapshotProvider for DaytonaSnapshots {
     async fn create(&self, spec: &SnapshotSpec) -> Result<SnapshotId> {
+        let name = spec.name.clone().unwrap_or_else(generated_snapshot_name);
         let image = match &spec.source {
             SnapshotSource::Image { reference } => ImageSource::Name(reference.clone()),
             SnapshotSource::Dockerfile { content } => {
                 ImageSource::Custom(DockerImage::from_dockerfile(content))
             }
-            SnapshotSource::Sandbox { .. } => {
-                return Err(Error::invalid_spec(
-                    "source",
-                    "snapshots from a live sandbox are not supported by this provider version",
-                ));
+            SnapshotSource::Sandbox { id, mode } => {
+                if *mode == SnapshotMode::LiveProcessState {
+                    let sdk =
+                        self.client.get(id.as_str()).await.map_err(|error| {
+                            daytona_error("fetching sandbox for snapshot", &error)
+                        })?;
+                    if matches!(
+                        sdk.sandbox_class,
+                        Some(SandboxClass::CONTAINER | SandboxClass::ANDROID)
+                    ) {
+                        return Err(Error::unsupported(Capability::SnapshotsLiveProcessState));
+                    }
+                }
+                create_sandbox_snapshot(&self.client, id.as_str(), &name, *mode).await?;
+                return created_snapshot_id(&self.client, &name).await;
             }
             _ => return Err(Error::invalid_spec("source", "unsupported snapshot source")),
         };
-        let name = spec.name.clone().unwrap_or_else(|| {
-            format!(
-                "sandbox-driver-{}",
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |elapsed| elapsed.as_secs())
-            )
-        });
         let params = CreateSnapshotParams {
             name,
             image,

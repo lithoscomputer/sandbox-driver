@@ -121,6 +121,7 @@ pub struct DirEntry {
     /// Path relative to the listed directory.
     pub path: String,
     pub kind: FileKind,
+    #[serde(default)]
     pub size: Option<u64>,
 }
 
@@ -140,7 +141,9 @@ impl DirEntry {
 pub struct FileMetadata {
     pub kind:        FileKind,
     pub size:        u64,
+    #[serde(default)]
     pub mode:        Option<u32>,
+    #[serde(default)]
     pub modified_at: Option<SystemTime>,
 }
 

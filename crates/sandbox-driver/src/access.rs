@@ -26,7 +26,9 @@ pub trait PreviewUrls: Send + Sync {
 #[non_exhaustive]
 pub struct PreviewUrl {
     pub url:        String,
+    #[serde(default)]
     pub headers:    BTreeMap<String, String>,
+    #[serde(default)]
     pub expires_at: Option<SystemTime>,
 }
 
@@ -43,11 +45,19 @@ impl PreviewUrl {
 /// Real SSH access minted by the provider.
 #[async_trait]
 pub trait SshAccess: Send + Sync {
-    /// Mints time-limited SSH access; returns a ready-to-run command.
-    async fn create_ssh_access(&self, ttl: Option<Duration>) -> Result<SshAccessInfo>;
+    /// Returns ready-to-run SSH access.
+    ///
+    /// With no TTL, the provider may return stable access or use its
+    /// default temporary lifetime. With a TTL, the provider must honor it
+    /// and declare `access.ssh.ttl`, or return `Unsupported` for that
+    /// capability.
+    async fn ssh_access(&self, ttl: Option<Duration>) -> Result<SshAccessInfo>;
 
-    /// Revokes previously minted access by its token.
-    async fn revoke_ssh_access(&self, token: &str) -> Result<()>;
+    /// Revokes previously returned access by its token.
+    async fn revoke_ssh_access(&self, token: &str) -> Result<()> {
+        let _ = token;
+        Err(Error::unsupported(Capability::SshRevoke))
+    }
 }
 
 /// Minted SSH access.
@@ -56,7 +66,9 @@ pub trait SshAccess: Send + Sync {
 pub struct SshAccessInfo {
     /// Ready-to-run command, e.g. `ssh user@gateway -p 2222`.
     pub command:    String,
+    #[serde(default)]
     pub token:      Option<String>,
+    #[serde(default)]
     pub expires_at: Option<SystemTime>,
 }
 
@@ -96,6 +108,7 @@ pub trait Vnc: Send + Sync {
 #[non_exhaustive]
 pub struct VncConnection {
     pub url:      String,
+    #[serde(default)]
     pub password: Option<String>,
 }
 

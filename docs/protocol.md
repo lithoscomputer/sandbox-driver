@@ -6,8 +6,9 @@ This is the normative specification of the wire protocol between a
 a plugin can be implemented in any language without reading the Rust
 source. The Rust implementation lives in the `sandbox-driver-protocol`
 crate: `serve_stdio()` is the plugin side, `PluginProvider` the host
-side, and the golden tests in `crates/sandbox-driver-protocol/tests/`
-pin every serialized shape shown here.
+side, and the compatibility tests in
+`crates/sandbox-driver-protocol/tests/` verify the encodings and
+tolerance rules shown here — behaviorally, not as full-shape pins.
 
 Normative words: **must**, **must not**, **may**.
 
@@ -111,7 +112,7 @@ for the connection. Per-sandbox capability sets travel in every
 ```json
 {
   "isolation": "none | container | vm",
-  "lifecycle": {"pause":false,"archive":false,"fork":false,"checkpoint":false,
+  "lifecycle": {"pause":false,"archive":false,"fork":false,
                  "resize":false,"recover":false,"undelete":false,
                  "refresh_activity":false,
                  "timers":false,"labels":false,"update_network":false,
@@ -125,10 +126,14 @@ for the connection. Per-sandbox capability sets travel in every
   "pty": null,
   "logs": null,
   "access": {"preview_urls":false,"signed_preview_urls":false,"ssh":false,
+              "ssh_ttl":false,"ssh_revoke":false,
               "shell_command":false,"web_terminal":false,"vnc":false,"vpn":false},
   "network": {"allow_all":false,"block_all":false,"cidr_allow_list":false,
                "domain_allow_list":false,"outbound_proxy":false},
-  "snapshots": null,
+  "snapshots": {"from_image":false,"from_dockerfile":false,
+                 "filesystem_from_sandbox":false,
+                 "live_process_state_from_sandbox":false,
+                 "build_logs":false,"activation":false},
   "volumes": null
 }
 ```
@@ -147,6 +152,9 @@ Rules:
 - The serialized `access.vpn` field is a compatibility tombstone. It is
   always false. VPN clients such as Tailscale are guest software managed
   through exec and are not a sandbox-driver capability.
+- Version-1 peers can still send the legacy `lifecycle.checkpoint`,
+  `snapshots.from_sandbox`, and `snapshots.include_memory` fields. Readers
+  ignore them. New peers emit the normalized fields shown above.
 - `capabilities.snapshots`/`volumes` being non-null is what authorizes
   the `snapshot/*` and `volume/*` methods (`snapshot/activate` and
   `snapshot/deactivate` additionally require `snapshots.activation`);
@@ -164,12 +172,13 @@ Rules:
   `{"secs":90,"nanos":0}` where a spec object embeds one (e.g.
   `timers.auto_stop_after_idle`, `exec` spec timeouts inside
   `sandbox/create` are not applicable — exec uses `timeout_ms`). Both
-  forms are pinned by golden tests; neither may change within version 1.
+  forms are covered by encoding tests; neither may change within
+  version 1.
 - **Timestamps** use the structural form
   `{"secs_since_epoch":…,"nanos_since_epoch":…}` where present
   (`created_at`, `expires_at`); they are informational.
-- **Identifiers** (`sandbox_id`, `snapshot_id`, `volume_id`,
-  `checkpoint_id`) are non-empty strings up to 256 bytes with no
+- **Identifiers** (`sandbox_id`, `snapshot_id`, `volume_id`) are non-empty
+  strings up to 256 bytes with no
   whitespace or control characters. They are opaque to the host and
   minted by the plugin; the host persists them to re-attach later.
 - **State enums** are `snake_case` strings. A reader encountering an
@@ -207,7 +216,7 @@ faithful reconstruction:
 | kind | detail fields |
 | --- | --- |
 | `unsupported` | `capability` (dotted path, e.g. `"exec.stdio_process"`) |
-| `not_found` | `resource` (`sandbox`/`snapshot`/`volume`/`checkpoint`/`plugin`), `id` |
+| `not_found` | `resource` (`sandbox`/`snapshot`/`volume`/`plugin`), `id` |
 | `invalid_spec` | `field`, `reason` |
 | `provider` | `provider` object: `{provider, code, message, retryable, detail}` |
 | `exec` | `exec` object: `{label, termination, exit_code, stdout_b64, stderr_b64}` |
@@ -305,13 +314,24 @@ handle, because a deleted sandbox cannot be attached.
 | --- | --- | --- |
 | `sandbox/fork` | `{sandbox_id, options:{name,include_memory}}` | HandleInfo |
 | `sandbox/undelete` | `{sandbox_id}` | HandleInfo |
-| `sandbox/checkpoint` | `{sandbox_id, options:{name}}` | `{checkpoint_id}` |
-| `sandbox/restore_checkpoint` | `{sandbox_id, checkpoint_id}` | `{}` |
 | `sandbox/resize` | `{sandbox_id, resources}` | `{}` |
 | `sandbox/snapshot` | `{sandbox_id, options:{name,include_memory}}` | `{snapshot_id}` |
 | `sandbox/set_timers` | `{sandbox_id, timers}` | `{}` |
 | `sandbox/set_labels` | `{sandbox_id, labels:{…}}` | `{}` (full replace) |
 | `sandbox/update_network` | `{sandbox_id, network}` | `{}` |
+
+The core API has no optional-memory fork. A v1 adapter sends
+`include_memory: true`; a v1 request with `false` fails as `invalid_spec`.
+The source and returned sandbox must both be Running, and filesystem,
+memory, running processes, and process IDs must be preserved.
+
+For snapshots, `include_memory: false` maps to `Filesystem` and `true`
+maps to `LiveProcessState`. Daytona requires a Stopped source for the
+filesystem mode and a Running source for the live-process mode.
+
+`sandbox/checkpoint` and `sandbox/restore_checkpoint` are reserved v1
+tombstones. A server returns JSON-RPC `method not found`; the public API
+does not expose these Boxd-only operations.
 
 ### 8.4 Exec
 
@@ -424,6 +444,8 @@ Deletes must be idempotent, including while deletion is in progress.
 Snapshot `source` variants: `{"image":{"reference":…}}`,
 `{"dockerfile":{"content":…}}`,
 `{"sandbox":{"id":…,"include_memory":…}}`.
+The sandbox source uses the same v1 mapping: `false` is `Filesystem` and
+`true` is `LiveProcessState`.
 
 ### 8.7 Access
 
@@ -435,6 +457,14 @@ Snapshot `source` variants: `{"image":{"reference":…}}`,
 | `access/ssh_revoke` | `{sandbox_id, token}` | `{}` |
 | `access/web_terminal` | `{sandbox_id}` | `{url}` |
 | `access/vnc` | `{sandbox_id}` | `{connection:{url,password}}` |
+
+`access/ssh_create` returns a ready-to-run command. When `ttl_ms` is
+absent, a provider may return stable access or use its default temporary
+lifetime. When it is present, the provider must honor the requested TTL
+or return `unsupported` for `access.ssh.ttl`. `token` and `expires_at`
+are optional. `access/ssh_revoke` is available only when
+`access.ssh.revoke` is true; a provider that declares it must return a
+token that can be revoked.
 
 ### 8.8 Provider health
 
@@ -578,9 +608,12 @@ Within version 1: changes must be additive (new methods, new optional
 fields, new enum values that readers already tolerate). Anything else —
 renaming fields, changing a pinned encoding, making an optional field
 required — requires incrementing `protocol_version`, and the handshake's
-version check is the only compatibility gate. The golden tests are the
-change detector: a golden-test failure is a wire break to be redesigned,
-not re-pinned.
+version check is the only compatibility gate. Compatibility is verified
+behaviorally: readers must decode era JSON written before any later
+additive field existed (every wire struct's growable fields carry serde
+defaults), tolerate unknown fields and enum values, and keep the pinned
+per-field encodings. Full-shape golden pins are deliberately not used —
+they fail on additive changes this section declares compatible.
 
 ## 14. Deferred beyond version 1
 

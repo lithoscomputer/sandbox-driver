@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::exec::Exec;
 use crate::fs::Filesystem;
 use crate::git::Git;
-use crate::id::{CheckpointId, SandboxId, SnapshotId};
+use crate::id::{SandboxId, SnapshotId};
 use crate::logs::Logs;
 use crate::pty::Pty;
 use crate::search::Search;
@@ -95,22 +95,13 @@ pub trait Sandbox: Send + Sync {
         Err(Error::unsupported(Capability::LifecycleArchive))
     }
 
-    /// Clones this sandbox into a new one.
+    /// Clones this running sandbox into a new running sandbox.
+    ///
+    /// Filesystem state, memory, running processes, and process IDs are
+    /// preserved.
     async fn fork(&self, options: &ForkOptions) -> Result<Arc<dyn Sandbox>> {
         let _ = options;
         Err(Error::unsupported(Capability::LifecycleFork))
-    }
-
-    /// Saves an identity-preserving rewind point.
-    async fn checkpoint(&self, options: &CheckpointOptions) -> Result<CheckpointId> {
-        let _ = options;
-        Err(Error::unsupported(Capability::LifecycleCheckpoint))
-    }
-
-    /// Rewinds this same sandbox — same ID, same handle — to a checkpoint.
-    async fn restore_checkpoint(&self, checkpoint: &CheckpointId) -> Result<()> {
-        let _ = checkpoint;
-        Err(Error::unsupported(Capability::LifecycleCheckpoint))
     }
 
     /// Changes the sandbox's resources.
@@ -216,24 +207,28 @@ pub trait Sandbox: Send + Sync {
 /// Options for [`Sandbox::fork`].
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[non_exhaustive]
+#[serde(default)]
 pub struct ForkOptions {
-    pub name:           Option<String>,
-    /// Include live memory in the clone, where supported.
-    pub include_memory: bool,
+    pub name: Option<String>,
 }
 
-/// Options for [`Sandbox::checkpoint`].
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// State captured by a sandbox snapshot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
-pub struct CheckpointOptions {
-    pub name: Option<String>,
+pub enum SnapshotMode {
+    /// Capture persistent filesystem state only.
+    #[default]
+    Filesystem,
+    /// Capture filesystem state, memory, running processes, and process IDs.
+    LiveProcessState,
 }
 
 /// Options for [`Sandbox::snapshot`].
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[non_exhaustive]
+#[serde(default)]
 pub struct SandboxSnapshotOptions {
-    pub name:           Option<String>,
-    /// Include VM memory, where supported (`snapshots.include_memory`).
-    pub include_memory: bool,
+    pub name: Option<String>,
+    pub mode: SnapshotMode,
 }

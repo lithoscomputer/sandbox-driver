@@ -222,6 +222,7 @@ impl ExecResult {
 /// [`ExecSpec::output_sanitization`] has been applied.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
+#[serde(default)]
 pub struct CaptureStats {
     pub observed_bytes: usize,
     pub retained_bytes: usize,

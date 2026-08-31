@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use sandbox_driver::{
@@ -67,8 +67,8 @@ impl PreviewUrls for DaytonaAccess {
 
 #[async_trait]
 impl SshAccess for DaytonaAccess {
-    async fn create_ssh_access(&self, ttl: Option<Duration>) -> Result<SshAccessInfo> {
-        let minutes = ttl.map(|ttl| (ttl.as_secs_f64() / 60.0).max(1.0));
+    async fn ssh_access(&self, ttl: Option<Duration>) -> Result<SshAccessInfo> {
+        let minutes = ttl.map(|ttl| ttl.as_secs_f64() / 60.0);
         let access = self
             .sdk()
             .await?
@@ -77,6 +77,7 @@ impl SshAccess for DaytonaAccess {
             .map_err(|error| daytona_error("creating ssh access", &error))?;
         let mut info = SshAccessInfo::new(access.ssh_command);
         info.token = Some(access.token);
+        info.expires_at = ttl.and_then(|ttl| SystemTime::now().checked_add(ttl));
         Ok(info)
     }
 

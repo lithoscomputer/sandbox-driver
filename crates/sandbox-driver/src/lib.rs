@@ -81,9 +81,7 @@ pub use fs::{DirEntry, FileKind, FileMetadata, Filesystem};
 pub use git::{
     Git, GitBranches, GitCloneOptions, GitCommitOptions, GitCredentials, GitPushOptions, GitStatus,
 };
-pub use id::{
-    CheckpointId, InvalidIdError, ProviderKind, SandboxId, ServiceId, SnapshotId, VolumeId,
-};
+pub use id::{InvalidIdError, ProviderKind, SandboxId, ServiceId, SnapshotId, VolumeId};
 pub use logs::{LogSink, LogSource, Logs};
 pub use probe::{BASH_PROBE_SCRIPT, ProbeFailure, activate, run_bash_probe};
 pub use provider::{
@@ -92,9 +90,7 @@ pub use provider::{
     VolumeState, VolumeStatus,
 };
 pub use pty::{Pty, PtyOptions, PtySession, PtySize};
-pub use sandbox::{
-    CheckpointOptions, ForkOptions, Sandbox, SandboxSnapshotOptions, WorkspaceOwnership,
-};
+pub use sandbox::{ForkOptions, Sandbox, SandboxSnapshotOptions, SnapshotMode, WorkspaceOwnership};
 pub use sanitize::{OutputSanitization, OutputSanitizer};
 pub use search::{GrepMatch, GrepOptions, Search, WalkOptions, WalkedFile};
 pub use service::{ServiceSpec, ServiceStatus, Services};

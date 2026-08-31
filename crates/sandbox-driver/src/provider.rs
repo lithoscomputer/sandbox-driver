@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::event::EventCallback;
 use crate::id::{ProviderKind, SandboxId, SnapshotId, VolumeId};
 use crate::logs::LogSink;
-use crate::sandbox::Sandbox;
+use crate::sandbox::{Sandbox, SnapshotMode};
 use crate::spec::{Resources, SandboxSpec};
 use crate::state::SandboxStatus;
 
@@ -85,6 +85,7 @@ pub trait SandboxProvider: Send + Sync {
 /// Filter for [`SandboxProvider::list`].
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[non_exhaustive]
+#[serde(default)]
 pub struct SandboxFilter {
     /// Labels the sandbox must carry (all of them).
     pub labels: BTreeMap<String, String>,
@@ -113,9 +114,11 @@ pub enum HealthStatus {
 pub struct ProviderHealth {
     pub status:              HealthStatus,
     /// Human-readable detail: which check failed and what to fix.
+    #[serde(default)]
     pub message:             Option<String>,
     /// Permissions the credential is missing, when the provider can
     /// enumerate them (e.g. Daytona API key scopes).
+    #[serde(default)]
     pub missing_permissions: Vec<String>,
 }
 
@@ -177,10 +180,10 @@ pub enum SnapshotSource {
     Dockerfile {
         content: String,
     },
-    /// Snapshot a live sandbox, optionally including VM memory.
+    /// Snapshot a sandbox using the requested capture mode.
     Sandbox {
-        id:             SandboxId,
-        include_memory: bool,
+        id:   SandboxId,
+        mode: SnapshotMode,
     },
 }
 
@@ -188,10 +191,13 @@ pub enum SnapshotSource {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct SnapshotSpec {
+    #[serde(default)]
     pub name:            Option<String>,
     pub source:          SnapshotSource,
+    #[serde(default)]
     pub resources:       Resources,
     /// Provider-specific options.
+    #[serde(default)]
     pub provider_config: serde_json::Value,
 }
 
@@ -225,10 +231,14 @@ pub enum SnapshotState {
 #[non_exhaustive]
 pub struct SnapshotStatus {
     pub id:           SnapshotId,
+    #[serde(default)]
     pub name:         Option<String>,
     pub state:        SnapshotState,
+    #[serde(default)]
     pub error_reason: Option<String>,
+    #[serde(default)]
     pub size_bytes:   Option<u64>,
+    #[serde(default)]
     pub created_at:   Option<SystemTime>,
 }
 
@@ -248,6 +258,7 @@ impl SnapshotStatus {
 /// Filter for [`SnapshotProvider::list`].
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[non_exhaustive]
+#[serde(default)]
 pub struct SnapshotFilter {
     pub name: Option<String>,
 }
@@ -272,6 +283,7 @@ pub trait VolumeProvider: Send + Sync {
 pub struct VolumeSpec {
     pub name:    String,
     /// Requested size; elastic providers (Daytona) ignore it.
+    #[serde(default)]
     pub size_mb: Option<u64>,
 }
 
@@ -303,9 +315,12 @@ pub enum VolumeState {
 #[non_exhaustive]
 pub struct VolumeStatus {
     pub id:           VolumeId,
+    #[serde(default)]
     pub name:         Option<String>,
     pub state:        VolumeState,
+    #[serde(default)]
     pub error_reason: Option<String>,
+    #[serde(default)]
     pub created_at:   Option<SystemTime>,
 }
 

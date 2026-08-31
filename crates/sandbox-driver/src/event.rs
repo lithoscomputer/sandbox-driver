@@ -23,8 +23,6 @@ pub enum LifecycleAction {
     Resume,
     Archive,
     Fork,
-    Checkpoint,
-    RestoreCheckpoint,
     Resize,
     SnapshotSandbox,
     Recover,
@@ -33,6 +31,9 @@ pub enum LifecycleAction {
     SetTimers,
     SetLabels,
     UpdateNetwork,
+    /// An action sent by a protocol peer that this version does not model.
+    #[serde(other)]
+    Unknown,
 }
 
 const MAX_CAUSES: usize = 8;
@@ -48,8 +49,10 @@ pub struct ErrorReport {
     /// Stable snake_case error kind, e.g. `"unsupported"`, `"timeout"`.
     pub kind:      String,
     pub message:   String,
+    #[serde(default)]
     pub retryable: bool,
     /// Rendered source chain, bounded in count and length.
+    #[serde(default)]
     pub causes:    Vec<String>,
 }
 

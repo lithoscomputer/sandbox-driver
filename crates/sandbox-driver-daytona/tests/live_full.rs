@@ -9,14 +9,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, process};
 
 use sandbox_driver::{
-    ExecSpec, LifecycleTimers, LogSink, LogSource, NetworkPolicy, Resources, SandboxProvider,
-    SandboxSource, SandboxSpec, SandboxState, SnapshotSource, SnapshotSpec, SnapshotState,
-    WaitOptions, wait_for_state,
+    Capability, Error, ExecSpec, LifecycleAction, LifecycleTimers, LogSink, LogSource,
+    NetworkPolicy, Resources, SandboxProvider, SandboxSnapshotOptions, SandboxSource, SandboxSpec,
+    SandboxState, SnapshotMode, SnapshotSource, SnapshotSpec, SnapshotState, WaitOptions,
+    wait_for_state,
 };
 use sandbox_driver_daytona::DaytonaProvider;
 use tokio::time;
 
 const TEST_SNAPSHOT: &str = "daytona-medium";
+const TEST_VM_SNAPSHOT: &str = "daytona-vm-small";
 
 fn unique(prefix: &str) -> String {
     let nanos = SystemTime::now()
@@ -98,9 +100,9 @@ async fn labels_timers_access_round_trip() {
         // SSH: mint, sanity-check, revoke.
         let ssh = sandbox.ssh().expect("facet declared");
         let access = ssh
-            .create_ssh_access(Some(Duration::from_secs(10 * 60)))
+            .ssh_access(Some(Duration::from_secs(10 * 60)))
             .await
-            .map_err(|error| format!("create_ssh_access: {error}"))?;
+            .map_err(|error| format!("ssh_access: {error}"))?;
         if !access.command.contains("ssh") {
             return Err(format!("ssh command looks wrong: {}", access.command));
         }
@@ -298,6 +300,310 @@ async fn stop_resize_archive_restore_lifecycle() {
 
     sandbox.delete().await.expect("delete");
     outcome.expect("lifecycle round trip");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fork_and_snapshot_modes_preserve_their_declared_state() {
+    if env::var("DAYTONA_API_KEY").is_err() {
+        return;
+    }
+    let provider = DaytonaProvider::connect().await.expect("connect");
+    let mut source_spec = SandboxSpec::new(SandboxSource::Snapshot {
+        name: TEST_VM_SNAPSHOT.to_owned(),
+    })
+    .name(unique("sd-live-vm-state"));
+    source_spec.region = Some("eu".to_owned());
+    let source = match provider.create(&source_spec, None).await {
+        Ok(source) => source,
+        Err(Error::Provider(provider_error))
+            if provider_error.code.as_deref() == Some("400")
+                && provider_error.message.contains("not available in region") =>
+        {
+            return;
+        }
+        Err(error) => panic!("create VM: {error}"),
+    };
+    let snapshots = provider.snapshots().expect("snapshot provider declared");
+    let mut created_sandboxes: Vec<Arc<dyn sandbox_driver::Sandbox>> = Vec::new();
+    let mut created_snapshots = Vec::new();
+
+    let outcome = async {
+        if !source.capabilities().lifecycle.fork
+            || !source
+                .capabilities()
+                .snapshots
+                .as_ref()
+                .is_some_and(|caps| caps.live_process_state_from_sandbox)
+        {
+            return Err("VM sandbox did not declare fork and hot snapshots".to_owned());
+        }
+        let setup = source
+            .exec()
+            .run(
+                &ExecSpec::new(
+                    "printf preserved > /tmp/sd-state-marker; \
+                     nohup bash -c 'exec -a sandbox-driver-live-process sleep 3600' \
+                     </dev/null >/dev/null 2>&1 & \
+                     echo $! > /tmp/sd-state-pid; cat /tmp/sd-state-pid",
+                )
+                .timeout(Duration::from_secs(30)),
+            )
+            .await
+            .map_err(|error| format!("start live process: {error}"))?;
+        if !setup.success() {
+            return Err(format!("start live process: {}", setup.stderr_lossy()));
+        }
+        let source_pid = setup.stdout_lossy().trim().to_owned();
+
+        let forked = source
+            .fork(&sandbox_driver::ForkOptions::default())
+            .await
+            .map_err(|error| format!("fork: {error}"))?;
+        created_sandboxes.push(Arc::clone(&forked));
+        assert_live_process(forked.as_ref(), &source_pid).await?;
+
+        let hot_name = unique("sd-live-hot");
+        let mut hot_options = SandboxSnapshotOptions::default();
+        hot_options.name = Some(hot_name.clone());
+        hot_options.mode = SnapshotMode::LiveProcessState;
+        let hot_id = source
+            .snapshot(&hot_options)
+            .await
+            .map_err(|error| format!("hot snapshot: {error}"))?;
+        created_snapshots.push(hot_id.clone());
+        wait_for_snapshot_state(snapshots, &hot_id, SnapshotState::Active).await?;
+        let mut hot_restore_spec =
+            SandboxSpec::new(SandboxSource::Snapshot { name: hot_name }).ephemeral(true);
+        hot_restore_spec.region = Some("eu".to_owned());
+        let hot_restore = provider
+            .create(&hot_restore_spec, None)
+            .await
+            .map_err(|error| format!("restore hot snapshot: {error}"))?;
+        created_sandboxes.push(Arc::clone(&hot_restore));
+        assert_live_process(hot_restore.as_ref(), &source_pid).await?;
+
+        let mut cold_while_running = SandboxSnapshotOptions::default();
+        cold_while_running.mode = SnapshotMode::Filesystem;
+        if !matches!(
+            source.snapshot(&cold_while_running).await,
+            Err(Error::InvalidState {
+                current: SandboxState::Running,
+                action:  LifecycleAction::SnapshotSandbox,
+            })
+        ) {
+            return Err("filesystem snapshot did not require a stopped sandbox".to_owned());
+        }
+
+        source
+            .stop()
+            .await
+            .map_err(|error| format!("stop source: {error}"))?;
+        wait_for_state(source.as_ref(), SandboxState::Stopped, &wait())
+            .await
+            .map_err(|error| format!("waiting for stopped source: {error}"))?;
+        if !matches!(
+            source.fork(&sandbox_driver::ForkOptions::default()).await,
+            Err(Error::InvalidState {
+                current: SandboxState::Stopped,
+                action:  LifecycleAction::Fork,
+            })
+        ) {
+            return Err("fork did not require a running source".to_owned());
+        }
+
+        let cold_name = unique("sd-live-cold");
+        let mut cold_options = SandboxSnapshotOptions::default();
+        cold_options.name = Some(cold_name.clone());
+        cold_options.mode = SnapshotMode::Filesystem;
+        let cold_id = source
+            .snapshot(&cold_options)
+            .await
+            .map_err(|error| format!("filesystem snapshot: {error}"))?;
+        created_snapshots.push(cold_id.clone());
+        wait_for_snapshot_state(snapshots, &cold_id, SnapshotState::Active).await?;
+        let mut cold_restore_spec =
+            SandboxSpec::new(SandboxSource::Snapshot { name: cold_name }).ephemeral(true);
+        cold_restore_spec.region = Some("eu".to_owned());
+        let cold_restore = provider
+            .create(&cold_restore_spec, None)
+            .await
+            .map_err(|error| format!("restore filesystem snapshot: {error}"))?;
+        created_sandboxes.push(Arc::clone(&cold_restore));
+        let cold_check = cold_restore
+            .exec()
+            .run(
+                &ExecSpec::new(
+                    "test \"$(cat /tmp/sd-state-marker)\" = preserved; \
+                     pid=$(cat /tmp/sd-state-pid); \
+                     if test -r \"/proc/$pid/cmdline\" && \
+                        tr '\\0' ' ' < \"/proc/$pid/cmdline\" | \
+                        grep -q sandbox-driver-live-process; then exit 23; fi",
+                )
+                .timeout(Duration::from_secs(30)),
+            )
+            .await
+            .map_err(|error| format!("check filesystem snapshot: {error}"))?;
+        if !cold_check.success() {
+            return Err(format!(
+                "filesystem snapshot restored a live process or lost its files: {cold_check:?}"
+            ));
+        }
+        Ok(())
+    }
+    .await;
+
+    for sandbox in created_sandboxes.iter().rev() {
+        let _ = sandbox.delete().await;
+    }
+    let _ = source.delete().await;
+    for snapshot in created_snapshots.iter().rev() {
+        let _ = snapshots.delete(snapshot).await;
+    }
+    outcome.expect("fork and snapshot mode behavior");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn filesystem_snapshot_restores_files_without_processes() {
+    if env::var("DAYTONA_API_KEY").is_err() {
+        return;
+    }
+    let provider = DaytonaProvider::connect().await.expect("connect");
+    let source_spec = SandboxSpec::new(SandboxSource::Snapshot {
+        name: TEST_SNAPSHOT.to_owned(),
+    })
+    .name(unique("sd-live-filesystem-source"));
+    let source = provider.create(&source_spec, None).await.expect("create");
+    let snapshots = provider.snapshots().expect("snapshot provider declared");
+    let mut restored = None;
+    let mut snapshot_id = None;
+
+    let outcome = async {
+        let snapshot_caps = source
+            .capabilities()
+            .snapshots
+            .as_ref()
+            .ok_or("snapshot capabilities absent")?;
+        if !snapshot_caps.filesystem_from_sandbox || snapshot_caps.live_process_state_from_sandbox {
+            return Err(format!(
+                "container snapshot modes are wrong: filesystem={}, live={}",
+                snapshot_caps.filesystem_from_sandbox,
+                snapshot_caps.live_process_state_from_sandbox
+            ));
+        }
+        let mut hot_options = SandboxSnapshotOptions::default();
+        hot_options.mode = SnapshotMode::LiveProcessState;
+        if !matches!(
+            source.snapshot(&hot_options).await,
+            Err(Error::Unsupported {
+                capability: Capability::SnapshotsLiveProcessState,
+            })
+        ) {
+            return Err("container accepted a live-process-state snapshot".to_owned());
+        }
+
+        let setup = source
+            .exec()
+            .run(
+                &ExecSpec::new(
+                    "printf preserved > /tmp/sd-cold-marker; \
+                     nohup bash -c 'exec -a sandbox-driver-cold-process sleep 3600' \
+                     </dev/null >/dev/null 2>&1 & \
+                     echo $! > /tmp/sd-cold-pid",
+                )
+                .timeout(Duration::from_secs(30)),
+            )
+            .await
+            .map_err(|error| format!("start process: {error}"))?;
+        if !setup.success() {
+            return Err(format!("start process: {}", setup.stderr_lossy()));
+        }
+        source
+            .stop()
+            .await
+            .map_err(|error| format!("stop source: {error}"))?;
+        wait_for_state(source.as_ref(), SandboxState::Stopped, &wait())
+            .await
+            .map_err(|error| format!("wait for stopped source: {error}"))?;
+
+        let name = unique("sd-live-filesystem");
+        let mut options = SandboxSnapshotOptions::default();
+        options.name = Some(name.clone());
+        options.mode = SnapshotMode::Filesystem;
+        let id = source
+            .snapshot(&options)
+            .await
+            .map_err(|error| format!("filesystem snapshot: {error}"))?;
+        snapshot_id = Some(id.clone());
+        wait_for_snapshot_state(snapshots, &id, SnapshotState::Active).await?;
+
+        let sandbox = provider
+            .create(
+                &SandboxSpec::new(SandboxSource::Snapshot { name }).ephemeral(true),
+                None,
+            )
+            .await
+            .map_err(|error| format!("restore filesystem snapshot: {error}"))?;
+        restored = Some(Arc::clone(&sandbox));
+        let check = sandbox
+            .exec()
+            .run(
+                &ExecSpec::new(
+                    "test \"$(cat /tmp/sd-cold-marker)\" = preserved; \
+                     pid=$(cat /tmp/sd-cold-pid); \
+                     if test -r \"/proc/$pid/cmdline\" && \
+                        tr '\\0' ' ' < \"/proc/$pid/cmdline\" | \
+                        grep -q sandbox-driver-cold-process; then exit 23; fi",
+                )
+                .timeout(Duration::from_secs(30)),
+            )
+            .await
+            .map_err(|error| format!("check restored filesystem snapshot: {error}"))?;
+        if !check.success() {
+            return Err(format!(
+                "filesystem snapshot lost files or restored a process: {check:?}"
+            ));
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Some(restored) = restored {
+        let _ = restored.delete().await;
+    }
+    let _ = source.delete().await;
+    if let Some(snapshot_id) = snapshot_id {
+        let _ = snapshots.delete(&snapshot_id).await;
+    }
+    outcome.expect("filesystem snapshot behavior");
+}
+
+async fn assert_live_process(
+    sandbox: &dyn sandbox_driver::Sandbox,
+    expected_pid: &str,
+) -> Result<(), String> {
+    let result = sandbox
+        .exec()
+        .run(
+            &ExecSpec::new(
+                "pid=$(cat /tmp/sd-state-pid); \
+                 test -r \"/proc/$pid/cmdline\"; \
+                 tr '\\0' ' ' < \"/proc/$pid/cmdline\" | \
+                 grep -q sandbox-driver-live-process; \
+                 printf '%s %s' \"$pid\" \"$(cat /tmp/sd-state-marker)\"",
+            )
+            .timeout(Duration::from_secs(30)),
+        )
+        .await
+        .map_err(|error| format!("check live process: {error}"))?;
+    let expected = format!("{expected_pid} preserved");
+    if !result.success() || result.stdout_lossy() != expected {
+        return Err(format!(
+            "live process state mismatch: got {:?}, expected {expected:?}, stderr {:?}",
+            result.stdout_lossy(),
+            result.stderr_lossy()
+        ));
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]

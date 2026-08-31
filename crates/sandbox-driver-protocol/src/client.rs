@@ -10,15 +10,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sandbox_driver::{
-    Capabilities, CheckpointId, CheckpointOptions, DirEntry, Error, EventCallback, Exec,
-    ExecControls, ExecResult, ExecSpec, ExecStreamingResult, FileMetadata, Filesystem, ForkOptions,
-    HealthStatus, LifecycleTimers, LogSink, LogSource, Logs, NetworkPolicy, OutputStream,
-    PlatformInfo, PreviewUrl, PreviewUrls, ProviderHealth, ProviderKind, Pty, PtyOptions,
-    PtySession, PtySize, Resources, Result, Sandbox, SandboxFilter, SandboxId,
-    SandboxSnapshotOptions, SandboxSpec, SandboxStatus, SnapshotFilter, SnapshotId,
-    SnapshotProvider, SnapshotSpec, SnapshotStatus, SpawnSpec, SshAccess, SshAccessInfo,
-    StderrTail, StdioProcess, StdioProcessHandle, Termination, Vnc, VncConnection, VolumeId,
-    VolumeProvider, VolumeSpec, VolumeStatus, WebTerminal,
+    Capabilities, DirEntry, Error, EventCallback, Exec, ExecControls, ExecResult, ExecSpec,
+    ExecStreamingResult, FileMetadata, Filesystem, ForkOptions, HealthStatus, LifecycleTimers,
+    LogSink, LogSource, Logs, NetworkPolicy, OutputStream, PlatformInfo, PreviewUrl, PreviewUrls,
+    ProviderHealth, ProviderKind, Pty, PtyOptions, PtySession, PtySize, Resources, Result, Sandbox,
+    SandboxFilter, SandboxId, SandboxSnapshotOptions, SandboxSpec, SandboxStatus, SnapshotFilter,
+    SnapshotId, SnapshotProvider, SnapshotSpec, SnapshotStatus, SpawnSpec, SshAccess,
+    SshAccessInfo, StderrTail, StdioProcess, StdioProcessHandle, Termination, Vnc, VncConnection,
+    VolumeId, VolumeProvider, VolumeSpec, VolumeStatus, WebTerminal,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -303,7 +302,7 @@ impl SnapshotProvider for ProviderSnapshots {
         let result: m::SnapshotIdResult = self
             .client
             .call(m::SNAPSHOT_CREATE, &m::SnapshotCreateParams {
-                spec: spec.clone(),
+                spec: m::SnapshotSpecDto::try_from(spec)?,
             })
             .await?;
         SnapshotId::try_new(result.snapshot_id)
@@ -455,7 +454,7 @@ impl PreviewUrls for SandboxAccess {
 
 #[async_trait]
 impl SshAccess for SandboxAccess {
-    async fn create_ssh_access(&self, ttl: Option<Duration>) -> Result<SshAccessInfo> {
+    async fn ssh_access(&self, ttl: Option<Duration>) -> Result<SshAccessInfo> {
         let result: m::SshCreateResult = self
             .client
             .call(m::ACCESS_SSH_CREATE, &m::SshCreateParams {
@@ -918,7 +917,7 @@ impl Sandbox for SandboxHandle {
             .client
             .call(m::SANDBOX_FORK, &m::ForkParams {
                 sandbox_id: self.id.as_str().to_owned(),
-                options:    options.clone(),
+                options:    options.into(),
             })
             .await?;
         let id = info.status.id.clone();
@@ -951,29 +950,6 @@ impl Sandbox for SandboxHandle {
         }))
     }
 
-    async fn checkpoint(&self, options: &CheckpointOptions) -> Result<CheckpointId> {
-        let result: m::CheckpointResult = self
-            .client
-            .call(m::SANDBOX_CHECKPOINT, &m::CheckpointParams {
-                sandbox_id: self.id.as_str().to_owned(),
-                options:    options.clone(),
-            })
-            .await?;
-        CheckpointId::try_new(result.checkpoint_id)
-            .map_err(|error| Error::invalid_spec("checkpoint_id", error.to_string()))
-    }
-
-    async fn restore_checkpoint(&self, checkpoint: &CheckpointId) -> Result<()> {
-        let _: m::Empty = self
-            .client
-            .call(m::SANDBOX_RESTORE_CHECKPOINT, &m::RestoreCheckpointParams {
-                sandbox_id:    self.id.as_str().to_owned(),
-                checkpoint_id: checkpoint.as_str().to_owned(),
-            })
-            .await?;
-        Ok(())
-    }
-
     async fn resize(&self, resources: &Resources) -> Result<()> {
         let _: m::Empty = self
             .client
@@ -990,7 +966,7 @@ impl Sandbox for SandboxHandle {
             .client
             .call(m::SANDBOX_SNAPSHOT, &m::SnapshotParams {
                 sandbox_id: self.id.as_str().to_owned(),
-                options:    options.clone(),
+                options:    options.into(),
             })
             .await?;
         SnapshotId::try_new(result.snapshot_id)

@@ -26,8 +26,6 @@ pub enum Capability {
     LifecycleArchive,
     #[serde(rename = "lifecycle.fork")]
     LifecycleFork,
-    #[serde(rename = "lifecycle.checkpoint")]
-    LifecycleCheckpoint,
     #[serde(rename = "lifecycle.resize")]
     LifecycleResize,
     #[serde(rename = "lifecycle.recover")]
@@ -68,6 +66,10 @@ pub enum Capability {
     SignedPreviewUrls,
     #[serde(rename = "access.ssh")]
     Ssh,
+    #[serde(rename = "access.ssh.ttl")]
+    SshTtl,
+    #[serde(rename = "access.ssh.revoke")]
+    SshRevoke,
     #[serde(rename = "access.shell_command")]
     ShellCommandAccess,
     #[serde(rename = "access.web_terminal")]
@@ -76,14 +78,20 @@ pub enum Capability {
     VncAccess,
     #[serde(rename = "snapshots")]
     Snapshots,
-    #[serde(rename = "snapshots.include_memory")]
-    SnapshotsIncludeMemory,
+    #[serde(rename = "snapshots.filesystem")]
+    SnapshotsFilesystem,
+    #[serde(rename = "snapshots.live_process_state")]
+    SnapshotsLiveProcessState,
     #[serde(rename = "snapshots.activation")]
     SnapshotsActivation,
     #[serde(rename = "services")]
     Services,
     #[serde(rename = "volumes")]
     Volumes,
+    /// A capability sent by a newer or legacy protocol peer that this
+    /// version does not model.
+    #[serde(other)]
+    Unknown,
 }
 
 impl fmt::Display for Capability {
@@ -106,17 +114,29 @@ impl fmt::Display for Capability {
 #[non_exhaustive]
 pub struct Capabilities {
     pub isolation: Isolation,
+    #[serde(default)]
     pub lifecycle: LifecycleCaps,
+    #[serde(default)]
     pub exec:      ExecCaps,
+    #[serde(default)]
     pub fs:        FsCaps,
+    #[serde(default)]
     pub search:    SearchCaps,
+    #[serde(default)]
     pub git:       GitCaps,
+    #[serde(default)]
     pub services:  ServiceCaps,
+    #[serde(default)]
     pub pty:       Option<PtyCaps>,
+    #[serde(default)]
     pub logs:      Option<LogsCaps>,
+    #[serde(default)]
     pub access:    AccessCaps,
+    #[serde(default)]
     pub network:   NetworkCaps,
+    #[serde(default)]
     pub snapshots: Option<SnapshotCaps>,
+    #[serde(default)]
     pub volumes:   Option<VolumeCaps>,
 }
 
@@ -144,13 +164,12 @@ impl Capabilities {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct LifecycleCaps {
     pub pause:            bool,
     pub archive:          bool,
     pub fork:             bool,
-    /// Identity-preserving checkpoint/restore of the same sandbox.
-    pub checkpoint:       bool,
     pub resize:           bool,
     /// Provider-assisted recovery from the `Error` state.
     pub recover:          bool,
@@ -166,6 +185,7 @@ pub struct LifecycleCaps {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct ExecCaps {
     /// Output arrives while the command runs (vs. buffered emulation).
@@ -179,6 +199,7 @@ pub struct ExecCaps {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct FsCaps {
     /// Provider serves file operations natively (vs. exec-derived).
@@ -189,6 +210,7 @@ pub struct FsCaps {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct SearchCaps {
     /// Provider overrides the exec-derived search implementation natively.
@@ -196,6 +218,7 @@ pub struct SearchCaps {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct GitCaps {
     /// Provider overrides the exec-derived git implementation natively.
@@ -203,6 +226,7 @@ pub struct GitCaps {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct ServiceCaps {
     /// Provider overrides the exec-derived services implementation
@@ -211,12 +235,14 @@ pub struct ServiceCaps {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct PtyCaps {
     pub resize: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct LogsCaps {
     pub provision:  bool,
@@ -224,11 +250,16 @@ pub struct LogsCaps {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct AccessCaps {
     pub preview_urls:        bool,
     pub signed_preview_urls: bool,
     pub ssh:                 bool,
+    /// SSH access honors a caller-supplied TTL.
+    pub ssh_ttl:             bool,
+    /// SSH access can be revoked by token.
+    pub ssh_revoke:          bool,
     pub shell_command:       bool,
     pub web_terminal:        bool,
     pub vnc:                 bool,
@@ -239,6 +270,7 @@ pub struct AccessCaps {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct NetworkCaps {
     pub allow_all:         bool,
@@ -249,20 +281,23 @@ pub struct NetworkCaps {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct SnapshotCaps {
-    pub from_image:      bool,
+    pub from_image: bool,
     pub from_dockerfile: bool,
-    pub from_sandbox:    bool,
-    /// Live-sandbox snapshots can include VM memory.
-    pub include_memory:  bool,
-    pub build_logs:      bool,
+    /// A sandbox can be captured as filesystem state.
+    pub filesystem_from_sandbox: bool,
+    /// A sandbox can be captured with its memory and running processes.
+    pub live_process_state_from_sandbox: bool,
+    pub build_logs: bool,
     /// Snapshots can be deactivated and reactivated
     /// ([`crate::SnapshotProvider::activate`]).
-    pub activation:      bool,
+    pub activation: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 #[non_exhaustive]
 pub struct VolumeCaps {
     /// Volumes attach at sandbox create time only (the common model).
