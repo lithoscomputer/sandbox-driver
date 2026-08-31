@@ -952,7 +952,10 @@ async fn search_greps_directories_and_single_files(ctx: &Conformance) -> CheckOu
 
 async fn unsupported_actions_say_so(ctx: &Conformance) -> CheckOutcome {
     let sandbox = ctx.create().await?;
-    let caps = ctx.caps().clone();
+    // The per-sandbox set is authoritative: a provider may narrow its
+    // upper bound by sandbox class (Daytona masks VM-only verbs on
+    // container sandboxes), and honesty is judged against the handle.
+    let caps = sandbox.capabilities().clone();
     let outcome = async {
         let mut wrong: Vec<String> = Vec::new();
         let mut check = |name: &str, declared: bool, result: Result<(), Error>| match result {
@@ -1061,6 +1064,13 @@ async fn pause_resume_cycle(ctx: &Conformance) -> CheckOutcome {
         return Ok(Some("capability lifecycle.pause not declared".to_owned()));
     }
     let sandbox = ctx.ready().await?;
+    // The provider's upper bound may be narrowed per sandbox class.
+    if !sandbox.capabilities().lifecycle.pause {
+        cleanup(&sandbox).await;
+        return Ok(Some(
+            "lifecycle.pause masked for this sandbox's class".to_owned(),
+        ));
+    }
     let outcome = async {
         sandbox
             .pause()
@@ -1107,6 +1117,12 @@ async fn stdio_process_round_trips(ctx: &Conformance) -> CheckOutcome {
         return outcome;
     }
     let sandbox = ctx.ready().await?;
+    if !sandbox.capabilities().exec.stdio_process {
+        cleanup(&sandbox).await;
+        return Ok(Some(
+            "exec.stdio_process masked for this sandbox".to_owned(),
+        ));
+    }
     let outcome = async {
         let mut process = sandbox
             .exec()
@@ -1197,11 +1213,15 @@ async fn services_match_capabilities(ctx: &Conformance) -> CheckOutcome {
         ));
     }
     let sandbox = ctx.create().await?;
-    if caps.access.preview_urls != sandbox.preview_urls().is_some() {
+    let sandbox_caps = sandbox.capabilities();
+    if sandbox_caps.access.preview_urls != sandbox.preview_urls().is_some() {
         wrong.push("preview_urls facet presence disagrees with capabilities".to_owned());
     }
-    if caps.access.ssh != sandbox.ssh().is_some() {
+    if sandbox_caps.access.ssh != sandbox.ssh().is_some() {
         wrong.push("ssh facet presence disagrees with capabilities".to_owned());
+    }
+    if sandbox_caps.pty.is_some() != sandbox.pty().is_some() {
+        wrong.push("pty facet presence disagrees with capabilities".to_owned());
     }
     cleanup(&sandbox).await;
     if wrong.is_empty() {
@@ -1399,7 +1419,7 @@ async fn fs_range_and_append_round_trip(ctx: &Conformance) -> CheckOutcome {
 async fn background_services_round_trip(ctx: &Conformance) -> CheckOutcome {
     let sandbox = ctx.ready().await?;
     let outcome = async {
-        if ctx.caps().services.native != sandbox.services().is_some() {
+        if sandbox.capabilities().services.native != sandbox.services().is_some() {
             return fail("services facet presence disagrees with services.native");
         }
         let derived;
