@@ -323,7 +323,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 [[package]]
 name = "daytona-api-client"
 version = "0.1.0"
-source = "git+https://github.com/brynary/daytona-sdk-rust?rev=f86e645e9372d7ad4cf645dd3e7b1249ac20cdb1#f86e645e9372d7ad4cf645dd3e7b1249ac20cdb1"
+source = "git+https://github.com/brynary/daytona-sdk-rust?rev=a94090b95e01d6c09bf210dd192f084675c6528a#a94090b95e01d6c09bf210dd192f084675c6528a"
 dependencies = [
  "reqwest",
  "reqwest-middleware",
@@ -337,7 +337,7 @@ dependencies = [
 [[package]]
 name = "daytona-sdk"
 version = "0.1.0"
-source = "git+https://github.com/brynary/daytona-sdk-rust?rev=f86e645e9372d7ad4cf645dd3e7b1249ac20cdb1#f86e645e9372d7ad4cf645dd3e7b1249ac20cdb1"
+source = "git+https://github.com/brynary/daytona-sdk-rust?rev=a94090b95e01d6c09bf210dd192f084675c6528a#a94090b95e01d6c09bf210dd192f084675c6528a"
 dependencies = [
  "daytona-api-client",
  "daytona-toolbox-client",
@@ -357,7 +357,7 @@ dependencies = [
 [[package]]
 name = "daytona-toolbox-client"
 version = "0.1.0"
-source = "git+https://github.com/brynary/daytona-sdk-rust?rev=f86e645e9372d7ad4cf645dd3e7b1249ac20cdb1#f86e645e9372d7ad4cf645dd3e7b1249ac20cdb1"
+source = "git+https://github.com/brynary/daytona-sdk-rust?rev=a94090b95e01d6c09bf210dd192f084675c6528a#a94090b95e01d6c09bf210dd192f084675c6528a"
 dependencies = [
  "reqwest",
  "reqwest-middleware",
@@ -1693,11 +1693,10 @@ dependencies = [
  "daytona-api-client",
  "daytona-sdk",
  "rand 0.10.2",
- "reqwest",
- "reqwest-middleware",
  "sandbox-driver",
  "sandbox-driver-conformance",
  "sandbox-driver-protocol",
+ "serde_json",
  "tokio",
  "tokio-util",
 ]
