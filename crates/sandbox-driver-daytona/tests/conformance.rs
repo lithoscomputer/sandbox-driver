@@ -28,16 +28,29 @@ async fn daytona_provider_passes_conformance() {
     let provider = DaytonaProvider::connect()
         .await
         .expect("connect with credentials");
-    let specs = SpecFactory::new(|| {
-        SandboxSpec::new(SandboxSource::Snapshot {
-            id: SnapshotId::try_new(TEST_SNAPSHOT).expect("valid snapshot id"),
-        })
-        .sandbox_kind(SandboxKind::Container)
-        .ephemeral(true)
-    });
+    let specs = SpecFactory::new(default_spec).with_entrypoint_logs(entrypoint_logs_spec);
     let mut conformance = Conformance::new(Arc::new(provider), specs);
     conformance.check_timeout = Duration::from_secs(900);
     conformance.wait.deadline = Some(Duration::from_secs(300));
     let report = conformance.run().await;
     report.assert_pass();
+}
+
+fn default_spec() -> SandboxSpec {
+    SandboxSpec::new(SandboxSource::Snapshot {
+        id: SnapshotId::try_new(TEST_SNAPSHOT).expect("valid snapshot id"),
+    })
+    .sandbox_kind(SandboxKind::Container)
+    .ephemeral(true)
+}
+
+fn entrypoint_logs_spec() -> SandboxSpec {
+    SandboxSpec::new(SandboxSource::Dockerfile {
+        content: r#"FROM debian:stable-slim
+ENTRYPOINT ["/bin/sh", "-c", "echo conformance-entrypoint; echo conformance-entrypoint-error >&2; exec sleep 600"]
+"#
+        .to_owned(),
+    })
+    .sandbox_kind(SandboxKind::Container)
+    .ephemeral(true)
 }

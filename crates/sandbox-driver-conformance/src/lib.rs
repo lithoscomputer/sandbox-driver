@@ -29,10 +29,10 @@ use std::{fmt, process};
 use async_trait::async_trait;
 use sandbox_driver::{
     Action, Capability, DerivedSearch, DerivedServices, Error, Event, EventBody, EventContext,
-    EventObserver, ExecControls, ExecSpec, GrepOptions, HealthStatus, NetworkPolicy,
-    OutputSanitization, OutputStream, PtyOptions, PtySize, Resources, Sandbox, SandboxFilter,
-    SandboxId, SandboxProvider, SandboxSpec, SandboxState, Search, ServiceSpec, Services,
-    SnapshotMode, SpawnSpec, Termination, WaitOptions, activate, wait_for_state,
+    EventObserver, ExecControls, ExecSpec, GrepOptions, HealthStatus, LogSink, LogSource,
+    NetworkPolicy, OutputSanitization, OutputStream, PtyOptions, PtySize, Resources, Sandbox,
+    SandboxFilter, SandboxId, SandboxProvider, SandboxSpec, SandboxState, Search, ServiceSpec,
+    Services, SnapshotMode, SpawnSpec, Termination, WaitOptions, activate, wait_for_state,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time;
@@ -54,18 +54,36 @@ impl EventObserver for RecordingEventObserver {
 
 /// Produces a provider-appropriate creation spec for each check.
 pub struct SpecFactory {
-    make: Box<dyn Fn() -> SandboxSpec + Send + Sync>,
+    make:                 Box<dyn Fn() -> SandboxSpec + Send + Sync>,
+    make_entrypoint_logs: Option<Box<dyn Fn() -> SandboxSpec + Send + Sync>>,
 }
 
 impl SpecFactory {
     pub fn new(make: impl Fn() -> SandboxSpec + Send + Sync + 'static) -> Self {
         Self {
-            make: Box::new(make),
+            make:                 Box::new(make),
+            make_entrypoint_logs: None,
         }
+    }
+
+    /// Adds a spec whose entrypoint emits output and remains running.
+    /// Providers that declare [`sandbox_driver::Logs`] use this fixture
+    /// for the behavioral follow-stream check.
+    #[must_use]
+    pub fn with_entrypoint_logs(
+        mut self,
+        make: impl Fn() -> SandboxSpec + Send + Sync + 'static,
+    ) -> Self {
+        self.make_entrypoint_logs = Some(Box::new(make));
+        self
     }
 
     fn spec(&self) -> SandboxSpec {
         (self.make)()
+    }
+
+    fn entrypoint_logs_spec(&self) -> Option<SandboxSpec> {
+        self.make_entrypoint_logs.as_ref().map(|make| make())
     }
 }
 
@@ -168,6 +186,9 @@ impl Conformance {
             }),
             ("pty_is_bidirectional", |ctx| {
                 Box::pin(pty_is_bidirectional(ctx))
+            }),
+            ("logs_follow_streams_and_cancels", |ctx| {
+                Box::pin(logs_follow_streams_and_cancels(ctx))
             }),
             ("attach_and_list_by_label", |ctx| {
                 Box::pin(attach_and_list_by_label(ctx))
@@ -1490,6 +1511,79 @@ async fn pty_is_bidirectional(ctx: &Conformance) -> CheckOutcome {
             .close()
             .await
             .map_err(|error| format!("close failed: {error}"))?;
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn logs_follow_streams_and_cancels(ctx: &Conformance) -> CheckOutcome {
+    if ctx.caps().logs.is_none() {
+        return Ok(Some("logs not declared".to_owned()));
+    }
+    let Some(spec) = ctx.specs.entrypoint_logs_spec() else {
+        return fail("logs declared but no entrypoint-log spec was configured");
+    };
+    let sandbox = ctx
+        .provider
+        .create(&spec, None)
+        .await
+        .map_err(|error| format!("create log-producing sandbox failed: {error}"))?;
+    if sandbox.capabilities().logs.is_none() {
+        cleanup(&sandbox).await;
+        return Ok(Some("logs not declared for this sandbox".to_owned()));
+    }
+    let outcome = async {
+        let Some(logs) = sandbox.logs() else {
+            return fail("logs declared but facet is absent");
+        };
+
+        // A follow stream is long-lived. Timing it out drops the future,
+        // which must cancel the provider-side stream without wedging the
+        // sandbox or a plugin connection.
+        let discard: LogSink = Arc::new(|_| Box::pin(async { Ok(()) }));
+        match time::timeout(
+            Duration::from_secs(5),
+            logs.follow(LogSource::Entrypoint, discard),
+        )
+        .await
+        {
+            Err(_) => {}
+            Ok(Ok(())) => return fail("log follow ended before it could be cancelled"),
+            Ok(Err(error)) => {
+                return fail(format!("log follow failed before cancellation: {error}"));
+            }
+        }
+
+        time::timeout(Duration::from_secs(30), sandbox.describe())
+            .await
+            .map_err(|_| "describe timed out after cancelling log follow".to_owned())?
+            .map_err(|error| format!("describe failed after cancelling log follow: {error}"))?;
+
+        // A sink error must stop the stream and reach the caller unchanged.
+        // Saving the chunk first also proves that bytes reached the sink.
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let sink_output = Arc::clone(&output);
+        let rejecting_sink: LogSink = Arc::new(move |chunk| {
+            sink_output.lock().expect("log output lock").extend(chunk);
+            Box::pin(async { Err(Error::invalid_spec("log_sink", "conformance sentinel")) })
+        });
+        match time::timeout(
+            Duration::from_secs(30),
+            logs.follow(LogSource::Entrypoint, rejecting_sink),
+        )
+        .await
+        {
+            Ok(Err(Error::InvalidSpec { field, reason }))
+                if field == "log_sink" && reason == "conformance sentinel" => {}
+            Ok(Err(error)) => return fail(format!("log sink error changed: {error}")),
+            Ok(Ok(())) => return fail("log follow ignored the sink error"),
+            Err(_) => return fail("entrypoint logs produced no output within 30 seconds"),
+        }
+        if output.lock().expect("log output lock").is_empty() {
+            return fail("entrypoint log sink received an empty chunk");
+        }
         PASS
     }
     .await;
