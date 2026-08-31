@@ -28,6 +28,7 @@ pub enum LifecycleAction {
     Resize,
     SnapshotSandbox,
     Recover,
+    Undelete,
     RefreshActivity,
     SetTimers,
     SetLabels,

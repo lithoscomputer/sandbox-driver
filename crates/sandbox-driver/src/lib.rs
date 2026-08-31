@@ -53,6 +53,7 @@ mod provider;
 mod pty;
 mod sandbox;
 mod search;
+mod service;
 mod spec;
 mod state;
 #[cfg(test)]
@@ -65,10 +66,10 @@ pub use access::{
 };
 pub use capabilities::{
     AccessCaps, Capabilities, Capability, ExecCaps, FsCaps, GitCaps, Isolation, LifecycleCaps,
-    LogsCaps, NetworkCaps, PtyCaps, SearchCaps, SnapshotCaps, VolumeCaps,
+    LogsCaps, NetworkCaps, PtyCaps, SearchCaps, ServiceCaps, SnapshotCaps, VolumeCaps,
 };
 pub use capture::OutputCaptureBuffer;
-pub use derived::{DerivedFs, DerivedGit, DerivedSearch};
+pub use derived::{DerivedFs, DerivedGit, DerivedSearch, DerivedServices};
 pub use error::{AuthError, Error, ExecFailure, ProviderError, ResourceKind, Result};
 pub use event::{ErrorReport, EventCallback, EventDispatcher, LifecycleAction, SandboxEvent};
 pub use exec::{
@@ -79,18 +80,22 @@ pub use fs::{DirEntry, FileKind, FileMetadata, Filesystem};
 pub use git::{
     Git, GitBranches, GitCloneOptions, GitCommitOptions, GitCredentials, GitPushOptions, GitStatus,
 };
-pub use id::{CheckpointId, InvalidIdError, ProviderKind, SandboxId, SnapshotId, VolumeId};
+pub use id::{
+    CheckpointId, InvalidIdError, ProviderKind, SandboxId, ServiceId, SnapshotId, VolumeId,
+};
 pub use logs::{LogSink, LogSource, Logs};
 pub use probe::{BASH_PROBE_SCRIPT, ProbeFailure, activate, run_bash_probe};
 pub use provider::{
-    SandboxFilter, SandboxProvider, SnapshotFilter, SnapshotProvider, SnapshotSource, SnapshotSpec,
-    SnapshotState, SnapshotStatus, VolumeProvider, VolumeSpec, VolumeState, VolumeStatus,
+    HealthStatus, ProviderHealth, SandboxFilter, SandboxProvider, SnapshotFilter, SnapshotProvider,
+    SnapshotSource, SnapshotSpec, SnapshotState, SnapshotStatus, VolumeProvider, VolumeSpec,
+    VolumeState, VolumeStatus,
 };
 pub use pty::{Pty, PtyOptions, PtySession, PtySize};
 pub use sandbox::{
     CheckpointOptions, ForkOptions, Sandbox, SandboxSnapshotOptions, WorkspaceOwnership,
 };
 pub use search::{GrepMatch, GrepOptions, Search, WalkOptions, WalkedFile};
+pub use service::{ServiceSpec, ServiceStatus, Services};
 pub use spec::{
     LifecycleTimers, NetworkPolicy, PlatformInfo, Resources, SandboxSource, SandboxSpec,
     VolumeMount,

@@ -14,6 +14,7 @@ use crate::id::{CheckpointId, SandboxId, SnapshotId};
 use crate::logs::Logs;
 use crate::pty::Pty;
 use crate::search::Search;
+use crate::service::Services;
 use crate::spec::{LifecycleTimers, NetworkPolicy, PlatformInfo, Resources};
 use crate::state::SandboxStatus;
 
@@ -125,6 +126,10 @@ pub trait Sandbox: Send + Sync {
     }
 
     /// Provider-assisted recovery from the `Error` state.
+    ///
+    /// Distinct from [`crate::SandboxProvider::undelete`]: `recover`
+    /// repairs a live sandbox that entered `Error`; `undelete` restores
+    /// a deleted one.
     async fn recover(&self) -> Result<()> {
         Err(Error::unsupported(Capability::LifecycleRecover))
     }
@@ -169,6 +174,13 @@ pub trait Sandbox: Send + Sync {
     /// Native git, when the provider has one. `None` means use the
     /// library's exec-derived implementation.
     fn git(&self) -> Option<&dyn Git> {
+        None
+    }
+
+    /// Native background-service management, when the provider has one.
+    /// `None` means use the library's exec-derived implementation
+    /// ([`crate::DerivedServices`]).
+    fn services(&self) -> Option<&dyn Services> {
         None
     }
 

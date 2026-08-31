@@ -18,8 +18,44 @@ pub trait Filesystem: Send + Sync {
     /// UTF-8.
     async fn read(&self, path: &str) -> Result<Vec<u8>>;
 
+    /// Reads `length` bytes (or to end of file when `None`) starting at
+    /// `offset`. Reading at or past the end returns empty bytes.
+    ///
+    /// The provided default reads the whole file and slices — correct
+    /// everywhere; providers with random access override it. This is
+    /// what chunked downloads build on.
+    async fn read_range(&self, path: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+        let content = self.read(path).await?;
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(content.len());
+        let end = match length {
+            Some(length) => start
+                .saturating_add(usize::try_from(length).unwrap_or(usize::MAX))
+                .min(content.len()),
+            None => content.len(),
+        };
+        Ok(content[start..end].to_vec())
+    }
+
     /// Writes a file, creating parent directories.
     async fn write(&self, path: &str, content: &[u8]) -> Result<()>;
+
+    /// Appends to a file, creating it (and parent directories) when
+    /// missing.
+    ///
+    /// The provided default reads, concatenates, and rewrites — correct
+    /// everywhere but quadratic over many appends; providers override
+    /// with a real append. This is what chunked uploads build on.
+    async fn write_append(&self, path: &str, content: &[u8]) -> Result<()> {
+        let mut combined = if self.exists(path).await? {
+            self.read(path).await?
+        } else {
+            Vec::new()
+        };
+        combined.extend_from_slice(content);
+        self.write(path, &combined).await
+    }
 
     /// Deletes a file or directory (recursively when `recursive`).
     ///

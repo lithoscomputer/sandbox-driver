@@ -97,6 +97,47 @@ impl Filesystem for DerivedFs {
         Ok(result.stdout)
     }
 
+    async fn read_range(&self, path: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+        let quoted = shell_quote(path);
+        // tail -c +K is 1-based; head applies the length bound only when
+        // one was given. Reading past EOF yields empty output.
+        let command = match length {
+            Some(length) => format!(
+                "tail -c +{} -- {quoted} | head -c {length}",
+                offset.saturating_add(1)
+            ),
+            None => format!("tail -c +{} -- {quoted}", offset.saturating_add(1)),
+        };
+        let result = self.run("fs read_range", command).await?;
+        Ok(result.stdout)
+    }
+
+    async fn write_append(&self, path: &str, content: &[u8]) -> Result<()> {
+        let quoted = shell_quote(path);
+        let mkdir = format!("dir=$(dirname -- {quoted}); mkdir -p -- \"$dir\"");
+        if content.is_empty() {
+            self.run("fs append", format!("{mkdir} && touch -- {quoted}"))
+                .await?;
+            return Ok(());
+        }
+        let mut first = true;
+        for chunk in content.chunks(WRITE_CHUNK_BYTES) {
+            let encoded = base64_encode(chunk);
+            let prefix = if first {
+                format!("{mkdir} && ")
+            } else {
+                String::new()
+            };
+            self.run(
+                "fs append",
+                format!("{prefix}printf '%s' '{encoded}' | base64 -d >> {quoted}"),
+            )
+            .await?;
+            first = false;
+        }
+        Ok(())
+    }
+
     async fn write(&self, path: &str, content: &[u8]) -> Result<()> {
         let quoted = shell_quote(path);
         let mkdir = format!("dir=$(dirname -- {quoted}); mkdir -p -- \"$dir\"");

@@ -68,6 +68,8 @@ pub struct SandboxStatus {
     pub source:              Option<String>,
     /// Host provider only: who owns the workspace directory.
     pub workspace_ownership: Option<WorkspaceOwnership>,
+    /// Provider console page for this sandbox, when the provider has one.
+    pub web_url:             Option<String>,
     pub created_at:          Option<SystemTime>,
     pub updated_at:          Option<SystemTime>,
 }
@@ -84,6 +86,7 @@ impl SandboxStatus {
             labels: BTreeMap::new(),
             source: None,
             workspace_ownership: None,
+            web_url: None,
             created_at: None,
             updated_at: None,
         }

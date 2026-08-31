@@ -103,6 +103,11 @@ id_newtype!(
     CheckpointId,
     "checkpoint id"
 );
+id_newtype!(
+    /// Sandbox-scoped background-service identifier.
+    ServiceId,
+    "service id"
+);
 
 /// Open provider kind: `"host"`, `"docker"`, `"daytona"`, or any plugin name.
 ///

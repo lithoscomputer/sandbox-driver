@@ -42,9 +42,34 @@ pub trait SandboxProvider: Send + Sync {
         events: Option<EventCallback>,
     ) -> Result<Arc<dyn Sandbox>>;
 
+    /// Restores a recently deleted sandbox and returns a fresh handle,
+    /// where the provider retains deleted sandboxes for a recovery
+    /// window (Daytona: 24 hours). Provider-level because a deleted
+    /// sandbox cannot be attached. Capability-gated on
+    /// `lifecycle.undelete`; distinct from [`Sandbox::recover`], which
+    /// repairs a live sandbox in the `Error` state.
+    async fn undelete(
+        &self,
+        id: &SandboxId,
+        events: Option<EventCallback>,
+    ) -> Result<Arc<dyn Sandbox>> {
+        let _ = (id, events);
+        Err(Error::unsupported(Capability::LifecycleUndelete))
+    }
+
     /// Lists sandboxes this provider manages. Providers that cannot
     /// enumerate declare it via capabilities and return an empty list.
     async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>>;
+
+    /// Checks that the provider's backend is reachable and the
+    /// configured credential is accepted, for preflight and diagnostics.
+    ///
+    /// Always callable; a provider without a real check reports
+    /// [`HealthStatus::Unknown`]. `Err` is reserved for failures of the
+    /// check itself, not for an unhealthy provider.
+    async fn health(&self) -> Result<ProviderHealth> {
+        Ok(ProviderHealth::new(HealthStatus::Unknown))
+    }
 
     /// Snapshot management, when the provider has it.
     fn snapshots(&self) -> Option<&dyn SnapshotProvider> {
@@ -63,6 +88,45 @@ pub trait SandboxProvider: Send + Sync {
 pub struct SandboxFilter {
     /// Labels the sandbox must carry (all of them).
     pub labels: BTreeMap<String, String>,
+}
+
+/// Outcome of a [`SandboxProvider::health`] check.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum HealthStatus {
+    /// The backend is reachable and the credential is accepted.
+    Ok,
+    /// The backend could not be reached.
+    Unreachable,
+    /// The backend is reachable but rejected the credential, or the
+    /// credential lacks required permissions.
+    Unauthorized,
+    /// The provider implements no health check.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Report from [`SandboxProvider::health`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ProviderHealth {
+    pub status:              HealthStatus,
+    /// Human-readable detail: which check failed and what to fix.
+    pub message:             Option<String>,
+    /// Permissions the credential is missing, when the provider can
+    /// enumerate them (e.g. Daytona API key scopes).
+    pub missing_permissions: Vec<String>,
+}
+
+impl ProviderHealth {
+    pub fn new(status: HealthStatus) -> Self {
+        Self {
+            status,
+            message: None,
+            missing_permissions: Vec::new(),
+        }
+    }
 }
 
 /// Snapshot management for one provider.
@@ -84,6 +148,21 @@ pub trait SnapshotProvider: Send + Sync {
     async fn build_logs(&self, id: &SnapshotId, follow: bool, sink: LogSink) -> Result<()> {
         let _ = (id, follow, sink);
         Err(Error::unsupported(Capability::Snapshots))
+    }
+
+    /// Reactivates an inactive snapshot so sandboxes can be created from
+    /// it again (Daytona deactivates snapshots unused for two weeks).
+    /// Capability-gated on `snapshots.activation`.
+    async fn activate(&self, id: &SnapshotId) -> Result<()> {
+        let _ = id;
+        Err(Error::unsupported(Capability::SnapshotsActivation))
+    }
+
+    /// Deactivates an active snapshot, releasing whatever the provider
+    /// keeps warm for it. Capability-gated on `snapshots.activation`.
+    async fn deactivate(&self, id: &SnapshotId) -> Result<()> {
+        let _ = id;
+        Err(Error::unsupported(Capability::SnapshotsActivation))
     }
 }
 

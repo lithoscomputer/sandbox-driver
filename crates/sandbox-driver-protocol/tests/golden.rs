@@ -114,6 +114,7 @@ fn capabilities_wire_shape_is_pinned() {
     "checkpoint": false,
     "resize": false,
     "recover": false,
+    "undelete": false,
     "refresh_activity": false,
     "timers": false,
     "labels": false,
@@ -137,6 +138,9 @@ fn capabilities_wire_shape_is_pinned() {
     "native": false
   },
   "git": {
+    "native": false
+  },
+  "services": {
     "native": false
   },
   "pty": null,

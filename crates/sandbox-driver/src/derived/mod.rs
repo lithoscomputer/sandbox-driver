@@ -13,10 +13,12 @@
 mod fs;
 mod git;
 mod search;
+mod service;
 
 pub use fs::DerivedFs;
 pub use git::DerivedGit;
 pub use search::DerivedSearch;
+pub use service::DerivedServices;
 
 /// Quotes a string for safe interpolation into Bash source.
 pub(crate) fn shell_quote(value: &str) -> String {

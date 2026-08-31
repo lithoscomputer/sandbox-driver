@@ -32,6 +32,8 @@ pub enum Capability {
     LifecycleResize,
     #[serde(rename = "lifecycle.recover")]
     LifecycleRecover,
+    #[serde(rename = "lifecycle.undelete")]
+    LifecycleUndelete,
     #[serde(rename = "lifecycle.refresh_activity")]
     LifecycleRefreshActivity,
     #[serde(rename = "lifecycle.timers")]
@@ -78,6 +80,10 @@ pub enum Capability {
     Snapshots,
     #[serde(rename = "snapshots.include_memory")]
     SnapshotsIncludeMemory,
+    #[serde(rename = "snapshots.activation")]
+    SnapshotsActivation,
+    #[serde(rename = "services")]
+    Services,
     #[serde(rename = "volumes")]
     Volumes,
 }
@@ -107,6 +113,7 @@ pub struct Capabilities {
     pub fs:        FsCaps,
     pub search:    SearchCaps,
     pub git:       GitCaps,
+    pub services:  ServiceCaps,
     pub pty:       Option<PtyCaps>,
     pub logs:      Option<LogsCaps>,
     pub access:    AccessCaps,
@@ -127,6 +134,7 @@ impl Capabilities {
             fs: FsCaps::default(),
             search: SearchCaps::default(),
             git: GitCaps::default(),
+            services: ServiceCaps::default(),
             pty: None,
             logs: None,
             access: AccessCaps::default(),
@@ -146,7 +154,11 @@ pub struct LifecycleCaps {
     /// Identity-preserving checkpoint/restore of the same sandbox.
     pub checkpoint:       bool,
     pub resize:           bool,
+    /// Provider-assisted recovery from the `Error` state.
     pub recover:          bool,
+    /// Restore a recently deleted sandbox within the provider's
+    /// recovery window.
+    pub undelete:         bool,
     pub refresh_activity: bool,
     pub timers:           bool,
     pub labels:           bool,
@@ -194,6 +206,14 @@ pub struct GitCaps {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[non_exhaustive]
+pub struct ServiceCaps {
+    /// Provider overrides the exec-derived services implementation
+    /// natively.
+    pub native: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PtyCaps {
     pub resize: bool,
 }
@@ -236,6 +256,9 @@ pub struct SnapshotCaps {
     /// Live-sandbox snapshots can include VM memory.
     pub include_memory:  bool,
     pub build_logs:      bool,
+    /// Snapshots can be deactivated and reactivated
+    /// ([`crate::SnapshotProvider::activate`]).
+    pub activation:      bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
