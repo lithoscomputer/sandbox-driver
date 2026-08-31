@@ -522,12 +522,12 @@ impl DaytonaExec {
                 };
                 let sanitized = sanitizer.lock().await.push(&missing);
                 seen.lock().await.push(&sanitized);
-                if !sanitized.is_empty()
-                    && !sink_failed.is_cancelled()
-                    && let Some(sink) = &controls.sink
-                    && sink(stream, sanitized).await.is_err()
-                {
-                    sink_failed.cancel();
+                if !sanitized.is_empty() && !sink_failed.is_cancelled() {
+                    if let Some(sink) = &controls.sink {
+                        if sink(stream, sanitized).await.is_err() {
+                            sink_failed.cancel();
+                        }
+                    }
                 }
             }
         }
@@ -538,12 +538,12 @@ impl DaytonaExec {
         ] {
             let final_bytes = sanitizer.lock().await.finish();
             seen.lock().await.push(&final_bytes);
-            if !final_bytes.is_empty()
-                && !sink_failed.is_cancelled()
-                && let Some(sink) = &controls.sink
-                && sink(stream, final_bytes).await.is_err()
-            {
-                sink_failed.cancel();
+            if !final_bytes.is_empty() && !sink_failed.is_cancelled() {
+                if let Some(sink) = &controls.sink {
+                    if sink(stream, final_bytes).await.is_err() {
+                        sink_failed.cancel();
+                    }
+                }
             }
         }
 

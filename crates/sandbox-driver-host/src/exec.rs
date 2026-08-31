@@ -257,11 +257,12 @@ async fn pump_stream(
             Ok(0) => {
                 let chunk = sanitizer.finish();
                 capture.push(&chunk);
-                if !chunk.is_empty()
-                    && let Some(sink) = sink
-                    && sink(stream, chunk).await.is_err()
-                {
-                    return PumpEnd::SinkError;
+                if !chunk.is_empty() {
+                    if let Some(sink) = sink {
+                        if sink(stream, chunk).await.is_err() {
+                            return PumpEnd::SinkError;
+                        }
+                    }
                 }
                 return PumpEnd::Eof;
             }
@@ -269,11 +270,12 @@ async fn pump_stream(
             Ok(read) => {
                 let chunk = sanitizer.push(&buffer[..read]);
                 capture.push(&chunk);
-                if !chunk.is_empty()
-                    && let Some(sink) = sink
-                    && sink(stream, chunk).await.is_err()
-                {
-                    return PumpEnd::SinkError;
+                if !chunk.is_empty() {
+                    if let Some(sink) = sink {
+                        if sink(stream, chunk).await.is_err() {
+                            return PumpEnd::SinkError;
+                        }
+                    }
                 }
             }
         }

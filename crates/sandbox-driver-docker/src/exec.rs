@@ -424,29 +424,33 @@ impl Exec for DockerExec {
                     Some(Ok(LogOutput::StdOut { message } | LogOutput::Console { message })) => {
                         let message = stdout_sanitizer.push(&message);
                         stdout_capture.push(&message);
-                        if !message.is_empty()
-                            && let Some(sink) = sink
-                            && sink(OutputStream::Stdout, message).await.is_err()
-                            && !kill_fired
-                        {
-                            termination = Termination::Cancelled;
-                            kill_fired = true;
-                            drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                            self.request_stop(&stop_file).await?;
+                        if !message.is_empty() {
+                            if let Some(sink) = sink {
+                                if sink(OutputStream::Stdout, message).await.is_err()
+                                    && !kill_fired
+                                {
+                                    termination = Termination::Cancelled;
+                                    kill_fired = true;
+                                    drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
+                                    self.request_stop(&stop_file).await?;
+                                }
+                            }
                         }
                     }
                     Some(Ok(LogOutput::StdErr { message })) => {
                         let message = stderr_sanitizer.push(&message);
                         stderr_capture.push(&message);
-                        if !message.is_empty()
-                            && let Some(sink) = sink
-                            && sink(OutputStream::Stderr, message).await.is_err()
-                            && !kill_fired
-                        {
-                            termination = Termination::Cancelled;
-                            kill_fired = true;
-                            drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                            self.request_stop(&stop_file).await?;
+                        if !message.is_empty() {
+                            if let Some(sink) = sink {
+                                if sink(OutputStream::Stderr, message).await.is_err()
+                                    && !kill_fired
+                                {
+                                    termination = Termination::Cancelled;
+                                    kill_fired = true;
+                                    drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
+                                    self.request_stop(&stop_file).await?;
+                                }
+                            }
                         }
                     }
                     Some(Ok(_)) => {}
@@ -481,11 +485,12 @@ impl Exec for DockerExec {
         ] {
             let bytes = sanitizer.finish();
             capture.push(&bytes);
-            if !bytes.is_empty()
-                && let Some(sink) = sink
-                && sink(stream, bytes).await.is_err()
-            {
-                termination = Termination::Cancelled;
+            if !bytes.is_empty() {
+                if let Some(sink) = sink {
+                    if sink(stream, bytes).await.is_err() {
+                        termination = Termination::Cancelled;
+                    }
+                }
             }
         }
 
