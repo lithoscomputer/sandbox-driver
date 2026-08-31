@@ -77,12 +77,12 @@ The full vocabulary. **Core** actions are required of every provider. Everything
 | `describe` | Observed status | core | ✔ | ✔ | ✔ | ✔ |
 | `start` / `stop` | Cold boot / shutdown; disk persists | core¹ | no-op | ✔ | ✔ | ✔ |
 | `delete` | Destroy; idempotent (unknown ID succeeds) | core | ✔ (cleanup) | ✔ | ✔ | ✔ |
-| `pause` / `resume` | Freeze with memory kept; distinct from stop | opt | — | ✔ (`docker pause`) | ✔ | ✔ (hibernate) |
+| `pause` / `resume` | Freeze with memory kept; distinct from stop | opt | — | ✔ (`docker pause`) | ✔ (VM classes; per-sandbox caps narrow it, resume = Daytona's start) | ✔ (hibernate) |
 | `archive` | Stopped → cold storage; `start` restores | opt | — | — | ✔ | — |
-| `fork` | Clone a sandbox (disk, optionally memory) → new sandbox | opt | — | — | ✔ (+ ancestry) | ✔ |
+| `fork` | Clone a sandbox (disk, optionally memory) → new sandbox | opt | — | — | ✔ (VM classes) | ✔ |
 | `checkpoint` / `restore` | Save a rewind point; rewind the **same sandbox** in place | opt | — | — | — | ✔ |
 | `resize` | Change cpu/memory/disk | opt | — | \~ (`docker update`, cpu/mem only) | ✔ | ? |
-| `snapshot_sandbox` | Snapshot a live sandbox (optionally incl. memory) → SnapshotProvider | opt | — | \~ (`docker commit`) | ✔ | ✔ |
+| `snapshot_sandbox` | Snapshot a live sandbox (optionally incl. memory) → SnapshotProvider | opt | — | \~ (`docker commit`) | ✔ (VM classes; memory not exposed by the SDK) | ✔ |
 | `recover` | Provider-assisted recovery from Error state | opt | — | — | — | — |
 | `undelete` | Restore a deleted sandbox within the recovery window; provider-level (a deleted sandbox cannot be attached), returns a fresh handle | opt | — | — | ✔ (24h, Daytona's "recover") | — |
 | `refresh_activity` | Keepalive; reset idle timers | opt | no-op | no-op | ✔ | ? |
@@ -112,7 +112,7 @@ pub struct LifecycleTimers {
 }
 ```
 
-Timer semantics: an unset timer inherits the provider's default — Daytona's server-side auto-stop default is **15 idle minutes**, shorter than a single long inference call, so callers running long commands set it explicitly. `Duration::ZERO` is the explicit "never": it disables the timer where the provider supports disabling. Daytona encodes that per timer — `0` for auto-stop, `-1` for auto-delete (whose wire `0` means delete-on-stop and is reserved for the ephemeral flag), and `0` for auto-archive, which Daytona reads as "the maximum interval" rather than disabled.
+Timer semantics: an unset timer inherits the provider's default — Daytona's server-side auto-stop default is **15 idle minutes**, shorter than a single long inference call, so callers running long commands set it explicitly. `Duration::ZERO` is the explicit "never": it disables the timer where the provider supports disabling. Daytona encodes that per timer — `0` for auto-stop, auto-pause, and ttl, `-1` for auto-delete (whose wire `0` means delete-on-stop and is reserved for the ephemeral flag), and `0` for auto-archive, which Daytona reads as "the maximum interval" rather than disabled. All five timers map on Daytona; auto-stop and auto-pause are mutually exclusive (at most one non-zero), and enabling auto-pause via `set_timers` without mentioning auto-stop disables auto-stop first, the documented upstream sequence.
 
 ## Sandbox features (facets)
 
@@ -121,7 +121,7 @@ Per-sandbox functionality is grouped into small **facet traits** (per the style 
 | Facet | Contents | Host | Docker | Daytona | boxd |
 | --- | --- | --- | --- | --- | --- |
 | `Exec` (core) | Buffered run; streaming run (callback sink, stdin, cancel, timeout); Bash contract | ✔ | ✔ | ✔ (streams via log-poll fallback) | ✔ |
-| `StdioProcess` | Spawn long-lived bidirectional process (ACP backends) | ✔ | ✔ | ✖ today — the known gap | ? |
+| `StdioProcess` | Spawn long-lived bidirectional process (ACP backends) | ✔ | ✔ | ✔ (command sessions; UTF-8 payloads only — the ACP case) | ? |
 | `Filesystem` (core) | read/write/delete/exists/stat/list/move/mkdir/permissions, upload/download (binary-safe, chunked) | native | native | native (toolbox FS) | ✔ |
 | `Search` (core, derived) | grep, glob, walk — default impl derived from `Exec` (rg with grep/find fallback); provider may override | derived | derived | derived (native find/replace exists) | derived |
 | `Git` | clone, status, add, commit, push, pull, branches, checkout — low-level plumbing only; default impl derived from `Exec`, per-call credentials | derived | derived | derived or native | derived |
