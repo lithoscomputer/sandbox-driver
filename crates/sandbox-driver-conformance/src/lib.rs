@@ -19,6 +19,7 @@
 //! safe to run against real (billed) providers — expect roughly a dozen
 //! short-lived sandboxes per run.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -26,8 +27,9 @@ use std::time::{Duration, Instant};
 use std::{fmt, process};
 
 use sandbox_driver::{
-    Capability, DerivedSearch, Error, ExecControls, ExecSpec, GrepOptions, OutputStream, Sandbox,
-    SandboxEvent, SandboxFilter, SandboxId, SandboxProvider, SandboxSpec, SandboxState, Search,
+    Capability, DerivedSearch, DerivedServices, Error, ExecControls, ExecSpec, GrepOptions,
+    HealthStatus, NetworkPolicy, OutputStream, Resources, Sandbox, SandboxEvent, SandboxFilter,
+    SandboxId, SandboxProvider, SandboxSpec, SandboxState, Search, ServiceSpec, Services,
     SpawnSpec, Termination, WaitOptions, activate, wait_for_state,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -149,6 +151,18 @@ impl Conformance {
             }),
             ("services_match_capabilities", |ctx| {
                 Box::pin(services_match_capabilities(ctx))
+            }),
+            ("exec_rejects_undeclared_stdin_and_cancel", |ctx| {
+                Box::pin(exec_rejects_undeclared_stdin_and_cancel(ctx))
+            }),
+            ("fs_range_and_append_round_trip", |ctx| {
+                Box::pin(fs_range_and_append_round_trip(ctx))
+            }),
+            ("background_services_round_trip", |ctx| {
+                Box::pin(background_services_round_trip(ctx))
+            }),
+            ("provider_health_answers", |ctx| {
+                Box::pin(provider_health_answers(ctx))
             }),
             ("volume_round_trip", |ctx| Box::pin(volume_round_trip(ctx))),
         ];
@@ -960,6 +974,41 @@ async fn unsupported_actions_say_so(ctx: &Conformance) -> CheckOutcome {
             caps.lifecycle.refresh_activity,
             sandbox.refresh_activity().await,
         );
+        check(
+            "resize",
+            caps.lifecycle.resize,
+            sandbox
+                .resize(&{
+                    let mut resources = Resources::default();
+                    resources.cpu_cores = Some(1);
+                    resources
+                })
+                .await,
+        );
+        check(
+            "set_timers",
+            caps.lifecycle.timers,
+            sandbox
+                .set_timers(&sandbox_driver::LifecycleTimers::default())
+                .await,
+        );
+        check(
+            "set_labels",
+            caps.lifecycle.labels,
+            sandbox.set_labels(&BTreeMap::new()).await,
+        );
+        check(
+            "update_network",
+            caps.lifecycle.update_network,
+            sandbox.update_network(&NetworkPolicy::AllowAll).await,
+        );
+        check(
+            "undelete",
+            caps.lifecycle.undelete,
+            ctx.provider.undelete(sandbox.id(), None).await.map(|_| ()),
+        );
+        // Handle-producing verbs are exercised only in the undeclared
+        // direction: expect a clean Unsupported, never a real resource.
         if !caps.lifecycle.checkpoint {
             if let Err(error) = sandbox
                 .checkpoint(&sandbox_driver::CheckpointOptions::default())
@@ -972,6 +1021,28 @@ async fn unsupported_actions_say_so(ctx: &Conformance) -> CheckOutcome {
                 }
             } else {
                 wrong.push("checkpoint: undeclared but succeeded".to_owned());
+            }
+        }
+        if !caps.lifecycle.fork {
+            match sandbox.fork(&sandbox_driver::ForkOptions::default()).await {
+                Err(Error::Unsupported { .. }) => {}
+                Err(error) => wrong.push(format!("fork: expected Unsupported, got {error}")),
+                Ok(forked) => {
+                    let _ = forked.delete().await;
+                    wrong.push("fork: undeclared but succeeded".to_owned());
+                }
+            }
+        }
+        if !caps.lifecycle.snapshot_sandbox {
+            match sandbox
+                .snapshot(&sandbox_driver::SandboxSnapshotOptions::default())
+                .await
+            {
+                Err(Error::Unsupported { .. }) => {}
+                Err(error) => {
+                    wrong.push(format!("snapshot: expected Unsupported, got {error}"));
+                }
+                Ok(_) => wrong.push("snapshot: undeclared but succeeded".to_owned()),
             }
         }
         if wrong.is_empty() {
@@ -1210,6 +1281,227 @@ async fn volume_round_trip(ctx: &Conformance) -> CheckOutcome {
         .await
         .map_err(|error| format!("second volume delete failed: {error}"))?;
     PASS
+}
+
+/// A spec field the capability set disclaims must be rejected with the
+/// matching `Unsupported`, never silently dropped.
+async fn exec_rejects_undeclared_stdin_and_cancel(ctx: &Conformance) -> CheckOutcome {
+    let caps = ctx.caps();
+    if caps.exec.stdin && caps.exec.cancel {
+        return Ok(Some(
+            "exec.stdin and exec.cancel are both declared".to_owned(),
+        ));
+    }
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        if !caps.exec.stdin {
+            let spec = ExecSpec::new("cat")
+                .stdin(b"dropped?".to_vec())
+                .timeout(Duration::from_secs(30));
+            match sandbox
+                .exec()
+                .run_streaming(&spec, ExecControls::default())
+                .await
+            {
+                Err(Error::Unsupported {
+                    capability: Capability::ExecStdin,
+                }) => {}
+                Err(other) => {
+                    return fail(format!("stdin: expected Unsupported(exec.stdin): {other}"));
+                }
+                Ok(_) => return fail("undeclared stdin was accepted (or dropped)"),
+            }
+        }
+        if !caps.exec.cancel {
+            let controls = ExecControls {
+                cancel: Some(CancellationToken::new()),
+                ..ExecControls::default()
+            };
+            let spec = ExecSpec::new("true").timeout(Duration::from_secs(30));
+            match sandbox.exec().run_streaming(&spec, controls).await {
+                Err(Error::Unsupported {
+                    capability: Capability::ExecCancel,
+                }) => {}
+                Err(other) => {
+                    return fail(format!(
+                        "cancel: expected Unsupported(exec.cancel): {other}"
+                    ));
+                }
+                Ok(_) => return fail("undeclared cancel token was accepted (or ignored)"),
+            }
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn fs_range_and_append_round_trip(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let fs = sandbox.fs();
+        fs.write("conformance-range/base.bin", b"0123456789")
+            .await
+            .map_err(|error| format!("write failed: {error}"))?;
+        let middle = fs
+            .read_range("conformance-range/base.bin", 2, Some(5))
+            .await
+            .map_err(|error| format!("read_range failed: {error}"))?;
+        if middle != b"23456" {
+            return fail(format!("read_range(2,5) returned {middle:?}"));
+        }
+        let tail = fs
+            .read_range("conformance-range/base.bin", 7, None)
+            .await
+            .map_err(|error| format!("read_range to EOF failed: {error}"))?;
+        if tail != b"789" {
+            return fail(format!("read_range(7,None) returned {tail:?}"));
+        }
+        let past = fs
+            .read_range("conformance-range/base.bin", 32, Some(4))
+            .await
+            .map_err(|error| format!("read_range past EOF failed: {error}"))?;
+        if !past.is_empty() {
+            return fail(format!("read past EOF returned {past:?}"));
+        }
+
+        // Append creates the file (and parents) and extends it.
+        fs.write_append("conformance-range/appended.bin", b"first-")
+            .await
+            .map_err(|error| format!("first append failed: {error}"))?;
+        fs.write_append("conformance-range/appended.bin", b"second")
+            .await
+            .map_err(|error| format!("second append failed: {error}"))?;
+        let combined = fs
+            .read("conformance-range/appended.bin")
+            .await
+            .map_err(|error| format!("read after append failed: {error}"))?;
+        if combined != b"first-second" {
+            return fail(format!(
+                "append round trip returned {:?}",
+                String::from_utf8_lossy(&combined)
+            ));
+        }
+        fs.delete("conformance-range", true)
+            .await
+            .map_err(|error| format!("cleanup delete failed: {error}"))?;
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+/// Background services: spawn outlives its exec, reports status, serves
+/// logs, and stops idempotently — via the native facet when declared,
+/// otherwise the library's derived implementation.
+async fn background_services_round_trip(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        if ctx.caps().services.native != sandbox.services().is_some() {
+            return fail("services facet presence disagrees with services.native");
+        }
+        let derived;
+        let services: &dyn Services = if let Some(native) = sandbox.services() {
+            native
+        } else {
+            derived = DerivedServices::new(sandbox.exec());
+            &derived
+        };
+
+        let spec = ServiceSpec::new("while true; do echo tick; sleep 0.2; done");
+        let id = services
+            .spawn(&spec)
+            .await
+            .map_err(|error| format!("spawn failed: {error}"))?;
+        // The service must be observable as running and produce logs.
+        let mut running = false;
+        for _ in 0..20 {
+            let status = services
+                .status(&id)
+                .await
+                .map_err(|error| format!("status failed: {error}"))?;
+            if status.running {
+                running = true;
+                break;
+            }
+            time::sleep(Duration::from_millis(250)).await;
+        }
+        if !running {
+            return fail("service never reported running");
+        }
+        let mut saw_logs = false;
+        for _ in 0..20 {
+            let logs = services
+                .logs(&id, 4096)
+                .await
+                .map_err(|error| format!("logs failed: {error}"))?;
+            if String::from_utf8_lossy(&logs).contains("tick") {
+                saw_logs = true;
+                break;
+            }
+            time::sleep(Duration::from_millis(250)).await;
+        }
+        if !saw_logs {
+            return fail("service logs never surfaced output");
+        }
+
+        services
+            .stop(&id)
+            .await
+            .map_err(|error| format!("stop failed: {error}"))?;
+        let mut stopped = false;
+        for _ in 0..20 {
+            let status = services
+                .status(&id)
+                .await
+                .map_err(|error| format!("status after stop failed: {error}"))?;
+            if !status.running {
+                stopped = true;
+                break;
+            }
+            time::sleep(Duration::from_millis(250)).await;
+        }
+        if !stopped {
+            return fail("service still running after stop");
+        }
+        // Stop is idempotent, and an unknown id reports not running.
+        services
+            .stop(&id)
+            .await
+            .map_err(|error| format!("second stop failed: {error}"))?;
+        let unknown = sandbox_driver::ServiceId::try_new("conformance-unknown-service")
+            .map_err(|error| error.to_string())?;
+        let status = services
+            .status(&unknown)
+            .await
+            .map_err(|error| format!("status of unknown id failed: {error}"))?;
+        if status.running {
+            return fail("unknown service id reported running");
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+/// `health` must answer — a working provider (this suite just created
+/// sandboxes on it) must not report itself unreachable or unauthorized.
+async fn provider_health_answers(ctx: &Conformance) -> CheckOutcome {
+    let health = ctx
+        .provider
+        .health()
+        .await
+        .map_err(|error| format!("health failed: {error}"))?;
+    match health.status {
+        HealthStatus::Ok | HealthStatus::Unknown => PASS,
+        status => fail(format!(
+            "a working provider reported {status:?}: {:?} (missing: {:?})",
+            health.message, health.missing_permissions
+        )),
+    }
 }
 
 async fn create_emits_terminal_events(ctx: &Conformance) -> CheckOutcome {
