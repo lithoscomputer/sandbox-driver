@@ -92,11 +92,19 @@ impl Session {
     /// Best-effort final log fetch; `None` on any failure or after
     /// `close` — the caller falls back to what the stream delivered.
     pub(crate) async fn fetch_logs(&self, command_id: &str) -> Option<SessionCommandLogsResult> {
-        self.process
+        let outcome = self
+            .process
             .as_ref()?
             .get_session_command_logs(&self.id, command_id)
-            .await
-            .ok()
+            .await;
+        match outcome {
+            Ok(logs) => Some(logs),
+            Err(error) => {
+                let error = daytona_error("fetching final command logs", error);
+                tracing::debug!(error = %error, "final command log fetch failed");
+                None
+            }
+        }
     }
 
     /// Deletes the session — killing anything still running in it —
@@ -106,7 +114,14 @@ impl Session {
         let Some(process) = self.process.as_ref() else {
             return;
         };
-        let _ = time::timeout(CLEANUP_TIMEOUT, process.delete_session(&self.id)).await;
+        match time::timeout(CLEANUP_TIMEOUT, process.delete_session(&self.id)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let error = daytona_error("deleting command session", error);
+                tracing::warn!(error = %error, "command session cleanup failed");
+            }
+            Err(_) => tracing::warn!("command session cleanup timed out"),
+        }
         self.process.take();
     }
 }
@@ -122,8 +137,17 @@ impl Drop for Session {
         let id = mem::take(&mut self.id);
         if let Ok(handle) = Handle::try_current() {
             handle.spawn(async move {
-                let _ = time::timeout(CLEANUP_TIMEOUT, process.delete_session(&id)).await;
+                match time::timeout(CLEANUP_TIMEOUT, process.delete_session(&id)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        let error = daytona_error("deleting dropped command session", error);
+                        tracing::warn!(error = %error, "dropped command session cleanup failed");
+                    }
+                    Err(_) => tracing::warn!("dropped command session cleanup timed out"),
+                }
             });
+        } else {
+            tracing::warn!("command session cleanup skipped without a runtime");
         }
     }
 }

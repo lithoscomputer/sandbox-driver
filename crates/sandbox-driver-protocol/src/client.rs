@@ -2,6 +2,7 @@
 //! [`SandboxProvider`] / [`Sandbox`] traits.
 
 use std::collections::{BTreeMap, HashMap};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -30,6 +31,7 @@ use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::{Mutex as AsyncMutex, OnceCell, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::{fs as tokio_fs, time};
+use tracing::field;
 
 use crate::methods as m;
 use crate::wire::{Message, decode_bytes, encode_bytes};
@@ -51,6 +53,7 @@ pub struct PluginProvider {
 }
 
 impl PluginProvider {
+    #[tracing::instrument(skip_all, err)]
     pub async fn connect(
         reader: impl AsyncRead + Unpin + Send + 'static,
         writer: impl AsyncWrite + Unpin + Send + 'static,
@@ -98,6 +101,7 @@ impl PluginProvider {
     /// logs reach the host's stderr, and marks the child kill-on-drop.
     /// [`PluginProvider::shutdown`] asks the plugin to exit and reaps it,
     /// killing after a grace period.
+    #[tracing::instrument(skip_all, err)]
     pub async fn spawn(mut command: Command) -> Result<Self> {
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
@@ -114,6 +118,7 @@ impl PluginProvider {
 
     /// Asks the plugin to shut down cleanly and, for a spawned plugin,
     /// reaps the child — killing it after a grace period if it lingers.
+    #[tracing::instrument(skip_all, fields(provider_kind = %self.kind), err)]
     pub async fn shutdown(&self) -> Result<()> {
         let _: m::Empty = self.client.call(m::SHUTDOWN, &m::Empty).await?;
         let child = self
@@ -125,8 +130,18 @@ impl PluginProvider {
                 .await
                 .is_err()
             {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                tracing::warn!(provider_kind = %self.kind, "plugin did not exit after shutdown");
+                if let Err(error) = child.kill().await {
+                    tracing::warn!(
+                        provider_kind = %self.kind,
+                        error = ?error,
+                        "plugin process kill failed"
+                    );
+                }
+                child
+                    .wait()
+                    .await
+                    .map_err(|error| Error::io("reaping plugin process", error))?;
             }
         }
         Ok(())
@@ -633,11 +648,14 @@ impl Client {
     /// both transport tasks; also re-checked by `call` after registering,
     /// closing the race where a call lands just after the drain.
     fn mark_closed(&self, error: TransportError) {
-        self.closed.store(true, Ordering::SeqCst);
+        let first_failure = !self.closed.swap(true, Ordering::SeqCst);
         let error = {
             let mut closed_error = self.closed_error.lock().expect("closed error lock");
             closed_error.get_or_insert(error).clone()
         };
+        if first_failure {
+            tracing::error!(error = ?error, "plugin transport failed");
+        }
         let pending: Vec<_> = {
             let mut pending = self.pending.lock().expect("pending lock");
             pending.drain().collect()
@@ -754,7 +772,12 @@ impl Client {
                             .cloned()
                     });
                 if let Some(callback) = callback {
-                    callback(notification.event);
+                    if catch_unwind(AssertUnwindSafe(|| callback(notification.event))).is_err() {
+                        tracing::warn!(
+                            sandbox_id = %notification.sandbox_id,
+                            "plugin event callback panicked"
+                        );
+                    }
                 }
             }
             _ => {}
@@ -762,8 +785,14 @@ impl Client {
         Ok(())
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(method = method, request_id = field::Empty),
+        err
+    )]
     async fn call<P: Serialize, R: DeserializeOwned>(&self, method: &str, params: &P) -> Result<R> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        tracing::Span::current().record("request_id", id);
         let params = serde_json::to_value(params).map_err(|error| {
             Error::Transport(TransportError::with_source(
                 "encoding plugin request parameters",
@@ -825,10 +854,15 @@ impl Drop for StreamCancelGuard {
         // connection is going away with the stream anyway.
         if let Ok(handle) = RuntimeHandle::try_current() {
             handle.spawn(async move {
-                let _: Result<m::Empty> = client
+                let outcome: Result<m::Empty> = client
                     .call(m::STREAM_CANCEL, &m::StreamIdParams { stream_id })
                     .await;
+                if let Err(error) = outcome {
+                    tracing::warn!(error = %error, "plugin log stream cancellation failed");
+                }
             });
+        } else {
+            tracing::debug!("plugin log stream cancellation skipped without a runtime");
         }
     }
 }
@@ -1259,10 +1293,26 @@ impl Exec for SandboxExec {
                 .lock()
                 .expect("exec streams lock")
                 .insert(exec_id.clone(), queue);
+            let client = Arc::clone(&self.client);
+            let cancel_exec_id = exec_id.clone();
             tokio::spawn(async move {
                 while let Some((stream, chunk)) = receiver.recv().await {
-                    let _ = sink(stream, chunk).await;
+                    if let Err(error) = sink(stream, chunk).await {
+                        let cancel: Result<m::Empty> = client
+                            .call(m::EXEC_CANCEL, &m::ExecCancelParams {
+                                exec_id: cancel_exec_id.clone(),
+                            })
+                            .await;
+                        if let Err(cancel_error) = cancel {
+                            tracing::warn!(
+                                error = %cancel_error,
+                                "plugin exec cancellation after sink failure failed"
+                            );
+                        }
+                        return Err(error);
+                    }
                 }
+                Ok(())
             })
         });
         // Forward cancellation as an exec/cancel request.
@@ -1271,9 +1321,12 @@ impl Exec for SandboxExec {
             let exec_id = exec_id.clone();
             tokio::spawn(async move {
                 token.cancelled().await;
-                let _: Result<m::Empty> = client
+                let outcome: Result<m::Empty> = client
                     .call(m::EXEC_CANCEL, &m::ExecCancelParams { exec_id })
                     .await;
+                if let Err(error) = outcome {
+                    tracing::warn!(error = %error, "plugin exec cancellation failed");
+                }
             })
         });
 
@@ -1292,14 +1345,23 @@ impl Exec for SandboxExec {
             .lock()
             .expect("exec streams lock")
             .remove(&exec_id);
-        if let Some(pump) = pump {
+        let pump_outcome = if let Some(pump) = pump {
             // The queue sender is gone; the pump drains what remains and
             // ends, so every chunk is delivered before the result is.
-            let _ = pump.await;
-        }
+            match pump.await {
+                Ok(result) => result,
+                Err(error) => Err(Error::Transport(TransportError::with_source(
+                    "joining plugin exec output pump",
+                    error,
+                ))),
+            }
+        } else {
+            Ok(())
+        };
         if let Some(task) = cancel_task {
             task.abort();
         }
+        pump_outcome?;
         let result = outcome?;
         let mut streaming = ExecStreamingResult::new(result.result.into_result()?);
         streaming.streams_separated = result.streams_separated;
@@ -1327,7 +1389,15 @@ impl Exec for SandboxExec {
             let mut buffer = vec![0; 32 * 1024];
             loop {
                 let read = match stdin_reader.read(&mut buffer).await {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
+                    Err(error) => {
+                        tracing::warn!(
+                            process_id = %input_id,
+                            error = %error,
+                            "plugin stdio input pipe failed"
+                        );
+                        return;
+                    }
                     Ok(read) => read,
                 };
                 let outcome: Result<m::Empty> = input_client
@@ -1336,15 +1406,27 @@ impl Exec for SandboxExec {
                         data_b64:   encode_bytes(&buffer[..read]),
                     })
                     .await;
-                if outcome.is_err() {
+                if let Err(error) = outcome {
+                    tracing::warn!(
+                        process_id = %input_id,
+                        error = %error,
+                        "plugin stdio input forwarding failed"
+                    );
                     return;
                 }
             }
-            let _: Result<m::Empty> = input_client
+            let outcome: Result<m::Empty> = input_client
                 .call(m::EXEC_STDIO_CLOSE_INPUT, &m::StdioIdParams {
-                    process_id: input_id,
+                    process_id: input_id.clone(),
                 })
                 .await;
+            if let Err(error) = outcome {
+                tracing::warn!(
+                    process_id = %input_id,
+                    error = %error,
+                    "plugin stdio input close failed"
+                );
+            }
         });
 
         let (mut stdout_writer, stdout_reader) = duplex(64 * 1024);
@@ -1357,16 +1439,45 @@ impl Exec for SandboxExec {
                         process_id: output_id.clone(),
                     })
                     .await;
-                let Ok(result) = result else { break };
-                let Some(chunk) = result.data_b64 else { break };
-                let Ok(chunk) = decode_bytes(&chunk) else {
-                    break;
+                let result = match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        tracing::warn!(
+                            process_id = %output_id,
+                            error = %error,
+                            "plugin stdio output polling failed"
+                        );
+                        break;
+                    }
                 };
-                if stdout_writer.write_all(&chunk).await.is_err() {
+                let Some(chunk) = result.data_b64 else { break };
+                let chunk = match decode_bytes(&chunk) {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        tracing::warn!(
+                            process_id = %output_id,
+                            error = %error,
+                            "plugin stdio output decoding failed"
+                        );
+                        break;
+                    }
+                };
+                if let Err(error) = stdout_writer.write_all(&chunk).await {
+                    tracing::debug!(
+                        process_id = %output_id,
+                        error = ?error,
+                        "plugin stdio output reader closed"
+                    );
                     break;
                 }
             }
-            let _ = stdout_writer.shutdown().await;
+            if let Err(error) = stdout_writer.shutdown().await {
+                tracing::debug!(
+                    process_id = %output_id,
+                    error = ?error,
+                    "plugin stdio output pipe close failed"
+                );
+            }
         });
 
         let stderr_tail = StderrTail::default();
@@ -1398,15 +1509,20 @@ struct RemoteStdioHandle {
 
 #[async_trait]
 impl StdioProcessHandle for RemoteStdioHandle {
+    #[tracing::instrument(skip_all, fields(process_id = %self.process_id))]
     async fn terminate(&self) {
-        let _: Result<m::Empty> = self
+        let outcome: Result<m::Empty> = self
             .client
             .call(m::EXEC_STDIO_TERMINATE, &m::StdioIdParams {
                 process_id: self.process_id.clone(),
             })
             .await;
+        if let Err(error) = outcome {
+            tracing::warn!(error = %error, "plugin stdio termination failed");
+        }
     }
 
+    #[tracing::instrument(skip_all, fields(process_id = %self.process_id))]
     async fn wait(&self) -> (Termination, Option<i32>) {
         *self
             .outcome
@@ -1417,12 +1533,18 @@ impl StdioProcessHandle for RemoteStdioHandle {
                         process_id: self.process_id.clone(),
                     })
                     .await;
-                let Ok(result) = result else {
-                    return (Termination::Unknown, None);
+                let result = match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        tracing::error!(error = %error, "plugin stdio wait failed");
+                        return (Termination::Unknown, None);
+                    }
                 };
                 self.stderr_tail.push(result.stderr_tail.as_bytes());
                 if let Some(task) = self.output_task.lock().await.take() {
-                    let _ = task.await;
+                    if let Err(error) = task.await {
+                        tracing::error!(error = ?error, "plugin stdio output task failed");
+                    }
                 }
                 if let Some(task) = self.input_task.lock().await.take() {
                     task.abort();

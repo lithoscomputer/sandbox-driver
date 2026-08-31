@@ -121,6 +121,11 @@ fn file_from_tar(archive: &[u8]) -> Result<Option<Vec<u8>>> {
 
 #[async_trait]
 impl Filesystem for DockerFs {
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "docker", sandbox_id = %self.container_id),
+        err
+    )]
     async fn read(&self, path: &str) -> Result<Vec<u8>> {
         let container_path = self.resolve(path);
         let options = DownloadFromContainerOptions {
@@ -142,6 +147,15 @@ impl Filesystem for DockerFs {
         }
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            provider_kind = "docker",
+            sandbox_id = %self.container_id,
+            byte_count = content.len()
+        ),
+        err
+    )]
     async fn write(&self, path: &str, content: &[u8]) -> Result<()> {
         let container_path = self.resolve(path);
         let (parent, file_name) = split_container_path(&container_path)?;
@@ -168,44 +182,78 @@ impl Filesystem for DockerFs {
         }
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "docker", sandbox_id = %self.container_id, recursive),
+        err
+    )]
     async fn delete(&self, path: &str, recursive: bool) -> Result<()> {
         self.derived.delete(path, recursive).await
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container_id), err)]
     async fn exists(&self, path: &str) -> Result<bool> {
         self.derived.exists(path).await
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container_id), err)]
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
         self.derived.metadata(path).await
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "docker", sandbox_id = %self.container_id, depth),
+        err
+    )]
     async fn list_dir(&self, path: &str, depth: usize) -> Result<Vec<DirEntry>> {
         self.derived.list_dir(path, depth).await
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container_id), err)]
     async fn create_dir(&self, path: &str) -> Result<()> {
         self.derived.create_dir(path).await
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container_id), err)]
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
         self.derived.rename(from, to).await
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "docker", sandbox_id = %self.container_id, mode),
+        err
+    )]
     async fn set_permissions(&self, path: &str, mode: u32) -> Result<()> {
         self.derived.set_permissions(path, mode).await
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "docker", sandbox_id = %self.container_id, offset),
+        err
+    )]
     async fn read_range(&self, path: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
         // The archive API only moves whole files; the exec-derived range
         // read avoids materializing the file for one slice.
         self.derived.read_range(path, offset, length).await
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            provider_kind = "docker",
+            sandbox_id = %self.container_id,
+            byte_count = content.len()
+        ),
+        err
+    )]
     async fn write_append(&self, path: &str, content: &[u8]) -> Result<()> {
         self.derived.write_append(path, content).await
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container_id), err)]
     async fn upload(&self, local: &Path, remote: &str) -> Result<()> {
         let bytes = fs::read(local)
             .await
@@ -213,6 +261,7 @@ impl Filesystem for DockerFs {
         self.write(remote, &bytes).await
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container_id), err)]
     async fn download(&self, remote: &str, local: &Path) -> Result<()> {
         let bytes = self.read(remote).await?;
         if let Some(parent) = local.parent() {

@@ -170,6 +170,19 @@ impl SandboxEvent {
                 | Self::SnapshotFailed { .. }
         )
     }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::ActionStarted { .. } => "action_started",
+            Self::ActionCompleted { .. } => "action_completed",
+            Self::ActionFailed { .. } => "action_failed",
+            Self::SnapshotBuilding { .. } => "snapshot_building",
+            Self::SnapshotReady { .. } => "snapshot_ready",
+            Self::SnapshotFailed { .. } => "snapshot_failed",
+            Self::StateChanged { .. } => "state_changed",
+            Self::Progress { .. } => "progress",
+        }
+    }
 }
 
 /// Event delivery callback, attached at `create`/`attach` and scoped to
@@ -208,6 +221,7 @@ impl EventDispatcher {
                 }
                 let call = AssertUnwindSafe(|| callback(event));
                 if catch_unwind(call).is_err() {
+                    tracing::warn!("sandbox event callback panicked");
                     panicked = true;
                 }
             }
@@ -218,20 +232,33 @@ impl EventDispatcher {
     /// Queues an event. Terminal events wait for queue space; others are
     /// dropped when the queue is full.
     pub async fn emit(&self, event: SandboxEvent) {
+        let event_kind = event.kind();
         if event.is_terminal() {
             // The receiver only closes when the dispatcher drops, so a
             // send failure here means shutdown is racing; dropping the
             // event then is correct.
-            let _ = self.queue.send(event).await;
+            if self.queue.send(event).await.is_err() {
+                tracing::debug!(event_kind, "sandbox event dispatcher closed");
+            }
         } else {
-            let _ = self.queue.try_send(event);
+            match self.queue.try_send(event) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(event_kind, "sandbox event queue full");
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::debug!(event_kind, "sandbox event dispatcher closed");
+                }
+            }
         }
     }
 
     /// Closes the queue, delivers what was queued, and joins the worker.
     pub async fn shutdown(self) {
         drop(self.queue);
-        let _ = self.worker.await;
+        if let Err(error) = self.worker.await {
+            tracing::error!(error = ?error, "sandbox event dispatcher failed");
+        }
     }
 }
 

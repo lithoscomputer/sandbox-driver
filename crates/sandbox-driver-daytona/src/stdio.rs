@@ -75,12 +75,13 @@ pub(crate) async fn spawn(
     let (stdout_into, stdout_reader) = duplex(PIPE_CAPACITY);
     let stderr_tail = StderrTail::default();
     let stream_task = tokio::spawn({
+        let sandbox_id = sandbox_id.to_owned();
         let session_id = session.id().to_owned();
         let command_id = command_id.clone();
         let stdout_into = Arc::new(Mutex::new(stdout_into));
         let stderr_tail = stderr_tail.clone();
         async move {
-            let _ = stream_process
+            let outcome = stream_process
                 .get_session_command_logs_stream(
                     &session_id,
                     &command_id,
@@ -90,7 +91,18 @@ pub(crate) async fn spawn(
                             // A closed reader means the caller dropped
                             // stdout; drain silently so control flow
                             // (exit polling) is unaffected.
-                            let _ = stdout_into.lock().await.write_all(chunk.as_bytes()).await;
+                            if stdout_into
+                                .lock()
+                                .await
+                                .write_all(chunk.as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                tracing::debug!(
+                                    provider_kind = "daytona",
+                                    "stdio output reader closed"
+                                );
+                            }
                             Ok::<_, DaytonaError>(())
                         }
                     },
@@ -103,6 +115,15 @@ pub(crate) async fn spawn(
                     },
                 )
                 .await;
+            if let Err(error) = outcome {
+                let error = daytona_error("following stdio logs", error);
+                tracing::warn!(
+                    provider_kind = "daytona",
+                    sandbox_id = %sandbox_id,
+                    error = %error,
+                    "stdio log stream failed"
+                );
+            }
             // Dropping the writer half delivers EOF to the reader.
         }
     });
@@ -114,6 +135,7 @@ pub(crate) async fn spawn(
     // fails with a closed pipe) instead of corrupting the stream.
     let (stdin_writer, mut stdin_reader) = duplex(PIPE_CAPACITY);
     let stdin_task = tokio::spawn({
+        let sandbox_id = sandbox_id.to_owned();
         let session_id = session.id().to_owned();
         let command_id = command_id.clone();
         async move {
@@ -121,7 +143,16 @@ pub(crate) async fn spawn(
             let mut buffer = vec![0u8; PIPE_CAPACITY];
             loop {
                 let read = match stdin_reader.read(&mut buffer).await {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
+                    Err(error) => {
+                        tracing::warn!(
+                            provider_kind = "daytona",
+                            sandbox_id = %sandbox_id,
+                            error = ?error,
+                            "stdio input pipe failed"
+                        );
+                        break;
+                    }
                     Ok(read) => read,
                 };
                 pending.extend_from_slice(&buffer[..read]);
@@ -131,6 +162,11 @@ pub(crate) async fn spawn(
                         if error.error_len().is_some() {
                             // Genuinely invalid bytes, not a split
                             // character: refuse rather than corrupt.
+                            tracing::warn!(
+                                provider_kind = "daytona",
+                                sandbox_id = %sandbox_id,
+                                "stdio input was not valid UTF-8"
+                            );
                             break;
                         }
                         error.valid_up_to()
@@ -141,11 +177,17 @@ pub(crate) async fn spawn(
                 }
                 let data = String::from_utf8_lossy(&pending[..valid_up_to]).into_owned();
                 pending.drain(..valid_up_to);
-                if input_process
+                if let Err(error) = input_process
                     .send_session_command_input(&session_id, &command_id, &data)
                     .await
-                    .is_err()
                 {
+                    let error = daytona_error("forwarding stdio input", error);
+                    tracing::warn!(
+                        provider_kind = "daytona",
+                        sandbox_id = %sandbox_id,
+                        error = %error,
+                        "stdio input forwarding failed"
+                    );
                     break;
                 }
             }
@@ -153,6 +195,7 @@ pub(crate) async fn spawn(
     });
 
     let handle = DaytonaStdioHandle {
+        sandbox_id: sandbox_id.to_owned(),
         session: Mutex::new(session),
         command_id,
         stream_task: Mutex::new(Some(stream_task)),
@@ -168,6 +211,7 @@ pub(crate) async fn spawn(
 }
 
 struct DaytonaStdioHandle {
+    sandbox_id:  String,
     session:     Mutex<Session>,
     command_id:  String,
     stream_task: Mutex<Option<JoinHandle<()>>>,
@@ -186,6 +230,11 @@ impl DaytonaStdioHandle {
                 .await
                 .is_err()
             {
+                tracing::warn!(
+                    provider_kind = "daytona",
+                    sandbox_id = %self.sandbox_id,
+                    "stdio log stream did not close"
+                );
                 task.abort();
             }
         }
@@ -194,12 +243,20 @@ impl DaytonaStdioHandle {
 
 #[async_trait::async_trait]
 impl StdioProcessHandle for DaytonaStdioHandle {
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id)
+    )]
     async fn terminate(&self) {
         // Deleting the session kills the command and closes its streams.
         self.session.lock().await.close().await;
         self.abort_pumps().await;
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id)
+    )]
     async fn wait(&self) -> (Termination, Option<i32>) {
         loop {
             let polled = {
@@ -214,7 +271,8 @@ impl StdioProcessHandle for DaytonaStdioHandle {
                 Ok(None) => {}
                 // The session is gone — terminate() ran, or the sandbox
                 // dropped it.
-                Err(_) => {
+                Err(error) => {
+                    tracing::debug!(error = %error, "stdio command session closed");
                     self.abort_pumps().await;
                     return (Termination::Killed, None);
                 }

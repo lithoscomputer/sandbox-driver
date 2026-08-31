@@ -19,6 +19,17 @@ re-runs the same suite through the wire.
 See `docs/design.md` for the interface design
 and `docs/protocol.md` for the normative plugin wire protocol.
 
+## Diagnostics
+
+The library crates emit `tracing` spans and events. Applications choose
+the subscriber and output destination. Operation fields include provider
+kinds, resource IDs, states, attempts, counts, and durations. They do not
+include commands, environment values, tokens, URLs, file paths, request
+bodies, or command output.
+
+The host plugin configures a stderr subscriber. It uses `RUST_LOG` when
+set and defaults to `info`. Protocol messages remain on stdout.
+
 ## Setup
 
 Install the locked tools and prepare the repository:

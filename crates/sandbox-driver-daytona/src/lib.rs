@@ -464,6 +464,7 @@ pub struct DaytonaProvider {
 
 impl DaytonaProvider {
     /// Connects using the SDK's environment configuration.
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona"), err)]
     pub async fn connect() -> Result<Self> {
         let client = Client::new()
             .await
@@ -485,6 +486,7 @@ impl DaytonaProvider {
     /// Creates the sandbox and waits for it to start under `budget`,
     /// deleting the half-created (and billed) sandbox when the wait
     /// fails so nothing is silently leaked.
+    #[tracing::instrument(skip_all, fields(provider_kind = %self.kind), err)]
     async fn create_inner(
         &self,
         params: CreateParams,
@@ -513,13 +515,17 @@ impl DaytonaProvider {
         budget: Duration,
     ) -> Result<daytona_sdk::Sandbox> {
         let started = Instant::now();
+        let mut attempt = 0_u64;
         loop {
+            attempt += 1;
             let sdk = self
                 .client
                 .get(sdk_id)
                 .await
                 .map_err(|error| daytona_error("fetching created sandbox", error))?;
-            match map_state(sdk.state) {
+            let state = map_state(sdk.state);
+            tracing::debug!(attempt, state = ?state, "sandbox create state observed");
+            match state {
                 SandboxState::Running => return Ok(sdk),
                 SandboxState::Error => {
                     return Err(Error::Provider(ProviderError::new(
@@ -867,6 +873,7 @@ impl SandboxProvider for DaytonaProvider {
         &self.capabilities
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = %self.kind), err)]
     async fn create(
         &self,
         spec: &SandboxSpec,
@@ -986,6 +993,11 @@ impl SandboxProvider for DaytonaProvider {
         Ok(handle)
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = %self.kind, sandbox_id = %id),
+        err
+    )]
     async fn attach(
         &self,
         id: &SandboxId,
@@ -1010,6 +1022,11 @@ impl SandboxProvider for DaytonaProvider {
         Ok(self.handle(sdk, events).await?)
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = %self.kind, sandbox_id = %id),
+        err
+    )]
     async fn undelete(
         &self,
         id: &SandboxId,
@@ -1044,10 +1061,12 @@ impl SandboxProvider for DaytonaProvider {
         Ok(self.handle(refreshed, events).await?)
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = %self.kind), err)]
     async fn health(&self) -> Result<ProviderHealth> {
         // Reachability and credential acceptance: the cheapest
         // authenticated call.
         if let Err(error) = self.client.list(None, Some(1), Some(1)).await {
+            tracing::warn!("daytona provider health check failed");
             let status = match &error {
                 DaytonaError::Api {
                     status_code: 401 | 403,
@@ -1075,6 +1094,10 @@ impl SandboxProvider for DaytonaProvider {
                 .map(|(_, name)| (*name).to_owned())
                 .collect();
             if !health.missing_permissions.is_empty() {
+                tracing::warn!(
+                    missing_permission_count = health.missing_permissions.len(),
+                    "daytona credentials lack required permissions"
+                );
                 health.status = HealthStatus::Unauthorized;
                 health.message = Some(format!("API key {:?} is missing required scopes", key.name));
             }
@@ -1082,6 +1105,11 @@ impl SandboxProvider for DaytonaProvider {
         Ok(health)
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = %self.kind, label_count = filter.labels.len()),
+        err
+    )]
     async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>> {
         let mut labels: HashMap<String, String> = filter
             .labels
@@ -1097,6 +1125,11 @@ impl SandboxProvider for DaytonaProvider {
                 .list(Some(&labels), Some(page_number), Some(LIST_PAGE_SIZE))
                 .await
                 .map_err(|error| daytona_error("listing sandboxes", error))?;
+            tracing::debug!(
+                page_number,
+                item_count = page.items.len(),
+                "sandbox page received"
+            );
             for item in &page.items {
                 statuses.push(status_from_sdk(&self.client, item)?);
             }
@@ -1149,12 +1182,15 @@ impl DaytonaSandbox {
         operation: &str,
         started: Instant,
     ) -> Result<SandboxState> {
+        let mut attempt = 0_u64;
         loop {
+            attempt += 1;
             let state = match self.client.get(&self.sdk_id).await {
                 Ok(sdk) => map_state(sdk.state),
                 Err(error) if is_not_found(&error) => return Ok(SandboxState::Deleted),
                 Err(error) => return Err(daytona_error("fetching sandbox", error)),
             };
+            tracing::debug!(attempt, state = ?state, "sandbox transition state observed");
             if state.is_stable() {
                 return Ok(state);
             }
@@ -1328,6 +1364,7 @@ impl Sandbox for DaytonaSandbox {
         &self.capabilities
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
     async fn describe(&self) -> Result<SandboxStatus> {
         match self.client.get(&self.sdk_id).await {
             Ok(sdk) => status_from_sdk(&self.client, &sdk),
@@ -1342,6 +1379,7 @@ impl Sandbox for DaytonaSandbox {
         &self.working_dir
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
     async fn platform_info(&self) -> Result<PlatformInfo> {
         // uname prints its fields in canonical order — sysname, release,
         // machine — regardless of flag order.
@@ -1357,24 +1395,28 @@ impl Sandbox for DaytonaSandbox {
         Ok(PlatformInfo::new(os, arch, version))
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
     async fn start(&self) -> Result<()> {
         let outcome = self.start_inner().await;
         self.emit_action(LifecycleAction::Start, &outcome).await;
         outcome
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
     async fn stop(&self) -> Result<()> {
         let outcome = self.stop_inner().await;
         self.emit_action(LifecycleAction::Stop, &outcome).await;
         outcome
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
     async fn delete(&self) -> Result<()> {
         let outcome = self.delete_inner().await;
         self.emit_action(LifecycleAction::Delete, &outcome).await;
         outcome
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
     async fn archive(&self) -> Result<()> {
         if !self.capabilities.lifecycle.archive {
             return Err(Error::unsupported(Capability::LifecycleArchive));
@@ -1390,6 +1432,7 @@ impl Sandbox for DaytonaSandbox {
         outcome
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
     async fn pause(&self) -> Result<()> {
         if !self.capabilities.lifecycle.pause {
             return Err(Error::unsupported(Capability::LifecyclePause));
@@ -1409,6 +1452,7 @@ impl Sandbox for DaytonaSandbox {
         outcome
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
     async fn resume(&self) -> Result<()> {
         if !self.capabilities.lifecycle.pause {
             return Err(Error::unsupported(Capability::LifecyclePause));
@@ -1420,6 +1464,7 @@ impl Sandbox for DaytonaSandbox {
         outcome
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
     async fn fork(&self, options: &ForkOptions) -> Result<Arc<dyn Sandbox>> {
         if !self.capabilities.lifecycle.fork {
             return Err(Error::unsupported(Capability::LifecycleFork));
@@ -1448,6 +1493,7 @@ impl Sandbox for DaytonaSandbox {
         Ok(build_handle(&self.client, &self.capabilities, forked, None).await?)
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
     async fn snapshot(&self, options: &SandboxSnapshotOptions) -> Result<SnapshotId> {
         if !self.capabilities.lifecycle.snapshot_sandbox {
             return Err(Error::unsupported(Capability::LifecycleSnapshotSandbox));
@@ -1481,6 +1527,7 @@ impl Sandbox for DaytonaSandbox {
         created_snapshot_id(&self.client, &name).await
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
     async fn update_network(&self, policy: &NetworkPolicy) -> Result<()> {
         let mut settings = UpdateSandboxNetworkSettings::new();
         match policy {
@@ -1512,6 +1559,7 @@ impl Sandbox for DaytonaSandbox {
         outcome
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
     async fn refresh_activity(&self) -> Result<()> {
         // A trivial exec is genuine activity and resets the idle timers.
         // (The pinned SDK's update_last_activity now sends a valid body;
@@ -1528,11 +1576,13 @@ impl Sandbox for DaytonaSandbox {
         }
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
     async fn resize(&self, resources: &Resources) -> Result<()> {
         let _ = resources;
         Err(Error::unsupported(Capability::LifecycleResize))
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
     async fn set_timers(&self, timers: &LifecycleTimers) -> Result<()> {
         let auto_stop = timers.auto_stop_after_idle.map(minutes);
         let auto_pause = timers.auto_pause_after_idle.map(minutes);
@@ -1585,6 +1635,15 @@ impl Sandbox for DaytonaSandbox {
         Ok(())
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            provider_kind = "daytona",
+            sandbox_id = %self.id,
+            label_count = labels.len()
+        ),
+        err
+    )]
     async fn set_labels(&self, labels: &BTreeMap<String, String>) -> Result<()> {
         let mut all: HashMap<String, String> = labels
             .iter()
@@ -1672,6 +1731,7 @@ struct DaytonaSnapshots {
 
 #[async_trait]
 impl SnapshotProvider for DaytonaSnapshots {
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona"), err)]
     async fn create(&self, spec: &SnapshotSpec) -> Result<SnapshotId> {
         spec.validate()?;
         let name = spec.name.clone().unwrap_or_else(generated_snapshot_name);
@@ -1754,6 +1814,11 @@ impl SnapshotProvider for DaytonaSnapshots {
             .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "daytona", snapshot_id = %id),
+        err
+    )]
     async fn get(&self, id: &SnapshotId) -> Result<SnapshotStatus> {
         let dto = self
             .client
@@ -1773,6 +1838,7 @@ impl SnapshotProvider for DaytonaSnapshots {
         snapshot_status(dto)
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona"), err)]
     async fn list(&self, filter: &SnapshotFilter) -> Result<Vec<SnapshotStatus>> {
         let mut statuses = Vec::new();
         let mut page_number: i32 = 1;
@@ -1783,6 +1849,11 @@ impl SnapshotProvider for DaytonaSnapshots {
                 .list(Some(page_number), Some(LIST_PAGE_SIZE))
                 .await
                 .map_err(|error| daytona_error("listing snapshots", error))?;
+            tracing::debug!(
+                page_number,
+                item_count = page.items.len(),
+                "snapshot page received"
+            );
             for dto in page.items {
                 if let Some(name) = &filter.name {
                     if dto.name != *name {
@@ -1799,6 +1870,11 @@ impl SnapshotProvider for DaytonaSnapshots {
         Ok(statuses)
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "daytona", snapshot_id = %id),
+        err
+    )]
     async fn delete(&self, id: &SnapshotId) -> Result<()> {
         match self.client.snapshot.delete(id.as_str()).await {
             Ok(()) => Ok(()),
@@ -1815,6 +1891,11 @@ impl SnapshotProvider for DaytonaSnapshots {
         }
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "daytona", snapshot_id = %id, follow),
+        err
+    )]
     async fn build_logs(&self, id: &SnapshotId, follow: bool, sink: LogSink) -> Result<()> {
         let sink_error = Arc::new(Mutex::new(None));
         let callback_error = Arc::clone(&sink_error);
@@ -1839,10 +1920,18 @@ impl SnapshotProvider for DaytonaSnapshots {
         outcome.map_err(|error| daytona_error("following snapshot build logs", error))
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "daytona", snapshot_id = %id),
+        err
+    )]
     async fn activate(&self, id: &SnapshotId) -> Result<()> {
         // The SDK resolves ids and names against the ID-only endpoint.
         let started = Instant::now();
+        let mut attempt = 0_u64;
         loop {
+            attempt += 1;
+            tracing::debug!(attempt, "snapshot activation requested");
             match self.client.snapshot.activate(id.as_str()).await {
                 Ok(_) => return Ok(()),
                 Err(error) if is_not_found(&error) => {
@@ -1866,6 +1955,11 @@ impl SnapshotProvider for DaytonaSnapshots {
         }
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "daytona", snapshot_id = %id),
+        err
+    )]
     async fn deactivate(&self, id: &SnapshotId) -> Result<()> {
         // Deactivation is unwrapped by the reference SDKs (the generated
         // client has it); the endpoint is ID-only, so resolve a name
@@ -1920,6 +2014,7 @@ struct DaytonaVolumes {
 
 #[async_trait]
 impl VolumeProvider for DaytonaVolumes {
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona"), err)]
     async fn create(&self, spec: &VolumeSpec) -> Result<VolumeId> {
         // Daytona volumes are elastic; a requested size is ignored.
         let dto = self
@@ -1932,6 +2027,11 @@ impl VolumeProvider for DaytonaVolumes {
             .map_err(|error| Error::invalid_spec("volume_id", error.to_string()))
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "daytona", volume_id = %id),
+        err
+    )]
     async fn get(&self, id: &VolumeId) -> Result<VolumeStatus> {
         let dto = self.client.volume.get(id.as_str()).await.map_err(|error| {
             if is_not_found(&error) {
@@ -1946,6 +2046,7 @@ impl VolumeProvider for DaytonaVolumes {
         volume_status(dto)
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona"), err)]
     async fn list(&self) -> Result<Vec<VolumeStatus>> {
         let volumes = self
             .client
@@ -1956,6 +2057,11 @@ impl VolumeProvider for DaytonaVolumes {
         volumes.into_iter().map(volume_status).collect()
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "daytona", volume_id = %id),
+        err
+    )]
     async fn delete(&self, id: &VolumeId) -> Result<()> {
         match self.client.volume.delete(id.as_str()).await {
             Ok(()) => Ok(()),

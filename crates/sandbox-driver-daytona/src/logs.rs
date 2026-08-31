@@ -23,6 +23,11 @@ impl DaytonaLogs {
 
 #[async_trait]
 impl Logs for DaytonaLogs {
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id, source = ?source),
+        err
+    )]
     async fn follow(&self, source: LogSource, sink: LogSink) -> Result<()> {
         if source != LogSource::Entrypoint {
             return Err(Error::unsupported(Capability::Logs));

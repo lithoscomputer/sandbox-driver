@@ -282,11 +282,21 @@ async fn pump_stream(
 
 #[async_trait]
 impl Exec for HostExec {
+    #[tracing::instrument(skip_all, fields(provider_kind = "host"), err)]
     async fn run(&self, spec: &ExecSpec) -> Result<ExecResult> {
         let streaming = self.run_streaming(spec, ExecControls::default()).await?;
         Ok(streaming.result)
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "host", has_stdin = spec.stdin.is_some()),
+        err
+    )]
+    #[expect(
+        clippy::large_futures,
+        reason = "the exec future owns bounded stream and process state for its operation span"
+    )]
     async fn run_streaming(
         &self,
         spec: &ExecSpec,
@@ -459,6 +469,7 @@ impl Exec for HostExec {
         Ok(streaming)
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "host"), err)]
     async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
         let program = format!("exec {}", spec.command);
         let mut command = self.command(&program, spec.working_dir.as_deref(), &spec.env)?;
@@ -481,7 +492,15 @@ impl Exec for HostExec {
             let mut buffer = [0u8; 4096];
             loop {
                 match reader.read(&mut buffer).await {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
+                    Err(error) => {
+                        tracing::warn!(
+                            provider_kind = "host",
+                            error = ?error,
+                            "stdio stderr reader failed"
+                        );
+                        break;
+                    }
                     Ok(read) => tail.push(&buffer[..read]),
                 }
             }
@@ -513,7 +532,14 @@ impl HostStdioHandle {
             let outcome = tokio::select! {
                 status = child.wait() => match status {
                     Ok(status) => (Termination::Exited, status.code()),
-                    Err(_) => (Termination::Unknown, None),
+                    Err(error) => {
+                        tracing::error!(
+                            provider_kind = "host",
+                            error = ?error,
+                            "stdio process wait failed"
+                        );
+                        (Termination::Unknown, None)
+                    }
                 },
                 () = async {
                     // A dropped handle means terminate can never be
@@ -523,11 +549,23 @@ impl HostStdioHandle {
                     }
                 } => {
                     terminate_process_group(&mut child).await;
-                    let code = child.wait().await.ok().and_then(|status| status.code());
+                    let code = match child.wait().await {
+                        Ok(status) => status.code(),
+                        Err(error) => {
+                            tracing::error!(
+                                provider_kind = "host",
+                                error = ?error,
+                                "terminated stdio process wait failed"
+                            );
+                            None
+                        }
+                    };
                     (Termination::Cancelled, code)
                 }
             };
-            let _ = outcome_tx.send(Some(outcome));
+            if outcome_tx.send(Some(outcome)).is_err() {
+                tracing::debug!(provider_kind = "host", "stdio process handle dropped");
+            }
         });
         Self {
             terminate_tx,
@@ -539,13 +577,21 @@ impl HostStdioHandle {
         let mut outcome_rx = self.outcome_rx.clone();
         match outcome_rx.wait_for(Option::is_some).await {
             Ok(outcome) => (*outcome).expect("guarded by wait_for"),
-            Err(_) => (Termination::Unknown, None),
+            Err(error) => {
+                tracing::error!(
+                    provider_kind = "host",
+                    error = ?error,
+                    "stdio process supervisor stopped"
+                );
+                (Termination::Unknown, None)
+            }
         }
     }
 }
 
 #[async_trait]
 impl StdioProcessHandle for HostStdioHandle {
+    #[tracing::instrument(skip_all, fields(provider_kind = "host"))]
     async fn terminate(&self) {
         let _ = self.terminate_tx.send(true);
         // Return only after the process is reaped, so callers can clean
@@ -553,6 +599,7 @@ impl StdioProcessHandle for HostStdioHandle {
         let _ = self.outcome().await;
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "host"))]
     async fn wait(&self) -> (Termination, Option<i32>) {
         self.outcome().await
     }

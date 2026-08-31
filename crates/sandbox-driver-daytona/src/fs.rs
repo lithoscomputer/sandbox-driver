@@ -74,6 +74,11 @@ fn parse_mode(mode: &str) -> Option<u32> {
 
 #[async_trait]
 impl Filesystem for DaytonaFs {
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id),
+        err
+    )]
     async fn read(&self, path: &str) -> Result<Vec<u8>> {
         self.service()
             .await?
@@ -82,6 +87,15 @@ impl Filesystem for DaytonaFs {
             .map_err(|error| daytona_error("reading file", error))
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            provider_kind = "daytona",
+            sandbox_id = %self.sandbox_id,
+            byte_count = content.len()
+        ),
+        err
+    )]
     async fn write(&self, path: &str, content: &[u8]) -> Result<()> {
         let full = self.resolve(path);
         let service = self.service().await?;
@@ -107,6 +121,11 @@ impl Filesystem for DaytonaFs {
             .map_err(|error| daytona_error("writing file", error))
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id, recursive),
+        err
+    )]
     async fn delete(&self, path: &str, recursive: bool) -> Result<()> {
         match self
             .service()
@@ -120,6 +139,7 @@ impl Filesystem for DaytonaFs {
         }
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id), err)]
     async fn exists(&self, path: &str) -> Result<bool> {
         match self
             .service()
@@ -136,6 +156,7 @@ impl Filesystem for DaytonaFs {
         }
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id), err)]
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
         let info = self
             .service()
@@ -155,6 +176,11 @@ impl Filesystem for DaytonaFs {
         Ok(metadata)
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id, depth),
+        err
+    )]
     async fn list_dir(&self, path: &str, depth: usize) -> Result<Vec<DirEntry>> {
         let depth = i32::try_from(depth.max(1)).unwrap_or(i32::MAX);
         let files = self
@@ -182,6 +208,7 @@ impl Filesystem for DaytonaFs {
         Ok(entries)
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id), err)]
     async fn create_dir(&self, path: &str) -> Result<()> {
         self.service()
             .await?
@@ -190,6 +217,7 @@ impl Filesystem for DaytonaFs {
             .map_err(|error| daytona_error("creating directory", error))
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id), err)]
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
         self.service()
             .await?
@@ -198,6 +226,11 @@ impl Filesystem for DaytonaFs {
             .map_err(|error| daytona_error("renaming", error))
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id, mode),
+        err
+    )]
     async fn set_permissions(&self, path: &str, mode: u32) -> Result<()> {
         let options = SetFilePermissionsOptions {
             mode:  Some(format!("{mode:o}")),
@@ -211,6 +244,7 @@ impl Filesystem for DaytonaFs {
             .map_err(|error| daytona_error("setting permissions", error))
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id), err)]
     async fn upload(&self, local: &Path, remote: &str) -> Result<()> {
         let content = tokio_fs::read(local)
             .await
@@ -218,6 +252,7 @@ impl Filesystem for DaytonaFs {
         self.write(remote, &content).await
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id), err)]
     async fn download(&self, remote: &str, local: &Path) -> Result<()> {
         let content = self.read(remote).await?;
         if let Some(parent) = local.parent() {

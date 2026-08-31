@@ -283,7 +283,14 @@ impl DockerExec {
         if let StartExecResults::Attached { mut output, .. } = start {
             // Drain to completion so the exit code below is final.
             while let Some(chunk) = output.next().await {
-                if chunk.is_err() {
+                if let Err(error) = chunk {
+                    let error = docker_error("reading stop request output", error);
+                    tracing::warn!(
+                        provider_kind = "docker",
+                        sandbox_id = %self.container_id,
+                        error = %error,
+                        "stop request output stream failed"
+                    );
                     break;
                 }
             }
@@ -314,6 +321,15 @@ impl Exec for DockerExec {
         Ok(streaming.result)
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            provider_kind = "docker",
+            sandbox_id = %self.container_id,
+            has_stdin = spec.stdin.is_some()
+        ),
+        err
+    )]
     async fn run_streaming(
         &self,
         spec: &ExecSpec,
@@ -505,6 +521,11 @@ impl Exec for DockerExec {
         Ok(streaming)
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "docker", sandbox_id = %self.container_id),
+        err
+    )]
     async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
         let (stop_file, pid_file) = self.control_paths();
         let wrapper = Self::wrapped(&spec.command, &stop_file, &pid_file, true);
@@ -542,6 +563,7 @@ impl Exec for DockerExec {
         let (stdout_writer, stdout_reader) = duplex(64 * 1024);
         let stderr_tail = StderrTail::default();
         let tail = stderr_tail.clone();
+        let sandbox_id = self.container_id.clone();
         tokio::spawn(async move {
             let mut stdout_writer = stdout_writer;
             loop {
@@ -550,14 +572,28 @@ impl Exec for DockerExec {
                     // Make a transport failure visible in the diagnostic
                     // tail instead of ending the stream silently.
                     Some(Err(error)) => {
+                        let diagnostic = error.to_string();
+                        let error = docker_error("reading stdio output", error);
+                        tracing::warn!(
+                            provider_kind = "docker",
+                            sandbox_id = %sandbox_id,
+                            error = %error,
+                            "stdio output stream failed"
+                        );
                         tail.push(
-                            format!("sandbox-driver: stdio output stream error: {error}\n")
+                            format!("sandbox-driver: stdio output stream error: {diagnostic}\n")
                                 .as_bytes(),
                         );
                         break;
                     }
                     Some(Ok(LogOutput::StdOut { message } | LogOutput::Console { message })) => {
-                        if stdout_writer.write_all(&message).await.is_err() {
+                        if let Err(error) = stdout_writer.write_all(&message).await {
+                            tracing::debug!(
+                                provider_kind = "docker",
+                                sandbox_id = %sandbox_id,
+                                error = ?error,
+                                "stdio output reader closed"
+                            );
                             break;
                         }
                     }
@@ -565,7 +601,14 @@ impl Exec for DockerExec {
                     Some(Ok(LogOutput::StdIn { .. })) => {}
                 }
             }
-            let _ = stdout_writer.shutdown().await;
+            if let Err(error) = stdout_writer.shutdown().await {
+                tracing::debug!(
+                    provider_kind = "docker",
+                    sandbox_id = %sandbox_id,
+                    error = ?error,
+                    "stdio output pipe close failed"
+                );
+            }
         });
 
         let handle = DockerStdioHandle {
@@ -600,15 +643,25 @@ struct DockerStdioHandle {
 
 #[async_trait]
 impl StdioProcessHandle for DockerStdioHandle {
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "docker", sandbox_id = %self.exec.container_id)
+    )]
     async fn terminate(&self) {
         if self.stop_requested.swap(true, Ordering::SeqCst) {
             return;
         }
         // The trait offers no error channel; awaiting at least keeps
         // the request ordered before any caller-side cleanup.
-        let _ = self.exec.request_stop(&self.stop_file).await;
+        if let Err(error) = self.exec.request_stop(&self.stop_file).await {
+            tracing::warn!(error = %error, "stdio stop request failed");
+        }
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "docker", sandbox_id = %self.exec.container_id)
+    )]
     async fn wait(&self) -> (Termination, Option<i32>) {
         let mut errors_since: Option<Instant> = None;
         let mut retry_delay = Duration::from_millis(100);
@@ -626,9 +679,14 @@ impl StdioProcessHandle for DockerStdioHandle {
                 // A transient daemon hiccup must not report an end that
                 // was never observed; give up with `Unknown` only after
                 // the daemon has been unreachable for the whole bound.
-                Err(_) => {
+                Err(error) => {
+                    if errors_since.is_none() {
+                        tracing::warn!("stdio status polling failed");
+                    }
                     let since = *errors_since.get_or_insert_with(Instant::now);
                     if since.elapsed() >= WAIT_INSPECT_RETRY {
+                        let error = docker_error("polling stdio status", error);
+                        tracing::error!(error = %error, "stdio status remained unavailable");
                         return (Termination::Unknown, None);
                     }
                     time::sleep(retry_delay).await;

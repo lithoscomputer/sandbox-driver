@@ -104,6 +104,7 @@ impl SandboxProvider for HostProvider {
         Ok(ProviderHealth::new(HealthStatus::Ok))
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = %self.kind), err)]
     async fn create(
         &self,
         spec: &SandboxSpec,
@@ -228,6 +229,11 @@ impl SandboxProvider for HostProvider {
         Ok(sandbox)
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = %self.kind, sandbox_id = %id),
+        err
+    )]
     async fn attach(
         &self,
         id: &SandboxId,
@@ -244,6 +250,11 @@ impl SandboxProvider for HostProvider {
             })
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = %self.kind, label_count = filter.labels.len()),
+        err
+    )]
     async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>> {
         let sandboxes: Vec<Arc<HostSandbox>> = self
             .registry
@@ -334,6 +345,7 @@ impl Sandbox for HostSandbox {
         &self.capabilities
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.id), err)]
     async fn describe(&self) -> Result<SandboxStatus> {
         Ok(self.status())
     }
@@ -342,6 +354,7 @@ impl Sandbox for HostSandbox {
         &self.working_directory
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.id), err)]
     async fn platform_info(&self) -> Result<PlatformInfo> {
         let version = self
             .exec
@@ -357,15 +370,18 @@ impl Sandbox for HostSandbox {
     }
 
     /// No-op: the host is always running.
+    #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.id), err)]
     async fn start(&self) -> Result<()> {
         Ok(())
     }
 
     /// No-op: stopping the caller's own machine is not this crate's job.
+    #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.id), err)]
     async fn stop(&self) -> Result<()> {
         Ok(())
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.id), err)]
     async fn delete(&self) -> Result<()> {
         {
             let mut state = self.state.lock().expect("state lock");

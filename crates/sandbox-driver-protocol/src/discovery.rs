@@ -209,9 +209,13 @@ pub struct PluginLaunch {
 ///
 /// `prefix` is the embedder's binary naming convention prefix (fabro
 /// uses `fabro-sandbox`, giving binaries like `fabro-sandbox-e2b`).
+#[tracing::instrument(skip_all, fields(provider_kind = %config.kind), err)]
 pub async fn launch_plugin(prefix: &str, config: &PluginConfig) -> Result<PluginLaunch> {
     let path = resolve_plugin_binary(prefix, config)?;
     let verified = enforce_checksum(&path, config).await?;
+    if !verified {
+        tracing::warn!(provider_kind = %config.kind, "launching unverified plugin");
+    }
 
     let mut command = Command::new(&path);
     command.args(&config.args);
@@ -230,7 +234,9 @@ pub async fn launch_plugin(prefix: &str, config: &PluginConfig) -> Result<Plugin
         let declared = provider.kind().clone();
         // The child dies with the provider (kill-on-drop); ask nicely
         // first so a well-behaved plugin exits cleanly.
-        let _ = provider.shutdown().await;
+        if let Err(error) = provider.shutdown().await {
+            tracing::warn!(error = %error, "mismatched plugin shutdown failed");
+        }
         return Err(Error::invalid_spec(
             "kind",
             format!(

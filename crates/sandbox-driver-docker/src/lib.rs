@@ -102,6 +102,7 @@ pub struct DockerProvider {
 
 impl DockerProvider {
     /// Connects to the local Docker daemon and verifies it responds.
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker"), err)]
     pub async fn connect() -> Result<Self> {
         let docker = Docker::connect_with_local_defaults()
             .map_err(|error| docker_error("connecting to the docker daemon", error))?;
@@ -116,6 +117,7 @@ impl DockerProvider {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = %self.kind), err)]
     async fn ensure_image(
         &self,
         reference: &str,
@@ -155,6 +157,11 @@ impl DockerProvider {
         Ok(())
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = %self.kind, sandbox_id = container_id),
+        err
+    )]
     async fn inspect(&self, container_id: &str) -> Result<ContainerInspectResponse> {
         self.docker
             .inspect_container(container_id, None::<InspectContainerOptions>)
@@ -313,6 +320,7 @@ impl SandboxProvider for DockerProvider {
         &self.capabilities
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = %self.kind), err)]
     async fn create(
         &self,
         spec: &SandboxSpec,
@@ -473,6 +481,11 @@ impl SandboxProvider for DockerProvider {
         Ok(handle)
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = %self.kind, sandbox_id = %id),
+        err
+    )]
     async fn attach(
         &self,
         id: &SandboxId,
@@ -512,10 +525,12 @@ impl SandboxProvider for DockerProvider {
         ))
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = %self.kind), err)]
     async fn health(&self) -> Result<ProviderHealth> {
         match self.docker.ping().await {
             Ok(_) => Ok(ProviderHealth::new(HealthStatus::Ok)),
             Err(error) => {
+                tracing::warn!("docker provider health check failed");
                 let mut health = ProviderHealth::new(HealthStatus::Unreachable);
                 health.message = Some(format!("pinging the docker daemon failed: {error}"));
                 Ok(health)
@@ -523,6 +538,11 @@ impl SandboxProvider for DockerProvider {
         }
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = %self.kind, label_count = filter.labels.len()),
+        err
+    )]
     async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>> {
         let mut label_filters = vec![format!("{MANAGED_LABEL}=true")];
         for (key, value) in &filter.labels {
@@ -608,6 +628,7 @@ impl Sandbox for DockerSandbox {
         &self.capabilities
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.id), err)]
     async fn describe(&self) -> Result<SandboxStatus> {
         match self
             .docker
@@ -634,6 +655,7 @@ impl Sandbox for DockerSandbox {
         &self.working_dir
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.id), err)]
     async fn platform_info(&self) -> Result<PlatformInfo> {
         // uname prints its fields in canonical order — sysname, release,
         // machine — regardless of flag order.
@@ -649,6 +671,7 @@ impl Sandbox for DockerSandbox {
         Ok(PlatformInfo::new(os, arch, version))
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.id), err)]
     async fn start(&self) -> Result<()> {
         let inspect = self
             .docker
@@ -682,6 +705,7 @@ impl Sandbox for DockerSandbox {
         outcome
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.id), err)]
     async fn stop(&self) -> Result<()> {
         // Managed containers run the driver's own `sleep infinity` init
         // as PID1, which never installs a SIGTERM handler and (as PID1)
@@ -699,6 +723,7 @@ impl Sandbox for DockerSandbox {
         outcome
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.id), err)]
     async fn delete(&self) -> Result<()> {
         let options = RemoveContainerOptions {
             force: true,
@@ -717,6 +742,7 @@ impl Sandbox for DockerSandbox {
         outcome
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.id), err)]
     async fn pause(&self) -> Result<()> {
         let outcome = self
             .docker
@@ -727,6 +753,7 @@ impl Sandbox for DockerSandbox {
         outcome
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.id), err)]
     async fn resume(&self) -> Result<()> {
         let outcome = self
             .docker

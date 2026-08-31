@@ -33,6 +33,7 @@ pub struct ProbeFailure {
 }
 
 /// Runs the bash contract probe through `exec`.
+#[tracing::instrument(skip_all, err)]
 pub async fn run_bash_probe(exec: &dyn Exec) -> Result<()> {
     let spec = ExecSpec::new(BASH_PROBE_SCRIPT).timeout(PROBE_TIMEOUT);
     let result = exec.run(&spec).await?;
@@ -53,6 +54,7 @@ pub async fn run_bash_probe(exec: &dyn Exec) -> Result<()> {
 ///
 /// This is fabro's `activate`, implemented once over the core instead of
 /// per provider. Idempotent: a running sandbox only gets the probe.
+#[tracing::instrument(skip_all, fields(sandbox_id = %sandbox.id()), err)]
 pub async fn activate(sandbox: &dyn Sandbox, wait: &WaitOptions) -> Result<()> {
     let status = sandbox.describe().await?;
     // Wait out an in-flight transition (an auto-stop racing this

@@ -81,7 +81,14 @@ impl StdinFile {
         let Some(fs) = self.fs.as_ref() else {
             return;
         };
-        let _ = time::timeout(STDIN_CLEANUP_TIMEOUT, fs.delete_file(&self.path, false)).await;
+        match time::timeout(STDIN_CLEANUP_TIMEOUT, fs.delete_file(&self.path, false)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let error = daytona_error("deleting exec stdin file", error);
+                tracing::warn!(error = %error, "exec stdin file cleanup failed");
+            }
+            Err(_) => tracing::warn!("exec stdin file cleanup timed out"),
+        }
         self.fs.take();
     }
 }
@@ -96,8 +103,17 @@ impl Drop for StdinFile {
         let path = mem::take(&mut self.path);
         if let Ok(handle) = Handle::try_current() {
             handle.spawn(async move {
-                let _ = time::timeout(STDIN_CLEANUP_TIMEOUT, fs.delete_file(&path, false)).await;
+                match time::timeout(STDIN_CLEANUP_TIMEOUT, fs.delete_file(&path, false)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        let error = daytona_error("deleting dropped exec stdin file", error);
+                        tracing::warn!(error = %error, "dropped exec stdin cleanup failed");
+                    }
+                    Err(_) => tracing::warn!("dropped exec stdin cleanup timed out"),
+                }
             });
+        } else {
+            tracing::warn!("exec stdin cleanup skipped without a runtime");
         }
     }
 }
@@ -194,6 +210,16 @@ impl Exec for DaytonaExec {
         Ok(streaming.result)
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            provider_kind = "daytona",
+            sandbox_id = %self.sandbox_id,
+            has_stdin = spec.stdin.is_some(),
+            live_streaming = controls.sink.is_some() || controls.cancel.is_some()
+        ),
+        err
+    )]
     async fn run_streaming(
         &self,
         spec: &ExecSpec,
@@ -209,6 +235,11 @@ impl Exec for DaytonaExec {
         self.run_buffered(spec, &controls).await
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id),
+        err
+    )]
     async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
         stdio::spawn(
             &self.client,
@@ -447,6 +478,13 @@ impl DaytonaExec {
                 false
             }
         };
+        if !stream_clean {
+            if outcome.termination == Termination::Exited {
+                tracing::warn!("command log stream ended before a natural exit was drained");
+            } else {
+                tracing::debug!("command log stream ended during command cancellation");
+            }
+        }
 
         let final_logs = match outcome.final_logs {
             Some(logs) => Some(logs),

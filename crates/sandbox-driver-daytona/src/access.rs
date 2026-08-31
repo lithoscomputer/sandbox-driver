@@ -33,6 +33,11 @@ impl DaytonaAccess {
 
 #[async_trait]
 impl PreviewUrls for DaytonaAccess {
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id, port),
+        err
+    )]
     async fn preview_url(&self, port: u16) -> Result<PreviewUrl> {
         let link = self
             .sdk()
@@ -51,6 +56,16 @@ impl PreviewUrls for DaytonaAccess {
         Ok(url)
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            provider_kind = "daytona",
+            sandbox_id = %self.sandbox_id,
+            port,
+            expires_in_secs = expires_in.as_secs()
+        ),
+        err
+    )]
     async fn signed_preview_url(&self, port: u16, expires_in: Duration) -> Result<PreviewUrl> {
         let expires_secs = i32::try_from(expires_in.as_secs())
             .unwrap_or(i32::MAX)
@@ -67,6 +82,15 @@ impl PreviewUrls for DaytonaAccess {
 
 #[async_trait]
 impl SshAccess for DaytonaAccess {
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            provider_kind = "daytona",
+            sandbox_id = %self.sandbox_id,
+            ttl_secs = ttl.map(|value| value.as_secs())
+        ),
+        err
+    )]
     async fn ssh_access(&self, ttl: Option<Duration>) -> Result<SshAccessInfo> {
         let minutes = ttl.map(|ttl| ttl.as_secs_f64() / 60.0);
         let access = self
@@ -81,6 +105,11 @@ impl SshAccess for DaytonaAccess {
         Ok(info)
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id),
+        err
+    )]
     async fn revoke_ssh_access(&self, token: &str) -> Result<()> {
         self.sdk()
             .await?
@@ -92,6 +121,11 @@ impl SshAccess for DaytonaAccess {
 
 #[async_trait]
 impl WebTerminal for DaytonaAccess {
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id),
+        err
+    )]
     async fn web_terminal_url(&self) -> Result<String> {
         Ok(self
             .signed_preview_url(WEB_TERMINAL_PORT, BROWSER_ACCESS_TTL)
@@ -102,6 +136,11 @@ impl WebTerminal for DaytonaAccess {
 
 #[async_trait]
 impl Vnc for DaytonaAccess {
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id),
+        err
+    )]
     async fn vnc_connection(&self) -> Result<VncConnection> {
         let sandbox = self.sdk().await?;
         sandbox

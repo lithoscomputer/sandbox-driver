@@ -9,6 +9,7 @@ rust-version = "1.85"
 publish = false
 
 [workspace.dependencies]
+anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"
 bollard = "0.18"
@@ -30,6 +31,8 @@ tar = "0.4"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "rt", "sync", "time"] }
 tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "=0.3.20", features = ["env-filter"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

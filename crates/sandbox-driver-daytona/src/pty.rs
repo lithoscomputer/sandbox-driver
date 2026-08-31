@@ -42,6 +42,17 @@ impl DaytonaPty {
 
 #[async_trait]
 impl Pty for DaytonaPty {
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            provider_kind = "daytona",
+            sandbox_id = %self.sandbox_id,
+            rows = options.size.rows,
+            cols = options.size.cols,
+            env_count = options.env.len()
+        ),
+        err
+    )]
     async fn open(&self, options: &PtyOptions) -> Result<Box<dyn PtySession>> {
         let sandbox = self
             .client
@@ -94,6 +105,11 @@ struct DaytonaPtySession {
 
 #[async_trait]
 impl PtySession for DaytonaPtySession {
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "daytona", byte_count = bytes.len()),
+        err
+    )]
     async fn write_input(&self, bytes: &[u8]) -> Result<()> {
         self.handle
             .read()
@@ -103,10 +119,16 @@ impl PtySession for DaytonaPtySession {
             .map_err(|error| daytona_error("writing pty input", error))
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona"), err)]
     async fn read_output(&self) -> Result<Option<Vec<u8>>> {
         Ok(self.output.lock().await.recv().await)
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = "daytona", rows = size.rows, cols = size.cols),
+        err
+    )]
     async fn resize(&self, size: PtySize) -> Result<()> {
         self.handle
             .read()
@@ -117,12 +139,19 @@ impl PtySession for DaytonaPtySession {
             .map_err(|error| daytona_error("resizing pty", error))
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona"), err)]
     async fn close(&self) -> Result<()> {
         // Kill the terminal process (fabro's DELETE-on-close semantics),
         // tolerating an already-dead session, then drop the socket.
         let mut handle = self.handle.write().await;
-        let _ = handle.kill().await;
-        let _ = handle.disconnect().await;
+        if let Err(error) = handle.kill().await {
+            let error = daytona_error("stopping pty process", error);
+            tracing::debug!(error = %error, "pty process was already stopped");
+        }
+        if let Err(error) = handle.disconnect().await {
+            let error = daytona_error("disconnecting pty", error);
+            tracing::warn!(error = %error, "pty disconnect failed");
+        }
         Ok(())
     }
 }

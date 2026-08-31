@@ -36,13 +36,17 @@ impl Default for WaitOptions {
 /// Polls [`Sandbox::describe`] until the state settles (per
 /// [`SandboxState::is_stable`]). Unlike [`wait_for_state`], `Error` is a
 /// valid outcome — the caller decides what to do with the settled state.
+#[tracing::instrument(skip_all, fields(sandbox_id = %sandbox.id()), err)]
 pub async fn wait_for_stable_state(
     sandbox: &dyn Sandbox,
     options: &WaitOptions,
 ) -> Result<SandboxStatus> {
     let started = Instant::now();
+    let mut attempt = 0_u64;
     loop {
+        attempt += 1;
         let status = sandbox.describe().await?;
+        tracing::debug!(attempt, state = ?status.state, "sandbox state observed");
         if status.state.is_stable() {
             return Ok(status);
         }
@@ -59,14 +63,22 @@ pub async fn wait_for_stable_state(
     }
 }
 
+#[tracing::instrument(
+    skip_all,
+    fields(sandbox_id = %sandbox.id(), target = ?target),
+    err
+)]
 pub async fn wait_for_state(
     sandbox: &dyn Sandbox,
     target: SandboxState,
     options: &WaitOptions,
 ) -> Result<SandboxStatus> {
     let started = Instant::now();
+    let mut attempt = 0_u64;
     loop {
+        attempt += 1;
         let status = sandbox.describe().await?;
+        tracing::debug!(attempt, state = ?status.state, "sandbox state observed");
         let reached = status.state == target
             || (target == SandboxState::Stopped && status.state == SandboxState::Deleted);
         if reached {

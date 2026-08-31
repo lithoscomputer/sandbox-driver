@@ -5,12 +5,29 @@
 //! on the machine it runs on. Stdout belongs to the protocol; logs go to
 //! stderr.
 
+use std::io::stderr;
 use std::sync::Arc;
 
+use anyhow::Context as _;
 use sandbox_driver_host::HostProvider;
 use sandbox_driver_protocol::serve_stdio;
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::{EnvFilter, fmt};
 
 #[tokio::main]
-async fn main() -> sandbox_driver::Result<()> {
-    serve_stdio(Arc::new(HostProvider::new())).await
+async fn main() -> anyhow::Result<()> {
+    let filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().with_writer(stderr))
+        .try_init()
+        .context("configuring host plugin diagnostics")?;
+
+    tracing::info!(provider_kind = "host", "host plugin starting");
+    serve_stdio(Arc::new(HostProvider::new()))
+        .await
+        .context("serving the host provider plugin")
 }

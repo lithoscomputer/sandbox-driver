@@ -52,6 +52,7 @@ pub async fn serve_stdio(provider: Arc<dyn SandboxProvider>) -> Result<()> {
 /// This is the plugin-side main loop: a provider binary calls it with
 /// stdin/stdout. It also runs over any in-process duplex, which is how
 /// the conformance tests drive it.
+#[tracing::instrument(skip_all, fields(provider_kind = %provider.kind()), err)]
 pub async fn serve(
     provider: Arc<dyn SandboxProvider>,
     reader: impl AsyncRead + Unpin + Send + 'static,
@@ -142,7 +143,12 @@ pub async fn serve(
             continue;
         };
         if method == m::SHUTDOWN {
-            let _ = outbound.send(Message::response(id, Value::Null)).await;
+            if let Err(error) = outbound.send(Message::response(id, Value::Null)).await {
+                break Err(Error::Transport(TransportError::with_source(
+                    "sending plugin shutdown response",
+                    error,
+                )));
+            }
             shutdown.cancel();
             continue;
         }
@@ -165,7 +171,9 @@ pub async fn serve(
                     Message::error_response(id, WireError::from_error(&error))
                 }
             };
-            let _ = state.outbound.send(reply).await;
+            if state.outbound.send(reply).await.is_err() {
+                tracing::warn!(request_id = id, method = %method, "plugin response queue closed");
+            }
         });
     };
 
@@ -244,7 +252,9 @@ impl ServerState {
             .map(|(_, session)| session)
             .collect::<Vec<_>>();
         for session in ptys {
-            let _ = session.close().await;
+            if let Err(error) = session.close().await {
+                tracing::warn!(error = %error, "plugin PTY cleanup failed");
+            }
         }
     }
 
@@ -284,15 +294,24 @@ impl ServerState {
                     event,
                     operation_id: operation_id.clone(),
                 })
-                .unwrap_or(Value::Null),
+                .expect("host event notification contains serializable values"),
             );
             // Best-effort: an overflowing notification queue drops the
             // event rather than blocking the provider.
-            let _ = outbound.try_send(notification);
+            match outbound.try_send(notification) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!("host event notification queue full");
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::debug!("host event notification transport closed");
+                }
+            }
         })
     }
 }
 
+#[derive(Debug)]
 enum DispatchError {
     UnknownMethod,
     BadParams(serde_json::Error),
@@ -352,12 +371,14 @@ fn log_sink(state: &ServerState, stream_id: &str) -> LogSink {
                     stream_id,
                     data_b64: encode_bytes(&chunk),
                 })
-                .unwrap_or(Value::Null),
+                .expect("log output notification contains serializable values"),
             );
-            outbound
-                .send(notification)
-                .await
-                .map_err(|_| Error::invalid_spec("transport", "notification channel closed"))
+            outbound.send(notification).await.map_err(|error| {
+                Error::Transport(TransportError::with_source(
+                    "sending plugin log notification",
+                    error,
+                ))
+            })
         })
     })
 }
@@ -400,6 +421,7 @@ fn handle_info(handle: &Arc<dyn Sandbox>, status: SandboxStatus) -> m::HandleInf
     }
 }
 
+#[tracing::instrument(skip_all, fields(method = method))]
 async fn dispatch(
     state: &Arc<ServerState>,
     method: &str,
@@ -596,10 +618,13 @@ async fn dispatch(
                             stream,
                             data_b64: encode_bytes(&chunk),
                         })
-                        .unwrap_or(Value::Null),
+                        .expect("exec output notification contains serializable values"),
                     );
-                    outbound.send(notification).await.map_err(|_| {
-                        Error::invalid_spec("transport", "notification channel closed")
+                    outbound.send(notification).await.map_err(|error| {
+                        Error::Transport(TransportError::with_source(
+                            "sending plugin exec output notification",
+                            error,
+                        ))
                     })?;
                     Ok(())
                 })
@@ -751,7 +776,9 @@ async fn dispatch(
                 }
             };
             if !inserted {
-                let _ = pty.close().await;
+                if let Err(error) = pty.close().await {
+                    tracing::warn!(error = %error, "duplicate plugin PTY cleanup failed");
+                }
                 return Err(Error::invalid_spec("pty_id", "duplicate PTY id").into());
             }
             to_value(&m::Empty)
