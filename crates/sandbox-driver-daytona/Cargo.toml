@@ -24,3 +24,4 @@ tracing.workspace = true
 sandbox-driver-conformance.workspace = true
 sandbox-driver-protocol = { path = "../sandbox-driver-protocol" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing-subscriber.workspace = true

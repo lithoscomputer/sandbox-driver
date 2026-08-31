@@ -18,6 +18,10 @@ use sandbox_driver_protocol::{PluginProvider, serve};
 use tokio::io::{duplex, split};
 use tokio::time;
 
+mod support;
+
+use support::init_diagnostics;
+
 const TEST_SNAPSHOT: &str = "daytona-medium";
 
 #[tokio::test(flavor = "multi_thread")]
@@ -26,6 +30,7 @@ async fn daytona_passes_conformance_over_the_wire() {
         // No credentials; nothing to verify.
         return;
     }
+    init_diagnostics();
     let provider = DaytonaProvider::connect()
         .await
         .expect("connect with credentials");
@@ -56,6 +61,7 @@ async fn extended_daytona_streams_and_browser_access_cross_the_wire() {
     if env::var("DAYTONA_API_KEY").is_err() {
         return;
     }
+    init_diagnostics();
     let provider = DaytonaProvider::connect()
         .await
         .expect("connect with credentials");

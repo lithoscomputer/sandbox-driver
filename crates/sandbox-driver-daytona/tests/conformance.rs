@@ -12,6 +12,10 @@ use sandbox_driver::{SandboxKind, SandboxSource, SandboxSpec, SnapshotId};
 use sandbox_driver_conformance::{Conformance, SpecFactory};
 use sandbox_driver_daytona::DaytonaProvider;
 
+mod support;
+
+use support::init_diagnostics;
+
 const TEST_SNAPSHOT: &str = "daytona-medium";
 
 #[tokio::test(flavor = "multi_thread")]
@@ -20,6 +24,7 @@ async fn daytona_provider_passes_conformance() {
         // No credentials; nothing to verify.
         return;
     }
+    init_diagnostics();
     let provider = DaytonaProvider::connect()
         .await
         .expect("connect with credentials");

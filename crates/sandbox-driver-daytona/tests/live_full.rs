@@ -4,6 +4,8 @@
 //! creates is deleted before it returns, on success and failure paths.
 
 use std::collections::BTreeMap;
+use std::error::Error as StdError;
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, process};
@@ -16,6 +18,10 @@ use sandbox_driver::{
 };
 use sandbox_driver_daytona::DaytonaProvider;
 use tokio::time;
+
+mod support;
+
+use support::init_diagnostics;
 
 const TEST_SNAPSHOT: &str = "daytona-medium";
 
@@ -41,11 +47,33 @@ fn snapshot_resources(disk_mb: u64) -> Resources {
     resources
 }
 
+fn error_chain_contains(error: &(dyn StdError + 'static), needle: &str) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error.to_string().contains(needle) {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+fn format_error_chain(error: &(dyn StdError + 'static)) -> String {
+    let mut report = error.to_string();
+    let mut current = error.source();
+    while let Some(error) = current {
+        write!(report, ": {error}").expect("writing to a String should not fail");
+        current = error.source();
+    }
+    report
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn labels_timers_access_round_trip() {
     if env::var("DAYTONA_API_KEY").is_err() {
         return;
     }
+    init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let spec = SandboxSpec::new(SandboxSource::Snapshot {
         id: SnapshotId::try_new(TEST_SNAPSHOT).expect("valid snapshot id"),
@@ -152,6 +180,7 @@ async fn cidr_egress_limits_apply_at_create_and_runtime() {
     if env::var("DAYTONA_API_KEY").is_err() {
         return;
     }
+    init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let spec = SandboxSpec::new(SandboxSource::Snapshot {
         id: SnapshotId::try_new(TEST_SNAPSHOT).expect("valid snapshot id"),
@@ -214,6 +243,7 @@ async fn stop_resize_archive_restore_lifecycle() {
     if env::var("DAYTONA_API_KEY").is_err() {
         return;
     }
+    init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     // Non-ephemeral: an ephemeral sandbox deletes itself on stop, and
     // archive requires a stopped sandbox.
@@ -314,6 +344,7 @@ async fn fork_and_snapshot_modes_preserve_their_declared_state() {
     if env::var("DAYTONA_API_KEY").is_err() {
         return;
     }
+    init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let snapshots = provider.snapshots().expect("snapshot provider declared");
     let vm_snapshot_spec = SnapshotSpec::new(SnapshotSource::Image {
@@ -325,15 +356,21 @@ async fn fork_and_snapshot_modes_preserve_their_declared_state() {
     .resources(snapshot_resources(3072));
     let vm_snapshot_id = match snapshots.create(&vm_snapshot_spec).await {
         Ok(id) => id,
-        Err(Error::Provider(error))
-            if (error.code.as_deref() == Some("400")
-                && error.message.contains("No runners are configured"))
-                || (error.code.as_deref() == Some("403")
-                    && error.message.contains("not available to the organization")) =>
+        Err(error)
+            if error_chain_contains(&error, "No runners are configured")
+                || error_chain_contains(&error, "not available to the organization") =>
         {
+            tracing::info!(
+                target: "sandbox_driver_daytona",
+                reason = "vm_snapshot_unavailable",
+                "live VM snapshot test skipped"
+            );
             return;
         }
-        Err(error) => panic!("create VM snapshot from image: {error}"),
+        Err(error) => panic!(
+            "create VM snapshot from image: {}",
+            format_error_chain(&error)
+        ),
     };
     if let Err(error) =
         wait_for_snapshot_state(snapshots, &vm_snapshot_id, SnapshotState::Active).await
@@ -512,6 +549,7 @@ async fn filesystem_snapshot_restores_files_without_processes() {
     if env::var("DAYTONA_API_KEY").is_err() {
         return;
     }
+    init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let source_spec = SandboxSpec::new(SandboxSource::Snapshot {
         id: SnapshotId::try_new(TEST_SNAPSHOT).expect("valid snapshot id"),
@@ -656,6 +694,7 @@ async fn snapshot_provider_round_trip() {
     if env::var("DAYTONA_API_KEY").is_err() {
         return;
     }
+    init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let snapshots = provider.snapshots().expect("snapshot provider declared");
 
@@ -766,6 +805,7 @@ async fn dockerfile_snapshot_build_and_entrypoint_logs() {
     if env::var("DAYTONA_API_KEY").is_err() {
         return;
     }
+    init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let snapshots = provider.snapshots().expect("snapshot provider declared");
     let name = unique("sd-live-dockerfile");
