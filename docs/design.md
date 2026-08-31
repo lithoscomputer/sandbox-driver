@@ -59,6 +59,7 @@ pub struct SandboxStatus {
     pub error_reason: Option<String>,
     pub resources: Option<Resources>,
     pub labels: BTreeMap<String, String>,
+    pub web_url: Option<String>,         // provider console page, when one exists
     pub created_at: Option<SystemTime>,
     // …timestamps, network summary
 }
@@ -82,7 +83,8 @@ The full vocabulary. **Core** actions are required of every provider. Everything
 | `checkpoint` / `restore` | Save a rewind point; rewind the **same sandbox** in place | opt | — | — | — | ✔ |
 | `resize` | Change cpu/memory/disk | opt | — | \~ (`docker update`, cpu/mem only) | ✔ | ? |
 | `snapshot_sandbox` | Snapshot a live sandbox (optionally incl. memory) → SnapshotProvider | opt | — | \~ (`docker commit`) | ✔ | ✔ |
-| `recover` | Provider-assisted recovery from Error state | opt | — | — | ✔ | — |
+| `recover` | Provider-assisted recovery from Error state | opt | — | — | — | — |
+| `undelete` | Restore a deleted sandbox within the recovery window; provider-level (a deleted sandbox cannot be attached), returns a fresh handle | opt | — | — | ✔ (24h, Daytona's "recover") | — |
 | `refresh_activity` | Keepalive; reset idle timers | opt | no-op | no-op | ✔ | ? |
 | `set_timers` | auto\_stop, auto\_pause, auto\_archive, auto\_delete, ttl | opt | — | — | ✔ | ? |
 | `set_labels` | Replace label map | opt | — | ✔ | ✔ | ✔ (tags) |
@@ -123,6 +125,7 @@ Per-sandbox functionality is grouped into small **facet traits** (per the style 
 | `Filesystem` (core) | read/write/delete/exists/stat/list/move/mkdir/permissions, upload/download (binary-safe, chunked) | native | native | native (toolbox FS) | ✔ |
 | `Search` (core, derived) | grep, glob, walk — default impl derived from `Exec` (rg with grep/find fallback); provider may override | derived | derived | derived (native find/replace exists) | derived |
 | `Git` | clone, status, add, commit, push, pull, branches, checkout — low-level plumbing only; default impl derived from `Exec`, per-call credentials | derived | derived | derived or native | derived |
+| `Services` (derived) | Background processes that outlive their exec (MCP servers, dev servers): spawn / status / logs / stop — default impl derived from `Exec` (`setsid` + pidfile, fabro's proven pattern); state is per-boot | derived | derived | derived | derived |
 | `Pty` | create/resize/kill + bidirectional byte stream (fabro's `TerminalSession`) | ✔ | ✔ (exec+tty) | ✔ (websocket) | ✔ (console) |
 | `Logs` | Provider-side logs: build/provision logs, entrypoint output, sandbox event log; streaming follow | — | ✔ (container logs) | ✔ | ? |
 | `PreviewUrls` | port → `{ url, headers }`; signed expiring URLs; revocation | \~ (localhost) | future (port map) | ✔ | ✔ (HTTPS proxies) |
@@ -137,6 +140,7 @@ Legend: ✔ supported · \~ partial/approximated · — unsupported (facet retur
 
 Notes:
 
+- **Services (background processes) ship as a derived implementation** over `Exec`: fabro manages MCP servers today with hand-rolled `setsid`/pidfile/port-poll shell, on every provider — the facet absorbs that pattern (`DerivedServices`), and a provider with a native mechanism can override and declare `services.native`. Service state is per-boot; ids from before a sandbox restart report not running.
 - **Search and Git ship as derived implementations** over `Exec` in this crate — fabro's experience shows `glob` was *never* overridden by any provider and git-via-exec is what both remote providers actually do. A provider with a native API can override per method.
 - **Git here is plumbing only.** Fabro's credential machinery (`refresh_push_credentials`, `push_token_source`, `git_push_ref` retry/lease engine, `setup_git` intent, clone orchestration and repo layout) stays in fabro, layered on `Exec` + `Git`. Those 6 of fabro's 34 methods do not move into this crate.
 - **`Vnc` and `Vpn` are reserved facets**: defined in the capability schema now so the wire protocol doesn't break when a provider adds them, but no trait methods beyond "get connection info" in v1.
@@ -153,15 +157,16 @@ Two complementary mechanisms, by design:
 #[non_exhaustive]
 pub struct Capabilities {
     pub isolation: Isolation,         // none | container | vm — declared by the provider, never assumed
-    pub lifecycle: LifecycleCaps,     // pause, archive, fork, checkpoint, resize, recover, timers…
+    pub lifecycle: LifecycleCaps,     // pause, archive, fork, checkpoint, resize, recover, undelete, timers…
     pub exec: ExecCaps,               // live_streaming, streams_separated, stdin, cancel, stdio_process
     pub fs: FsCaps,                   // native, upload, download, permissions
     pub git: GitCaps,
+    pub services: ServiceCaps,        // background services; native flag, derived otherwise
     pub pty: Option<PtyCaps>,
     pub logs: Option<LogsCaps>,
     pub access: AccessCaps,           // preview_urls { signed }, ssh, shell_command, web_terminal, vnc, vpn
     pub network: NetworkCaps,         // modes: block_all, allow_all, cidr_allow_list, domain_allow_list, proxy
-    pub snapshots: Option<SnapshotCaps>,  // sources: image, dockerfile, live_sandbox, memory
+    pub snapshots: Option<SnapshotCaps>,  // sources: image, dockerfile, live_sandbox, memory; activation
     pub volumes: Option<VolumeCaps>,
 }
 ```
@@ -194,7 +199,15 @@ pub trait SandboxProvider: Send + Sync {
         -> Result<Arc<dyn Sandbox>, Error>;
     async fn attach(&self, id: &SandboxId, events: Option<EventCallback>)
         -> Result<Arc<dyn Sandbox>, Error>;               // re-attach by persisted ID
+    async fn undelete(&self, id: &SandboxId, events: Option<EventCallback>)
+        -> Result<Arc<dyn Sandbox>, Error>;               // optional; restore a deleted sandbox
     async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>, Error>;
+
+    /// Reachability + credential check for preflight and diagnostics.
+    /// Always callable; an unhealthy provider is an Ok(report), never Err.
+    async fn health(&self) -> Result<ProviderHealth, Error>;
+        // ProviderHealth { status: ok|unreachable|unauthorized|unknown,
+        //                  message, missing_permissions }
 
     fn snapshots(&self) -> Option<&dyn SnapshotProvider>;
     fn volumes(&self) -> Option<&dyn VolumeProvider>;
@@ -241,6 +254,7 @@ pub trait Sandbox: Send + Sync {
     fn fs(&self) -> &dyn Filesystem;
     fn search(&self) -> &dyn Search;                      // default: derived over exec
     fn git(&self) -> &dyn Git;                            // default: derived over exec
+    fn services(&self) -> Option<&dyn Services>;          // default: None → use DerivedServices
     fn pty(&self) -> Option<&dyn Pty>;                    // default: None
     fn logs(&self) -> Option<&dyn Logs>;                  // default: None
     fn preview_urls(&self) -> Option<&dyn PreviewUrls>;   // default: None
@@ -290,6 +304,10 @@ pub trait SnapshotProvider: Send + Sync {
     async fn list(&self, filter: &SnapshotFilter) -> Result<Vec<SnapshotStatus>, Error>;
     async fn delete(&self, id: &SnapshotId) -> Result<(), Error>;
     async fn build_logs(&self, id: &SnapshotId, follow: bool, sink: LogSink) -> Result<(), Error>;
+    // Gated on snapshots.activation: Daytona deactivates snapshots unused
+    // for two weeks; content-addressed reuse needs a way back.
+    async fn activate(&self, id: &SnapshotId) -> Result<(), Error>;
+    async fn deactivate(&self, id: &SnapshotId) -> Result<(), Error>;
 }
 
 #[async_trait]
@@ -420,3 +438,7 @@ Each of these is implementable over `Exec`/`Git`/core — the fabro survey confi
 7. **Workspace layout**: `crates/sandbox-driver` (core: types + traits + derived impls + wait helper), with `sandbox-driver-{protocol,host,docker,daytona}` siblings added as they are built.
 8. **VNC/VPN v1 surface is "get connection info" only**; VPN join configuration is create-time spec, status via the facet.
 9. **The Docker image contract requires `setsid`** alongside bash, `stat`, `find`, and `base64` — reliable kill semantics need a separate session, and an image without it fails every exec with a clear message rather than degrading silently.
+10. **`recover` and `undelete` are separate verbs.** `recover` repairs a live sandbox in the `Error` state; `undelete` (provider-level, returns a fresh handle) restores a deleted one. Daytona's "recover" endpoint is our `undelete`; it declares `lifecycle.recover: false`.
+11. **Chunked file transfer is `read_range`/`write_append`**, not a streaming transfer protocol: stateless, additive on `fs/read`/`fs/write`, with efficient overrides per provider (seek on Host, `tail`/`>>` on exec-derived) and correct read-and-slice / read-concat-write defaults everywhere else.
+12. **`operation_id` correlates create progress on the wire.** Host-generated, echoed on `host/event`, create-only in v1 (fork events flow through the parent handle's callback and stay attributable by sandbox id). Cancellation of long operations is a later additive step.
+13. **Provider health is a report, not an error**: `health()` always answers; non-`ok` statuses (`unreachable`, `unauthorized` with `missing_permissions`) are successful responses, and `Err` is reserved for the check itself failing.
