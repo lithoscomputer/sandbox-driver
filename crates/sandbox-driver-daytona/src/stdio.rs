@@ -41,7 +41,7 @@ pub(crate) async fn spawn(
     let sandbox = client
         .get(sandbox_id)
         .await
-        .map_err(|error| daytona_error("fetching sandbox", &error))?;
+        .map_err(|error| daytona_error("fetching sandbox", error))?;
 
     let mut session = Session::create(&sandbox).await?;
     let program = wrap_session_script(&build_session_script(cwd, &spec.env, &spec.command));
@@ -58,14 +58,14 @@ pub(crate) async fn spawn(
         Ok(process) => process,
         Err(error) => {
             session.close().await;
-            return Err(daytona_error("connecting to the toolbox", &error));
+            return Err(daytona_error("connecting to the toolbox", error));
         }
     };
     let input_process = match sandbox.process().await {
         Ok(process) => process,
         Err(error) => {
             session.close().await;
-            return Err(daytona_error("connecting to the toolbox", &error));
+            return Err(daytona_error("connecting to the toolbox", error));
         }
     };
 

@@ -110,12 +110,33 @@ impl Error {
 }
 
 /// Authentication or authorization failure against a provider.
-#[derive(Debug, thiserror::Error)]
-#[error("authentication with {provider} failed: {reason}")]
+#[derive(Debug)]
 #[non_exhaustive]
 pub struct AuthError {
     pub provider: ProviderKind,
     pub reason:   String,
+    source:       Option<Box<OpaqueSource>>,
+}
+
+#[derive(Debug)]
+struct OpaqueSource(Box<dyn StdError + Send + Sync>);
+
+impl fmt::Display for AuthError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "authentication with {} failed: {}",
+            self.provider, self.reason
+        )
+    }
+}
+
+impl StdError for AuthError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source.0.as_ref() as &(dyn StdError + 'static))
+    }
 }
 
 impl AuthError {
@@ -123,6 +144,20 @@ impl AuthError {
         Self {
             provider,
             reason: reason.into(),
+            source: None,
+        }
+    }
+
+    /// Creates an authentication failure while preserving its infrastructure
+    /// cause without exposing the cause type in the public API.
+    pub fn with_source<E>(provider: ProviderKind, reason: impl Into<String>, source: E) -> Self
+    where
+        E: StdError + Send + Sync + 'static,
+    {
+        Self {
+            provider,
+            reason: reason.into(),
+            source: Some(Box::new(OpaqueSource(Box::new(source)))),
         }
     }
 }
@@ -216,8 +251,7 @@ impl ExecFailure {
 
 /// Structured provider-side failure detail. Serializable so it crosses the
 /// JSON-RPC boundary without losing structure.
-#[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
-#[error("{provider} error{}: {message}", code.as_deref().map(|c| format!(" [{c}]")).unwrap_or_default())]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct ProviderError {
     pub provider:  ProviderKind,
@@ -228,6 +262,28 @@ pub struct ProviderError {
     pub retryable: bool,
     /// Additional provider-specific structured detail.
     pub detail:    Option<serde_json::Value>,
+    /// The in-process infrastructure cause. The JSON-RPC projection carries
+    /// its rendered chain through [`crate::ErrorReport`] instead.
+    #[serde(skip)]
+    source:        Option<Box<OpaqueSource>>,
+}
+
+impl fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} error", self.provider)?;
+        if let Some(code) = &self.code {
+            write!(f, " [{code}]")?;
+        }
+        write!(f, ": {}", self.message)
+    }
+}
+
+impl StdError for ProviderError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source.0.as_ref() as &(dyn StdError + 'static))
+    }
 }
 
 impl ProviderError {
@@ -238,6 +294,23 @@ impl ProviderError {
             message: message.into(),
             retryable: false,
             detail: None,
+            source: None,
+        }
+    }
+
+    /// Creates a provider failure while preserving its infrastructure cause
+    /// without exposing the cause type in the public API.
+    pub fn with_source<E>(provider: ProviderKind, message: impl Into<String>, source: E) -> Self
+    where
+        E: StdError + Send + Sync + 'static,
+    {
+        Self {
+            provider,
+            code: None,
+            message: message.into(),
+            retryable: false,
+            detail: None,
+            source: Some(Box::new(OpaqueSource(Box::new(source)))),
         }
     }
 }
@@ -253,6 +326,19 @@ mod tests {
             error.to_string(),
             "capability lifecycle.pause is not supported by this provider"
         );
+    }
+
+    #[test]
+    fn provider_errors_preserve_in_process_sources() {
+        let provider = ProviderKind::try_new("test").expect("static provider kind is valid");
+        let error = Error::Provider(ProviderError::with_source(
+            provider,
+            "listing sandboxes",
+            io::Error::new(io::ErrorKind::ConnectionReset, "daemon disconnected"),
+        ));
+
+        let source = error.source().expect("provider error has a source");
+        assert_eq!(source.to_string(), "daemon disconnected");
     }
 
     #[test]

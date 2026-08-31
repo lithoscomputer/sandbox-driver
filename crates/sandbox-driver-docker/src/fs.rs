@@ -131,7 +131,7 @@ impl Filesystem for DockerFs {
             .download_from_container(&self.container_id, Some(options));
         let mut archive = Vec::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| docker_error("downloading file", &error))?;
+            let chunk = chunk.map_err(|error| docker_error("downloading file", error))?;
             archive.extend_from_slice(&chunk);
         }
         match file_from_tar(&archive)? {
@@ -162,9 +162,9 @@ impl Filesystem for DockerFs {
                 }
                 self.upload_tar(&parent, archive)
                     .await
-                    .map_err(|error| docker_error("uploading file", &error))
+                    .map_err(|error| docker_error("uploading file", error))
             }
-            Err(error) => Err(docker_error("uploading file", &error)),
+            Err(error) => Err(docker_error("uploading file", error)),
         }
     }
 

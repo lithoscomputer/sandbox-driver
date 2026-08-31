@@ -31,11 +31,11 @@ impl Logs for DaytonaLogs {
             .client
             .get(&self.sandbox_id)
             .await
-            .map_err(|error| daytona_error("fetching sandbox", &error))?;
+            .map_err(|error| daytona_error("fetching sandbox", error))?;
         let process = sandbox
             .process()
             .await
-            .map_err(|error| daytona_error("connecting to the toolbox", &error))?;
+            .map_err(|error| daytona_error("connecting to the toolbox", error))?;
 
         // The SDK callback error type cannot carry sandbox-driver's
         // typed sink error. Save it and use a sentinel SDK error to stop
@@ -61,7 +61,7 @@ impl Logs for DaytonaLogs {
         if let Some(error) = sink_error.lock().expect("sink error lock").take() {
             return Err(error);
         }
-        outcome.map_err(|error| daytona_error("following entrypoint logs", &error))
+        outcome.map_err(|error| daytona_error("following entrypoint logs", error))
     }
 }
 

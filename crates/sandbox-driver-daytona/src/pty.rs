@@ -47,11 +47,11 @@ impl Pty for DaytonaPty {
             .client
             .get(&self.sandbox_id)
             .await
-            .map_err(|error| daytona_error("fetching sandbox", &error))?;
+            .map_err(|error| daytona_error("fetching sandbox", error))?;
         let process = sandbox
             .process()
             .await
-            .map_err(|error| daytona_error("connecting to the toolbox", &error))?;
+            .map_err(|error| daytona_error("connecting to the toolbox", error))?;
 
         // Random nonce plus host pid, like sessions: never collides with
         // a concurrent or crashed driver's terminal.
@@ -73,7 +73,7 @@ impl Pty for DaytonaPty {
         let mut handle = process
             .create_pty(&id, create)
             .await
-            .map_err(|error| daytona_error("opening pty", &error))?;
+            .map_err(|error| daytona_error("opening pty", error))?;
         let output = handle
             .take_output_receiver()
             .expect("a newly created PTY owns its output receiver");
@@ -100,7 +100,7 @@ impl PtySession for DaytonaPtySession {
             .await
             .send_input(bytes)
             .await
-            .map_err(|error| daytona_error("writing pty input", &error))
+            .map_err(|error| daytona_error("writing pty input", error))
     }
 
     async fn read_output(&self) -> Result<Option<Vec<u8>>> {
@@ -114,7 +114,7 @@ impl PtySession for DaytonaPtySession {
             .resize(size.cols, size.rows)
             .await
             .map(|_| ())
-            .map_err(|error| daytona_error("resizing pty", &error))
+            .map_err(|error| daytona_error("resizing pty", error))
     }
 
     async fn close(&self) -> Result<()> {

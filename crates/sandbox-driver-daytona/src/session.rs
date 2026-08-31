@@ -43,7 +43,7 @@ impl Session {
         let process = sandbox
             .process()
             .await
-            .map_err(|error| daytona_error("connecting to the toolbox", &error))?;
+            .map_err(|error| daytona_error("connecting to the toolbox", error))?;
         // Random nonce plus host pid: a session id can never collide
         // with one from a crashed or concurrent driver — including two
         // concurrent execs in one process on a coarse-clock platform,
@@ -53,7 +53,7 @@ impl Session {
         process
             .create_session(&id)
             .await
-            .map_err(|error| daytona_error("creating command session", &error))?;
+            .map_err(|error| daytona_error("creating command session", error))?;
         Ok(Self {
             process: Some(process),
             id,
@@ -77,7 +77,7 @@ impl Session {
         self.service()?
             .execute_session_command(&self.id, command, true, true)
             .await
-            .map_err(|error| daytona_error("executing session command", &error))
+            .map_err(|error| daytona_error("executing session command", error))
     }
 
     pub(crate) async fn exit_code(&self, command_id: &str) -> Result<Option<i32>> {
@@ -85,7 +85,7 @@ impl Session {
             .service()?
             .get_session_command(&self.id, command_id)
             .await
-            .map_err(|error| daytona_error("polling session command", &error))?;
+            .map_err(|error| daytona_error("polling session command", error))?;
         Ok(command.exit_code)
     }
 

@@ -104,11 +104,11 @@ impl DockerProvider {
     /// Connects to the local Docker daemon and verifies it responds.
     pub async fn connect() -> Result<Self> {
         let docker = Docker::connect_with_local_defaults()
-            .map_err(|error| docker_error("connecting to the docker daemon", &error))?;
+            .map_err(|error| docker_error("connecting to the docker daemon", error))?;
         docker
             .ping()
             .await
-            .map_err(|error| docker_error("pinging the docker daemon", &error))?;
+            .map_err(|error| docker_error("pinging the docker daemon", error))?;
         Ok(Self {
             kind: ProviderKind::try_new("docker").expect("static kind is valid"),
             capabilities: docker_capabilities(),
@@ -127,7 +127,7 @@ impl DockerProvider {
             // Only a definitive "not present" justifies a pull; a daemon
             // or transport failure must surface as what it is.
             Err(error) if is_not_found(&error) => {}
-            Err(error) => return Err(docker_error("inspecting image", &error)),
+            Err(error) => return Err(docker_error("inspecting image", error)),
         }
         if !auto_pull {
             return Err(Error::Provider(ProviderError::new(
@@ -150,7 +150,7 @@ impl DockerProvider {
             .docker
             .create_image(Some(pull_options(reference)), None, None);
         while let Some(progress) = stream.next().await {
-            progress.map_err(|error| docker_error("pulling image", &error))?;
+            progress.map_err(|error| docker_error("pulling image", error))?;
         }
         Ok(())
     }
@@ -166,7 +166,7 @@ impl DockerProvider {
                         id:       container_id.to_owned(),
                     }
                 } else {
-                    docker_error("inspecting container", &error)
+                    docker_error("inspecting container", error)
                 }
             })
     }
@@ -419,13 +419,13 @@ impl SandboxProvider for DockerProvider {
                     if is_conflict(&error) && spec.name.is_some() {
                         Error::invalid_spec("name", "a container with this name already exists")
                     } else {
-                        docker_error("creating container", &error)
+                        docker_error("creating container", error)
                     }
                 })?;
             self.docker
                 .start_container(&created.id, None::<StartContainerOptions<String>>)
                 .await
-                .map_err(|error| docker_error("starting container", &error))?;
+                .map_err(|error| docker_error("starting container", error))?;
             Ok::<_, Error>((created.id, working_dir))
         }
         .await;
@@ -539,7 +539,7 @@ impl SandboxProvider for DockerProvider {
             .docker
             .list_containers(Some(options))
             .await
-            .map_err(|error| docker_error("listing containers", &error))?;
+            .map_err(|error| docker_error("listing containers", error))?;
         let mut statuses = Vec::new();
         for container in containers {
             let Some(id) = container.id else { continue };
@@ -626,7 +626,7 @@ impl Sandbox for DockerSandbox {
                 status.sandbox_kind = Some(SandboxKind::Container);
                 Ok(status)
             }
-            Err(error) => Err(docker_error("inspecting container", &error)),
+            Err(error) => Err(docker_error("inspecting container", error)),
         }
     }
 
@@ -654,12 +654,12 @@ impl Sandbox for DockerSandbox {
             .docker
             .inspect_container(self.id.as_str(), None::<InspectContainerOptions>)
             .await
-            .map_err(|error| docker_error("inspecting container", &error))?;
+            .map_err(|error| docker_error("inspecting container", error))?;
         let outcome = if inspect.state.as_ref().and_then(|state| state.paused) == Some(true) {
             self.docker
                 .unpause_container(self.id.as_str())
                 .await
-                .map_err(|error| docker_error("unpausing container", &error))
+                .map_err(|error| docker_error("unpausing container", error))
         } else {
             // Already-running (304) is success; a vanished container is
             // not — start's postcondition is a running sandbox, so 404
@@ -675,7 +675,7 @@ impl Sandbox for DockerSandbox {
                     resource: ResourceKind::Sandbox,
                     id:       self.id.as_str().to_owned(),
                 }),
-                Err(error) => Err(docker_error("starting container", &error)),
+                Err(error) => Err(docker_error("starting container", error)),
             }
         };
         self.emit_action(LifecycleAction::Start, &outcome).await;
@@ -711,7 +711,7 @@ impl Sandbox for DockerSandbox {
         {
             Ok(()) => Ok(()),
             Err(error) if is_not_found(&error) => Ok(()),
-            Err(error) => Err(docker_error("removing container", &error)),
+            Err(error) => Err(docker_error("removing container", error)),
         };
         self.emit_action(LifecycleAction::Delete, &outcome).await;
         outcome
@@ -722,7 +722,7 @@ impl Sandbox for DockerSandbox {
             .docker
             .pause_container(self.id.as_str())
             .await
-            .map_err(|error| docker_error("pausing container", &error));
+            .map_err(|error| docker_error("pausing container", error));
         self.emit_action(LifecycleAction::Pause, &outcome).await;
         outcome
     }
@@ -732,7 +732,7 @@ impl Sandbox for DockerSandbox {
             .docker
             .unpause_container(self.id.as_str())
             .await
-            .map_err(|error| docker_error("unpausing container", &error));
+            .map_err(|error| docker_error("unpausing container", error));
         self.emit_action(LifecycleAction::Resume, &outcome).await;
         outcome
     }

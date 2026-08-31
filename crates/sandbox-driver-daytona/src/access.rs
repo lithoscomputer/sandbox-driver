@@ -27,7 +27,7 @@ impl DaytonaAccess {
         self.client
             .get(&self.sandbox_id)
             .await
-            .map_err(|error| daytona_error("fetching sandbox", &error))
+            .map_err(|error| daytona_error("fetching sandbox", error))
     }
 }
 
@@ -39,7 +39,7 @@ impl PreviewUrls for DaytonaAccess {
             .await?
             .get_preview_link(port)
             .await
-            .map_err(|error| daytona_error("fetching preview link", &error))?;
+            .map_err(|error| daytona_error("fetching preview link", error))?;
         let mut url = PreviewUrl::new(link.url);
         url.headers = BTreeMap::from([
             ("x-daytona-preview-token".to_owned(), link.token),
@@ -60,7 +60,7 @@ impl PreviewUrls for DaytonaAccess {
             .await?
             .get_signed_preview_url(i32::from(port), Some(expires_secs))
             .await
-            .map_err(|error| daytona_error("fetching signed preview url", &error))?;
+            .map_err(|error| daytona_error("fetching signed preview url", error))?;
         Ok(PreviewUrl::new(signed.url))
     }
 }
@@ -74,7 +74,7 @@ impl SshAccess for DaytonaAccess {
             .await?
             .create_ssh_access(minutes)
             .await
-            .map_err(|error| daytona_error("creating ssh access", &error))?;
+            .map_err(|error| daytona_error("creating ssh access", error))?;
         let mut info = SshAccessInfo::new(access.ssh_command);
         info.token = Some(access.token);
         info.expires_at = ttl.and_then(|ttl| SystemTime::now().checked_add(ttl));
@@ -86,7 +86,7 @@ impl SshAccess for DaytonaAccess {
             .await?
             .revoke_ssh_access(token)
             .await
-            .map_err(|error| daytona_error("revoking ssh access", &error))
+            .map_err(|error| daytona_error("revoking ssh access", error))
     }
 }
 
@@ -107,10 +107,10 @@ impl Vnc for DaytonaAccess {
         sandbox
             .computer_use()
             .await
-            .map_err(|error| daytona_error("connecting to computer use", &error))?
+            .map_err(|error| daytona_error("connecting to computer use", error))?
             .start()
             .await
-            .map_err(|error| daytona_error("starting computer use", &error))?;
+            .map_err(|error| daytona_error("starting computer use", error))?;
         let signed = sandbox
             .get_signed_preview_url(
                 i32::from(VNC_PORT),
@@ -120,7 +120,7 @@ impl Vnc for DaytonaAccess {
                 ),
             )
             .await
-            .map_err(|error| daytona_error("fetching signed VNC URL", &error))?;
+            .map_err(|error| daytona_error("fetching signed VNC URL", error))?;
         Ok(VncConnection::new(vnc_viewer_url(&signed.url)))
     }
 }

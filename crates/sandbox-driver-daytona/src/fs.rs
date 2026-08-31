@@ -36,11 +36,11 @@ impl DaytonaFs {
                     .client
                     .get(&self.sandbox_id)
                     .await
-                    .map_err(|error| daytona_error("fetching sandbox", &error))?;
+                    .map_err(|error| daytona_error("fetching sandbox", error))?;
                 sandbox
                     .fs()
                     .await
-                    .map_err(|error| daytona_error("connecting to the toolbox", &error))
+                    .map_err(|error| daytona_error("connecting to the toolbox", error))
             })
             .await
     }
@@ -79,7 +79,7 @@ impl Filesystem for DaytonaFs {
             .await?
             .download_file(&self.resolve(path))
             .await
-            .map_err(|error| daytona_error("reading file", &error))
+            .map_err(|error| daytona_error("reading file", error))
     }
 
     async fn write(&self, path: &str, content: &[u8]) -> Result<()> {
@@ -93,10 +93,10 @@ impl Filesystem for DaytonaFs {
             Ok(()) => return Ok(()),
             Err(first_error) => {
                 let Some((parent, _)) = full.rsplit_once('/') else {
-                    return Err(daytona_error("writing file", &first_error));
+                    return Err(daytona_error("writing file", first_error));
                 };
                 if parent.is_empty() {
-                    return Err(daytona_error("writing file", &first_error));
+                    return Err(daytona_error("writing file", first_error));
                 }
                 let _ = service.create_folder(parent, Some("0755")).await;
             }
@@ -104,7 +104,7 @@ impl Filesystem for DaytonaFs {
         service
             .upload_file_bytes(&full, content)
             .await
-            .map_err(|error| daytona_error("writing file", &error))
+            .map_err(|error| daytona_error("writing file", error))
     }
 
     async fn delete(&self, path: &str, recursive: bool) -> Result<()> {
@@ -116,7 +116,7 @@ impl Filesystem for DaytonaFs {
         {
             Ok(()) => Ok(()),
             Err(error) if is_not_found(&error) => Ok(()),
-            Err(error) => Err(daytona_error("deleting file", &error)),
+            Err(error) => Err(daytona_error("deleting file", error)),
         }
     }
 
@@ -132,7 +132,7 @@ impl Filesystem for DaytonaFs {
             // The toolbox reports missing paths as a plain 400/500 in some
             // versions; treat any error mentioning existence as absence.
             Err(error) if error.to_string().contains("no such file") => Ok(false),
-            Err(error) => Err(daytona_error("checking file existence", &error)),
+            Err(error) => Err(daytona_error("checking file existence", error)),
         }
     }
 
@@ -142,7 +142,7 @@ impl Filesystem for DaytonaFs {
             .await?
             .get_file_info(&self.resolve(path))
             .await
-            .map_err(|error| daytona_error("reading file metadata", &error))?;
+            .map_err(|error| daytona_error("reading file metadata", error))?;
         let kind = if info.is_dir {
             FileKind::Directory
         } else {
@@ -162,7 +162,7 @@ impl Filesystem for DaytonaFs {
             .await?
             .list_files_with_depth(&self.resolve(path), Some(depth))
             .await
-            .map_err(|error| daytona_error("listing directory", &error))?;
+            .map_err(|error| daytona_error("listing directory", error))?;
         let mut entries: Vec<DirEntry> = files
             .into_iter()
             .map(|info| {
@@ -187,7 +187,7 @@ impl Filesystem for DaytonaFs {
             .await?
             .create_folder(&self.resolve(path), Some("0755"))
             .await
-            .map_err(|error| daytona_error("creating directory", &error))
+            .map_err(|error| daytona_error("creating directory", error))
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
@@ -195,7 +195,7 @@ impl Filesystem for DaytonaFs {
             .await?
             .move_files(&self.resolve(from), &self.resolve(to))
             .await
-            .map_err(|error| daytona_error("renaming", &error))
+            .map_err(|error| daytona_error("renaming", error))
     }
 
     async fn set_permissions(&self, path: &str, mode: u32) -> Result<()> {
@@ -208,7 +208,7 @@ impl Filesystem for DaytonaFs {
             .await?
             .set_file_permissions(&self.resolve(path), options)
             .await
-            .map_err(|error| daytona_error("setting permissions", &error))
+            .map_err(|error| daytona_error("setting permissions", error))
     }
 
     async fn upload(&self, local: &Path, remote: &str) -> Result<()> {

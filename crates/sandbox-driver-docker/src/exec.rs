@@ -38,11 +38,16 @@ const STOP_POLL_SLEEP_SECONDS: &str = "0.1";
 /// the normal path.
 const TERM_GRACE_SECONDS: &str = "2";
 
-pub(crate) fn docker_error(context: &str, error: &DockerApiError) -> Error {
+pub(crate) fn docker_error(context: &str, error: DockerApiError) -> Error {
     let kind = ProviderKind::try_new("docker").expect("static kind is valid");
-    let mut provider = ProviderError::new(kind, format!("{context}: {error}"));
-    if let DockerApiError::DockerResponseServerError { status_code, .. } = error {
+    let status_code = match &error {
+        DockerApiError::DockerResponseServerError { status_code, .. } => Some(*status_code),
+        _ => None,
+    };
+    let mut provider = ProviderError::with_source(kind, context, error);
+    if let Some(status_code) = status_code {
         provider.code = Some(status_code.to_string());
+        provider.retryable = status_code >= 500;
     }
     Error::Provider(provider)
 }
@@ -75,7 +80,7 @@ pub(crate) fn tolerate_not_modified(
     match outcome {
         Ok(()) => Ok(()),
         Err(error) if is_not_modified(&error) || is_not_found(&error) => Ok(()),
-        Err(error) => Err(docker_error(context, &error)),
+        Err(error) => Err(docker_error(context, error)),
     }
 }
 
@@ -269,12 +274,12 @@ impl DockerExec {
             .docker
             .create_exec(&self.container_id, options)
             .await
-            .map_err(|error| docker_error("creating stop-request exec", &error))?;
+            .map_err(|error| docker_error("creating stop-request exec", error))?;
         let start = self
             .docker
             .start_exec(&exec.id, None::<StartExecOptions>)
             .await
-            .map_err(|error| docker_error("starting stop-request exec", &error))?;
+            .map_err(|error| docker_error("starting stop-request exec", error))?;
         if let StartExecResults::Attached { mut output, .. } = start {
             // Drain to completion so the exit code below is final.
             while let Some(chunk) = output.next().await {
@@ -297,7 +302,7 @@ impl DockerExec {
             .docker
             .inspect_exec(exec_id)
             .await
-            .map_err(|error| docker_error("inspecting exec", &error))?;
+            .map_err(|error| docker_error("inspecting exec", error))?;
         Ok(inspect.exit_code.and_then(|code| i32::try_from(code).ok()))
     }
 }
@@ -334,14 +339,14 @@ impl Exec for DockerExec {
             .docker
             .create_exec(&self.container_id, options)
             .await
-            .map_err(|error| docker_error("creating exec", &error))?;
+            .map_err(|error| docker_error("creating exec", error))?;
         let start = self
             .docker
             .start_exec(&exec.id, None::<StartExecOptions>)
             .await
-            .map_err(|error| docker_error("starting exec", &error))?;
+            .map_err(|error| docker_error("starting exec", error))?;
         let StartExecResults::Attached { mut output, input } = start else {
-            return Err(docker_error("starting exec", &DockerApiError::IOError {
+            return Err(docker_error("starting exec", DockerApiError::IOError {
                 err: io::Error::other("exec started detached"),
             }));
         };
@@ -484,7 +489,7 @@ impl Exec for DockerExec {
             }
         }
         if let Some(error) = stream_error {
-            return Err(docker_error("reading exec output", &error));
+            return Err(docker_error("reading exec output", error));
         }
         let exit_code = self.exit_code(&exec.id).await?;
         let (stdout_bytes, stdout_stats) = stdout_capture.into_parts();
@@ -518,16 +523,16 @@ impl Exec for DockerExec {
             .docker
             .create_exec(&self.container_id, options)
             .await
-            .map_err(|error| docker_error("creating stdio exec", &error))?;
+            .map_err(|error| docker_error("creating stdio exec", error))?;
         let start = self
             .docker
             .start_exec(&exec.id, None::<StartExecOptions>)
             .await
-            .map_err(|error| docker_error("starting stdio exec", &error))?;
+            .map_err(|error| docker_error("starting stdio exec", error))?;
         let StartExecResults::Attached { mut output, input } = start else {
             return Err(docker_error(
                 "starting stdio exec",
-                &DockerApiError::IOError {
+                DockerApiError::IOError {
                     err: io::Error::other("exec started detached"),
                 },
             ));
@@ -631,5 +636,33 @@ impl StdioProcessHandle for DockerStdioHandle {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as _;
+
+    use super::*;
+
+    #[test]
+    fn docker_mapping_preserves_sources_and_retry_metadata() {
+        let error = docker_error(
+            "listing containers",
+            DockerApiError::DockerResponseServerError {
+                status_code: 503,
+                message:     "daemon unavailable".to_owned(),
+            },
+        );
+        let Error::Provider(provider) = error else {
+            panic!("expected a provider error");
+        };
+        assert_eq!(provider.message, "listing containers");
+        assert_eq!(provider.code.as_deref(), Some("503"));
+        assert!(provider.retryable);
+        assert_eq!(
+            provider.source().expect("provider source").to_string(),
+            "Docker responded with status code 503: daemon unavailable"
+        );
     }
 }

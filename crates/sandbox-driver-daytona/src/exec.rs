@@ -59,11 +59,11 @@ impl StdinFile {
         let sandbox = client
             .get(sandbox_id)
             .await
-            .map_err(|error| daytona_error("fetching sandbox", &error))?;
+            .map_err(|error| daytona_error("fetching sandbox", error))?;
         let fs = sandbox
             .fs()
             .await
-            .map_err(|error| daytona_error("connecting to the toolbox", &error))?;
+            .map_err(|error| daytona_error("connecting to the toolbox", error))?;
         // Random nonce plus host pid: unique even across concurrent
         // execs in one process, so a stale file from a crashed driver
         // can never feed a later command.
@@ -71,7 +71,7 @@ impl StdinFile {
         let path = format!("/tmp/.sandbox-driver-stdin-{}-{nonce:016x}", process::id());
         fs.upload_file_bytes(&path, bytes)
             .await
-            .map_err(|error| daytona_error("uploading exec stdin", &error))?;
+            .map_err(|error| daytona_error("uploading exec stdin", error))?;
         Ok(Self { fs: Some(fs), path })
     }
 
@@ -139,11 +139,11 @@ impl DaytonaExec {
                     .client
                     .get(&self.sandbox_id)
                     .await
-                    .map_err(|error| daytona_error("fetching sandbox", &error))?;
+                    .map_err(|error| daytona_error("fetching sandbox", error))?;
                 sandbox
                     .process()
                     .await
-                    .map_err(|error| daytona_error("connecting to the toolbox", &error))
+                    .map_err(|error| daytona_error("connecting to the toolbox", error))
             })
             .await
     }
@@ -247,7 +247,7 @@ impl DaytonaExec {
             Some(timeout) => match time::timeout(timeout + TIMEOUT_GRACE, call).await {
                 Ok(Ok(response)) => Ok(Some(response)),
                 Ok(Err(error)) if is_server_timeout(&error) => Ok(None),
-                Ok(Err(error)) => Err(daytona_error("executing command", &error)),
+                Ok(Err(error)) => Err(daytona_error("executing command", error)),
                 Err(_) => Ok(None),
             },
             None => match call.await {
@@ -255,7 +255,7 @@ impl DaytonaExec {
                 // The unbounded stand-in is still finite server-side, so
                 // its expiry is a timeout kill, not a provider failure.
                 Err(error) if is_server_timeout(&error) => Ok(None),
-                Err(error) => Err(daytona_error("executing command", &error)),
+                Err(error) => Err(daytona_error("executing command", error)),
             },
         };
         // Clean up before propagating any failure, so an errored command
@@ -320,7 +320,7 @@ impl DaytonaExec {
             .client
             .get(&self.sandbox_id)
             .await
-            .map_err(|error| daytona_error("fetching sandbox", &error))?;
+            .map_err(|error| daytona_error("fetching sandbox", error))?;
 
         let mut stdin_file = match &spec.stdin {
             Some(bytes) => Some(StdinFile::create(&self.client, &self.sandbox_id, bytes).await?),
@@ -357,7 +357,7 @@ impl DaytonaExec {
             Err(error) => {
                 session.close().await;
                 close_stdin(&mut stdin_file).await;
-                return Err(daytona_error("connecting to the toolbox", &error));
+                return Err(daytona_error("connecting to the toolbox", error));
             }
         };
         let stdout_seen = Arc::new(Mutex::new(OutputCaptureBuffer::new(

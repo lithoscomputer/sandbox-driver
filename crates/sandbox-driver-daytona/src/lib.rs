@@ -50,6 +50,7 @@ mod session;
 mod stdio;
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Debug;
 use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -69,15 +70,15 @@ use daytona_sdk::{
     ImageParams, ImageSource, SandboxBaseParams, SnapshotParams,
 };
 use sandbox_driver::{
-    Capabilities, Capability, Error, ErrorReport, EventCallback, EventDispatcher, Exec, ExecSpec,
-    Filesystem, ForkOptions, HealthStatus, Isolation, LifecycleAction, LifecycleTimers, LogSink,
-    Logs, LogsCaps, NetworkPolicy, PlatformInfo, PreviewUrls, ProviderError, ProviderHealth,
-    ProviderKind, Pty, PtyCaps, ResourceKind, Resources, Result, Sandbox, SandboxEvent,
-    SandboxFilter, SandboxId, SandboxKind, SandboxProvider, SandboxSnapshotOptions, SandboxSource,
-    SandboxSpec, SandboxState, SandboxStatus, SnapshotCaps, SnapshotFilter, SnapshotId,
-    SnapshotMode, SnapshotProvider, SnapshotSource, SnapshotSpec, SnapshotState, SnapshotStatus,
-    SshAccess, Vnc, VolumeCaps, VolumeId, VolumeProvider, VolumeSpec, VolumeState, VolumeStatus,
-    WebTerminal,
+    AuthError, Capabilities, Capability, Error, ErrorReport, EventCallback, EventDispatcher, Exec,
+    ExecSpec, Filesystem, ForkOptions, HealthStatus, Isolation, LifecycleAction, LifecycleTimers,
+    LogSink, Logs, LogsCaps, NetworkPolicy, PlatformInfo, PreviewUrls, ProviderError,
+    ProviderHealth, ProviderKind, Pty, PtyCaps, ResourceKind, Resources, Result, Sandbox,
+    SandboxEvent, SandboxFilter, SandboxId, SandboxKind, SandboxProvider, SandboxSnapshotOptions,
+    SandboxSource, SandboxSpec, SandboxState, SandboxStatus, SnapshotCaps, SnapshotFilter,
+    SnapshotId, SnapshotMode, SnapshotProvider, SnapshotSource, SnapshotSpec, SnapshotState,
+    SnapshotStatus, SshAccess, Vnc, VolumeCaps, VolumeId, VolumeProvider, VolumeSpec, VolumeState,
+    VolumeStatus, WebTerminal,
 };
 use tokio::time;
 
@@ -176,12 +177,19 @@ fn is_snapshot_deactivation_in_progress(error: &DaytonaError) -> bool {
 /// Maps a generated-client error for the few control-plane endpoints the
 /// wrapped SDK does not cover (snapshot deactivation, API-key
 /// introspection).
-fn generated_error<T>(context: &str, error: &ApiError<T>) -> Error {
+fn generated_error<T>(context: &str, error: ApiError<T>) -> Error
+where
+    T: Debug + Send + Sync + 'static,
+{
     let kind = ProviderKind::try_new("daytona").expect("static kind is valid");
-    let mut provider = ProviderError::new(kind, format!("{context}: {error}"));
-    if let ApiError::ResponseError(content) = error {
-        provider.code = Some(content.status.as_u16().to_string());
-        provider.retryable = content.status.is_server_error();
+    let status = match &error {
+        ApiError::ResponseError(content) => Some(content.status),
+        _ => None,
+    };
+    let mut provider = ProviderError::with_source(kind, context, error);
+    if let Some(status) = status {
+        provider.code = Some(status.as_u16().to_string());
+        provider.retryable = status.is_server_error();
     }
     Error::Provider(provider)
 }
@@ -202,24 +210,34 @@ fn dashboard_url(client: &daytona_sdk::Client) -> Option<String> {
         .map(|base| format!("{base}/dashboard/sandboxes"))
 }
 
-pub(crate) fn daytona_error(context: &str, error: &DaytonaError) -> Error {
+pub(crate) fn daytona_error(context: &str, error: DaytonaError) -> Error {
     let kind = ProviderKind::try_new("daytona").expect("static kind is valid");
-    match error {
-        DaytonaError::RateLimit { .. } => Error::RateLimited { retry_after: None },
-        DaytonaError::NotFound { message, .. } => Error::Provider({
-            let mut provider = ProviderError::new(kind, format!("{context}: {message}"));
-            provider.code = Some("404".to_owned());
-            provider
-        }),
-        other => {
-            let mut provider = ProviderError::new(kind, format!("{context}: {other}"));
-            if let DaytonaError::Api { status_code, .. } = other {
-                provider.code = Some(status_code.to_string());
-                provider.retryable = *status_code >= 500;
-            }
-            Error::Provider(provider)
-        }
+    if let DaytonaError::RateLimit { headers, .. } = &error {
+        let retry_after = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+            .and_then(|(_, value)| value.parse::<u64>().ok())
+            .map(Duration::from_secs);
+        return Error::RateLimited { retry_after };
     }
+    if matches!(&error, DaytonaError::Api {
+        status_code: 401 | 403,
+        ..
+    }) {
+        return Error::Auth(AuthError::with_source(kind, context, error));
+    }
+
+    let status_code = error.status_code();
+    let timed_out = matches!(&error, DaytonaError::Timeout { .. });
+    let mut provider = ProviderError::with_source(kind, context, error);
+    if let Some(status_code) = status_code {
+        provider.code = Some(status_code.to_string());
+        provider.retryable = status_code >= 500;
+    } else if timed_out {
+        provider.code = Some("timeout".to_owned());
+        provider.retryable = true;
+    }
+    Error::Provider(provider)
 }
 
 fn map_state(state: Option<daytona_sdk::SandboxState>) -> SandboxState {
@@ -268,7 +286,7 @@ async fn create_sandbox_snapshot(
     let sdk = client
         .get(sandbox_id)
         .await
-        .map_err(|error| daytona_error("fetching sandbox for snapshot", &error))?;
+        .map_err(|error| daytona_error("fetching sandbox for snapshot", error))?;
     let current = map_state(sdk.state);
     let required = match mode {
         SnapshotMode::Filesystem => SandboxState::Stopped,
@@ -298,14 +316,14 @@ async fn create_sandbox_snapshot(
         client.organization_id(),
     )
     .await
-    .map_err(|error| generated_error("snapshotting sandbox", &error))?;
+    .map_err(|error| generated_error("snapshotting sandbox", error))?;
 
     let started = Instant::now();
     loop {
         let sdk = client
             .get(sandbox_id)
             .await
-            .map_err(|error| daytona_error("waiting for sandbox snapshot", &error))?;
+            .map_err(|error| daytona_error("waiting for sandbox snapshot", error))?;
         match map_state(sdk.state) {
             SandboxState::Snapshotting => {}
             SandboxState::Error => {
@@ -333,7 +351,7 @@ async fn created_snapshot_id(client: &DaytonaClient, name: &str) -> Result<Snaps
         .snapshot
         .get(name)
         .await
-        .map_err(|error| daytona_error("fetching created snapshot", &error))?;
+        .map_err(|error| daytona_error("fetching created snapshot", error))?;
     SnapshotId::try_new(dto.id)
         .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))
 }
@@ -449,7 +467,7 @@ impl DaytonaProvider {
     pub async fn connect() -> Result<Self> {
         let client = Client::new()
             .await
-            .map_err(|error| daytona_error("connecting to daytona", &error))?;
+            .map_err(|error| daytona_error("connecting to daytona", error))?;
         let client = Arc::new(client);
         Ok(Self {
             kind: ProviderKind::try_new("daytona").expect("static kind is valid"),
@@ -481,7 +499,7 @@ impl DaytonaProvider {
             .client
             .create(params, options)
             .await
-            .map_err(|error| daytona_error("creating sandbox", &error))?;
+            .map_err(|error| daytona_error("creating sandbox", error))?;
         let sdk_id = created.id.clone();
         match self.wait_for_started(&sdk_id, budget).await {
             Ok(sdk) => Ok(sdk),
@@ -500,7 +518,7 @@ impl DaytonaProvider {
                 .client
                 .get(sdk_id)
                 .await
-                .map_err(|error| daytona_error("fetching created sandbox", &error))?;
+                .map_err(|error| daytona_error("fetching created sandbox", error))?;
             match map_state(sdk.state) {
                 SandboxState::Running => return Ok(sdk),
                 SandboxState::Error => {
@@ -531,9 +549,10 @@ impl DaytonaProvider {
         match time::timeout(CLEANUP_TIMEOUT, self.client.delete(sdk_id)).await {
             Ok(Ok(())) => cause,
             Ok(Err(error)) if is_not_found(&error) => cause,
-            _ => Error::Provider(ProviderError::new(
+            _ => Error::Provider(ProviderError::with_source(
                 self.kind.clone(),
-                format!("{cause}; the failed create left sandbox {sdk_id} behind"),
+                format!("failed create left sandbox {sdk_id} behind"),
+                cause,
             )),
         }
     }
@@ -566,7 +585,7 @@ impl DaytonaProvider {
                         id:       id.as_str().to_owned(),
                     }
                 } else {
-                    daytona_error("fetching snapshot kind", &error)
+                    daytona_error("fetching snapshot kind", error)
                 }
             })?;
         let Some(actual) = snapshot.sandbox_class.map(sandbox_kind_from_snapshot_class) else {
@@ -980,7 +999,7 @@ impl SandboxProvider for DaytonaProvider {
                     id:       id.as_str().to_owned(),
                 });
             }
-            Err(error) => return Err(daytona_error("fetching sandbox", &error)),
+            Err(error) => return Err(daytona_error("fetching sandbox", error)),
         };
         if sdk.labels.get(MANAGED_LABEL).map(String::as_str) != Some("true") {
             return Err(Error::NotFound {
@@ -1006,7 +1025,7 @@ impl SandboxProvider for DaytonaProvider {
                     id:       id.as_str().to_owned(),
                 });
             }
-            Err(error) => return Err(daytona_error("fetching sandbox", &error)),
+            Err(error) => return Err(daytona_error("fetching sandbox", error)),
         };
         if sdk.labels.get(MANAGED_LABEL).map(String::as_str) != Some("true") {
             return Err(Error::NotFound {
@@ -1016,12 +1035,12 @@ impl SandboxProvider for DaytonaProvider {
         }
         sdk.recover()
             .await
-            .map_err(|error| daytona_error("undeleting sandbox", &error))?;
+            .map_err(|error| daytona_error("undeleting sandbox", error))?;
         let refreshed = self
             .client
             .get(id.as_str())
             .await
-            .map_err(|error| daytona_error("fetching undeleted sandbox", &error))?;
+            .map_err(|error| daytona_error("fetching undeleted sandbox", error))?;
         Ok(self.handle(refreshed, events).await?)
     }
 
@@ -1077,7 +1096,7 @@ impl SandboxProvider for DaytonaProvider {
                 .client
                 .list(Some(&labels), Some(page_number), Some(LIST_PAGE_SIZE))
                 .await
-                .map_err(|error| daytona_error("listing sandboxes", &error))?;
+                .map_err(|error| daytona_error("listing sandboxes", error))?;
             for item in &page.items {
                 statuses.push(status_from_sdk(&self.client, item)?);
             }
@@ -1118,7 +1137,7 @@ impl DaytonaSandbox {
         self.client
             .get(&self.sdk_id)
             .await
-            .map_err(|error| daytona_error("fetching sandbox", &error))
+            .map_err(|error| daytona_error("fetching sandbox", error))
     }
 
     /// Polls until the sandbox settles in a stable state, bounded by
@@ -1134,7 +1153,7 @@ impl DaytonaSandbox {
             let state = match self.client.get(&self.sdk_id).await {
                 Ok(sdk) => map_state(sdk.state),
                 Err(error) if is_not_found(&error) => return Ok(SandboxState::Deleted),
-                Err(error) => return Err(daytona_error("fetching sandbox", &error)),
+                Err(error) => return Err(daytona_error("fetching sandbox", error)),
             };
             if state.is_stable() {
                 return Ok(state);
@@ -1174,7 +1193,7 @@ impl DaytonaSandbox {
             .client
             .get(&self.sdk_id)
             .await
-            .map_err(|error| daytona_error("fetching sandbox", &error))?;
+            .map_err(|error| daytona_error("fetching sandbox", error))?;
         if map_state(current.state) == SandboxState::Running {
             return Ok(());
         }
@@ -1193,7 +1212,7 @@ impl DaytonaSandbox {
                     self.transition_retry_pause("starting sandbox", started)
                         .await?;
                 }
-                Err(error) => return Err(daytona_error("starting sandbox", &error)),
+                Err(error) => return Err(daytona_error("starting sandbox", error)),
             }
         }
     }
@@ -1221,7 +1240,7 @@ impl DaytonaSandbox {
                         }
                     }
                 }
-                Err(error) => return Err(daytona_error("stopping sandbox", &error)),
+                Err(error) => return Err(daytona_error("stopping sandbox", error)),
             }
         }
     }
@@ -1253,7 +1272,7 @@ impl DaytonaSandbox {
                     let state = match self.client.get(&self.sdk_id).await {
                         Ok(sdk) => map_state(sdk.state),
                         Err(error) if is_not_found(&error) => return Ok(()),
-                        Err(error) => return Err(daytona_error("fetching sandbox", &error)),
+                        Err(error) => return Err(daytona_error("fetching sandbox", error)),
                     };
                     if matches!(state, SandboxState::Deleting | SandboxState::Deleted) {
                         return Ok(());
@@ -1269,7 +1288,7 @@ impl DaytonaSandbox {
                         }
                     }
                 }
-                Err(error) => return Err(daytona_error("deleting sandbox", &error)),
+                Err(error) => return Err(daytona_error("deleting sandbox", error)),
             }
         }
     }
@@ -1315,7 +1334,7 @@ impl Sandbox for DaytonaSandbox {
             Err(error) if is_not_found(&error) => {
                 Ok(SandboxStatus::new(self.id.clone(), SandboxState::Deleted))
             }
-            Err(error) => Err(daytona_error("fetching sandbox", &error)),
+            Err(error) => Err(daytona_error("fetching sandbox", error)),
         }
     }
 
@@ -1364,7 +1383,7 @@ impl Sandbox for DaytonaSandbox {
             let mut sdk = self.sdk().await?;
             sdk.archive()
                 .await
-                .map_err(|error| daytona_error("archiving sandbox", &error))
+                .map_err(|error| daytona_error("archiving sandbox", error))
         }
         .await;
         self.emit_action(LifecycleAction::Archive, &outcome).await;
@@ -1383,7 +1402,7 @@ impl Sandbox for DaytonaSandbox {
             let mut sdk = self.sdk().await?;
             sdk.pause_with_timeout(TRANSITION_BUDGET)
                 .await
-                .map_err(|error| daytona_error("pausing sandbox", &error))
+                .map_err(|error| daytona_error("pausing sandbox", error))
         }
         .await;
         self.emit_action(LifecycleAction::Pause, &outcome).await;
@@ -1416,7 +1435,7 @@ impl Sandbox for DaytonaSandbox {
         let forked = sdk
             .fork_with_timeout(options.name.as_deref(), CREATE_TIMEOUT)
             .await
-            .map_err(|error| daytona_error("forking sandbox", &error))?;
+            .map_err(|error| daytona_error("forking sandbox", error))?;
         let child_state = map_state(forked.state);
         if child_state != SandboxState::Running {
             return Err(Error::InvalidState {
@@ -1485,7 +1504,7 @@ impl Sandbox for DaytonaSandbox {
             let mut sdk = self.sdk().await?;
             sdk.update_network_settings(settings)
                 .await
-                .map_err(|error| daytona_error("updating network settings", &error))
+                .map_err(|error| daytona_error("updating network settings", error))
         }
         .await;
         self.emit_action(LifecycleAction::UpdateNetwork, &outcome)
@@ -1534,34 +1553,34 @@ impl Sandbox for DaytonaSandbox {
         if auto_pause.is_some_and(|interval| interval != 0) && auto_stop.is_none() {
             sdk.set_autostop_interval(0)
                 .await
-                .map_err(|error| daytona_error("disabling auto-stop", &error))?;
+                .map_err(|error| daytona_error("disabling auto-stop", error))?;
         }
         if let Some(idle) = auto_stop {
             sdk.set_autostop_interval(idle)
                 .await
-                .map_err(|error| daytona_error("setting auto-stop", &error))?;
+                .map_err(|error| daytona_error("setting auto-stop", error))?;
         }
         if let Some(pause) = auto_pause {
             sdk.set_auto_pause_interval(pause)
                 .await
-                .map_err(|error| daytona_error("setting auto-pause", &error))?;
+                .map_err(|error| daytona_error("setting auto-pause", error))?;
         }
         if let Some(archive) = timers.auto_archive_after_stop {
             sdk.set_auto_archive_interval(minutes(archive))
                 .await
-                .map_err(|error| daytona_error("setting auto-archive", &error))?;
+                .map_err(|error| daytona_error("setting auto-archive", error))?;
         }
         if let Some(delete) = timers.auto_delete_after_stop {
             sdk.set_auto_delete_interval(auto_delete_minutes(delete))
                 .await
-                .map_err(|error| daytona_error("setting auto-delete", &error))?;
+                .map_err(|error| daytona_error("setting auto-delete", error))?;
         }
         if let Some(ttl) = timers.ttl {
             // The deadline re-anchors from now; zero disables (subject to
             // the org/region maximum lifespan).
             sdk.set_ttl(minutes(ttl))
                 .await
-                .map_err(|error| daytona_error("setting ttl", &error))?;
+                .map_err(|error| daytona_error("setting ttl", error))?;
         }
         Ok(())
     }
@@ -1576,7 +1595,7 @@ impl Sandbox for DaytonaSandbox {
         sdk.set_labels(all)
             .await
             .map(|_| ())
-            .map_err(|error| daytona_error("setting labels", &error))
+            .map_err(|error| daytona_error("setting labels", error))
     }
 
     fn exec(&self) -> &dyn Exec {
@@ -1675,7 +1694,7 @@ impl SnapshotProvider for DaytonaSnapshots {
                     .client
                     .get(id.as_str())
                     .await
-                    .map_err(|error| daytona_error("fetching sandbox for snapshot", &error))?;
+                    .map_err(|error| daytona_error("fetching sandbox for snapshot", error))?;
                 let actual_kind = sdk.sandbox_class.map(sandbox_kind_from_sandbox_class);
                 if let Some(requested) = spec.sandbox_kind {
                     if actual_kind != Some(requested) {
@@ -1730,7 +1749,7 @@ impl SnapshotProvider for DaytonaSnapshots {
             .snapshot
             .create(&params)
             .await
-            .map_err(|error| daytona_error("creating snapshot", &error))?;
+            .map_err(|error| daytona_error("creating snapshot", error))?;
         SnapshotId::try_new(created.id)
             .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))
     }
@@ -1748,7 +1767,7 @@ impl SnapshotProvider for DaytonaSnapshots {
                         id:       id.as_str().to_owned(),
                     }
                 } else {
-                    daytona_error("fetching snapshot", &error)
+                    daytona_error("fetching snapshot", error)
                 }
             })?;
         snapshot_status(dto)
@@ -1763,7 +1782,7 @@ impl SnapshotProvider for DaytonaSnapshots {
                 .snapshot
                 .list(Some(page_number), Some(LIST_PAGE_SIZE))
                 .await
-                .map_err(|error| daytona_error("listing snapshots", &error))?;
+                .map_err(|error| daytona_error("listing snapshots", error))?;
             for dto in page.items {
                 if let Some(name) = &filter.name {
                     if dto.name != *name {
@@ -1791,7 +1810,7 @@ impl SnapshotProvider for DaytonaSnapshots {
                         return Ok(());
                     }
                 }
-                Err(daytona_error("deleting snapshot", &error))
+                Err(daytona_error("deleting snapshot", error))
             }
         }
     }
@@ -1817,7 +1836,7 @@ impl SnapshotProvider for DaytonaSnapshots {
         if let Some(error) = sink_error.lock().expect("sink error lock").take() {
             return Err(error);
         }
-        outcome.map_err(|error| daytona_error("following snapshot build logs", &error))
+        outcome.map_err(|error| daytona_error("following snapshot build logs", error))
     }
 
     async fn activate(&self, id: &SnapshotId) -> Result<()> {
@@ -1842,7 +1861,7 @@ impl SnapshotProvider for DaytonaSnapshots {
                     }
                     time::sleep(SNAPSHOT_ACTIVATE_POLL).await;
                 }
-                Err(error) => return Err(daytona_error("activating snapshot", &error)),
+                Err(error) => return Err(daytona_error("activating snapshot", error)),
             }
         }
     }
@@ -1856,7 +1875,7 @@ impl SnapshotProvider for DaytonaSnapshots {
         match snapshots_api::deactivate_snapshot(configuration, id.as_str(), organization).await {
             Ok(()) => return Ok(()),
             Err(error) if is_generated_not_found(&error) => {}
-            Err(error) => return Err(generated_error("deactivating snapshot", &error)),
+            Err(error) => return Err(generated_error("deactivating snapshot", error)),
         }
         let resolved = match self.client.snapshot.get(id.as_str()).await {
             Ok(dto) => dto.id,
@@ -1866,11 +1885,11 @@ impl SnapshotProvider for DaytonaSnapshots {
                     id:       id.as_str().to_owned(),
                 });
             }
-            Err(error) => return Err(daytona_error("fetching snapshot", &error)),
+            Err(error) => return Err(daytona_error("fetching snapshot", error)),
         };
         snapshots_api::deactivate_snapshot(configuration, &resolved, organization)
             .await
-            .map_err(|error| generated_error("deactivating snapshot", &error))
+            .map_err(|error| generated_error("deactivating snapshot", error))
     }
 }
 
@@ -1908,7 +1927,7 @@ impl VolumeProvider for DaytonaVolumes {
             .volume
             .create(&spec.name)
             .await
-            .map_err(|error| daytona_error("creating volume", &error))?;
+            .map_err(|error| daytona_error("creating volume", error))?;
         VolumeId::try_new(dto.id)
             .map_err(|error| Error::invalid_spec("volume_id", error.to_string()))
     }
@@ -1921,7 +1940,7 @@ impl VolumeProvider for DaytonaVolumes {
                     id:       id.as_str().to_owned(),
                 }
             } else {
-                daytona_error("fetching volume", &error)
+                daytona_error("fetching volume", error)
             }
         })?;
         volume_status(dto)
@@ -1933,7 +1952,7 @@ impl VolumeProvider for DaytonaVolumes {
             .volume
             .list()
             .await
-            .map_err(|error| daytona_error("listing volumes", &error))?;
+            .map_err(|error| daytona_error("listing volumes", error))?;
         volumes.into_iter().map(volume_status).collect()
     }
 
@@ -1953,7 +1972,7 @@ impl VolumeProvider for DaytonaVolumes {
                         return Ok(());
                     }
                 }
-                Err(daytona_error("deleting volume", &error))
+                Err(daytona_error("deleting volume", error))
             }
         }
     }
@@ -1962,6 +1981,7 @@ impl VolumeProvider for DaytonaVolumes {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap as StdHashMap;
+    use std::error::Error as _;
 
     use super::*;
 
@@ -2001,6 +2021,47 @@ mod tests {
             400,
             "Bad request"
         )));
+    }
+
+    #[test]
+    fn provider_mapping_preserves_sources_and_retry_metadata() {
+        let error = daytona_error("listing sandboxes", api_error(503, "service unavailable"));
+        let Error::Provider(provider) = error else {
+            panic!("expected a provider error");
+        };
+        assert_eq!(provider.message, "listing sandboxes");
+        assert_eq!(provider.code.as_deref(), Some("503"));
+        assert!(provider.retryable);
+        assert_eq!(
+            provider.source().expect("provider source").to_string(),
+            "service unavailable"
+        );
+    }
+
+    #[test]
+    fn authentication_mapping_keeps_the_sdk_cause() {
+        let error = daytona_error("connecting to daytona", api_error(401, "invalid token"));
+        let Error::Auth(auth) = error else {
+            panic!("expected an authentication error");
+        };
+        assert_eq!(auth.reason, "connecting to daytona");
+        assert_eq!(
+            auth.source().expect("authentication source").to_string(),
+            "invalid token"
+        );
+    }
+
+    #[test]
+    fn rate_limit_mapping_keeps_retry_after() {
+        let mut headers = StdHashMap::new();
+        headers.insert("Retry-After".to_owned(), "17".to_owned());
+        let error = daytona_error("listing sandboxes", DaytonaError::RateLimit {
+            message: "slow down".to_owned(),
+            headers,
+        });
+        assert!(matches!(error, Error::RateLimited {
+            retry_after: Some(retry_after),
+        } if retry_after == Duration::from_secs(17)));
     }
 
     #[test]
