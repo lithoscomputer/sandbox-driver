@@ -40,6 +40,9 @@
 //! [`DaytonaProvider::connect`] uses the SDK's environment configuration:
 //! `DAYTONA_API_KEY` (or `DAYTONA_JWT_TOKEN` + `DAYTONA_ORGANIZATION_ID`),
 //! optional `DAYTONA_API_URL` and `DAYTONA_TARGET`.
+//! [`DaytonaProvider::connect_with_config`] accepts the same values explicitly,
+//! so an embedding application can pass vault-resolved credentials without
+//! changing the process environment.
 
 mod access;
 mod exec;
@@ -65,6 +68,7 @@ use daytona_api_client::models::{
     SnapshotState as ApiSnapshotState, UpdateSandboxNetworkSettings, VolumeDto,
     VolumeState as ApiVolumeState,
 };
+pub use daytona_sdk::DaytonaConfig;
 use daytona_sdk::{
     Client, CreateParams, CreateSandboxOptions, CreateSnapshotParams, DaytonaError, DockerImage,
     ImageParams, ImageSource, SandboxBaseParams, SnapshotParams,
@@ -468,9 +472,30 @@ impl DaytonaProvider {
         let client = Client::new()
             .await
             .map_err(|error| daytona_error("connecting to daytona", error))?;
+        Ok(Self::from_client(client))
+    }
+
+    /// Connects using explicit SDK configuration.
+    ///
+    /// Values set in `config` take precedence over the SDK's environment
+    /// variables. Unset values retain the SDK's environment fallbacks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configuration is invalid or the SDK client
+    /// cannot be initialized.
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona"), err)]
+    pub async fn connect_with_config(config: DaytonaConfig) -> Result<Self> {
+        let client = Client::new_with_config(config)
+            .await
+            .map_err(|error| daytona_error("connecting to daytona", error))?;
+        Ok(Self::from_client(client))
+    }
+
+    fn from_client(client: Client) -> Self {
         let client = Arc::new(client);
         let kind = ProviderKind::try_new("daytona").expect("static kind is valid");
-        Ok(Self {
+        Self {
             kind: kind.clone(),
             capabilities: daytona_capabilities(),
             snapshots: DaytonaSnapshots {
@@ -482,7 +507,7 @@ impl DaytonaProvider {
                 kind,
             },
             client,
-        })
+        }
     }
 
     /// Creates the sandbox and waits for it to start under `budget`,
@@ -2263,6 +2288,26 @@ mod tests {
             auth.source().expect("authentication source").to_string(),
             "invalid token"
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_connection_config_reaches_the_sdk_client() {
+        let provider = DaytonaProvider::connect_with_config(DaytonaConfig {
+            api_key: Some("dtn_vault_resolved".to_owned()),
+            organization_id: Some("org-1".to_owned()),
+            api_url: Some("https://daytona.example/api".to_owned()),
+            ..DaytonaConfig::default()
+        })
+        .await
+        .expect("explicit Daytona configuration should initialize the SDK client");
+
+        let sdk_config = provider.client.api_configuration();
+        assert_eq!(
+            sdk_config.bearer_access_token.as_deref(),
+            Some("dtn_vault_resolved")
+        );
+        assert_eq!(sdk_config.base_path, "https://daytona.example/api");
+        assert_eq!(provider.client.organization_id(), Some("org-1"));
     }
 
     #[test]
