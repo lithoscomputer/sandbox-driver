@@ -4,7 +4,7 @@
 //! plane and per-sandbox toolbox daemon, with snapshots and volumes as
 //! first-class services and preview-URL/SSH access facets.
 //!
-//! Lifecycle: archive, resize, undelete (Daytona's "recover" — restore
+//! Lifecycle: archive, undelete (Daytona's "recover" — restore
 //! within 24 hours of deletion), refresh-activity, all five timers (TTL
 //! and auto-pause included), labels, runtime network updates, and — on
 //! VM sandbox classes, narrowed per sandbox — pause/resume, fork, and
@@ -19,6 +19,9 @@
 //! separated stdout/stderr, kills on cancel/timeout by deleting the
 //! session, and preserves partial output on timeout. Stdin is delivered
 //! through a temp-file redirection inside the sandbox on both paths.
+//! Resize remains in the normalized interface, but the current hosted
+//! Daytona API and official SDK do not expose a working resize route, so
+//! this provider does not declare it.
 //!
 //! # Lifecycle timers
 //!
@@ -41,13 +44,14 @@
 mod access;
 mod exec;
 mod fs;
+mod logs;
 mod pty;
 mod session;
 mod stdio;
 
 use std::collections::{BTreeMap, HashMap};
 use std::result::Result as StdResult;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -64,19 +68,20 @@ use daytona_sdk::{
 };
 use sandbox_driver::{
     Capabilities, Capability, Error, ErrorReport, EventCallback, EventDispatcher, Exec, ExecSpec,
-    Filesystem, ForkOptions, HealthStatus, Isolation, LifecycleAction, LifecycleTimers,
-    NetworkPolicy, PlatformInfo, PreviewUrls, ProviderError, ProviderHealth, ProviderKind, Pty,
-    PtyCaps, ResourceKind, Resources, Result, Sandbox, SandboxEvent, SandboxFilter, SandboxId,
-    SandboxProvider, SandboxSnapshotOptions, SandboxSource, SandboxSpec, SandboxState,
-    SandboxStatus, SnapshotCaps, SnapshotFilter, SnapshotId, SnapshotProvider, SnapshotSource,
-    SnapshotSpec, SnapshotState, SnapshotStatus, SshAccess, VolumeCaps, VolumeId, VolumeProvider,
-    VolumeSpec, VolumeState, VolumeStatus,
+    Filesystem, ForkOptions, HealthStatus, Isolation, LifecycleAction, LifecycleTimers, LogSink,
+    Logs, LogsCaps, NetworkPolicy, PlatformInfo, PreviewUrls, ProviderError, ProviderHealth,
+    ProviderKind, Pty, PtyCaps, ResourceKind, Resources, Result, Sandbox, SandboxEvent,
+    SandboxFilter, SandboxId, SandboxProvider, SandboxSnapshotOptions, SandboxSource, SandboxSpec,
+    SandboxState, SandboxStatus, SnapshotCaps, SnapshotFilter, SnapshotId, SnapshotProvider,
+    SnapshotSource, SnapshotSpec, SnapshotState, SnapshotStatus, SshAccess, Vnc, VolumeCaps,
+    VolumeId, VolumeProvider, VolumeSpec, VolumeState, VolumeStatus, WebTerminal,
 };
 use tokio::time;
 
 pub use crate::access::DaytonaAccess;
 pub use crate::exec::DaytonaExec;
 pub use crate::fs::DaytonaFs;
+pub use crate::logs::DaytonaLogs;
 pub use crate::pty::DaytonaPty;
 
 const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
@@ -93,6 +98,8 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// (for example an auto-stop racing a reactivation).
 const TRANSITION_BUDGET: Duration = Duration::from_secs(120);
 const TRANSITION_POLL: Duration = Duration::from_secs(1);
+const SNAPSHOT_ACTIVATE_BUDGET: Duration = Duration::from_secs(900);
+const SNAPSHOT_ACTIVATE_POLL: Duration = Duration::from_secs(5);
 
 /// Items requested per page when listing sandboxes or snapshots. The
 /// paginated endpoints truncate an unpaged request to their own default
@@ -149,6 +156,17 @@ pub(crate) fn is_state_change_in_progress(error: &DaytonaError) -> bool {
             message,
             ..
         } if message.to_lowercase().contains("state change in progress")
+    )
+}
+
+fn is_snapshot_deactivation_in_progress(error: &DaytonaError) -> bool {
+    matches!(
+        error,
+        DaytonaError::Api {
+            status_code: 400,
+            message,
+            ..
+        } if message.to_lowercase().contains("deactivation is still in progress")
     )
 }
 
@@ -426,6 +444,7 @@ async fn build_handle(
         exec: DaytonaExec::new(Arc::clone(client), sdk.id.clone(), working_dir.clone()),
         fs: DaytonaFs::new(Arc::clone(client), sdk.id.clone(), working_dir.clone()),
         access: DaytonaAccess::new(Arc::clone(client), sdk.id.clone()),
+        logs: DaytonaLogs::new(Arc::clone(client), sdk.id.clone()),
         pty: DaytonaPty::new(Arc::clone(client), sdk.id.clone(), working_dir.clone()),
         id,
         capabilities: narrowed_capabilities(base_capabilities, sdk.sandbox_class),
@@ -447,7 +466,7 @@ fn daytona_capabilities() -> Capabilities {
     // Daytona's "recover" endpoint is an undelete (restore within 24
     // hours of deletion), not recovery from the Error state.
     caps.lifecycle.undelete = true;
-    caps.lifecycle.resize = true;
+    caps.lifecycle.resize = false;
     caps.lifecycle.refresh_activity = true;
     caps.lifecycle.timers = true;
     caps.lifecycle.labels = true;
@@ -468,9 +487,16 @@ fn daytona_capabilities() -> Capabilities {
         pty.resize = true;
         pty
     });
+    caps.logs = Some({
+        let mut logs = LogsCaps::default();
+        logs.entrypoint = true;
+        logs
+    });
     caps.access.preview_urls = true;
     caps.access.signed_preview_urls = true;
     caps.access.ssh = true;
+    caps.access.web_terminal = true;
+    caps.access.vnc = true;
     caps.network.allow_all = true;
     caps.network.block_all = true;
     caps.network.cidr_allow_list = true;
@@ -479,7 +505,10 @@ fn daytona_capabilities() -> Capabilities {
         let mut snapshots = SnapshotCaps::default();
         snapshots.from_image = true;
         snapshots.from_dockerfile = true;
-        snapshots.from_sandbox = true;
+        // Live-sandbox snapshots use Sandbox::snapshot. The provider
+        // snapshot service accepts image and Dockerfile sources only.
+        snapshots.from_sandbox = false;
+        snapshots.build_logs = true;
         snapshots.activation = true;
         snapshots
     });
@@ -493,16 +522,22 @@ fn daytona_capabilities() -> Capabilities {
 
 /// Narrows the provider's upper-bound capability set to one sandbox.
 ///
-/// Pause, fork, and sandbox snapshots are VM-class operations: container
-/// and android sandboxes get them masked. An unknown or unreported class
-/// keeps the upper bound — the typed `Unsupported`/provider error at the
-/// call is still the enforcement.
+/// Pause and fork are VM-class operations; archive is a container-class
+/// operation. Live snapshots are supported on the hosted default sandbox
+/// class and remain declared. An unknown or unreported class keeps the
+/// upper bound — the typed `Unsupported`/provider error at the call is
+/// still the enforcement.
 fn narrowed_capabilities(base: &Capabilities, class: Option<SandboxClass>) -> Capabilities {
     let mut caps = base.clone();
     if matches!(class, Some(SandboxClass::CONTAINER | SandboxClass::ANDROID)) {
         caps.lifecycle.pause = false;
         caps.lifecycle.fork = false;
-        caps.lifecycle.snapshot_sandbox = false;
+    }
+    if matches!(
+        class,
+        Some(SandboxClass::LINUX_VM | SandboxClass::ANDROID | SandboxClass::WINDOWS)
+    ) {
+        caps.lifecycle.archive = false;
     }
     caps
 }
@@ -864,6 +899,7 @@ pub struct DaytonaSandbox {
     exec:         DaytonaExec,
     fs:           DaytonaFs,
     access:       DaytonaAccess,
+    logs:         DaytonaLogs,
     pty:          DaytonaPty,
     dispatcher:   Option<EventDispatcher>,
 }
@@ -1112,6 +1148,9 @@ impl Sandbox for DaytonaSandbox {
     }
 
     async fn archive(&self) -> Result<()> {
+        if !self.capabilities.lifecycle.archive {
+            return Err(Error::unsupported(Capability::LifecycleArchive));
+        }
         let outcome = async {
             let mut sdk = self.sdk().await?;
             sdk.archive()
@@ -1124,6 +1163,9 @@ impl Sandbox for DaytonaSandbox {
     }
 
     async fn pause(&self) -> Result<()> {
+        if !self.capabilities.lifecycle.pause {
+            return Err(Error::unsupported(Capability::LifecyclePause));
+        }
         // The SDK applies the upstream contract: the pause completes when
         // the sandbox has left the pausing state, not only on exactly
         // Paused. VM classes only; the per-sandbox capability set masks
@@ -1140,6 +1182,9 @@ impl Sandbox for DaytonaSandbox {
     }
 
     async fn resume(&self) -> Result<()> {
+        if !self.capabilities.lifecycle.pause {
+            return Err(Error::unsupported(Capability::LifecyclePause));
+        }
         // Daytona has no separate resume endpoint: start resumes a
         // paused sandbox.
         let outcome = self.start_inner().await;
@@ -1148,6 +1193,9 @@ impl Sandbox for DaytonaSandbox {
     }
 
     async fn fork(&self, options: &ForkOptions) -> Result<Arc<dyn Sandbox>> {
+        if !self.capabilities.lifecycle.fork {
+            return Err(Error::unsupported(Capability::LifecycleFork));
+        }
         if options.include_memory {
             return Err(Error::invalid_spec(
                 "include_memory",
@@ -1165,6 +1213,9 @@ impl Sandbox for DaytonaSandbox {
     }
 
     async fn snapshot(&self, options: &SandboxSnapshotOptions) -> Result<SnapshotId> {
+        if !self.capabilities.lifecycle.snapshot_sandbox {
+            return Err(Error::unsupported(Capability::LifecycleSnapshotSandbox));
+        }
         if options.include_memory {
             // On the wire upstream, but exposed by no reference SDK.
             return Err(Error::unsupported(Capability::SnapshotsIncludeMemory));
@@ -1245,21 +1296,8 @@ impl Sandbox for DaytonaSandbox {
     }
 
     async fn resize(&self, resources: &Resources) -> Result<()> {
-        let Some(sdk_resources) = sdk_resources(resources) else {
-            return Err(Error::invalid_spec(
-                "resources",
-                "resize needs at least one resource",
-            ));
-        };
-        let outcome = async {
-            let mut sdk = self.sdk().await?;
-            sdk.resize(&sdk_resources)
-                .await
-                .map_err(|error| daytona_error("resizing sandbox", &error))
-        }
-        .await;
-        self.emit_action(LifecycleAction::Resize, &outcome).await;
-        outcome
+        let _ = resources;
+        Err(Error::unsupported(Capability::LifecycleResize))
     }
 
     async fn set_timers(&self, timers: &LifecycleTimers) -> Result<()> {
@@ -1345,6 +1383,18 @@ impl Sandbox for DaytonaSandbox {
 
     fn pty(&self) -> Option<&dyn Pty> {
         Some(&self.pty)
+    }
+
+    fn logs(&self) -> Option<&dyn Logs> {
+        Some(&self.logs)
+    }
+
+    fn web_terminal(&self) -> Option<&dyn WebTerminal> {
+        Some(&self.access)
+    }
+
+    fn vnc(&self) -> Option<&dyn Vnc> {
+        Some(&self.access)
     }
 }
 
@@ -1473,15 +1523,54 @@ impl SnapshotProvider for DaytonaSnapshots {
         }
     }
 
+    async fn build_logs(&self, id: &SnapshotId, follow: bool, sink: LogSink) -> Result<()> {
+        let sink_error = Arc::new(Mutex::new(None));
+        let callback_error = Arc::clone(&sink_error);
+        let outcome = self
+            .client
+            .snapshot
+            .stream_build_logs(id.as_str(), follow, move |chunk| {
+                let sink = Arc::clone(&sink);
+                let callback_error = Arc::clone(&callback_error);
+                async move {
+                    if let Err(error) = sink(chunk).await {
+                        *callback_error.lock().expect("sink error lock") = Some(error);
+                        return Err(DaytonaError::general("sandbox-driver log sink failed"));
+                    }
+                    Ok(())
+                }
+            })
+            .await;
+        if let Some(error) = sink_error.lock().expect("sink error lock").take() {
+            return Err(error);
+        }
+        outcome.map_err(|error| daytona_error("following snapshot build logs", &error))
+    }
+
     async fn activate(&self, id: &SnapshotId) -> Result<()> {
         // The SDK resolves ids and names against the ID-only endpoint.
-        match self.client.snapshot.activate(id.as_str()).await {
-            Ok(_) => Ok(()),
-            Err(error) if is_not_found(&error) => Err(Error::NotFound {
-                resource: ResourceKind::Snapshot,
-                id:       id.as_str().to_owned(),
-            }),
-            Err(error) => Err(daytona_error("activating snapshot", &error)),
+        let started = Instant::now();
+        loop {
+            match self.client.snapshot.activate(id.as_str()).await {
+                Ok(_) => return Ok(()),
+                Err(error) if is_not_found(&error) => {
+                    return Err(Error::NotFound {
+                        resource: ResourceKind::Snapshot,
+                        id:       id.as_str().to_owned(),
+                    });
+                }
+                Err(error) if is_snapshot_deactivation_in_progress(&error) => {
+                    let elapsed = started.elapsed();
+                    if elapsed >= SNAPSHOT_ACTIVATE_BUDGET {
+                        return Err(Error::Timeout {
+                            operation: "waiting to activate snapshot".to_owned(),
+                            elapsed,
+                        });
+                    }
+                    time::sleep(SNAPSHOT_ACTIVATE_POLL).await;
+                }
+                Err(error) => return Err(daytona_error("activating snapshot", &error)),
+            }
         }
     }
 
@@ -1627,6 +1716,38 @@ mod tests {
             409,
             "Name conflict"
         )));
+    }
+
+    #[test]
+    fn snapshot_deactivation_race_matches_the_observed_rejection() {
+        assert!(is_snapshot_deactivation_in_progress(&api_error(
+            400,
+            "Snapshot deactivation is still in progress. Please try again in a few minutes."
+        )));
+        assert!(!is_snapshot_deactivation_in_progress(&api_error(
+            400,
+            "Bad request"
+        )));
+    }
+
+    #[test]
+    fn sandbox_class_narrows_lifecycle_capabilities() {
+        let base = daytona_capabilities();
+
+        let container = narrowed_capabilities(&base, Some(SandboxClass::CONTAINER));
+        assert!(container.lifecycle.archive);
+        assert!(!container.lifecycle.pause);
+        assert!(!container.lifecycle.fork);
+
+        let linux_vm = narrowed_capabilities(&base, Some(SandboxClass::LINUX_VM));
+        assert!(!linux_vm.lifecycle.archive);
+        assert!(linux_vm.lifecycle.pause);
+        assert!(linux_vm.lifecycle.fork);
+
+        let android = narrowed_capabilities(&base, Some(SandboxClass::ANDROID));
+        assert!(!android.lifecycle.archive);
+        assert!(!android.lifecycle.pause);
+        assert!(!android.lifecycle.fork);
     }
 
     #[test]

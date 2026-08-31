@@ -99,19 +99,11 @@ pub struct VncConnection {
     pub password: Option<String>,
 }
 
-/// Private-network (VPN) status. Reserved surface: join configuration is
-/// create-time spec; status only in v1.
-#[async_trait]
-pub trait Vpn: Send + Sync {
-    async fn vpn_status(&self) -> Result<VpnStatus>;
-}
-
-/// VPN attachment status.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct VpnStatus {
-    pub connected: bool,
-    /// Address of the sandbox on the private network, when connected.
-    pub address:   Option<String>,
-    pub network:   Option<String>,
+impl VncConnection {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url:      url.into(),
+            password: None,
+        }
+    }
 }

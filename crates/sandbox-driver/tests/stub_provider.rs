@@ -168,7 +168,6 @@ async fn optional_facets_default_to_none() {
     assert!(sandbox.pty().is_none());
     assert!(sandbox.git().is_none());
     assert!(sandbox.preview_urls().is_none());
-    assert!(sandbox.vpn().is_none());
 }
 
 #[tokio::test]

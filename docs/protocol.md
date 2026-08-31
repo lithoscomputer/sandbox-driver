@@ -139,16 +139,14 @@ Rules:
   work; an undeclared operation must fail with the `unsupported` error
   kind (§7). Capabilities optimize failure timing; the error is still
   the enforcement.
-- **The version-1 mask.** The wire cannot carry long-lived stdio
-  processes, PTY, provider logs, or native search/git/services
-  passthrough, and the `shell_command`, `web_terminal`, `vnc`, and
-  `vpn` access facets are reserved. A host must treat these as absent
-  regardless of what the plugin declares: force `exec.stdio_process` to
-  false, `pty` and `logs` to null, `search.native`, `git.native`, and
-  `services.native` to false, and the four reserved access booleans to
-  false. A plugin should not declare them. (Background services still
-  work over the wire — hosts run the exec-derived implementation over
-  `exec/run`; only a provider-native override cannot pass through.)
+- **The version-1 mask.** Native search/git/service passthrough and local
+  shell commands do not cross the wire. A host forces `search.native`,
+  `git.native`, `services.native`, and `access.shell_command` to false.
+  Background services still work because the host runs the exec-derived
+  implementation over `exec/run`.
+- The serialized `access.vpn` field is a compatibility tombstone. It is
+  always false. VPN clients such as Tailscale are guest software managed
+  through exec and are not a sandbox-driver capability.
 - `capabilities.snapshots`/`volumes` being non-null is what authorizes
   the `snapshot/*` and `volume/*` methods (`snapshot/activate` and
   `snapshot/deactivate` additionally require `snapshots.activation`);
@@ -325,14 +323,32 @@ execution must not differ in interpreter or options.
 The exec spec DTO:
 
 ```json
-{"command":"echo hi","timeout_ms":30000,"working_dir":null,"env":{},"stdin_b64":null}
+{"command":"echo hi","timeout_ms":30000,"working_dir":null,"env":{},"stdin_b64":null,"output_sanitization":"strip_ansi"}
 ```
+
+`output_sanitization` is optional. Its values are `raw`, `strip_ansi`,
+and `strip_all`; omission means `raw`. A plugin applies this policy to
+buffered output and streaming notifications before capture accounting.
+PTY and bidirectional stdio traffic always remains raw.
 
 | method | params | result |
 | --- | --- | --- |
 | `exec/run` | `{sandbox_id, spec}` | ExecResult (below) |
 | `exec/stream` | `{sandbox_id, exec_id, spec, retained_output_limit}` | ExecStreamResult (§9) |
 | `exec/cancel` | `{exec_id}` | `{}` |
+| `exec/stdio_open` | `{sandbox_id, process_id, spec}` | `{}` |
+| `exec/stdio_input` | `{process_id, data_b64}` | `{}` |
+| `exec/stdio_close_input` | `{process_id}` | `{}` |
+| `exec/stdio_output` | `{process_id}` | `{data_b64:null | "…"}` |
+| `exec/stdio_terminate` | `{process_id}` | `{}` |
+| `exec/stdio_wait` | `{process_id}` | `{termination,exit_code,stderr_tail}` |
+| `pty/open` | `{sandbox_id, pty_id, options}` | `{}` |
+| `pty/input` | `{pty_id, data_b64}` | `{}` |
+| `pty/output` | `{pty_id}` | `{data_b64:null | "…"}` |
+| `pty/resize` | `{pty_id, size}` | `{}` |
+| `pty/close` | `{pty_id}` | `{}` |
+| `logs/follow` | `{sandbox_id, stream_id, source}` | `{}` after the stream ends |
+| `stream/cancel` | `{stream_id}` | `{}` |
 
 ExecResult:
 
@@ -346,6 +362,15 @@ or cancellation resolves the call **normally** with the corresponding
 termination — it is not an error. `stdin_b64`, when present, is written
 to the process then closed for EOF; a broken pipe while writing is not
 an error.
+
+`process_id`, `pty_id`, and `stream_id` are host-generated and unique
+for the connection. Stdio and PTY reads are long-poll requests. The
+server handles requests concurrently, so an output read never blocks
+input, resize, terminate, or unrelated work — but a host must keep **at
+most one outstanding output read per process or PTY id**: concurrent
+reads on one id race their response ordering. `logs/follow` emits
+`logs/output` notifications with `{stream_id,data_b64}` before its final
+response. Dropping the host-side follow future sends `stream/cancel`.
 
 ### 8.5 Filesystem
 
@@ -390,6 +415,7 @@ Deletes must be idempotent, including while deletion is in progress.
 | `snapshot/delete` | `{snapshot_id}` | `{}` |
 | `snapshot/activate` | `{snapshot_id}` | `{}` (gated on `snapshots.activation`) |
 | `snapshot/deactivate` | `{snapshot_id}` | `{}` (gated on `snapshots.activation`) |
+| `snapshot/build_logs` | `{snapshot_id, stream_id, follow}` | `{}` after the stream ends |
 | `volume/create` | `{spec:{name,size_mb}}` | `{volume_id}` |
 | `volume/get` | `{volume_id}` | `{status:{id,name,state,error_reason,created_at}}` |
 | `volume/list` | `{}` | `{volumes:[status…]}` |
@@ -407,6 +433,8 @@ Snapshot `source` variants: `{"image":{"reference":…}}`,
 | `access/signed_preview_url` | `{sandbox_id, port, expires_in_ms}` | `{preview}` |
 | `access/ssh_create` | `{sandbox_id, ttl_ms}` | `{access:{command,token,expires_at}}` |
 | `access/ssh_revoke` | `{sandbox_id, token}` | `{}` |
+| `access/web_terminal` | `{sandbox_id}` | `{url}` |
+| `access/vnc` | `{sandbox_id}` | `{connection:{url,password}}` |
 
 ### 8.8 Provider health
 
@@ -556,9 +584,6 @@ not re-pinned.
 
 ## 14. Deferred beyond version 1
 
-Long-lived bidirectional stdio (`exec.stdio_process`) and its
-side-channel transport; PTY; provider log streaming; native
-search/git/services passthrough; the `shell_command`, `web_terminal`,
-`vnc`, and `vpn` access facets; snapshot build-log streaming; and
-`host/credentials` (per-call secret fetches from the host). All are
-masked or absent in version 1 per §5.
+Native search/git/service passthrough, local `shell_command`, and
+`host/credentials` (per-call secret fetches from the host) remain
+deferred. They are masked or absent in version 1 per §5.

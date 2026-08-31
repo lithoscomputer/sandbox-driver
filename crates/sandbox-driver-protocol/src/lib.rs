@@ -9,13 +9,12 @@
 //! Protocol v1 (see `methods::PROTOCOL_VERSION`): lifecycle, exec
 //! (buffered and streamed via `exec/output` notifications with
 //! client-generated exec ids), filesystem, list/attach, snapshot and
-//! volume services, preview-URL and SSH access facets, plugin→host
-//! `host/event` notifications, and plugin binaries spawned over stdio
-//! ([`serve_stdio`], [`PluginProvider::spawn`]). Deferred to a later
-//! version: the stdio side-channel transport (long-lived bidirectional
-//! processes), PTY, logs, native search/git passthrough, the reserved
-//! access facets, and `host/credentials` — the client masks all of
-//! these out of the capabilities it reports.
+//! volume services, bidirectional stdio and PTY, provider and snapshot
+//! logs, preview-URL, SSH, web-terminal, and VNC access facets,
+//! plugin→host `host/event` notifications, and plugin binaries spawned
+//! over stdio ([`serve_stdio`], [`PluginProvider::spawn`]). Native
+//! search/git/service passthrough, local shell commands, and
+//! `host/credentials` remain deferred.
 //!
 //! The normative wire specification is `docs/protocol.md` at the
 //! repository root; the golden tests in this crate pin its shapes.

@@ -13,8 +13,8 @@ use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use futures_util::StreamExt;
 use sandbox_driver::{
     Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputCaptureBuffer,
-    OutputSink, OutputStream, ProviderError, ProviderKind, Result, SpawnSpec, StderrTail,
-    StdioProcess, StdioProcessHandle, Termination,
+    OutputSanitizer, OutputSink, OutputStream, ProviderError, ProviderKind, Result, SpawnSpec,
+    StderrTail, StdioProcess, StdioProcessHandle, Termination,
 };
 use tokio::io::{AsyncWrite, AsyncWriteExt, duplex};
 use tokio::time;
@@ -355,6 +355,8 @@ impl Exec for DockerExec {
 
         let mut stdout_capture = OutputCaptureBuffer::new(controls.retained_output_limit);
         let mut stderr_capture = OutputCaptureBuffer::new(controls.retained_output_limit);
+        let mut stdout_sanitizer = OutputSanitizer::new(spec.output_sanitization);
+        let mut stderr_sanitizer = OutputSanitizer::new(spec.output_sanitization);
         let sink: Option<&OutputSink> = controls.sink.as_ref();
 
         let mut termination = Termination::Exited;
@@ -399,29 +401,31 @@ impl Exec for DockerExec {
                         break;
                     }
                     Some(Ok(LogOutput::StdOut { message } | LogOutput::Console { message })) => {
+                        let message = stdout_sanitizer.push(&message);
                         stdout_capture.push(&message);
-                        if let Some(sink) = sink {
-                            if sink(OutputStream::Stdout, message.to_vec()).await.is_err()
-                                && !kill_fired
-                            {
-                                termination = Termination::Cancelled;
-                                kill_fired = true;
-                                drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                                self.request_stop(&stop_file).await?;
-                            }
+                        if !message.is_empty()
+                            && let Some(sink) = sink
+                            && sink(OutputStream::Stdout, message).await.is_err()
+                            && !kill_fired
+                        {
+                            termination = Termination::Cancelled;
+                            kill_fired = true;
+                            drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
+                            self.request_stop(&stop_file).await?;
                         }
                     }
                     Some(Ok(LogOutput::StdErr { message })) => {
+                        let message = stderr_sanitizer.push(&message);
                         stderr_capture.push(&message);
-                        if let Some(sink) = sink {
-                            if sink(OutputStream::Stderr, message.to_vec()).await.is_err()
-                                && !kill_fired
-                            {
-                                termination = Termination::Cancelled;
-                                kill_fired = true;
-                                drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                                self.request_stop(&stop_file).await?;
-                            }
+                        if !message.is_empty()
+                            && let Some(sink) = sink
+                            && sink(OutputStream::Stderr, message).await.is_err()
+                            && !kill_fired
+                        {
+                            termination = Termination::Cancelled;
+                            kill_fired = true;
+                            drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
+                            self.request_stop(&stop_file).await?;
                         }
                     }
                     Some(Ok(_)) => {}
@@ -439,6 +443,28 @@ impl Exec for DockerExec {
                     self.request_stop(&stop_file).await?;
                 }
                 () = drain_timeout => break,
+            }
+        }
+
+        for (stream, sanitizer, capture) in [
+            (
+                OutputStream::Stdout,
+                &mut stdout_sanitizer,
+                &mut stdout_capture,
+            ),
+            (
+                OutputStream::Stderr,
+                &mut stderr_sanitizer,
+                &mut stderr_capture,
+            ),
+        ] {
+            let bytes = sanitizer.finish();
+            capture.push(&bytes);
+            if !bytes.is_empty()
+                && let Some(sink) = sink
+                && sink(stream, bytes).await.is_err()
+            {
+                termination = Termination::Cancelled;
             }
         }
 

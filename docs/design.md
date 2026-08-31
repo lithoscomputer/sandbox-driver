@@ -5,7 +5,7 @@ A library for driving sandboxes. Initial providers: **Daytona**, **Docker**, **H
 ## Inputs
 
 - **fabro** — the de-facto trait: filesystem, exec (buffered / streaming / bidirectional stdio), grep/glob/walk, lifecycle, preview URLs, SSH, auto-stop, events, the Bash contract and probe, plus a git/credential surface we deliberately leave above this crate.
-- **Daytona** (docs + `daytona-sdk-rust`) — the richest provider: pause/resume distinct from stop/start, archive, fork with ancestry, resize, live-sandbox snapshots including memory, TTL and four auto-intervals, snapshots and volumes as first-class resources, per-region toolbox daemon (fs/git/process/PTY/LSP/computer-use), preview links with signed URLs, SSH tokens, network block/allow lists.
+- **Daytona** (docs + `daytona-sdk-rust`) — the richest provider: pause/resume distinct from stop/start, archive, fork with ancestry, live-sandbox snapshots including memory, TTL and four auto-intervals, snapshots and volumes as first-class resources, per-region toolbox daemon (fs/git/process/PTY/LSP/computer-use), preview links with signed URLs, SSH tokens, network block/allow lists. The normalized interface includes resize, but the current Daytona API and SDK do not expose a working resize operation.
 - **boxd** (deferred) — pause/resume/hibernate, **fork with memory+disk in milliseconds**, **checkpoints (rewind in place)**, snapshots as named images, HTTPS proxies per machine, VM-to-VM private networking. Included now only to make sure the lifecycle vocabulary doesn't need reshaping later.
 
 ## Security and trust boundary
@@ -78,11 +78,11 @@ The full vocabulary. **Core** actions are required of every provider. Everything
 | `start` / `stop` | Cold boot / shutdown; disk persists | core¹ | no-op | ✔ | ✔ | ✔ |
 | `delete` | Destroy; idempotent (unknown ID succeeds) | core | ✔ (cleanup) | ✔ | ✔ | ✔ |
 | `pause` / `resume` | Freeze with memory kept; distinct from stop | opt | — | ✔ (`docker pause`) | ✔ (VM classes; per-sandbox caps narrow it, resume = Daytona's start) | ✔ (hibernate) |
-| `archive` | Stopped → cold storage; `start` restores | opt | — | — | ✔ | — |
+| `archive` | Stopped → cold storage; `start` restores | opt | — | — | ✔ (container class; per-sandbox caps mask it on VM/android/windows) | — |
 | `fork` | Clone a sandbox (disk, optionally memory) → new sandbox | opt | — | — | ✔ (VM classes) | ✔ |
 | `checkpoint` / `restore` | Save a rewind point; rewind the **same sandbox** in place | opt | — | — | — | ✔ |
-| `resize` | Change cpu/memory/disk | opt | — | \~ (`docker update`, cpu/mem only) | ✔ | ? |
-| `snapshot_sandbox` | Snapshot a live sandbox (optionally incl. memory) → SnapshotProvider | opt | — | \~ (`docker commit`) | ✔ (VM classes; memory not exposed by the SDK) | ✔ |
+| `resize` | Change cpu/memory/disk | opt | — | \~ (`docker update`, cpu/mem only) | —² | ? |
+| `snapshot_sandbox` | Snapshot a live sandbox (optionally incl. memory) → SnapshotProvider | opt | — | \~ (`docker commit`) | ✔ (memory not exposed by the SDK) | ✔ |
 | `recover` | Provider-assisted recovery from Error state | opt | — | — | — | — |
 | `undelete` | Restore a deleted sandbox within the recovery window; provider-level (a deleted sandbox cannot be attached), returns a fresh handle | opt | — | — | ✔ (24h, Daytona's "recover") | — |
 | `refresh_activity` | Keepalive; reset idle timers | opt | no-op | no-op | ✔ | ? |
@@ -91,6 +91,10 @@ The full vocabulary. **Core** actions are required of every provider. Everything
 | `update_network` | Change network policy on a live sandbox | opt | — | — | ✔ | ✔ |
 
 ¹ Host implements `start`/`stop` as no-ops (nothing to boot); they are still in the core so callers never branch on provider kind.
+
+² The current Daytona API returns a route-level 404 for resize, and the
+current official SDK leaves resize disabled. Daytona reports
+`lifecycle.resize: false`.
 
 Deliberate merges:
 
@@ -132,8 +136,7 @@ Per-sandbox functionality is grouped into small **facet traits** (per the style 
 | `SshAccess` | Mint/revoke time-limited SSH access; returns ready-to-run command | — | — | ✔ | ✔ |
 | `ShellCommand` | A local command string that opens a shell (Docker's `docker exec -it …`) — distinct from real SSH | trivial | ✔ | — | — |
 | `WebTerminal` | URL to a browser terminal | — | — | ✔ | ✔ |
-| `Vnc` | Desktop viewing: connection URL/credentials. Reserved; no initial provider has it natively (Daytona: computer-use screenshots or self-run VNC behind a preview URL) | — | — | \~ | — |
-| `Vpn` | Join a private network (Tailscale, provider VPN); create-time config + status. Reserved capability | — | future | \~ (VPN connections) | \~ (VM-to-VM) |
+| `Vnc` | Desktop viewing: connection URL/credentials | — | — | ✔ (Computer Use + signed noVNC URL) | — |
 | `NetworkLimits` | Spec-time: block-all / CIDR allow-list / domain allow-list / outbound proxy. Runtime update where supported | — | \~ (none/bridge only) | ✔ | ✔ |
 
 Legend: ✔ supported · \~ partial/approximated · — unsupported (facet returns `None`) · ? unknown until boxd work starts.
@@ -143,7 +146,9 @@ Notes:
 - **Services (background processes) ship as a derived implementation** over `Exec`: fabro manages MCP servers today with hand-rolled `setsid`/pidfile/port-poll shell, on every provider — the facet absorbs that pattern (`DerivedServices`), and a provider with a native mechanism can override and declare `services.native`. Service state is per-boot; ids from before a sandbox restart report not running.
 - **Search and Git ship as derived implementations** over `Exec` in this crate — fabro's experience shows `glob` was *never* overridden by any provider and git-via-exec is what both remote providers actually do. A provider with a native API can override per method.
 - **Git here is plumbing only.** Fabro's credential machinery (`refresh_push_credentials`, `push_token_source`, `git_push_ref` retry/lease engine, `setup_git` intent, clone orchestration and repo layout) stays in fabro, layered on `Exec` + `Git`. Those 6 of fabro's 34 methods do not move into this crate.
-- **`Vnc` and `Vpn` are reserved facets**: defined in the capability schema now so the wire protocol doesn't break when a provider adds them, but no trait methods beyond "get connection info" in v1.
+- **Tailscale and other VPN clients are guest software.** Callers install
+  and configure them through `Exec`; they are not sandbox-driver
+  resources or facets.
 - Daytona's **LSP, code interpreter, and computer-use input automation** are out of scope for v1 — real surfaces, but no consumer yet. The capability schema reserves names for them. Command sessions were originally deferred with them, but the Daytona provider now uses them internally as the transport for streaming, cancellation, and partial-output-on-timeout execs (plain buffered runs keep the cheaper one-shot endpoint); sessions remain unexposed as an API surface.
 
 ## Capability discovery
@@ -164,7 +169,7 @@ pub struct Capabilities {
     pub services: ServiceCaps,        // background services; native flag, derived otherwise
     pub pty: Option<PtyCaps>,
     pub logs: Option<LogsCaps>,
-    pub access: AccessCaps,           // preview_urls { signed }, ssh, shell_command, web_terminal, vnc, vpn
+    pub access: AccessCaps,           // preview_urls { signed }, ssh, shell_command, web_terminal, vnc
     pub network: NetworkCaps,         // modes: block_all, allow_all, cidr_allow_list, domain_allow_list, proxy
     pub snapshots: Option<SnapshotCaps>,  // sources: image, dockerfile, live_sandbox, memory; activation
     pub volumes: Option<VolumeCaps>,
@@ -262,7 +267,6 @@ pub trait Sandbox: Send + Sync {
     fn shell_command(&self) -> Option<&dyn ShellCommand>; // default: None
     fn web_terminal(&self) -> Option<&dyn WebTerminal>;   // default: None
     fn vnc(&self) -> Option<&dyn Vnc>;                    // default: None
-    fn vpn(&self) -> Option<&dyn Vpn>;                    // default: None
 }
 ```
 
@@ -287,7 +291,9 @@ Carried over from fabro **verbatim, as normative spec text**, because it is the 
 - Buffered and streaming exec must not differ in interpreter or options.
 - The library ships the **bash probe** (`fabro-bash-ready` check) as a helper; the `activate` convenience runs it. This goes into the conformance suite.
 
-`ExecSpec` is a plain owned serializable value — command, timeout, working dir, env vars, optional stdin bytes (write-then-EOF) — and is exactly what crosses the JSON-RPC boundary. A relative working dir resolves against the sandbox working directory on every provider — a conformance case pins it. Process-local control objects travel separately in `ExecControls`: the cancellation token, the async output sink, and the retention cap (head+tail with `omitted_bytes` accounting — fabro's `OutputCaptureBuffer` moves here). On the wire, controls map to negotiated IDs — a host-generated `execId` routes `exec/output` notifications and `exec/cancel` — never to serialized fields, and buffered `run` carries no streaming controls at all.
+`ExecSpec` is a plain owned serializable value — command, timeout, working dir, env vars, optional stdin bytes (write-then-EOF), and output sanitization — and is exactly what crosses the JSON-RPC boundary. `OutputSanitization` has three policies: `Raw` preserves every byte and is the default; `StripAnsi` removes ANSI terminal escape sequences but preserves standalone control characters; `StripAll` also removes standalone C0/C1 control characters except tab, line feed, and carriage return. Providers apply the policy before output reaches the sink, retained result, or capture statistics. Stateful filtering prevents an escape sequence from leaking when it spans streaming chunks. The policies apply only to `run` and `run_streaming`; PTY sessions and long-lived bidirectional stdio remain raw. Non-raw policies are lossy and callers must use `Raw` for binary output.
+
+A relative working dir resolves against the sandbox working directory on every provider — a conformance case pins it. Process-local control objects travel separately in `ExecControls`: the cancellation token, the async output sink, and the retention cap (head+tail with `omitted_bytes` accounting — fabro's `OutputCaptureBuffer` moves here). On the wire, controls map to negotiated IDs — a host-generated `execId` routes `exec/output` notifications and `exec/cancel` — never to serialized fields, and buffered `run` carries no streaming controls at all.
 
 Control contracts, normative: cancellation resolves the call normally with `termination: Cancelled` after a best-effort process-group kill — SIGTERM to the group, a short grace so traps run and locks release (a killed `git` otherwise leaves `.git/index.lock`), then SIGKILL. A provider that does not support stdin or cancellation rejects a call that supplies them with `Unsupported` (`exec.stdin` / `exec.cancel`) — never runs the command with the input silently dropped. The output sink is awaited per chunk — a slow consumer backpressures the read loop rather than growing an unbounded buffer; output beyond the retention cap is still drained (and counted in `omitted_bytes`), never left to block the process. A sink that returns an error cancels the exec and reports it as such. `ExecResult` keeps `streams_separated` and `live_streaming` honesty flags — Daytona's combined-output and log-polling degradations are *reported*, not hidden.
 
@@ -396,7 +402,7 @@ The `Exec` variant preserves fabro's redaction boundary: `Display` shows bounded
 - Git credentials and push machinery: `refresh_push_credentials`, `push_token_source`, `git_push_ref` (lease/retry engine), `setup_git` intents, `resume_setup_commands`, `origin_url`.
 - Clone orchestration: clone-source decisions, repo layout (`/repos/<owner>/<repo>` + symlink), pinned revisions, clone depth, clone events.
 - Content-addressed snapshot naming (HMAC of manifest).
-- Output redaction and sanitization policy: raw exec output may contain terminal control sequences; both escape stripping and secret redaction are the caller's.
+- Secret redaction policy: output sanitization is portable through `ExecSpec`, but provider-independent secret detection and redaction remain the caller's responsibility.
 - Fabro's run lifecycle: `initialize`-then-probe sequencing, cleanup scope guards, `--preserve-sandbox`, reconnect. These consume the crate's core + wait helper.
 
 Each of these is implementable over `Exec`/`Git`/core — the fabro survey confirmed both remote providers already implement them via exec today.
@@ -436,7 +442,8 @@ Each of these is implementable over `Exec`/`Git`/core — the fabro survey confi
 5. **Command sessions**: capability name reserved in the schema; no trait in v1.
 6. **`Logs` is follow-style streams only** in v1; historical querying is a later capability.
 7. **Workspace layout**: `crates/sandbox-driver` (core: types + traits + derived impls + wait helper), with `sandbox-driver-{protocol,host,docker,daytona}` siblings added as they are built.
-8. **VNC/VPN v1 surface is "get connection info" only**; VPN join configuration is create-time spec, status via the facet.
+8. **VNC v1 returns browser connection information.** VPN clients are
+   guest software managed through exec.
 9. **The Docker image contract requires `setsid`** alongside bash, `stat`, `find`, and `base64` — reliable kill semantics need a separate session, and an image without it fails every exec with a clear message rather than degrading silently.
 10. **`recover` and `undelete` are separate verbs.** `recover` repairs a live sandbox in the `Error` state; `undelete` (provider-level, returns a fresh handle) restores a deleted one. Daytona's "recover" endpoint is our `undelete`; it declares `lifecycle.recover: false`.
 11. **Chunked file transfer is `read_range`/`write_append`**, not a streaming transfer protocol: stateless, additive on `fs/read`/`fs/write`, with efficient overrides per provider (seek on Host, `tail`/`>>` on exec-derived) and correct read-and-slice / read-concat-write defaults everywhere else.

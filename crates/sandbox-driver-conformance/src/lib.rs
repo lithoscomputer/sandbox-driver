@@ -28,9 +28,9 @@ use std::{fmt, process};
 
 use sandbox_driver::{
     Capability, DerivedSearch, DerivedServices, Error, ExecControls, ExecSpec, GrepOptions,
-    HealthStatus, NetworkPolicy, OutputStream, Resources, Sandbox, SandboxEvent, SandboxFilter,
-    SandboxId, SandboxProvider, SandboxSpec, SandboxState, Search, ServiceSpec, Services,
-    SpawnSpec, Termination, WaitOptions, activate, wait_for_state,
+    HealthStatus, NetworkPolicy, OutputSanitization, OutputStream, PtyOptions, PtySize, Resources,
+    Sandbox, SandboxEvent, SandboxFilter, SandboxId, SandboxProvider, SandboxSpec, SandboxState,
+    Search, ServiceSpec, Services, SpawnSpec, Termination, WaitOptions, activate, wait_for_state,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time;
@@ -112,6 +112,9 @@ impl Conformance {
             ("exec_output_is_binary_safe", |ctx| {
                 Box::pin(exec_output_is_binary_safe(ctx))
             }),
+            ("exec_output_sanitization_is_consistent", |ctx| {
+                Box::pin(exec_output_sanitization_is_consistent(ctx))
+            }),
             ("exec_stdin_round_trips", |ctx| {
                 Box::pin(exec_stdin_round_trips(ctx))
             }),
@@ -142,6 +145,9 @@ impl Conformance {
             }),
             ("stdio_process_round_trips", |ctx| {
                 Box::pin(stdio_process_round_trips(ctx))
+            }),
+            ("pty_is_bidirectional", |ctx| {
+                Box::pin(pty_is_bidirectional(ctx))
             }),
             ("attach_and_list_by_label", |ctx| {
                 Box::pin(attach_and_list_by_label(ctx))
@@ -475,6 +481,87 @@ async fn exec_output_is_binary_safe(ctx: &Conformance) -> CheckOutcome {
             .map_err(|error| format!("exec failed: {error}"))?;
         if result.stdout != b"a\0b\x01c" {
             return fail(format!("binary output mangled: {:?}", result.stdout));
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn exec_output_sanitization_is_consistent(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let command = "printf '\\033[31mred\\033[0m\\007\\001\\n'";
+
+        let raw = sandbox
+            .exec()
+            .run(&ExecSpec::new(command))
+            .await
+            .map_err(|error| format!("raw exec failed: {error}"))?;
+        if raw.stdout != b"\x1b[31mred\x1b[0m\x07\x01\n" {
+            return fail(format!("raw output changed: {:?}", raw.stdout));
+        }
+
+        let ansi = sandbox
+            .exec()
+            .run(&ExecSpec::new(command).output_sanitization(OutputSanitization::StripAnsi))
+            .await
+            .map_err(|error| format!("StripAnsi exec failed: {error}"))?;
+        if ansi.stdout != b"red\x07\x01\n" {
+            return fail(format!(
+                "StripAnsi returned wrong output: {:?}",
+                ansi.stdout
+            ));
+        }
+
+        let chunks: SeenChunks = Arc::new(Mutex::new(Vec::new()));
+        let sink_chunks = Arc::clone(&chunks);
+        let controls = ExecControls {
+            sink: Some(Arc::new(move |stream, chunk| {
+                let chunks = Arc::clone(&sink_chunks);
+                Box::pin(async move {
+                    chunks.lock().expect("chunks lock").push((stream, chunk));
+                    Ok(())
+                })
+            })),
+            ..ExecControls::default()
+        };
+        let spec =
+            ExecSpec::new("printf '\\033'; sleep 0.05; printf '[31mred\\033[0m\\007\\001\\n'")
+                .output_sanitization(OutputSanitization::StripAll)
+                .timeout(Duration::from_secs(30));
+        let all = sandbox
+            .exec()
+            .run_streaming(&spec, controls)
+            .await
+            .map_err(|error| format!("StripAll streaming exec failed: {error}"))?;
+        if !all.result.success() {
+            return fail(format!(
+                "StripAll streaming command failed: {}",
+                all.result.stderr_lossy()
+            ));
+        }
+        if all.result.stdout != b"red\n" {
+            return fail(format!(
+                "StripAll returned wrong output: {:?}",
+                all.result.stdout
+            ));
+        }
+        let streamed: Vec<u8> = chunks
+            .lock()
+            .expect("chunks lock")
+            .iter()
+            .flat_map(|(_, chunk)| chunk.clone())
+            .collect();
+        if streamed != b"red\n" {
+            return fail(format!("StripAll sink saw wrong output: {streamed:?}"));
+        }
+        if all.stdout_capture.observed_bytes != b"red\n".len() {
+            return fail(format!(
+                "capture stats counted pre-sanitization bytes: {:?}",
+                all.stdout_capture
+            ));
         }
         PASS
     }
@@ -1157,6 +1244,73 @@ async fn stdio_process_round_trips(ctx: &Conformance) -> CheckOutcome {
     outcome
 }
 
+async fn pty_is_bidirectional(ctx: &Conformance) -> CheckOutcome {
+    if ctx.caps().pty.is_none() {
+        return Ok(Some("pty not declared".to_owned()));
+    }
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let Some(pty) = sandbox.pty() else {
+            return fail("pty declared but facet is absent");
+        };
+        let session = pty
+            .open(&PtyOptions::default())
+            .await
+            .map_err(|error| format!("open failed: {error}"))?;
+        let marker = format!("pty-conformance-{}", process::id());
+        let exchange = async {
+            let input = async {
+                if sandbox
+                    .capabilities()
+                    .pty
+                    .as_ref()
+                    .is_some_and(|caps| caps.resize)
+                {
+                    session
+                        .resize(PtySize {
+                            rows: 40,
+                            cols: 100,
+                        })
+                        .await
+                        .map_err(|error| format!("resize failed: {error}"))?;
+                }
+                session
+                    .write_input(format!("printf '{marker}\\n'; exit\n").as_bytes())
+                    .await
+                    .map_err(|error| format!("input failed: {error}"))
+            };
+            let output = async {
+                let mut output = Vec::new();
+                while let Some(chunk) = session
+                    .read_output()
+                    .await
+                    .map_err(|error| format!("output failed: {error}"))?
+                {
+                    output.extend(chunk);
+                    if String::from_utf8_lossy(&output).contains(&marker) {
+                        return Ok::<_, String>(());
+                    }
+                }
+                Err("PTY ended before the marker appeared".to_owned())
+            };
+            let (input, output) = tokio::join!(input, output);
+            input?;
+            output
+        };
+        time::timeout(Duration::from_secs(30), exchange)
+            .await
+            .map_err(|_| "PTY exchange timed out".to_owned())??;
+        session
+            .close()
+            .await
+            .map_err(|error| format!("close failed: {error}"))?;
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
 async fn attach_and_list_by_label(ctx: &Conformance) -> CheckOutcome {
     let marker = format!("conformance-{}", process::id());
     let mut spec = ctx.specs.spec();
@@ -1222,6 +1376,15 @@ async fn services_match_capabilities(ctx: &Conformance) -> CheckOutcome {
     }
     if sandbox_caps.pty.is_some() != sandbox.pty().is_some() {
         wrong.push("pty facet presence disagrees with capabilities".to_owned());
+    }
+    if sandbox_caps.logs.is_some() != sandbox.logs().is_some() {
+        wrong.push("logs facet presence disagrees with capabilities".to_owned());
+    }
+    if sandbox_caps.access.web_terminal != sandbox.web_terminal().is_some() {
+        wrong.push("web_terminal facet presence disagrees with capabilities".to_owned());
+    }
+    if sandbox_caps.access.vnc != sandbox.vnc().is_some() {
+        wrong.push("vnc facet presence disagrees with capabilities".to_owned());
     }
     cleanup(&sandbox).await;
     if wrong.is_empty() {

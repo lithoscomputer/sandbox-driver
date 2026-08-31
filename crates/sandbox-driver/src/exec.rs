@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::capabilities::Capability;
 use crate::error::{Error, Result};
+use crate::sanitize::OutputSanitization;
 
 /// Command execution inside a sandbox.
 ///
@@ -69,23 +70,28 @@ pub trait Exec: Send + Sync {
 #[non_exhaustive]
 pub struct ExecSpec {
     /// Bash source; see the trait-level contract.
-    pub command:     String,
-    pub timeout:     Option<Duration>,
-    pub working_dir: Option<String>,
-    pub env:         BTreeMap<String, String>,
+    pub command:             String,
+    pub timeout:             Option<Duration>,
+    pub working_dir:         Option<String>,
+    pub env:                 BTreeMap<String, String>,
     /// Written to the process then closed for EOF. A broken pipe while
     /// writing (the `head -1` case) is not an error.
-    pub stdin:       Option<Vec<u8>>,
+    pub stdin:               Option<Vec<u8>>,
+    /// Output policy for buffered results and streaming sink chunks. PTY
+    /// sessions and [`Exec::spawn_stdio`] remain raw.
+    #[serde(default)]
+    pub output_sanitization: OutputSanitization,
 }
 
 impl ExecSpec {
     pub fn new(command: impl Into<String>) -> Self {
         Self {
-            command:     command.into(),
-            timeout:     None,
-            working_dir: None,
-            env:         BTreeMap::new(),
-            stdin:       None,
+            command:             command.into(),
+            timeout:             None,
+            working_dir:         None,
+            env:                 BTreeMap::new(),
+            stdin:               None,
+            output_sanitization: OutputSanitization::Raw,
         }
     }
 
@@ -110,6 +116,12 @@ impl ExecSpec {
     #[must_use]
     pub fn stdin(mut self, bytes: Vec<u8>) -> Self {
         self.stdin = Some(bytes);
+        self
+    }
+
+    #[must_use]
+    pub fn output_sanitization(mut self, policy: OutputSanitization) -> Self {
+        self.output_sanitization = policy;
         self
     }
 }
@@ -206,7 +218,8 @@ impl ExecResult {
     }
 }
 
-/// Retention accounting for one captured stream.
+/// Retention accounting for one captured stream. Counts describe bytes after
+/// [`ExecSpec::output_sanitization`] has been applied.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct CaptureStats {

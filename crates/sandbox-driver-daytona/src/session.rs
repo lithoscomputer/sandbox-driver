@@ -15,7 +15,7 @@ use std::{mem, process};
 use daytona_sdk::{
     ProcessService, Sandbox as SdkSandbox, SessionCommandLogsResult, SessionExecuteResult,
 };
-use sandbox_driver::{OutputCaptureBuffer, Result, Termination};
+use sandbox_driver::{Error, OutputCaptureBuffer, Result, Termination};
 use tokio::runtime::Handle;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
@@ -64,15 +64,17 @@ impl Session {
         &self.id
     }
 
-    fn service(&self) -> &ProcessService {
-        self.process.as_ref().expect("session is open until close")
+    fn service(&self) -> Result<&ProcessService> {
+        self.process
+            .as_ref()
+            .ok_or_else(|| Error::invalid_spec("session", "command session is closed"))
     }
 
     /// Starts the command asynchronously; the result usually carries
     /// only `cmd_id`, but a command that completed synchronously comes
     /// back with its exit code.
     pub(crate) async fn execute(&self, command: &str) -> Result<SessionExecuteResult> {
-        self.service()
+        self.service()?
             .execute_session_command(&self.id, command, true, true)
             .await
             .map_err(|error| daytona_error("executing session command", &error))
@@ -80,7 +82,7 @@ impl Session {
 
     pub(crate) async fn exit_code(&self, command_id: &str) -> Result<Option<i32>> {
         let command = self
-            .service()
+            .service()?
             .get_session_command(&self.id, command_id)
             .await
             .map_err(|error| daytona_error("polling session command", &error))?;
@@ -300,6 +302,7 @@ mod tests {
             id:      "closed".to_owned(),
         };
         assert!(session.fetch_logs("cmd").await.is_none());
+        assert!(session.exit_code("cmd").await.is_err());
     }
 
     #[test]

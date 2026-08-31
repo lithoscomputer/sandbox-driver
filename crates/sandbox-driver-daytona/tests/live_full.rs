@@ -4,12 +4,14 @@
 //! creates is deleted before it returns, on success and failure paths.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, process};
 
 use sandbox_driver::{
-    LifecycleTimers, Resources, SandboxProvider, SandboxSource, SandboxSpec, SandboxState,
-    SnapshotSource, SnapshotSpec, SnapshotState, WaitOptions, wait_for_state,
+    ExecSpec, LifecycleTimers, LogSink, LogSource, NetworkPolicy, Resources, SandboxProvider,
+    SandboxSource, SandboxSpec, SandboxState, SnapshotSource, SnapshotSpec, SnapshotState,
+    WaitOptions, wait_for_state,
 };
 use sandbox_driver_daytona::DaytonaProvider;
 use tokio::time;
@@ -106,12 +108,96 @@ async fn labels_timers_access_round_trip() {
         ssh.revoke_ssh_access(&token)
             .await
             .map_err(|error| format!("revoke_ssh_access: {error}"))?;
+
+        // Browser terminal: Daytona exposes the service on port 22222.
+        let terminal = sandbox
+            .web_terminal()
+            .expect("web terminal facet declared")
+            .web_terminal_url()
+            .await
+            .map_err(|error| format!("web_terminal_url: {error}"))?;
+        if !terminal.starts_with("https://") {
+            return Err(format!("web terminal URL looks wrong: {terminal}"));
+        }
+
+        // VNC: starting Computer Use must yield a signed noVNC viewer.
+        let vnc = sandbox
+            .vnc()
+            .expect("vnc facet declared")
+            .vnc_connection()
+            .await
+            .map_err(|error| format!("vnc_connection: {error}"))?;
+        if !vnc.url.starts_with("https://") || !vnc.url.contains("/vnc.html") {
+            return Err(format!("VNC URL looks wrong: {}", vnc.url));
+        }
         Ok(())
     }
     .await;
 
     sandbox.delete().await.expect("delete");
     outcome.expect("live access round trip");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cidr_egress_limits_apply_at_create_and_runtime() {
+    if env::var("DAYTONA_API_KEY").is_err() {
+        return;
+    }
+    let provider = DaytonaProvider::connect().await.expect("connect");
+    let spec = SandboxSpec::new(SandboxSource::Snapshot {
+        name: TEST_SNAPSHOT.to_owned(),
+    })
+    .network(NetworkPolicy::CidrAllowList {
+        // TEST-NET-3 cannot contain Cloudflare's public endpoint.
+        cidrs: vec!["203.0.113.0/24".to_owned()],
+    })
+    .ephemeral(true);
+    let sandbox = provider.create(&spec, None).await.expect("create");
+
+    let outcome = async {
+        let blocked = tcp_probe(sandbox.as_ref()).await?;
+        if blocked != "blocked" {
+            return Err(format!(
+                "creation-time CIDR policy did not block egress: {blocked:?}"
+            ));
+        }
+
+        sandbox
+            .update_network(&NetworkPolicy::CidrAllowList {
+                cidrs: vec!["1.1.1.1/32".to_owned()],
+            })
+            .await
+            .map_err(|error| format!("update_network: {error}"))?;
+        for _ in 0..12 {
+            if tcp_probe(sandbox.as_ref()).await? == "reachable" {
+                return Ok(());
+            }
+            time::sleep(Duration::from_secs(5)).await;
+        }
+        Err("runtime CIDR update did not allow the endpoint within 60 seconds".to_owned())
+    }
+    .await;
+
+    sandbox.delete().await.expect("delete");
+    outcome.expect("live CIDR egress policy");
+}
+
+async fn tcp_probe(sandbox: &dyn sandbox_driver::Sandbox) -> Result<String, String> {
+    let result = sandbox
+        .exec()
+        .run(
+            &ExecSpec::new(
+                "if timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null; \
+                 then printf reachable; else printf blocked; fi",
+            )
+            .timeout(Duration::from_secs(15)),
+        )
+        .await
+        .map_err(|error| format!("egress probe: {error}"))?;
+    if !result.success() {
+        return Err(format!("egress probe failed: {result:?}"));
+    }
+    String::from_utf8(result.stdout).map_err(|error| format!("egress probe output: {error}"))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -275,7 +361,13 @@ async fn snapshot_provider_round_trip() {
                     .timeout(Duration::from_secs(60)),
             )
             .await;
-        let _ = sandbox.delete().await;
+        sandbox
+            .delete()
+            .await
+            .map_err(|error| format!("delete snapshot sandbox: {error}"))?;
+        wait_for_state(sandbox.as_ref(), SandboxState::Deleted, &wait())
+            .await
+            .map_err(|error| format!("waiting for snapshot sandbox deletion: {error}"))?;
         let result = result.map_err(|error| format!("exec on snapshot sandbox: {error}"))?;
         if !result.success() {
             return Err(format!(
@@ -283,6 +375,17 @@ async fn snapshot_provider_round_trip() {
                 result.stdout_lossy()
             ));
         }
+
+        snapshots
+            .deactivate(&id)
+            .await
+            .map_err(|error| format!("snapshot deactivate: {error}"))?;
+        wait_for_snapshot_state(snapshots, &id, SnapshotState::Inactive).await?;
+        snapshots
+            .activate(&id)
+            .await
+            .map_err(|error| format!("snapshot activate: {error}"))?;
+        wait_for_snapshot_state(snapshots, &id, SnapshotState::Active).await?;
         Ok(())
     }
     .await;
@@ -293,4 +396,111 @@ async fn snapshot_provider_round_trip() {
         .await
         .expect("snapshot delete is idempotent");
     outcome.expect("snapshot round trip");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dockerfile_snapshot_build_and_entrypoint_logs() {
+    if env::var("DAYTONA_API_KEY").is_err() {
+        return;
+    }
+    let provider = DaytonaProvider::connect().await.expect("connect");
+    let snapshots = provider.snapshots().expect("snapshot provider declared");
+    let name = unique("sd-live-dockerfile");
+    let mut spec = SnapshotSpec::new(SnapshotSource::Dockerfile {
+        content: r#"FROM debian:stable-slim
+ENTRYPOINT ["/bin/sh", "-c", "echo sandbox-driver-entrypoint; echo sandbox-driver-entrypoint-error >&2; sleep 2"]
+"#
+        .to_owned(),
+    });
+    spec.name = Some(name.clone());
+    spec.resources.cpu_cores = Some(1);
+    spec.resources.memory_mb = Some(1024);
+    spec.resources.disk_mb = Some(1024);
+    let id = snapshots
+        .create(&spec)
+        .await
+        .expect("Dockerfile snapshot create");
+
+    let outcome = async {
+        let build_output = Arc::new(Mutex::new(Vec::new()));
+        snapshots
+            .build_logs(&id, true, collecting_sink(Arc::clone(&build_output)))
+            .await
+            .map_err(|error| format!("snapshot build logs: {error}"))?;
+        if build_output.lock().expect("build output lock").is_empty() {
+            return Err("snapshot build log stream was empty".to_owned());
+        }
+        wait_for_snapshot_state(snapshots, &id, SnapshotState::Active).await?;
+
+        let sandbox = provider
+            .create(
+                &SandboxSpec::new(SandboxSource::Snapshot { name: name.clone() }).ephemeral(true),
+                None,
+            )
+            .await
+            .map_err(|error| format!("create from Dockerfile snapshot: {error}"))?;
+        let entrypoint_output = Arc::new(Mutex::new(Vec::new()));
+        let logs = sandbox.logs().expect("entrypoint logs facet declared");
+        let followed = time::timeout(
+            Duration::from_secs(60),
+            logs.follow(
+                LogSource::Entrypoint,
+                collecting_sink(Arc::clone(&entrypoint_output)),
+            ),
+        )
+        .await;
+        let _ = sandbox.delete().await;
+        followed
+            .map_err(|_| "entrypoint log stream timed out".to_owned())?
+            .map_err(|error| format!("entrypoint logs: {error}"))?;
+        let output = entrypoint_output.lock().expect("entrypoint output lock");
+        let output = String::from_utf8_lossy(&output);
+        if !output.contains("sandbox-driver-entrypoint")
+            || !output.contains("sandbox-driver-entrypoint-error")
+        {
+            return Err(format!("entrypoint logs missing markers: {output:?}"));
+        }
+        Ok(())
+    }
+    .await;
+
+    snapshots.delete(&id).await.expect("snapshot delete");
+    outcome.expect("Dockerfile snapshot and entrypoint logs");
+}
+
+fn collecting_sink(output: Arc<Mutex<Vec<u8>>>) -> LogSink {
+    Arc::new(move |chunk| {
+        let output = Arc::clone(&output);
+        Box::pin(async move {
+            output.lock().expect("log output lock").extend(chunk);
+            Ok(())
+        })
+    })
+}
+
+async fn wait_for_snapshot_state(
+    snapshots: &dyn sandbox_driver::SnapshotProvider,
+    id: &sandbox_driver::SnapshotId,
+    expected: SnapshotState,
+) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        let status = snapshots
+            .get(id)
+            .await
+            .map_err(|error| format!("snapshot get: {error}"))?;
+        if status.state == expected {
+            return Ok(());
+        }
+        if status.state == SnapshotState::Error {
+            return Err(format!("snapshot failed: {:?}", status.error_reason));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "snapshot did not reach {expected:?} (state {:?})",
+                status.state
+            ));
+        }
+        time::sleep(Duration::from_secs(5)).await;
+    }
 }

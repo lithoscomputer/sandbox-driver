@@ -43,14 +43,14 @@ pub struct PtyOptions {
 #[async_trait]
 pub trait PtySession: Send + Sync {
     /// Writes input bytes to the terminal.
-    async fn write_input(&mut self, bytes: &[u8]) -> Result<()>;
+    async fn write_input(&self, bytes: &[u8]) -> Result<()>;
 
     /// Reads the next chunk of output; `None` when the session ended.
-    async fn read_output(&mut self) -> Result<Option<Vec<u8>>>;
+    async fn read_output(&self) -> Result<Option<Vec<u8>>>;
 
     /// Resizes the terminal. Capability-gated on `pty.resize`.
-    async fn resize(&mut self, size: PtySize) -> Result<()>;
+    async fn resize(&self, size: PtySize) -> Result<()>;
 
     /// Closes the session.
-    async fn close(&mut self) -> Result<()>;
+    async fn close(&self) -> Result<()>;
 }

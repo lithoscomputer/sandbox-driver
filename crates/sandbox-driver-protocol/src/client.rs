@@ -10,20 +10,26 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sandbox_driver::{
-    Capabilities, Capability, CheckpointId, CheckpointOptions, DirEntry, Error, EventCallback,
-    Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, FileMetadata, Filesystem,
-    ForkOptions, HealthStatus, LifecycleTimers, NetworkPolicy, OutputStream, PlatformInfo,
-    PreviewUrl, PreviewUrls, ProviderHealth, ProviderKind, Resources, Result, Sandbox,
-    SandboxFilter, SandboxId, SandboxSnapshotOptions, SandboxSpec, SandboxStatus, SnapshotFilter,
-    SnapshotId, SnapshotProvider, SnapshotSpec, SnapshotStatus, SpawnSpec, SshAccess,
-    SshAccessInfo, StdioProcess, VolumeId, VolumeProvider, VolumeSpec, VolumeStatus,
+    Capabilities, CheckpointId, CheckpointOptions, DirEntry, Error, EventCallback, Exec,
+    ExecControls, ExecResult, ExecSpec, ExecStreamingResult, FileMetadata, Filesystem, ForkOptions,
+    HealthStatus, LifecycleTimers, LogSink, LogSource, Logs, NetworkPolicy, OutputStream,
+    PlatformInfo, PreviewUrl, PreviewUrls, ProviderHealth, ProviderKind, Pty, PtyOptions,
+    PtySession, PtySize, Resources, Result, Sandbox, SandboxFilter, SandboxId,
+    SandboxSnapshotOptions, SandboxSpec, SandboxStatus, SnapshotFilter, SnapshotId,
+    SnapshotProvider, SnapshotSpec, SnapshotStatus, SpawnSpec, SshAccess, SshAccessInfo,
+    StderrTail, StdioProcess, StdioProcessHandle, Termination, Vnc, VncConnection, VolumeId,
+    VolumeProvider, VolumeSpec, VolumeStatus, WebTerminal,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, duplex,
+};
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::runtime::Handle as RuntimeHandle;
+use tokio::sync::{Mutex as AsyncMutex, OnceCell, mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio::{fs as tokio_fs, time};
 
 use crate::methods as m;
@@ -152,6 +158,14 @@ impl PluginProvider {
                 sandbox_id: id.clone(),
             },
             access:            SandboxAccess {
+                client:     Arc::clone(&self.client),
+                sandbox_id: id.clone(),
+            },
+            pty:               SandboxPty {
+                client:     Arc::clone(&self.client),
+                sandbox_id: id.clone(),
+            },
+            logs:              SandboxLogs {
                 client:     Arc::clone(&self.client),
                 sandbox_id: id.clone(),
             },
@@ -326,6 +340,22 @@ impl SnapshotProvider for ProviderSnapshots {
         Ok(())
     }
 
+    async fn build_logs(&self, id: &SnapshotId, follow: bool, sink: LogSink) -> Result<()> {
+        let stream_id = self.client.next_stream_id("snapshot");
+        follow_log_stream(
+            &self.client,
+            m::SNAPSHOT_BUILD_LOGS,
+            &m::SnapshotBuildLogsParams {
+                snapshot_id: id.as_str().to_owned(),
+                stream_id: stream_id.clone(),
+                follow,
+            },
+            &stream_id,
+            sink,
+        )
+        .await
+    }
+
     async fn activate(&self, id: &SnapshotId) -> Result<()> {
         let _: m::Empty = self
             .client
@@ -448,22 +478,41 @@ impl SshAccess for SandboxAccess {
     }
 }
 
-/// Removes capabilities the protocol cannot yet deliver through the
-/// wire, so the client never advertises what its adapters would then
-/// refuse: long-lived stdio (needs the side-channel transport), PTY,
-/// logs, native search/git passthrough, and the reserved access facets.
-/// Snapshots, volumes, preview URLs, and SSH cross the wire and stay.
+#[async_trait]
+impl WebTerminal for SandboxAccess {
+    async fn web_terminal_url(&self) -> Result<String> {
+        let result: m::WebTerminalResult = self
+            .client
+            .call(m::ACCESS_WEB_TERMINAL, &m::SandboxIdParams {
+                sandbox_id: self.sandbox_id.as_str().to_owned(),
+            })
+            .await?;
+        Ok(result.url)
+    }
+}
+
+#[async_trait]
+impl Vnc for SandboxAccess {
+    async fn vnc_connection(&self) -> Result<VncConnection> {
+        let result: m::VncResult = self
+            .client
+            .call(m::ACCESS_VNC, &m::SandboxIdParams {
+                sandbox_id: self.sandbox_id.as_str().to_owned(),
+            })
+            .await?;
+        Ok(result.connection)
+    }
+}
+
+/// Removes capabilities the protocol cannot deliver through the wire.
+/// Native search/git/service passthrough and local shell commands remain
+/// process-local. The normalized stdio, PTY, logs, browser access,
+/// snapshots, volumes, preview URLs, and SSH facets cross the wire.
 fn mask_wire_capabilities(capabilities: &mut Capabilities) {
-    capabilities.exec.stdio_process = false;
-    capabilities.pty = None;
-    capabilities.logs = None;
     capabilities.search.native = false;
     capabilities.git.native = false;
     capabilities.services.native = false;
     capabilities.access.shell_command = false;
-    capabilities.access.web_terminal = false;
-    capabilities.access.vnc = false;
-    capabilities.access.vpn = false;
 }
 
 /// One in-flight chunk of streamed exec output.
@@ -488,12 +537,14 @@ struct Client {
     outbound:            mpsc::Sender<Message>,
     next_id:             AtomicU64,
     next_exec:           AtomicU64,
+    next_stream:         AtomicU64,
     next_operation:      AtomicU64,
     /// Set when either transport task ends; every pending and future call
     /// fails fast instead of waiting on a dead pipe.
     closed:              AtomicBool,
     pending:             Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>,
     exec_streams:        Mutex<HashMap<String, mpsc::Sender<ExecChunk>>>,
+    log_streams:         Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>,
     event_callbacks:     Mutex<HashMap<String, EventCallback>>,
     /// Callbacks for in-flight creates, keyed by operation id, so events
     /// arrive before a sandbox id exists.
@@ -510,10 +561,12 @@ impl Client {
             outbound,
             next_id: AtomicU64::new(1),
             next_exec: AtomicU64::new(1),
+            next_stream: AtomicU64::new(1),
             next_operation: AtomicU64::new(1),
             closed: AtomicBool::new(false),
             pending: Mutex::new(HashMap::new()),
             exec_streams: Mutex::new(HashMap::new()),
+            log_streams: Mutex::new(HashMap::new()),
             event_callbacks: Mutex::new(HashMap::new()),
             operation_callbacks: Mutex::new(HashMap::new()),
         });
@@ -564,6 +617,15 @@ impl Client {
         for (_, sender) in pending {
             let _ = sender.send(Err(Error::invalid_spec("transport", "connection closed")));
         }
+        self.exec_streams.lock().expect("exec streams lock").clear();
+        self.log_streams.lock().expect("log streams lock").clear();
+    }
+
+    fn next_stream_id(&self, prefix: &str) -> String {
+        format!(
+            "{prefix}-{}",
+            self.next_stream.fetch_add(1, Ordering::Relaxed)
+        )
     }
 
     async fn route(&self, message: Message) {
@@ -599,6 +661,21 @@ impl Client {
                     // A send failure means the exec already resolved and
                     // unregistered; dropping the late chunk is correct.
                     let _ = queue.send((notification.stream, chunk)).await;
+                }
+            }
+            m::LOG_OUTPUT => {
+                let Ok(notification) = serde_json::from_value::<m::LogOutputNotification>(params)
+                else {
+                    return;
+                };
+                let queue = self
+                    .log_streams
+                    .lock()
+                    .expect("log streams lock")
+                    .get(&notification.stream_id)
+                    .cloned();
+                if let (Some(queue), Ok(chunk)) = (queue, decode_bytes(&notification.data_b64)) {
+                    let _ = queue.send(chunk).await;
                 }
             }
             m::HOST_EVENT => {
@@ -664,6 +741,85 @@ impl Client {
     }
 }
 
+struct StreamCancelGuard {
+    client:    Arc<Client>,
+    stream_id: String,
+    armed:     bool,
+}
+
+impl Drop for StreamCancelGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let client = Arc::clone(&self.client);
+        let stream_id = self.stream_id.clone();
+        // The follow future is normally dropped inside the runtime, but a
+        // teardown-time drop must not panic; without a runtime the plugin
+        // connection is going away with the stream anyway.
+        if let Ok(handle) = RuntimeHandle::try_current() {
+            handle.spawn(async move {
+                let _: Result<m::Empty> = client
+                    .call(m::STREAM_CANCEL, &m::StreamIdParams { stream_id })
+                    .await;
+            });
+        }
+    }
+}
+
+async fn follow_log_stream<P: Serialize>(
+    client: &Arc<Client>,
+    method: &str,
+    params: &P,
+    stream_id: &str,
+    sink: LogSink,
+) -> Result<()> {
+    let (queue, mut receiver) = mpsc::channel::<Vec<u8>>(EXEC_STREAM_QUEUE);
+    client
+        .log_streams
+        .lock()
+        .expect("log streams lock")
+        .insert(stream_id.to_owned(), queue);
+    let mut guard = StreamCancelGuard {
+        client:    Arc::clone(client),
+        stream_id: stream_id.to_owned(),
+        armed:     true,
+    };
+    let mut call = Box::pin(client.call::<_, m::Empty>(method, params));
+    let mut queue_open = true;
+    loop {
+        tokio::select! {
+            outcome = &mut call => {
+                client
+                    .log_streams
+                    .lock()
+                    .expect("log streams lock")
+                    .remove(stream_id);
+                while let Ok(chunk) = receiver.try_recv() {
+                    sink(chunk).await?;
+                }
+                guard.armed = false;
+                return outcome.map(|_| ());
+            }
+            chunk = receiver.recv(), if queue_open => {
+                match chunk {
+                    Some(chunk) => {
+                        if let Err(error) = sink(chunk).await {
+                            client
+                                .log_streams
+                                .lock()
+                                .expect("log streams lock")
+                                .remove(stream_id);
+                            return Err(error);
+                        }
+                    }
+                    None => queue_open = false,
+                }
+            }
+        }
+    }
+}
+
 /// A sandbox handle backed by the plugin.
 struct SandboxHandle {
     client:            Arc<Client>,
@@ -673,6 +829,8 @@ struct SandboxHandle {
     runtime_directory: Option<String>,
     exec:              SandboxExec,
     access:            SandboxAccess,
+    pty:               SandboxPty,
+    logs:              SandboxLogs,
     fs:                SandboxFs,
 }
 
@@ -775,6 +933,14 @@ impl Sandbox for SandboxHandle {
                 sandbox_id: id.clone(),
             },
             access:            SandboxAccess {
+                client:     Arc::clone(&self.client),
+                sandbox_id: id.clone(),
+            },
+            pty:               SandboxPty {
+                client:     Arc::clone(&self.client),
+                sandbox_id: id.clone(),
+            },
+            logs:              SandboxLogs {
                 client:     Arc::clone(&self.client),
                 sandbox_id: id.clone(),
             },
@@ -885,6 +1051,132 @@ impl Sandbox for SandboxHandle {
             .ssh
             .then_some(&self.access as &dyn SshAccess)
     }
+
+    fn pty(&self) -> Option<&dyn Pty> {
+        self.capabilities
+            .pty
+            .as_ref()
+            .map(|_| &self.pty as &dyn Pty)
+    }
+
+    fn logs(&self) -> Option<&dyn Logs> {
+        self.capabilities
+            .logs
+            .as_ref()
+            .map(|_| &self.logs as &dyn Logs)
+    }
+
+    fn web_terminal(&self) -> Option<&dyn WebTerminal> {
+        self.capabilities
+            .access
+            .web_terminal
+            .then_some(&self.access as &dyn WebTerminal)
+    }
+
+    fn vnc(&self) -> Option<&dyn Vnc> {
+        self.capabilities
+            .access
+            .vnc
+            .then_some(&self.access as &dyn Vnc)
+    }
+}
+
+struct SandboxPty {
+    client:     Arc<Client>,
+    sandbox_id: SandboxId,
+}
+
+#[async_trait]
+impl Pty for SandboxPty {
+    async fn open(&self, options: &PtyOptions) -> Result<Box<dyn PtySession>> {
+        let pty_id = self.client.next_stream_id("pty");
+        let _: m::Empty = self
+            .client
+            .call(m::PTY_OPEN, &m::PtyOpenParams {
+                sandbox_id: self.sandbox_id.as_str().to_owned(),
+                pty_id:     pty_id.clone(),
+                options:    options.clone(),
+            })
+            .await?;
+        Ok(Box::new(RemotePtySession {
+            client: Arc::clone(&self.client),
+            pty_id,
+        }))
+    }
+}
+
+struct RemotePtySession {
+    client: Arc<Client>,
+    pty_id: String,
+}
+
+#[async_trait]
+impl PtySession for RemotePtySession {
+    async fn write_input(&self, bytes: &[u8]) -> Result<()> {
+        let _: m::Empty = self
+            .client
+            .call(m::PTY_INPUT, &m::PtyInputParams {
+                pty_id:   self.pty_id.clone(),
+                data_b64: encode_bytes(bytes),
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn read_output(&self) -> Result<Option<Vec<u8>>> {
+        let result: m::PtyOutputResult = self
+            .client
+            .call(m::PTY_OUTPUT, &m::PtyIdParams {
+                pty_id: self.pty_id.clone(),
+            })
+            .await?;
+        result.data_b64.map(|data| decode_bytes(&data)).transpose()
+    }
+
+    async fn resize(&self, size: PtySize) -> Result<()> {
+        let _: m::Empty = self
+            .client
+            .call(m::PTY_RESIZE, &m::PtyResizeParams {
+                pty_id: self.pty_id.clone(),
+                size,
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn close(&self) -> Result<()> {
+        let _: m::Empty = self
+            .client
+            .call(m::PTY_CLOSE, &m::PtyIdParams {
+                pty_id: self.pty_id.clone(),
+            })
+            .await?;
+        Ok(())
+    }
+}
+
+struct SandboxLogs {
+    client:     Arc<Client>,
+    sandbox_id: SandboxId,
+}
+
+#[async_trait]
+impl Logs for SandboxLogs {
+    async fn follow(&self, source: LogSource, sink: LogSink) -> Result<()> {
+        let stream_id = self.client.next_stream_id("logs");
+        follow_log_stream(
+            &self.client,
+            m::LOGS_FOLLOW,
+            &m::LogsFollowParams {
+                sandbox_id: self.sandbox_id.as_str().to_owned(),
+                stream_id: stream_id.clone(),
+                source,
+            },
+            &stream_id,
+            sink,
+        )
+        .await
+    }
 }
 
 struct SandboxExec {
@@ -974,10 +1266,127 @@ impl Exec for SandboxExec {
         Ok(streaming)
     }
 
-    /// Deferred: the base64 side-channel transport for long-lived stdio
-    /// is not in protocol v1.
-    async fn spawn_stdio(&self, _spec: &SpawnSpec) -> Result<StdioProcess> {
-        Err(Error::unsupported(Capability::ExecStdioProcess))
+    async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
+        let process_id = self.client.next_stream_id("stdio");
+        let _: m::Empty = self
+            .client
+            .call(m::EXEC_STDIO_OPEN, &m::StdioOpenParams {
+                sandbox_id: self.sandbox_id.as_str().to_owned(),
+                process_id: process_id.clone(),
+                spec:       spec.clone(),
+            })
+            .await?;
+
+        let (stdin_writer, mut stdin_reader) = duplex(64 * 1024);
+        let input_client = Arc::clone(&self.client);
+        let input_id = process_id.clone();
+        let input_task = tokio::spawn(async move {
+            let mut buffer = vec![0; 32 * 1024];
+            loop {
+                let read = match stdin_reader.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => read,
+                };
+                let outcome: Result<m::Empty> = input_client
+                    .call(m::EXEC_STDIO_INPUT, &m::StdioInputParams {
+                        process_id: input_id.clone(),
+                        data_b64:   encode_bytes(&buffer[..read]),
+                    })
+                    .await;
+                if outcome.is_err() {
+                    return;
+                }
+            }
+            let _: Result<m::Empty> = input_client
+                .call(m::EXEC_STDIO_CLOSE_INPUT, &m::StdioIdParams {
+                    process_id: input_id,
+                })
+                .await;
+        });
+
+        let (mut stdout_writer, stdout_reader) = duplex(64 * 1024);
+        let output_client = Arc::clone(&self.client);
+        let output_id = process_id.clone();
+        let output_task = tokio::spawn(async move {
+            loop {
+                let result: Result<m::StdioOutputResult> = output_client
+                    .call(m::EXEC_STDIO_OUTPUT, &m::StdioIdParams {
+                        process_id: output_id.clone(),
+                    })
+                    .await;
+                let Ok(result) = result else { break };
+                let Some(chunk) = result.data_b64 else { break };
+                let Ok(chunk) = decode_bytes(&chunk) else {
+                    break;
+                };
+                if stdout_writer.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+            let _ = stdout_writer.shutdown().await;
+        });
+
+        let stderr_tail = StderrTail::default();
+        let handle = RemoteStdioHandle {
+            client: Arc::clone(&self.client),
+            process_id,
+            stderr_tail: stderr_tail.clone(),
+            outcome: OnceCell::new(),
+            input_task: AsyncMutex::new(Some(input_task)),
+            output_task: AsyncMutex::new(Some(output_task)),
+        };
+        Ok(StdioProcess {
+            stdin: Box::pin(stdin_writer),
+            stdout: Box::pin(stdout_reader),
+            stderr_tail,
+            handle: Box::new(handle),
+        })
+    }
+}
+
+struct RemoteStdioHandle {
+    client:      Arc<Client>,
+    process_id:  String,
+    stderr_tail: StderrTail,
+    outcome:     OnceCell<(Termination, Option<i32>)>,
+    input_task:  AsyncMutex<Option<JoinHandle<()>>>,
+    output_task: AsyncMutex<Option<JoinHandle<()>>>,
+}
+
+#[async_trait]
+impl StdioProcessHandle for RemoteStdioHandle {
+    async fn terminate(&self) {
+        let _: Result<m::Empty> = self
+            .client
+            .call(m::EXEC_STDIO_TERMINATE, &m::StdioIdParams {
+                process_id: self.process_id.clone(),
+            })
+            .await;
+    }
+
+    async fn wait(&self) -> (Termination, Option<i32>) {
+        *self
+            .outcome
+            .get_or_init(|| async {
+                let result: Result<m::StdioWaitResult> = self
+                    .client
+                    .call(m::EXEC_STDIO_WAIT, &m::StdioIdParams {
+                        process_id: self.process_id.clone(),
+                    })
+                    .await;
+                let Ok(result) = result else {
+                    return (Termination::Unknown, None);
+                };
+                self.stderr_tail.push(result.stderr_tail.as_bytes());
+                if let Some(task) = self.output_task.lock().await.take() {
+                    let _ = task.await;
+                }
+                if let Some(task) = self.input_task.lock().await.take() {
+                    task.abort();
+                }
+                (result.termination, result.exit_code)
+            })
+            .await
     }
 }
 

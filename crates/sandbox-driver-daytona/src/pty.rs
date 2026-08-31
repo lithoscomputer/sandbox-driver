@@ -11,6 +11,7 @@ use std::process;
 use async_trait::async_trait;
 use daytona_sdk::{PtyCreateOptions, PtyHandle};
 use sandbox_driver::{Pty, PtyOptions, PtySession, PtySize, Result};
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 use crate::{DaytonaClient, daytona_error};
 
@@ -69,44 +70,59 @@ impl Pty for DaytonaPty {
                 cols: options.size.cols,
             }),
         };
-        let handle = process
+        let mut handle = process
             .create_pty(&id, create)
             .await
             .map_err(|error| daytona_error("opening pty", &error))?;
-        Ok(Box::new(DaytonaPtySession { handle }))
+        let output = handle
+            .take_output_receiver()
+            .expect("a newly created PTY owns its output receiver");
+        Ok(Box::new(DaytonaPtySession {
+            handle: RwLock::new(handle),
+            output: Mutex::new(output),
+        }))
     }
 }
 
 struct DaytonaPtySession {
-    handle: PtyHandle,
+    /// Input and resize take a shared guard. Close takes the exclusive
+    /// guard. Output has its own lock so a blocked read never prevents
+    /// input, resize, or close.
+    handle: RwLock<PtyHandle>,
+    output: Mutex<mpsc::Receiver<Vec<u8>>>,
 }
 
 #[async_trait]
 impl PtySession for DaytonaPtySession {
-    async fn write_input(&mut self, bytes: &[u8]) -> Result<()> {
+    async fn write_input(&self, bytes: &[u8]) -> Result<()> {
         self.handle
+            .read()
+            .await
             .send_input(bytes)
             .await
             .map_err(|error| daytona_error("writing pty input", &error))
     }
 
-    async fn read_output(&mut self) -> Result<Option<Vec<u8>>> {
-        Ok(self.handle.recv().await)
+    async fn read_output(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self.output.lock().await.recv().await)
     }
 
-    async fn resize(&mut self, size: PtySize) -> Result<()> {
+    async fn resize(&self, size: PtySize) -> Result<()> {
         self.handle
+            .read()
+            .await
             .resize(size.cols, size.rows)
             .await
             .map(|_| ())
             .map_err(|error| daytona_error("resizing pty", &error))
     }
 
-    async fn close(&mut self) -> Result<()> {
+    async fn close(&self) -> Result<()> {
         // Kill the terminal process (fabro's DELETE-on-close semantics),
         // tolerating an already-dead session, then drop the socket.
-        let _ = self.handle.kill().await;
-        let _ = self.handle.disconnect().await;
+        let mut handle = self.handle.write().await;
+        let _ = handle.kill().await;
+        let _ = handle.disconnect().await;
         Ok(())
     }
 }

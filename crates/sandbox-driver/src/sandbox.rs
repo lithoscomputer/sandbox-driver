@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::access::{PreviewUrls, ShellCommand, SshAccess, Vnc, Vpn, WebTerminal};
+use crate::access::{PreviewUrls, ShellCommand, SshAccess, Vnc, WebTerminal};
 use crate::capabilities::{Capabilities, Capability};
 use crate::error::{Error, Result};
 use crate::exec::Exec;
@@ -209,10 +209,6 @@ pub trait Sandbox: Send + Sync {
     }
 
     fn vnc(&self) -> Option<&dyn Vnc> {
-        None
-    }
-
-    fn vpn(&self) -> Option<&dyn Vpn> {
         None
     }
 }

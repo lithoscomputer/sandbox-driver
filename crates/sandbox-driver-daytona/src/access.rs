@@ -2,9 +2,15 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sandbox_driver::{PreviewUrl, PreviewUrls, Result, SshAccess, SshAccessInfo};
+use sandbox_driver::{
+    PreviewUrl, PreviewUrls, Result, SshAccess, SshAccessInfo, Vnc, VncConnection, WebTerminal,
+};
 
 use crate::{DaytonaClient, daytona_error};
+
+const WEB_TERMINAL_PORT: u16 = 22_222;
+const VNC_PORT: u16 = 6_080;
+const BROWSER_ACCESS_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// Preview-URL and SSH access through the Daytona control plane.
 pub struct DaytonaAccess {
@@ -80,5 +86,66 @@ impl SshAccess for DaytonaAccess {
             .revoke_ssh_access(token)
             .await
             .map_err(|error| daytona_error("revoking ssh access", &error))
+    }
+}
+
+#[async_trait]
+impl WebTerminal for DaytonaAccess {
+    async fn web_terminal_url(&self) -> Result<String> {
+        Ok(self
+            .signed_preview_url(WEB_TERMINAL_PORT, BROWSER_ACCESS_TTL)
+            .await?
+            .url)
+    }
+}
+
+#[async_trait]
+impl Vnc for DaytonaAccess {
+    async fn vnc_connection(&self) -> Result<VncConnection> {
+        let sandbox = self.sdk().await?;
+        sandbox
+            .computer_use()
+            .await
+            .map_err(|error| daytona_error("connecting to computer use", &error))?
+            .start()
+            .await
+            .map_err(|error| daytona_error("starting computer use", &error))?;
+        let signed = sandbox
+            .get_signed_preview_url(
+                i32::from(VNC_PORT),
+                Some(
+                    i32::try_from(BROWSER_ACCESS_TTL.as_secs())
+                        .expect("browser access TTL fits in an i32"),
+                ),
+            )
+            .await
+            .map_err(|error| daytona_error("fetching signed VNC URL", &error))?;
+        Ok(VncConnection::new(vnc_viewer_url(&signed.url)))
+    }
+}
+
+fn vnc_viewer_url(signed_url: &str) -> String {
+    match signed_url.split_once('?') {
+        Some((base, query)) => format!(
+            "{}/vnc.html?{query}&autoconnect=true&resize=scale",
+            base.trim_end_matches('/')
+        ),
+        None => format!(
+            "{}/vnc.html?autoconnect=true&resize=scale",
+            signed_url.trim_end_matches('/')
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vnc_viewer_url;
+
+    #[test]
+    fn vnc_url_selects_the_browser_viewer_and_preserves_auth() {
+        assert_eq!(
+            vnc_viewer_url("https://preview.test/?token=secret"),
+            "https://preview.test/vnc.html?token=secret&autoconnect=true&resize=scale"
+        );
     }
 }

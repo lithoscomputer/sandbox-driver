@@ -4,15 +4,19 @@
 //!
 //! Live test: requires `DAYTONA_API_KEY`; skipped otherwise.
 
-use std::env;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::{env, process};
 
-use sandbox_driver::{SandboxSource, SandboxSpec};
+use sandbox_driver::{
+    LogSink, LogSource, SandboxProvider, SandboxSource, SandboxSpec, SnapshotSource, SnapshotSpec,
+    SnapshotState,
+};
 use sandbox_driver_conformance::{Conformance, SpecFactory};
 use sandbox_driver_daytona::DaytonaProvider;
 use sandbox_driver_protocol::{PluginProvider, serve};
 use tokio::io::{duplex, split};
+use tokio::time;
 
 const TEST_SNAPSHOT: &str = "daytona-medium";
 
@@ -44,4 +48,151 @@ async fn daytona_passes_conformance_over_the_wire() {
     conformance.wait.deadline = Some(Duration::from_secs(300));
     let report = conformance.run().await;
     report.assert_pass();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn extended_daytona_streams_and_browser_access_cross_the_wire() {
+    if env::var("DAYTONA_API_KEY").is_err() {
+        return;
+    }
+    let provider = DaytonaProvider::connect()
+        .await
+        .expect("connect with credentials");
+    let (host_side, plugin_side) = duplex(1024 * 1024);
+    let (host_read, host_write) = split(host_side);
+    let (plugin_read, plugin_write) = split(plugin_side);
+    tokio::spawn(serve(Arc::new(provider), plugin_read, plugin_write));
+    let remote = PluginProvider::connect(host_read, host_write)
+        .await
+        .expect("handshake");
+
+    let snapshots = remote.snapshots().expect("snapshot service declared");
+    let name = format!("sd-wire-logs-{}", process::id());
+    let mut snapshot_spec = SnapshotSpec::new(SnapshotSource::Dockerfile {
+        content: r#"FROM debian:stable-slim
+ENTRYPOINT ["/bin/sh", "-c", "echo wire-entrypoint; echo wire-entrypoint-error >&2; sleep 2"]
+"#
+        .to_owned(),
+    });
+    snapshot_spec.name = Some(name.clone());
+    snapshot_spec.resources.cpu_cores = Some(1);
+    snapshot_spec.resources.memory_mb = Some(1024);
+    snapshot_spec.resources.disk_mb = Some(1024);
+    let snapshot_id = snapshots
+        .create(&snapshot_spec)
+        .await
+        .expect("create Dockerfile snapshot over wire");
+
+    let outcome = async {
+        let build = Arc::new(Mutex::new(Vec::new()));
+        snapshots
+            .build_logs(&snapshot_id, true, collecting_sink(Arc::clone(&build)))
+            .await
+            .map_err(|error| format!("snapshot build logs: {error}"))?;
+        if build.lock().expect("build output lock").is_empty() {
+            return Err("snapshot build logs were empty".to_owned());
+        }
+        wait_for_snapshot(snapshots, &snapshot_id).await?;
+
+        let sandbox = remote
+            .create(
+                &SandboxSpec::new(SandboxSource::Snapshot { name }).ephemeral(true),
+                None,
+            )
+            .await
+            .map_err(|error| format!("create log sandbox: {error}"))?;
+        let log_outcome = async {
+            let terminal = sandbox
+                .web_terminal()
+                .ok_or("web terminal facet missing")?
+                .web_terminal_url()
+                .await
+                .map_err(|error| format!("web terminal: {error}"))?;
+            if !terminal.starts_with("https://") {
+                return Err(format!("web terminal URL looks wrong: {terminal}"));
+            }
+            let entrypoint = Arc::new(Mutex::new(Vec::new()));
+            time::timeout(
+                Duration::from_secs(60),
+                sandbox.logs().ok_or("logs facet missing")?.follow(
+                    LogSource::Entrypoint,
+                    collecting_sink(Arc::clone(&entrypoint)),
+                ),
+            )
+            .await
+            .map_err(|_| "entrypoint logs timed out".to_owned())?
+            .map_err(|error| format!("entrypoint logs: {error}"))?;
+            let output = entrypoint.lock().expect("entrypoint output lock");
+            let output = String::from_utf8_lossy(&output);
+            if !output.contains("wire-entrypoint") || !output.contains("wire-entrypoint-error") {
+                return Err(format!("entrypoint logs missing markers: {output:?}"));
+            }
+            Ok(())
+        }
+        .await;
+        let _ = sandbox.delete().await;
+        log_outcome?;
+
+        let desktop = remote
+            .create(
+                &SandboxSpec::new(SandboxSource::Snapshot {
+                    name: TEST_SNAPSHOT.to_owned(),
+                })
+                .ephemeral(true),
+                None,
+            )
+            .await
+            .map_err(|error| format!("create VNC sandbox: {error}"))?;
+        let vnc = match desktop.vnc() {
+            Some(vnc) => vnc
+                .vnc_connection()
+                .await
+                .map_err(|error| format!("VNC: {error}")),
+            None => Err("VNC facet missing".to_owned()),
+        };
+        let _ = desktop.delete().await;
+        let vnc = vnc?;
+        if !vnc.url.contains("/vnc.html") {
+            return Err(format!("VNC URL looks wrong: {}", vnc.url));
+        }
+        Ok(())
+    }
+    .await;
+
+    snapshots
+        .delete(&snapshot_id)
+        .await
+        .expect("delete wire snapshot");
+    remote.shutdown().await.expect("shutdown");
+    outcome.expect("extended Daytona facets over wire");
+}
+
+fn collecting_sink(output: Arc<Mutex<Vec<u8>>>) -> LogSink {
+    Arc::new(move |chunk| {
+        let output = Arc::clone(&output);
+        Box::pin(async move {
+            output.lock().expect("log output lock").extend(chunk);
+            Ok(())
+        })
+    })
+}
+
+async fn wait_for_snapshot(
+    snapshots: &dyn sandbox_driver::SnapshotProvider,
+    id: &sandbox_driver::SnapshotId,
+) -> Result<(), String> {
+    for _ in 0..120 {
+        let status = snapshots
+            .get(id)
+            .await
+            .map_err(|error| format!("snapshot get: {error}"))?;
+        match status.state {
+            SnapshotState::Active => return Ok(()),
+            SnapshotState::Error => {
+                return Err(format!("snapshot failed: {:?}", status.error_reason));
+            }
+            _ => time::sleep(Duration::from_secs(5)).await,
+        }
+    }
+    Err("snapshot did not become active".to_owned())
 }

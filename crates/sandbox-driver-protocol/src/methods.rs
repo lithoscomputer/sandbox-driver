@@ -10,8 +10,9 @@ use std::time::Duration;
 
 use sandbox_driver::{
     Capabilities, CaptureStats, CheckpointOptions, DirEntry, ExecResult, ExecSpec, FileMetadata,
-    ForkOptions, LifecycleTimers, NetworkPolicy, PlatformInfo, ProviderKind, Resources,
-    SandboxEvent, SandboxFilter, SandboxSnapshotOptions, SandboxSpec, SandboxStatus, Termination,
+    ForkOptions, LifecycleTimers, LogSource, NetworkPolicy, OutputSanitization, PlatformInfo,
+    ProviderKind, PtyOptions, PtySize, Resources, SandboxEvent, SandboxFilter,
+    SandboxSnapshotOptions, SandboxSpec, SandboxStatus, SpawnSpec, Termination, VncConnection,
 };
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +49,19 @@ pub const SANDBOX_UPDATE_NETWORK: &str = "sandbox/update_network";
 pub const EXEC_RUN: &str = "exec/run";
 pub const EXEC_STREAM: &str = "exec/stream";
 pub const EXEC_CANCEL: &str = "exec/cancel";
+pub const EXEC_STDIO_OPEN: &str = "exec/stdio_open";
+pub const EXEC_STDIO_INPUT: &str = "exec/stdio_input";
+pub const EXEC_STDIO_CLOSE_INPUT: &str = "exec/stdio_close_input";
+pub const EXEC_STDIO_OUTPUT: &str = "exec/stdio_output";
+pub const EXEC_STDIO_TERMINATE: &str = "exec/stdio_terminate";
+pub const EXEC_STDIO_WAIT: &str = "exec/stdio_wait";
+pub const PTY_OPEN: &str = "pty/open";
+pub const PTY_INPUT: &str = "pty/input";
+pub const PTY_OUTPUT: &str = "pty/output";
+pub const PTY_RESIZE: &str = "pty/resize";
+pub const PTY_CLOSE: &str = "pty/close";
+pub const LOGS_FOLLOW: &str = "logs/follow";
+pub const STREAM_CANCEL: &str = "stream/cancel";
 pub const FS_READ: &str = "fs/read";
 pub const FS_WRITE: &str = "fs/write";
 pub const FS_DELETE: &str = "fs/delete";
@@ -64,6 +78,7 @@ pub const SNAPSHOT_LIST: &str = "snapshot/list";
 pub const SNAPSHOT_DELETE: &str = "snapshot/delete";
 pub const SNAPSHOT_ACTIVATE: &str = "snapshot/activate";
 pub const SNAPSHOT_DEACTIVATE: &str = "snapshot/deactivate";
+pub const SNAPSHOT_BUILD_LOGS: &str = "snapshot/build_logs";
 pub const PROVIDER_HEALTH: &str = "provider/health";
 pub const VOLUME_CREATE: &str = "volume/create";
 pub const VOLUME_GET: &str = "volume/get";
@@ -73,11 +88,14 @@ pub const ACCESS_PREVIEW_URL: &str = "access/preview_url";
 pub const ACCESS_SIGNED_PREVIEW_URL: &str = "access/signed_preview_url";
 pub const ACCESS_SSH_CREATE: &str = "access/ssh_create";
 pub const ACCESS_SSH_REVOKE: &str = "access/ssh_revoke";
+pub const ACCESS_WEB_TERMINAL: &str = "access/web_terminal";
+pub const ACCESS_VNC: &str = "access/vnc";
 
 // Notifications, plugin → host.
 pub const EXEC_OUTPUT: &str = "exec/output";
 pub const HOST_EVENT: &str = "host/event";
 pub const HOST_LOG: &str = "host/log";
+pub const LOG_OUTPUT: &str = "logs/output";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InitializeParams {
@@ -206,23 +224,26 @@ pub struct UpdateNetworkParams {
 /// [`ExecSpec`] with the stdin payload in base64.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExecSpecDto {
-    pub command:     String,
-    pub timeout_ms:  Option<u64>,
-    pub working_dir: Option<String>,
-    pub env:         BTreeMap<String, String>,
-    pub stdin_b64:   Option<String>,
+    pub command:             String,
+    pub timeout_ms:          Option<u64>,
+    pub working_dir:         Option<String>,
+    pub env:                 BTreeMap<String, String>,
+    pub stdin_b64:           Option<String>,
+    #[serde(default, skip_serializing_if = "output_sanitization_is_raw")]
+    pub output_sanitization: OutputSanitization,
 }
 
 impl ExecSpecDto {
     pub fn from_spec(spec: &ExecSpec) -> Self {
         Self {
-            command:     spec.command.clone(),
-            timeout_ms:  spec
+            command:             spec.command.clone(),
+            timeout_ms:          spec
                 .timeout
                 .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
-            working_dir: spec.working_dir.clone(),
-            env:         spec.env.clone(),
-            stdin_b64:   spec.stdin.as_deref().map(encode_bytes),
+            working_dir:         spec.working_dir.clone(),
+            env:                 spec.env.clone(),
+            stdin_b64:           spec.stdin.as_deref().map(encode_bytes),
+            output_sanitization: spec.output_sanitization,
         }
     }
 
@@ -240,8 +261,19 @@ impl ExecSpecDto {
         if let Some(stdin) = self.stdin_b64 {
             spec = spec.stdin(decode_bytes(&stdin)?);
         }
+        spec = spec.output_sanitization(self.output_sanitization);
         Ok(spec)
     }
+}
+
+// serde's `skip_serializing_if` callback receives a reference even for a
+// one-byte Copy enum.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires a reference callback"
+)]
+fn output_sanitization_is_raw(value: &OutputSanitization) -> bool {
+    *value == OutputSanitization::Raw
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -311,6 +343,83 @@ pub struct ExecOutputNotification {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExecCancelParams {
     pub exec_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StdioOpenParams {
+    pub sandbox_id: String,
+    pub process_id: String,
+    pub spec:       SpawnSpec,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StdioIdParams {
+    pub process_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StdioInputParams {
+    pub process_id: String,
+    pub data_b64:   String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StdioOutputResult {
+    pub data_b64: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StdioWaitResult {
+    pub termination: Termination,
+    pub exit_code:   Option<i32>,
+    pub stderr_tail: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PtyOpenParams {
+    pub sandbox_id: String,
+    pub pty_id:     String,
+    pub options:    PtyOptions,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PtyIdParams {
+    pub pty_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PtyInputParams {
+    pub pty_id:   String,
+    pub data_b64: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PtyOutputResult {
+    pub data_b64: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PtyResizeParams {
+    pub pty_id: String,
+    pub size:   PtySize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LogsFollowParams {
+    pub sandbox_id: String,
+    pub stream_id:  String,
+    pub source:     LogSource,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StreamIdParams {
+    pub stream_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LogOutputNotification {
+    pub stream_id: String,
+    pub data_b64:  String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -421,6 +530,13 @@ pub struct SnapshotIdResult {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct SnapshotBuildLogsParams {
+    pub snapshot_id: String,
+    pub stream_id:   String,
+    pub follow:      bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SnapshotStatusResult {
     pub status: sandbox_driver::SnapshotStatus,
 }
@@ -493,6 +609,16 @@ pub struct SshCreateResult {
 pub struct SshRevokeParams {
     pub sandbox_id: String,
     pub token:      String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WebTerminalResult {
+    pub url: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VncResult {
+    pub connection: VncConnection,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

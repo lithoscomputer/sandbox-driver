@@ -52,6 +52,7 @@ mod probe;
 mod provider;
 mod pty;
 mod sandbox;
+mod sanitize;
 mod search;
 mod service;
 mod spec;
@@ -61,8 +62,8 @@ mod test_exec;
 mod wait;
 
 pub use access::{
-    PreviewUrl, PreviewUrls, ShellCommand, SshAccess, SshAccessInfo, Vnc, VncConnection, Vpn,
-    VpnStatus, WebTerminal,
+    PreviewUrl, PreviewUrls, ShellCommand, SshAccess, SshAccessInfo, Vnc, VncConnection,
+    WebTerminal,
 };
 pub use capabilities::{
     AccessCaps, Capabilities, Capability, ExecCaps, FsCaps, GitCaps, Isolation, LifecycleCaps,
@@ -94,6 +95,7 @@ pub use pty::{Pty, PtyOptions, PtySession, PtySize};
 pub use sandbox::{
     CheckpointOptions, ForkOptions, Sandbox, SandboxSnapshotOptions, WorkspaceOwnership,
 };
+pub use sanitize::{OutputSanitization, OutputSanitizer};
 pub use search::{GrepMatch, GrepOptions, Search, WalkOptions, WalkedFile};
 pub use service::{ServiceSpec, ServiceStatus, Services};
 pub use spec::{

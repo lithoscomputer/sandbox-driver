@@ -8,8 +8,8 @@ use std::{mem, process};
 use async_trait::async_trait;
 use daytona_sdk::{DaytonaError, ExecuteCommandOptions, FileSystemService, ProcessService};
 use sandbox_driver::{
-    Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputCaptureBuffer, OutputSink,
-    OutputStream, Result, SpawnSpec, StdioProcess, Termination,
+    Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputCaptureBuffer,
+    OutputSanitizer, OutputSink, OutputStream, Result, SpawnSpec, StdioProcess, Termination,
 };
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, OnceCell};
@@ -275,7 +275,8 @@ impl DaytonaExec {
             Some(response) => (
                 Termination::Exited,
                 Some(response.exit_code),
-                response.result.into_bytes(),
+                spec.output_sanitization
+                    .sanitize(response.result.as_bytes()),
             ),
         };
 
@@ -365,6 +366,16 @@ impl DaytonaExec {
         let stderr_seen = Arc::new(Mutex::new(OutputCaptureBuffer::new(
             controls.retained_output_limit,
         )));
+        // Deduplication must compare the provider's raw live and final
+        // output. The public captures below contain sanitized bytes.
+        let stdout_raw_seen = Arc::new(Mutex::new(OutputCaptureBuffer::new(
+            controls.retained_output_limit,
+        )));
+        let stderr_raw_seen = Arc::new(Mutex::new(OutputCaptureBuffer::new(
+            controls.retained_output_limit,
+        )));
+        let stdout_sanitizer = Arc::new(Mutex::new(OutputSanitizer::new(spec.output_sanitization)));
+        let stderr_sanitizer = Arc::new(Mutex::new(OutputSanitizer::new(spec.output_sanitization)));
         let saw_live = Arc::new(AtomicBool::new(false));
         // A failing sink cancels the execution (the core contract); the
         // token routes the failure into the wait loop below.
@@ -375,14 +386,18 @@ impl DaytonaExec {
             let command_id = command_id.clone();
             let stdout = StreamSide {
                 stream:      OutputStream::Stdout,
+                raw_seen:    Arc::clone(&stdout_raw_seen),
                 seen:        Arc::clone(&stdout_seen),
+                sanitizer:   Arc::clone(&stdout_sanitizer),
                 saw_live:    Arc::clone(&saw_live),
                 sink:        controls.sink.clone(),
                 sink_failed: sink_failed.clone(),
             };
             let stderr = StreamSide {
                 stream:      OutputStream::Stderr,
+                raw_seen:    Arc::clone(&stderr_raw_seen),
                 seen:        Arc::clone(&stderr_seen),
+                sanitizer:   Arc::clone(&stderr_sanitizer),
                 saw_live:    Arc::clone(&saw_live),
                 sink:        controls.sink.clone(),
                 sink_failed: sink_failed.clone(),
@@ -445,21 +460,52 @@ impl DaytonaExec {
         let mut logs_separated = false;
         if let Some(logs) = &final_logs {
             logs_separated = logs.streams_separated;
-            for (buffer, stream, bytes) in [
-                (&stdout_seen, OutputStream::Stdout, logs.stdout.as_bytes()),
-                (&stderr_seen, OutputStream::Stderr, logs.stderr.as_bytes()),
+            for (raw_seen, seen, sanitizer, stream, bytes) in [
+                (
+                    &stdout_raw_seen,
+                    &stdout_seen,
+                    &stdout_sanitizer,
+                    OutputStream::Stdout,
+                    logs.stdout.as_bytes(),
+                ),
+                (
+                    &stderr_raw_seen,
+                    &stderr_seen,
+                    &stderr_sanitizer,
+                    OutputStream::Stderr,
+                    logs.stderr.as_bytes(),
+                ),
             ] {
                 let missing = {
-                    let mut seen = buffer.lock().await;
-                    let missing = missing_suffix(&mut seen, bytes);
-                    seen.push(&missing);
+                    let mut raw_seen = raw_seen.lock().await;
+                    let missing = missing_suffix(&mut raw_seen, bytes);
+                    raw_seen.push(&missing);
                     missing
                 };
-                if !missing.is_empty() && !sink_failed.is_cancelled() {
-                    if let Some(sink) = &controls.sink {
-                        sink(stream, missing).await?;
-                    }
+                let sanitized = sanitizer.lock().await.push(&missing);
+                seen.lock().await.push(&sanitized);
+                if !sanitized.is_empty()
+                    && !sink_failed.is_cancelled()
+                    && let Some(sink) = &controls.sink
+                    && sink(stream, sanitized).await.is_err()
+                {
+                    sink_failed.cancel();
                 }
+            }
+        }
+
+        for (seen, sanitizer, stream) in [
+            (&stdout_seen, &stdout_sanitizer, OutputStream::Stdout),
+            (&stderr_seen, &stderr_sanitizer, OutputStream::Stderr),
+        ] {
+            let final_bytes = sanitizer.lock().await.finish();
+            seen.lock().await.push(&final_bytes);
+            if !final_bytes.is_empty()
+                && !sink_failed.is_cancelled()
+                && let Some(sink) = &controls.sink
+                && sink(stream, final_bytes).await.is_err()
+            {
+                sink_failed.cancel();
             }
         }
 
@@ -505,7 +551,9 @@ async fn close_stdin(file: &mut Option<StdinFile>) {
 #[derive(Clone)]
 struct StreamSide {
     stream:      OutputStream,
+    raw_seen:    Arc<Mutex<OutputCaptureBuffer>>,
     seen:        Arc<Mutex<OutputCaptureBuffer>>,
+    sanitizer:   Arc<Mutex<OutputSanitizer>>,
     saw_live:    Arc<AtomicBool>,
     sink:        Option<OutputSink>,
     sink_failed: CancellationToken,
@@ -518,7 +566,12 @@ impl StreamSide {
             return Ok(());
         }
         self.saw_live.store(true, Ordering::Relaxed);
+        self.raw_seen.lock().await.push(&bytes);
+        let bytes = self.sanitizer.lock().await.push(&bytes);
         self.seen.lock().await.push(&bytes);
+        if bytes.is_empty() {
+            return Ok(());
+        }
         if let Some(sink) = &self.sink {
             if sink(self.stream, bytes).await.is_err() {
                 // Cancels the execution via the wait loop; ending the

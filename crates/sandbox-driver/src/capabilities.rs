@@ -74,8 +74,6 @@ pub enum Capability {
     WebTerminalAccess,
     #[serde(rename = "access.vnc")]
     VncAccess,
-    #[serde(rename = "access.vpn")]
-    VpnAccess,
     #[serde(rename = "snapshots")]
     Snapshots,
     #[serde(rename = "snapshots.include_memory")]
@@ -234,7 +232,10 @@ pub struct AccessCaps {
     pub shell_command:       bool,
     pub web_terminal:        bool,
     pub vnc:                 bool,
-    pub vpn:                 bool,
+    /// Protocol v1 compatibility tombstone. VPN setup is guest software
+    /// managed through exec, not a sandbox-driver capability.
+    #[serde(rename = "vpn")]
+    vpn_legacy:              bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

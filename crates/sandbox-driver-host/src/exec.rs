@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use nix::sys::signal::Signal;
 use sandbox_driver::{
     Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputCaptureBuffer,
-    OutputSink, OutputStream, Result, SpawnSpec, StderrTail, StdioProcess, StdioProcessHandle,
-    Termination,
+    OutputSanitization, OutputSanitizer, OutputSink, OutputStream, Result, SpawnSpec, StderrTail,
+    StdioProcess, StdioProcessHandle, Termination,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
@@ -248,19 +248,32 @@ async fn pump_stream(
     stream: OutputStream,
     capture: &mut OutputCaptureBuffer,
     sink: Option<&OutputSink>,
+    output_sanitization: OutputSanitization,
 ) -> PumpEnd {
     let mut buffer = [0u8; 8192];
+    let mut sanitizer = OutputSanitizer::new(output_sanitization);
     loop {
         match reader.read(&mut buffer).await {
-            Ok(0) => return PumpEnd::Eof,
+            Ok(0) => {
+                let chunk = sanitizer.finish();
+                capture.push(&chunk);
+                if !chunk.is_empty()
+                    && let Some(sink) = sink
+                    && sink(stream, chunk).await.is_err()
+                {
+                    return PumpEnd::SinkError;
+                }
+                return PumpEnd::Eof;
+            }
             Err(error) => return PumpEnd::ReadError(error),
             Ok(read) => {
-                let chunk = &buffer[..read];
-                capture.push(chunk);
-                if let Some(sink) = sink {
-                    if sink(stream, chunk.to_vec()).await.is_err() {
-                        return PumpEnd::SinkError;
-                    }
+                let chunk = sanitizer.push(&buffer[..read]);
+                capture.push(&chunk);
+                if !chunk.is_empty()
+                    && let Some(sink) = sink
+                    && sink(stream, chunk).await.is_err()
+                {
+                    return PumpEnd::SinkError;
                 }
             }
         }
@@ -318,8 +331,20 @@ impl Exec for HostExec {
         let (termination, status) = {
             let mut pumps = pin!(async {
                 tokio::join!(
-                    pump_stream(stdout, OutputStream::Stdout, &mut stdout_capture, sink),
-                    pump_stream(stderr, OutputStream::Stderr, &mut stderr_capture, sink),
+                    pump_stream(
+                        stdout,
+                        OutputStream::Stdout,
+                        &mut stdout_capture,
+                        sink,
+                        spec.output_sanitization,
+                    ),
+                    pump_stream(
+                        stderr,
+                        OutputStream::Stderr,
+                        &mut stderr_capture,
+                        sink,
+                        spec.output_sanitization,
+                    ),
                 )
             });
             let mut pumps_done = false;
