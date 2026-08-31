@@ -131,6 +131,8 @@ for the connection. Per-sandbox capability sets travel in every
   "network": {"allow_all":false,"block_all":false,"cidr_allow_list":false,
                "domain_allow_list":false,"outbound_proxy":false},
   "snapshots": {"from_image":false,"from_dockerfile":false,
+                 "from_image_kinds":{"container":false,"virtual_machine":false},
+                 "from_dockerfile_kinds":{"container":false,"virtual_machine":false},
                  "filesystem_from_sandbox":false,
                  "live_process_state_from_sandbox":false,
                  "build_logs":false,"activation":false},
@@ -155,6 +157,9 @@ Rules:
 - Version-1 peers can still send the legacy `lifecycle.checkpoint`,
   `snapshots.from_sandbox`, and `snapshots.include_memory` fields. Readers
   ignore them. New peers emit the normalized fields shown above.
+- The aggregate snapshot source flags remain for version-1 compatibility.
+  The `from_*_kinds` objects give exact container and virtual-machine
+  support. If an exact flag is true, its aggregate flag must also be true.
 - `capabilities.snapshots`/`volumes` being non-null is what authorizes
   the `snapshot/*` and `volume/*` methods (`snapshot/activate` and
   `snapshot/deactivate` additionally require `snapshots.activation`);
@@ -237,7 +242,8 @@ to operate a sandbox without further negotiation:
 ```json
 {
   "status": {"id":"sb-1","state":"running","provider_state":"started",
-              "error_reason":null,"resources":{"...":"…"},"labels":{},
+              "error_reason":null,"resources":{"...":"…"},
+              "sandbox_kind":"container","region":"eu","labels":{},
               "source":null,"workspace_ownership":null,
               "created_at":null,"updated_at":null},
   "capabilities": {"...":"per-sandbox set, §5"},
@@ -264,6 +270,7 @@ to operate a sandbox without further negotiation:
   "name": null,
   "source": {"image":{"reference":"ubuntu:24.04"}},
   "resources": {"cpu_cores":null,"memory_mb":null,"disk_mb":null,"gpus":null},
+  "sandbox_kind": "container",
   "env": {}, "labels": {}, "user": null,
   "working_directory": null,
   "network": "provider_default",
@@ -281,6 +288,14 @@ to operate a sandbox without further negotiation:
 `"allow_all"`, `"block"`, `{"cidr_allow_list":{"cidrs":[…]}}`,
 `{"domain_allow_list":{"domains":[…]}}`. `provider_config` is an opaque
 JSON value the plugin defines and documents.
+
+`sandbox_kind` is nullable and accepts `"container"` or
+`"virtual_machine"`. When set, it is a required result. The plugin must
+honor it or return `invalid_spec`; it must not silently substitute a
+different kind. This field is separate from `capabilities.isolation`.
+The latter describes the provider's security boundary. The public Rust
+API uses a typed `SnapshotId` for a snapshot source, but protocol version
+1 retains the original `source.snapshot.name` field shown above.
 
 Timer semantics: a `null` timer defers to the provider's default. A
 **zero duration** (`{"secs":0,"nanos":0}`) is the explicit "never" — it
@@ -429,8 +444,8 @@ Deletes must be idempotent, including while deletion is in progress.
 
 | method | params | result |
 | --- | --- | --- |
-| `snapshot/create` | `{spec:{name,source,resources,provider_config}}` | `{snapshot_id}` |
-| `snapshot/get` | `{snapshot_id}` | `{status:{id,name,state,error_reason,size_bytes,created_at}}` |
+| `snapshot/create` | `{spec:{name,source,sandbox_kind,region,resources,provider_config}}` | `{snapshot_id}` |
+| `snapshot/get` | `{snapshot_id}` | `{status:{id,name,state,sandbox_kind,regions,resources,error_reason,size_bytes,created_at}}` |
 | `snapshot/list` | `{filter:{name}}` | `{snapshots:[status…]}` |
 | `snapshot/delete` | `{snapshot_id}` | `{}` |
 | `snapshot/activate` | `{snapshot_id}` | `{}` (gated on `snapshots.activation`) |
@@ -446,6 +461,10 @@ Snapshot `source` variants: `{"image":{"reference":…}}`,
 `{"sandbox":{"id":…,"include_memory":…}}`.
 The sandbox source uses the same v1 mapping: `false` is `Filesystem` and
 `true` is `LiveProcessState`.
+`sandbox_kind` and `region` are optional additive fields. A snapshot made
+from a sandbox inherits its kind and resources; a conflicting request is
+`invalid_spec`. Daytona supports image sources for both sandbox kinds and
+Dockerfile sources for containers only.
 
 ### 8.7 Access
 

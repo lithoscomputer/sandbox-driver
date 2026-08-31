@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use sandbox_driver::{
     Capability, Error, EventCallback, ExecControls, LogSink, OutputSink, Result, Sandbox,
-    SandboxId, SandboxProvider, SandboxStatus, SnapshotId, StderrTail, StdioProcessHandle,
-    VolumeId,
+    SandboxId, SandboxProvider, SandboxSpec, SandboxStatus, SnapshotId, StderrTail,
+    StdioProcessHandle, VolumeId,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -394,7 +394,8 @@ async fn dispatch(
             // everything after routes correctly.
             let hint = Arc::new(Mutex::new(String::new()));
             let callback = state.event_callback(Arc::clone(&hint), request.operation_id.clone());
-            let handle = state.provider.create(&request.spec, Some(callback)).await?;
+            let spec = SandboxSpec::try_from(request.spec)?;
+            let handle = state.provider.create(&spec, Some(callback)).await?;
             handle
                 .id()
                 .as_str()

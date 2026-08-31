@@ -9,8 +9,8 @@ use std::time::Duration;
 use std::{env, process};
 
 use sandbox_driver::{
-    LogSink, LogSource, SandboxProvider, SandboxSource, SandboxSpec, SnapshotSource, SnapshotSpec,
-    SnapshotState,
+    LogSink, LogSource, SandboxKind, SandboxProvider, SandboxSource, SandboxSpec, SnapshotId,
+    SnapshotSource, SnapshotSpec, SnapshotState,
 };
 use sandbox_driver_conformance::{Conformance, SpecFactory};
 use sandbox_driver_daytona::DaytonaProvider;
@@ -39,8 +39,9 @@ async fn daytona_passes_conformance_over_the_wire() {
 
     let specs = SpecFactory::new(|| {
         SandboxSpec::new(SandboxSource::Snapshot {
-            name: TEST_SNAPSHOT.to_owned(),
+            id: SnapshotId::try_new(TEST_SNAPSHOT).expect("valid snapshot id"),
         })
+        .sandbox_kind(SandboxKind::Container)
         .ephemeral(true)
     });
     let mut conformance = Conformance::new(Arc::new(remote), specs);
@@ -75,6 +76,8 @@ ENTRYPOINT ["/bin/sh", "-c", "echo wire-entrypoint; echo wire-entrypoint-error >
         .to_owned(),
     });
     snapshot_spec.name = Some(name.clone());
+    snapshot_spec.sandbox_kind = Some(SandboxKind::Container);
+    snapshot_spec.region = Some("us".to_owned());
     snapshot_spec.resources.cpu_cores = Some(1);
     snapshot_spec.resources.memory_mb = Some(1024);
     snapshot_spec.resources.disk_mb = Some(1024);
@@ -96,7 +99,12 @@ ENTRYPOINT ["/bin/sh", "-c", "echo wire-entrypoint; echo wire-entrypoint-error >
 
         let sandbox = remote
             .create(
-                &SandboxSpec::new(SandboxSource::Snapshot { name }).ephemeral(true),
+                &SandboxSpec::new(SandboxSource::Snapshot {
+                    id: SnapshotId::try_new(name).expect("valid snapshot id"),
+                })
+                .sandbox_kind(SandboxKind::Container)
+                .region("us")
+                .ephemeral(true),
                 None,
             )
             .await
@@ -136,8 +144,9 @@ ENTRYPOINT ["/bin/sh", "-c", "echo wire-entrypoint; echo wire-entrypoint-error >
         let desktop = remote
             .create(
                 &SandboxSpec::new(SandboxSource::Snapshot {
-                    name: TEST_SNAPSHOT.to_owned(),
+                    id: SnapshotId::try_new(TEST_SNAPSHOT).expect("valid snapshot id"),
                 })
+                .sandbox_kind(SandboxKind::Container)
                 .ephemeral(true),
                 None,
             )

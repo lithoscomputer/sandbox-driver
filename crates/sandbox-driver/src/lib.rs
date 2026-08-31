@@ -67,7 +67,8 @@ pub use access::{
 };
 pub use capabilities::{
     AccessCaps, Capabilities, Capability, ExecCaps, FsCaps, GitCaps, Isolation, LifecycleCaps,
-    LogsCaps, NetworkCaps, PtyCaps, SearchCaps, ServiceCaps, SnapshotCaps, VolumeCaps,
+    LogsCaps, NetworkCaps, PtyCaps, SandboxKindSupport, SearchCaps, ServiceCaps, SnapshotCaps,
+    VolumeCaps,
 };
 pub use capture::OutputCaptureBuffer;
 pub use derived::{DerivedFs, DerivedGit, DerivedSearch, DerivedServices};
@@ -95,8 +96,8 @@ pub use sanitize::{OutputSanitization, OutputSanitizer};
 pub use search::{GrepMatch, GrepOptions, Search, WalkOptions, WalkedFile};
 pub use service::{ServiceSpec, ServiceStatus, Services};
 pub use spec::{
-    LifecycleTimers, NetworkPolicy, PlatformInfo, Resources, SandboxSource, SandboxSpec,
-    VolumeMount,
+    LifecycleTimers, NetworkPolicy, PlatformInfo, Resources, SandboxKind, SandboxSource,
+    SandboxSpec, VolumeMount,
 };
 pub use state::{SandboxState, SandboxStatus};
 pub use wait::{WaitOptions, wait_for_stable_state, wait_for_state};

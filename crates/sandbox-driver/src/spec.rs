@@ -3,6 +3,23 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::SnapshotId;
+
+/// Provisioning form of a sandbox.
+///
+/// This is distinct from [`crate::Isolation`]: a provider can implement a
+/// container sandbox with a VM-backed security boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SandboxKind {
+    Container,
+    VirtualMachine,
+    /// A kind sent by a newer protocol peer.
+    #[serde(other)]
+    Unknown,
+}
+
 /// What a sandbox is created from.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -12,8 +29,8 @@ pub enum SandboxSource {
     Image { reference: String },
     /// A Dockerfile to build. Build context handling is provider-specific.
     Dockerfile { content: String },
-    /// An existing snapshot, by provider id or name.
-    Snapshot { name: String },
+    /// An existing snapshot, by provider-scoped id or name.
+    Snapshot { id: SnapshotId },
     /// Host provider: no image at all, just a working directory.
     HostDirectory,
 }
@@ -141,6 +158,11 @@ pub struct SandboxSpec {
     pub source:            SandboxSource,
     #[serde(default)]
     pub resources:         Resources,
+    /// Required provisioning kind for the resulting sandbox. Providers
+    /// must honor it or reject the request; they must not silently change
+    /// the kind or create hidden intermediate snapshots.
+    #[serde(default)]
+    pub sandbox_kind:      Option<SandboxKind>,
     #[serde(default)]
     pub env:               BTreeMap<String, String>,
     #[serde(default)]
@@ -177,6 +199,7 @@ impl SandboxSpec {
             name: None,
             source,
             resources: Resources::default(),
+            sandbox_kind: None,
             env: BTreeMap::new(),
             labels: BTreeMap::new(),
             user: None,
@@ -200,6 +223,18 @@ impl SandboxSpec {
     #[must_use]
     pub fn resources(mut self, resources: Resources) -> Self {
         self.resources = resources;
+        self
+    }
+
+    #[must_use]
+    pub fn sandbox_kind(mut self, sandbox_kind: SandboxKind) -> Self {
+        self.sandbox_kind = Some(sandbox_kind);
+        self
+    }
+
+    #[must_use]
+    pub fn region(mut self, region: impl Into<String>) -> Self {
+        self.region = Some(region.into());
         self
     }
 
@@ -254,6 +289,15 @@ impl SandboxSpec {
     /// Checks the cross-provider invariants. Providers call this at
     /// `create` before their own provider-specific validation.
     pub fn validate(&self) -> Result<(), crate::Error> {
+        if self.sandbox_kind == Some(SandboxKind::Unknown) {
+            return Err(crate::Error::invalid_spec(
+                "sandbox_kind",
+                "unknown sandbox kind",
+            ));
+        }
+        if self.region.as_deref() == Some("") {
+            return Err(crate::Error::invalid_spec("region", "must not be empty"));
+        }
         if self.timers.auto_stop_after_idle.is_some() && self.timers.auto_pause_after_idle.is_some()
         {
             return Err(crate::Error::invalid_spec(
@@ -295,9 +339,13 @@ mod tests {
             reference: "ubuntu:24.04".into(),
         })
         .name("demo")
+        .sandbox_kind(SandboxKind::Container)
+        .region("us")
         .env_var("FOO", "bar")
         .ephemeral(true);
         assert_eq!(spec.name.as_deref(), Some("demo"));
+        assert_eq!(spec.sandbox_kind, Some(SandboxKind::Container));
+        assert_eq!(spec.region.as_deref(), Some("us"));
         assert_eq!(spec.env.get("FOO").map(String::as_str), Some("bar"));
         assert!(spec.ephemeral);
     }
@@ -305,10 +353,34 @@ mod tests {
     #[test]
     fn spec_round_trips_through_json() {
         let spec = SandboxSpec::new(SandboxSource::Snapshot {
-            name: "base".into(),
+            id: SnapshotId::try_new("base").expect("valid snapshot id"),
         });
         let json = serde_json::to_string(&spec).expect("serializes");
         let back: SandboxSpec = serde_json::from_str(&json).expect("deserializes");
-        assert!(matches!(back.source, SandboxSource::Snapshot { name } if name == "base"));
+        assert!(matches!(back.source, SandboxSource::Snapshot { id } if id.as_str() == "base"));
+    }
+
+    #[test]
+    fn sandbox_kind_has_stable_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&SandboxKind::VirtualMachine).expect("serializes"),
+            "\"virtual_machine\""
+        );
+    }
+
+    #[test]
+    fn spec_rejects_unknown_kind_and_empty_region() {
+        let unknown =
+            SandboxSpec::new(SandboxSource::HostDirectory).sandbox_kind(SandboxKind::Unknown);
+        assert!(matches!(
+            unknown.validate(),
+            Err(crate::Error::InvalidSpec { .. })
+        ));
+
+        let empty_region = SandboxSpec::new(SandboxSource::HostDirectory).region("");
+        assert!(matches!(
+            empty_region.validate(),
+            Err(crate::Error::InvalidSpec { .. })
+        ));
     }
 }

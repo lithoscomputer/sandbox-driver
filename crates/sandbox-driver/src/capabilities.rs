@@ -78,6 +78,14 @@ pub enum Capability {
     VncAccess,
     #[serde(rename = "snapshots")]
     Snapshots,
+    #[serde(rename = "snapshots.from_image.container")]
+    SnapshotsContainerFromImage,
+    #[serde(rename = "snapshots.from_image.virtual_machine")]
+    SnapshotsVmFromImage,
+    #[serde(rename = "snapshots.from_dockerfile.container")]
+    SnapshotsContainerFromDockerfile,
+    #[serde(rename = "snapshots.from_dockerfile.virtual_machine")]
+    SnapshotsVmFromDockerfile,
     #[serde(rename = "snapshots.filesystem")]
     SnapshotsFilesystem,
     #[serde(rename = "snapshots.live_process_state")]
@@ -284,8 +292,16 @@ pub struct NetworkCaps {
 #[serde(default)]
 #[non_exhaustive]
 pub struct SnapshotCaps {
+    /// Aggregate compatibility flag: at least one sandbox kind can be
+    /// built from an image.
     pub from_image: bool,
+    /// Aggregate compatibility flag: at least one sandbox kind can be
+    /// built from a Dockerfile.
     pub from_dockerfile: bool,
+    /// Exact sandbox kinds supported for image builds.
+    pub from_image_kinds: SandboxKindSupport,
+    /// Exact sandbox kinds supported for Dockerfile builds.
+    pub from_dockerfile_kinds: SandboxKindSupport,
     /// A sandbox can be captured as filesystem state.
     pub filesystem_from_sandbox: bool,
     /// A sandbox can be captured with its memory and running processes.
@@ -294,6 +310,25 @@ pub struct SnapshotCaps {
     /// Snapshots can be deactivated and reactivated
     /// ([`crate::SnapshotProvider::activate`]).
     pub activation: bool,
+}
+
+/// Sandbox kinds supported for one creation path.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
+pub struct SandboxKindSupport {
+    pub container:       bool,
+    pub virtual_machine: bool,
+}
+
+impl SandboxKindSupport {
+    pub fn supports(&self, kind: crate::SandboxKind) -> bool {
+        match kind {
+            crate::SandboxKind::Container => self.container,
+            crate::SandboxKind::VirtualMachine => self.virtual_machine,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -321,5 +356,16 @@ mod tests {
         assert!(caps.pty.is_none());
         assert!(caps.snapshots.is_none());
         assert!(!caps.lifecycle.pause);
+    }
+
+    #[test]
+    fn sandbox_kind_support_is_exact() {
+        let support = SandboxKindSupport {
+            container: true,
+            ..SandboxKindSupport::default()
+        };
+        assert!(support.supports(crate::SandboxKind::Container));
+        assert!(!support.supports(crate::SandboxKind::VirtualMachine));
+        assert!(!support.supports(crate::SandboxKind::Unknown));
     }
 }

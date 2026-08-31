@@ -42,7 +42,8 @@ use sandbox_driver::{
     Capabilities, Error, ErrorReport, EventCallback, EventDispatcher, Exec, ExecSpec, Filesystem,
     HealthStatus, Isolation, LifecycleAction, NetworkPolicy, PlatformInfo, ProviderError,
     ProviderHealth, ProviderKind, ResourceKind, Result, Sandbox, SandboxEvent, SandboxFilter,
-    SandboxId, SandboxProvider, SandboxSource, SandboxSpec, SandboxState, SandboxStatus,
+    SandboxId, SandboxKind, SandboxProvider, SandboxSource, SandboxSpec, SandboxState,
+    SandboxStatus,
 };
 
 pub use crate::exec::DockerExec;
@@ -265,6 +266,7 @@ fn map_state(inspect: &ContainerInspectResponse) -> SandboxState {
 
 fn status_from_inspect(id: SandboxId, inspect: &ContainerInspectResponse) -> SandboxStatus {
     let mut status = SandboxStatus::new(id, map_state(inspect));
+    status.sandbox_kind = Some(SandboxKind::Container);
     status.provider_state = inspect
         .state
         .as_ref()
@@ -317,6 +319,12 @@ impl SandboxProvider for DockerProvider {
         events: Option<EventCallback>,
     ) -> Result<Arc<dyn Sandbox>> {
         spec.validate()?;
+        if matches!(spec.sandbox_kind, Some(kind) if kind != SandboxKind::Container) {
+            return Err(Error::invalid_spec(
+                "sandbox_kind",
+                "the docker provider creates container sandboxes only",
+            ));
+        }
         let SandboxSource::Image { reference } = &spec.source else {
             return Err(Error::invalid_spec(
                 "source",
@@ -614,7 +622,9 @@ impl Sandbox for DockerSandbox {
                 Ok(status)
             }
             Err(error) if is_not_found(&error) => {
-                Ok(SandboxStatus::new(self.id.clone(), SandboxState::Deleted))
+                let mut status = SandboxStatus::new(self.id.clone(), SandboxState::Deleted);
+                status.sandbox_kind = Some(SandboxKind::Container);
+                Ok(status)
             }
             Err(error) => Err(docker_error("inspecting container", &error)),
         }

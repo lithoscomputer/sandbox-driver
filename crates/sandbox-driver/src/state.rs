@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::id::SandboxId;
 use crate::sandbox::WorkspaceOwnership;
-use crate::spec::Resources;
+use crate::spec::{Resources, SandboxKind};
 
 /// Typed sandbox state for logic. The provider's raw state string travels
 /// alongside in [`SandboxStatus::provider_state`] for display and debugging.
@@ -66,6 +66,12 @@ pub struct SandboxStatus {
     pub error_reason:        Option<String>,
     #[serde(default)]
     pub resources:           Option<Resources>,
+    /// Observed provisioning kind. This is not an isolation guarantee.
+    #[serde(default)]
+    pub sandbox_kind:        Option<SandboxKind>,
+    /// Provider region or target in which the sandbox runs.
+    #[serde(default)]
+    pub region:              Option<String>,
     #[serde(default)]
     pub labels:              BTreeMap<String, String>,
     /// Snapshot or image the sandbox was created from, when known.
@@ -92,6 +98,8 @@ impl SandboxStatus {
             provider_state: String::new(),
             error_reason: None,
             resources: None,
+            sandbox_kind: None,
+            region: None,
             labels: BTreeMap::new(),
             source: None,
             workspace_ownership: None,

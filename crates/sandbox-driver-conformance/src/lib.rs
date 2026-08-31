@@ -295,11 +295,29 @@ async fn provider_identity_and_list(ctx: &Conformance) -> CheckOutcome {
         .list(&SandboxFilter::default())
         .await
         .map_err(|error| format!("list failed: {error}"))?;
+    if let Some(snapshots) = &ctx.provider.capabilities().snapshots {
+        if (snapshots.from_image_kinds.container || snapshots.from_image_kinds.virtual_machine)
+            && !snapshots.from_image
+        {
+            return fail("exact image snapshot support is set but aggregate support is false");
+        }
+        if (snapshots.from_dockerfile_kinds.container
+            || snapshots.from_dockerfile_kinds.virtual_machine)
+            && !snapshots.from_dockerfile
+        {
+            return fail("exact Dockerfile snapshot support is set but aggregate support is false");
+        }
+    }
     PASS
 }
 
 async fn create_describe_delete(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.create().await?;
+    let spec = ctx.specs.spec();
+    let sandbox = ctx
+        .provider
+        .create(&spec, None)
+        .await
+        .map_err(|error| format!("create failed: {error}"))?;
     let outcome = async {
         let status = sandbox
             .describe()
@@ -307,6 +325,22 @@ async fn create_describe_delete(ctx: &Conformance) -> CheckOutcome {
             .map_err(|error| format!("describe failed: {error}"))?;
         if status.id != *sandbox.id() {
             return fail("describe returned a different sandbox id");
+        }
+        if let Some(requested) = spec.sandbox_kind {
+            if status.sandbox_kind != Some(requested) {
+                return fail(format!(
+                    "requested sandbox kind {requested:?}, observed {:?}",
+                    status.sandbox_kind
+                ));
+            }
+        }
+        if let Some(requested) = &spec.region {
+            if status.region.as_deref() != Some(requested) {
+                return fail(format!(
+                    "requested region {requested:?}, observed {:?}",
+                    status.region
+                ));
+            }
         }
         if sandbox.working_directory().is_empty() {
             return fail("working_directory is empty");

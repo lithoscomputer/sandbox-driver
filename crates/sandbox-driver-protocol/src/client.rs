@@ -210,7 +210,7 @@ impl sandbox_driver::SandboxProvider for PluginProvider {
         let outcome: Result<m::HandleInfo> = self
             .client
             .call(m::SANDBOX_CREATE, &m::CreateParams {
-                spec:         spec.clone(),
+                spec:         m::SandboxSpecDto::try_from(spec)?,
                 operation_id: operation_id.clone(),
             })
             .await;

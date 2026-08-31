@@ -58,6 +58,8 @@ pub struct SandboxStatus {
     pub provider_state: String,          // raw, e.g. Daytona's "pulling_snapshot"
     pub error_reason: Option<String>,
     pub resources: Option<Resources>,
+    pub sandbox_kind: Option<SandboxKind>, // observed container or virtual_machine provisioning form
+    pub region: Option<String>,
     pub labels: BTreeMap<String, String>,
     pub web_url: Option<String>,         // provider console page, when one exists
     pub created_at: Option<SystemTime>,
@@ -172,7 +174,7 @@ pub struct Capabilities {
     pub logs: Option<LogsCaps>,
     pub access: AccessCaps,           // preview_urls { signed }, ssh { ttl, revoke }, shell_command, web_terminal, vnc
     pub network: NetworkCaps,         // modes: block_all, allow_all, cidr_allow_list, domain_allow_list, proxy
-    pub snapshots: Option<SnapshotCaps>,  // image, dockerfile, filesystem/live-process sandbox modes; activation
+    pub snapshots: Option<SnapshotCaps>,  // image/dockerfile × container/VM, sandbox capture modes; activation
     pub volumes: Option<VolumeCaps>,
 }
 ```
@@ -315,6 +317,24 @@ pub trait SnapshotProvider: Send + Sync {
     async fn deactivate(&self, id: &SnapshotId) -> Result<(), Error>;
 }
 
+pub struct SnapshotSpec {
+    pub name: Option<String>,
+    pub source: SnapshotSource,
+    pub sandbox_kind: Option<SandboxKind>,
+    pub region: Option<String>,
+    pub resources: Resources,
+    pub provider_config: serde_json::Value,
+}
+
+pub struct SnapshotStatus {
+    pub id: SnapshotId,
+    pub state: SnapshotState,
+    pub sandbox_kind: Option<SandboxKind>,
+    pub regions: Vec<String>,
+    pub resources: Option<Resources>,
+    // …name, error, size, timestamps
+}
+
 #[async_trait]
 pub trait VolumeProvider: Send + Sync {
     async fn create(&self, spec: &VolumeSpec) -> Result<VolumeId, Error>;
@@ -326,13 +346,16 @@ pub trait VolumeProvider: Send + Sync {
 
 Volumes attach at **create time only** (`SandboxSpec.volumes: Vec<VolumeMount { volume, mount_path, subpath }>`) — Daytona has no runtime attach/detach and we don't invent one. Snapshot build progress flows through events and `build_logs`; content-addressed snapshot naming (fabro's HMAC scheme) stays in fabro — this crate takes names.
 
+`SandboxKind` selects the provisioning form: `Container` or `VirtualMachine`. It is separate from `Isolation`, which describes the provider's security boundary. `SnapshotSpec.sandbox_kind` selects the snapshot class. `SandboxSpec.sandbox_kind` is a required-result constraint: a provider must honor it or reject the request. It must not silently change the kind or create a hidden intermediate snapshot. Daytona supports image-based snapshots for both kinds and Dockerfile-based snapshots for containers only. A Daytona sandbox created from a snapshot inherits that snapshot's class; the provider validates a requested kind before and after creation.
+
 ### The creation spec
 
 ```rust
 pub struct SandboxSpec {
     pub name: Option<String>,
-    pub source: SandboxSource,            // Image(ref) | Dockerfile { content, context } | Snapshot(id/name)
-    pub resources: Option<Resources>,     // cpu cores, memory_mb, disk_mb, gpu
+    pub source: SandboxSource,            // Image(ref) | Dockerfile { content } | Snapshot { id }
+    pub resources: Resources,             // optional cpu_cores, memory_mb, disk_mb, gpus fields
+    pub sandbox_kind: Option<SandboxKind>, // required result when set
     pub env: BTreeMap<String, String>,
     pub labels: BTreeMap<String, String>,
     pub user: Option<String>,
@@ -349,7 +372,7 @@ pub struct SandboxSpec {
 
 `provider_config` is the pressure valve: Daytona's GPU type preference lists, spot instances, linked sandboxes, warm-pool hints, and future boxd golden-image options live there without polluting the common spec. It crosses the JSON-RPC boundary opaquely.
 
-**The spec is an unvalidated wire DTO, by name.** Its fields are public so it round-trips JSON-RPC, and it can express combinations no provider accepts. Validation happens at the provider boundary: every provider calls `SandboxSpec::validate()` (the cross-provider invariants — mutually exclusive idle timers, absolute mount paths, non-empty ids) and layers its own provider-specific checks, returning the typed `Error::InvalidSpec` naming the field. The builder setters are construction convenience, not an invariant guarantee.
+**The spec is an unvalidated serializable request.** Its fields are public and it can express combinations no provider accepts. The protocol adapter maps it to the stable version-1 wire DTO; in particular, the public typed snapshot `id` still crosses as `source.snapshot.name`. Validation happens at the provider boundary: every provider calls `SandboxSpec::validate()` (the cross-provider invariants — known sandbox kind, mutually exclusive idle timers, absolute mount paths, non-empty ids) and layers its own provider-specific checks, returning the typed `Error::InvalidSpec` naming the field. The builder setters are construction convenience, not an invariant guarantee.
 
 **Not in the spec:** clone URLs, branches, tags, commit SHAs, GitHub credentials. Fabro's spec carries these today, but cloning is an orchestration recipe over `Exec` + `Git`, not a provisioning concern — it stays in fabro (with its repo-layout, pinned-revision, and retry logic).
 

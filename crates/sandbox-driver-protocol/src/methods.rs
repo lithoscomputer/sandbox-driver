@@ -11,9 +11,9 @@ use std::time::Duration;
 use sandbox_driver::{
     Capabilities, CaptureStats, DirEntry, Error, ExecResult, ExecSpec, FileMetadata, ForkOptions,
     LifecycleTimers, LogSource, NetworkPolicy, OutputSanitization, PlatformInfo, ProviderKind,
-    PtyOptions, PtySize, Resources, SandboxEvent, SandboxFilter, SandboxId, SandboxSnapshotOptions,
-    SandboxSpec, SandboxStatus, SnapshotMode, SnapshotSource, SnapshotSpec, SpawnSpec, Termination,
-    VncConnection,
+    PtyOptions, PtySize, Resources, SandboxEvent, SandboxFilter, SandboxId, SandboxKind,
+    SandboxSnapshotOptions, SandboxSource, SandboxSpec, SandboxStatus, SnapshotId, SnapshotMode,
+    SnapshotSource, SnapshotSpec, SpawnSpec, Termination, VncConnection, VolumeMount,
 };
 use serde::{Deserialize, Serialize};
 
@@ -118,11 +118,125 @@ pub struct ProviderInfo {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateParams {
-    pub spec:         SandboxSpec,
+    pub spec:         SandboxSpecDto,
     /// Host-generated id correlating `host/event` notifications emitted
     /// while this create runs, before a sandbox id exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<String>,
+}
+
+/// Protocol-v1 sandbox creation shape. Snapshot sources retain the
+/// original `name` field even though the public API uses a typed id.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SandboxSpecDto {
+    #[serde(default)]
+    pub name:              Option<String>,
+    pub source:            SandboxSourceDto,
+    #[serde(default)]
+    pub resources:         Resources,
+    #[serde(default)]
+    pub sandbox_kind:      Option<SandboxKind>,
+    #[serde(default)]
+    pub env:               BTreeMap<String, String>,
+    #[serde(default)]
+    pub labels:            BTreeMap<String, String>,
+    #[serde(default)]
+    pub user:              Option<String>,
+    #[serde(default)]
+    pub working_directory: Option<String>,
+    #[serde(default)]
+    pub network:           NetworkPolicy,
+    #[serde(default)]
+    pub volumes:           Vec<VolumeMount>,
+    #[serde(default)]
+    pub timers:            LifecycleTimers,
+    #[serde(default)]
+    pub ephemeral:         bool,
+    #[serde(default)]
+    pub public:            Option<bool>,
+    #[serde(default)]
+    pub region:            Option<String>,
+    #[serde(default)]
+    pub provider_config:   serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxSourceDto {
+    Image { reference: String },
+    Dockerfile { content: String },
+    Snapshot { name: String },
+    HostDirectory,
+}
+
+impl TryFrom<&SandboxSpec> for SandboxSpecDto {
+    type Error = Error;
+
+    fn try_from(spec: &SandboxSpec) -> Result<Self, Self::Error> {
+        let source = match &spec.source {
+            SandboxSource::Image { reference } => SandboxSourceDto::Image {
+                reference: reference.clone(),
+            },
+            SandboxSource::Dockerfile { content } => SandboxSourceDto::Dockerfile {
+                content: content.clone(),
+            },
+            SandboxSource::Snapshot { id } => SandboxSourceDto::Snapshot {
+                name: id.as_str().to_owned(),
+            },
+            SandboxSource::HostDirectory => SandboxSourceDto::HostDirectory,
+            _ => return Err(Error::invalid_spec("source", "unsupported sandbox source")),
+        };
+        Ok(Self {
+            name: spec.name.clone(),
+            source,
+            resources: spec.resources,
+            sandbox_kind: spec.sandbox_kind,
+            env: spec.env.clone(),
+            labels: spec.labels.clone(),
+            user: spec.user.clone(),
+            working_directory: spec.working_directory.clone(),
+            network: spec.network.clone(),
+            volumes: spec.volumes.clone(),
+            timers: spec.timers,
+            ephemeral: spec.ephemeral,
+            public: spec.public,
+            region: spec.region.clone(),
+            provider_config: spec.provider_config.clone(),
+        })
+    }
+}
+
+impl TryFrom<SandboxSpecDto> for SandboxSpec {
+    type Error = Error;
+
+    fn try_from(spec: SandboxSpecDto) -> Result<Self, Self::Error> {
+        let source = match spec.source {
+            SandboxSourceDto::Image { reference } => SandboxSource::Image { reference },
+            SandboxSourceDto::Dockerfile { content } => SandboxSource::Dockerfile { content },
+            SandboxSourceDto::Snapshot { name } => SandboxSource::Snapshot {
+                id: SnapshotId::try_new(name).map_err(|error| {
+                    Error::invalid_spec("source.snapshot.name", error.to_string())
+                })?,
+            },
+            SandboxSourceDto::HostDirectory => SandboxSource::HostDirectory,
+        };
+        let mut result = Self::new(source);
+        result.name = spec.name;
+        result.resources = spec.resources;
+        result.sandbox_kind = spec.sandbox_kind;
+        result.env = spec.env;
+        result.labels = spec.labels;
+        result.user = spec.user;
+        result.working_directory = spec.working_directory;
+        result.network = spec.network;
+        result.volumes = spec.volumes;
+        result.timers = spec.timers;
+        result.ephemeral = spec.ephemeral;
+        result.public = spec.public;
+        result.region = spec.region;
+        result.provider_config = spec.provider_config;
+        Ok(result)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -577,6 +691,10 @@ pub struct SnapshotSpecDto {
     pub name:            Option<String>,
     pub source:          SnapshotSourceDto,
     #[serde(default)]
+    pub sandbox_kind:    Option<SandboxKind>,
+    #[serde(default)]
+    pub region:          Option<String>,
+    #[serde(default)]
     pub resources:       Resources,
     #[serde(default)]
     pub provider_config: serde_json::Value,
@@ -618,6 +736,8 @@ impl TryFrom<&SnapshotSpec> for SnapshotSpecDto {
         Ok(Self {
             name: spec.name.clone(),
             source,
+            sandbox_kind: spec.sandbox_kind,
+            region: spec.region.clone(),
             resources: spec.resources,
             provider_config: spec.provider_config.clone(),
         })
@@ -640,6 +760,8 @@ impl From<SnapshotSpecDto> for SnapshotSpec {
         };
         let mut result = Self::new(source);
         result.name = spec.name;
+        result.sandbox_kind = spec.sandbox_kind;
+        result.region = spec.region;
         result.resources = spec.resources;
         result.provider_config = spec.provider_config;
         result

@@ -11,11 +11,11 @@ use std::time::Duration;
 
 use sandbox_driver::{
     Capabilities, Capability, Error, ErrorReport, ForkOptions, LifecycleAction, ResourceKind,
-    SandboxSnapshotOptions, SandboxSpec, SandboxState, SandboxStatus, SnapshotMode, SnapshotSource,
-    SnapshotSpec, Termination,
+    SandboxKind, SandboxSnapshotOptions, SandboxSource, SandboxSpec, SandboxState, SandboxStatus,
+    SnapshotId, SnapshotMode, SnapshotSource, SnapshotSpec, Termination,
 };
 use sandbox_driver_protocol::methods::{
-    ForkOptionsDto, SandboxSnapshotOptionsDto, SnapshotSourceDto, SnapshotSpecDto,
+    ForkOptionsDto, SandboxSnapshotOptionsDto, SandboxSpecDto, SnapshotSourceDto, SnapshotSpecDto,
 };
 
 /// The version-1 launch shape of the capability set, exactly as a plugin
@@ -50,7 +50,10 @@ fn launch_era_capabilities_still_decode() {
     assert!(caps.lifecycle.archive);
     assert!(!caps.lifecycle.undelete, "absent field defaults to false");
     assert!(!caps.services.native, "absent group defaults");
-    assert!(caps.snapshots.expect("snapshots present").from_image);
+    let snapshots = caps.snapshots.expect("snapshots present");
+    assert!(snapshots.from_image);
+    assert!(!snapshots.from_image_kinds.container);
+    assert!(!snapshots.from_image_kinds.virtual_machine);
 }
 
 /// A launch-era creation spec — written by hand the way a non-Rust host
@@ -98,7 +101,43 @@ fn launch_era_status_still_decodes() {
     let status: SandboxStatus = serde_json::from_str(json).expect("launch-era status decodes");
     assert_eq!(status.state, SandboxState::Running);
     assert!(status.web_url.is_none(), "absent newer field defaults");
+    assert!(status.sandbox_kind.is_none());
+    assert!(status.region.is_none());
     assert_eq!(status.labels.get("team").map(String::as_str), Some("a"));
+}
+
+#[test]
+fn snapshot_sandbox_source_keeps_the_v1_name_field() {
+    let legacy: SandboxSpecDto = serde_json::from_value(serde_json::json!({
+        "source": {"snapshot": {"name": "base-snapshot"}}
+    }))
+    .expect("v1 snapshot source decodes");
+    let core = SandboxSpec::try_from(legacy).expect("maps to public API");
+    assert!(matches!(
+        &core.source,
+        SandboxSource::Snapshot { id } if id.as_str() == "base-snapshot"
+    ));
+
+    let dto = SandboxSpecDto::try_from(&core).expect("maps back to v1");
+    let json = serde_json::to_value(dto).expect("serializes");
+    assert_eq!(json["source"]["snapshot"]["name"], "base-snapshot");
+    assert!(json["source"]["snapshot"].get("id").is_none());
+}
+
+#[test]
+fn sandbox_kind_and_region_cross_as_additive_fields() {
+    let spec = SandboxSpec::new(SandboxSource::Snapshot {
+        id: SnapshotId::try_new("base-snapshot").expect("valid snapshot id"),
+    })
+    .sandbox_kind(SandboxKind::VirtualMachine)
+    .region("eu");
+    let dto = SandboxSpecDto::try_from(&spec).expect("maps to v1 DTO");
+    let json = serde_json::to_value(&dto).expect("serializes");
+    assert_eq!(json["sandbox_kind"], "virtual_machine");
+    assert_eq!(json["region"], "eu");
+    let back = SandboxSpec::try_from(dto).expect("maps to public API");
+    assert_eq!(back.sandbox_kind, Some(SandboxKind::VirtualMachine));
+    assert_eq!(back.region.as_deref(), Some("eu"));
 }
 
 #[test]
@@ -186,4 +225,20 @@ fn normalized_snapshot_modes_map_to_the_v1_memory_shape() {
         };
         assert_eq!(actual, include_memory);
     }
+}
+
+#[test]
+fn snapshot_build_kind_and_region_cross_as_additive_fields() {
+    let spec = SnapshotSpec::new(SnapshotSource::Image {
+        reference: "ubuntu:24.04".to_owned(),
+    })
+    .sandbox_kind(SandboxKind::VirtualMachine)
+    .region("us");
+    let dto = SnapshotSpecDto::try_from(&spec).expect("maps to v1 DTO");
+    let json = serde_json::to_value(&dto).expect("serializes");
+    assert_eq!(json["sandbox_kind"], "virtual_machine");
+    assert_eq!(json["region"], "us");
+    let back = SnapshotSpec::from(dto);
+    assert_eq!(back.sandbox_kind, Some(SandboxKind::VirtualMachine));
+    assert_eq!(back.region.as_deref(), Some("us"));
 }

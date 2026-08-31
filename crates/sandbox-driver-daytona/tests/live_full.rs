@@ -10,15 +10,14 @@ use std::{env, process};
 
 use sandbox_driver::{
     Capability, Error, ExecSpec, LifecycleAction, LifecycleTimers, LogSink, LogSource,
-    NetworkPolicy, Resources, SandboxProvider, SandboxSnapshotOptions, SandboxSource, SandboxSpec,
-    SandboxState, SnapshotMode, SnapshotSource, SnapshotSpec, SnapshotState, WaitOptions,
-    wait_for_state,
+    NetworkPolicy, Resources, SandboxKind, SandboxProvider, SandboxSnapshotOptions, SandboxSource,
+    SandboxSpec, SandboxState, SnapshotId, SnapshotMode, SnapshotSource, SnapshotSpec,
+    SnapshotState, WaitOptions, wait_for_state,
 };
 use sandbox_driver_daytona::DaytonaProvider;
 use tokio::time;
 
 const TEST_SNAPSHOT: &str = "daytona-medium";
-const TEST_VM_SNAPSHOT: &str = "daytona-vm-small";
 
 fn unique(prefix: &str) -> String {
     let nanos = SystemTime::now()
@@ -34,6 +33,14 @@ fn wait() -> WaitOptions {
     }
 }
 
+fn snapshot_resources(disk_mb: u64) -> Resources {
+    let mut resources = Resources::default();
+    resources.cpu_cores = Some(1);
+    resources.memory_mb = Some(1024);
+    resources.disk_mb = Some(disk_mb);
+    resources
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn labels_timers_access_round_trip() {
     if env::var("DAYTONA_API_KEY").is_err() {
@@ -41,7 +48,7 @@ async fn labels_timers_access_round_trip() {
     }
     let provider = DaytonaProvider::connect().await.expect("connect");
     let spec = SandboxSpec::new(SandboxSource::Snapshot {
-        name: TEST_SNAPSHOT.to_owned(),
+        id: SnapshotId::try_new(TEST_SNAPSHOT).expect("valid snapshot id"),
     })
     .ephemeral(true);
     let sandbox = provider.create(&spec, None).await.expect("create");
@@ -147,7 +154,7 @@ async fn cidr_egress_limits_apply_at_create_and_runtime() {
     }
     let provider = DaytonaProvider::connect().await.expect("connect");
     let spec = SandboxSpec::new(SandboxSource::Snapshot {
-        name: TEST_SNAPSHOT.to_owned(),
+        id: SnapshotId::try_new(TEST_SNAPSHOT).expect("valid snapshot id"),
     })
     .network(NetworkPolicy::CidrAllowList {
         // TEST-NET-3 cannot contain Cloudflare's public endpoint.
@@ -211,7 +218,7 @@ async fn stop_resize_archive_restore_lifecycle() {
     // Non-ephemeral: an ephemeral sandbox deletes itself on stop, and
     // archive requires a stopped sandbox.
     let spec = SandboxSpec::new(SandboxSource::Snapshot {
-        name: TEST_SNAPSHOT.to_owned(),
+        id: SnapshotId::try_new(TEST_SNAPSHOT).expect("valid snapshot id"),
     })
     .name(unique("sd-live-lifecycle"));
     let sandbox = provider.create(&spec, None).await.expect("create");
@@ -308,24 +315,47 @@ async fn fork_and_snapshot_modes_preserve_their_declared_state() {
         return;
     }
     let provider = DaytonaProvider::connect().await.expect("connect");
-    let mut source_spec = SandboxSpec::new(SandboxSource::Snapshot {
-        name: TEST_VM_SNAPSHOT.to_owned(),
+    let snapshots = provider.snapshots().expect("snapshot provider declared");
+    let vm_snapshot_spec = SnapshotSpec::new(SnapshotSource::Image {
+        reference: "ubuntu:24.04".to_owned(),
     })
-    .name(unique("sd-live-vm-state"));
-    source_spec.region = Some("eu".to_owned());
-    let source = match provider.create(&source_spec, None).await {
-        Ok(source) => source,
-        Err(Error::Provider(provider_error))
-            if provider_error.code.as_deref() == Some("400")
-                && provider_error.message.contains("not available in region") =>
+    .name(unique("sd-live-vm-base"))
+    .sandbox_kind(SandboxKind::VirtualMachine)
+    .region("us-central-1")
+    .resources(snapshot_resources(3072));
+    let vm_snapshot_id = match snapshots.create(&vm_snapshot_spec).await {
+        Ok(id) => id,
+        Err(Error::Provider(error))
+            if (error.code.as_deref() == Some("400")
+                && error.message.contains("No runners are configured"))
+                || (error.code.as_deref() == Some("403")
+                    && error.message.contains("not available to the organization")) =>
         {
             return;
         }
-        Err(error) => panic!("create VM: {error}"),
+        Err(error) => panic!("create VM snapshot from image: {error}"),
     };
-    let snapshots = provider.snapshots().expect("snapshot provider declared");
+    if let Err(error) =
+        wait_for_snapshot_state(snapshots, &vm_snapshot_id, SnapshotState::Active).await
+    {
+        let _ = snapshots.delete(&vm_snapshot_id).await;
+        panic!("VM snapshot did not become active: {error}");
+    }
+    let source_spec = SandboxSpec::new(SandboxSource::Snapshot {
+        id: vm_snapshot_id.clone(),
+    })
+    .name(unique("sd-live-vm-state"))
+    .sandbox_kind(SandboxKind::VirtualMachine)
+    .region("us-central-1");
+    let source = match provider.create(&source_spec, None).await {
+        Ok(source) => source,
+        Err(error) => {
+            let _ = snapshots.delete(&vm_snapshot_id).await;
+            panic!("create VM: {error}");
+        }
+    };
     let mut created_sandboxes: Vec<Arc<dyn sandbox_driver::Sandbox>> = Vec::new();
-    let mut created_snapshots = Vec::new();
+    let mut created_snapshots = vec![vm_snapshot_id];
 
     let outcome = async {
         if !source.capabilities().lifecycle.fork
@@ -336,6 +366,17 @@ async fn fork_and_snapshot_modes_preserve_their_declared_state() {
                 .is_some_and(|caps| caps.live_process_state_from_sandbox)
         {
             return Err("VM sandbox did not declare fork and hot snapshots".to_owned());
+        }
+        let source_status = source
+            .describe()
+            .await
+            .map_err(|error| format!("describe VM: {error}"))?;
+        if source_status.sandbox_kind != Some(SandboxKind::VirtualMachine)
+            || source_status.region.as_deref() != Some("us-central-1")
+        {
+            return Err(format!(
+                "VM status did not preserve kind and region: {source_status:?}"
+            ));
         }
         let setup = source
             .exec()
@@ -372,9 +413,10 @@ async fn fork_and_snapshot_modes_preserve_their_declared_state() {
             .map_err(|error| format!("hot snapshot: {error}"))?;
         created_snapshots.push(hot_id.clone());
         wait_for_snapshot_state(snapshots, &hot_id, SnapshotState::Active).await?;
-        let mut hot_restore_spec =
-            SandboxSpec::new(SandboxSource::Snapshot { name: hot_name }).ephemeral(true);
-        hot_restore_spec.region = Some("eu".to_owned());
+        let mut hot_restore_spec = SandboxSpec::new(SandboxSource::Snapshot { id: hot_id.clone() })
+            .sandbox_kind(SandboxKind::VirtualMachine)
+            .ephemeral(true);
+        hot_restore_spec.region = Some("us-central-1".to_owned());
         let hot_restore = provider
             .create(&hot_restore_spec, None)
             .await
@@ -421,9 +463,12 @@ async fn fork_and_snapshot_modes_preserve_their_declared_state() {
             .map_err(|error| format!("filesystem snapshot: {error}"))?;
         created_snapshots.push(cold_id.clone());
         wait_for_snapshot_state(snapshots, &cold_id, SnapshotState::Active).await?;
-        let mut cold_restore_spec =
-            SandboxSpec::new(SandboxSource::Snapshot { name: cold_name }).ephemeral(true);
-        cold_restore_spec.region = Some("eu".to_owned());
+        let mut cold_restore_spec = SandboxSpec::new(SandboxSource::Snapshot {
+            id: cold_id.clone(),
+        })
+        .sandbox_kind(SandboxKind::VirtualMachine)
+        .ephemeral(true);
+        cold_restore_spec.region = Some("us-central-1".to_owned());
         let cold_restore = provider
             .create(&cold_restore_spec, None)
             .await
@@ -469,7 +514,7 @@ async fn filesystem_snapshot_restores_files_without_processes() {
     }
     let provider = DaytonaProvider::connect().await.expect("connect");
     let source_spec = SandboxSpec::new(SandboxSource::Snapshot {
-        name: TEST_SNAPSHOT.to_owned(),
+        id: SnapshotId::try_new(TEST_SNAPSHOT).expect("valid snapshot id"),
     })
     .name(unique("sd-live-filesystem-source"));
     let source = provider.create(&source_spec, None).await.expect("create");
@@ -538,7 +583,7 @@ async fn filesystem_snapshot_restores_files_without_processes() {
 
         let sandbox = provider
             .create(
-                &SandboxSpec::new(SandboxSource::Snapshot { name }).ephemeral(true),
+                &SandboxSpec::new(SandboxSource::Snapshot { id: id.clone() }).ephemeral(true),
                 None,
             )
             .await
@@ -615,13 +660,13 @@ async fn snapshot_provider_round_trip() {
     let snapshots = provider.snapshots().expect("snapshot provider declared");
 
     let name = unique("sd-live-snap");
-    let mut spec = SnapshotSpec::new(SnapshotSource::Image {
+    let spec = SnapshotSpec::new(SnapshotSource::Image {
         reference: "debian:stable-slim".to_owned(),
-    });
-    spec.name = Some(name.clone());
-    spec.resources.cpu_cores = Some(1);
-    spec.resources.memory_mb = Some(1024);
-    spec.resources.disk_mb = Some(1024);
+    })
+    .name(name.clone())
+    .sandbox_kind(SandboxKind::Container)
+    .region("us")
+    .resources(snapshot_resources(1024));
     let id = snapshots.create(&spec).await.expect("snapshot create");
 
     let outcome = async {
@@ -633,7 +678,16 @@ async fn snapshot_provider_round_trip() {
                 .await
                 .map_err(|error| format!("snapshot get: {error}"))?;
             match status.state {
-                SnapshotState::Active => break,
+                SnapshotState::Active => {
+                    if status.sandbox_kind != Some(SandboxKind::Container)
+                        || !status.regions.iter().any(|region| region == "us")
+                    {
+                        return Err(format!(
+                            "snapshot status did not preserve kind and region: {status:?}"
+                        ));
+                    }
+                    break;
+                }
                 SnapshotState::Error => {
                     return Err(format!("snapshot build failed: {:?}", status.error_reason));
                 }
@@ -655,7 +709,10 @@ async fn snapshot_provider_round_trip() {
         }
 
         // A sandbox must boot from it.
-        let spec = SandboxSpec::new(SandboxSource::Snapshot { name: name.clone() }).ephemeral(true);
+        let spec = SandboxSpec::new(SandboxSource::Snapshot { id: id.clone() })
+            .sandbox_kind(SandboxKind::Container)
+            .region("us")
+            .ephemeral(true);
         let sandbox = provider
             .create(&spec, None)
             .await
@@ -712,16 +769,27 @@ async fn dockerfile_snapshot_build_and_entrypoint_logs() {
     let provider = DaytonaProvider::connect().await.expect("connect");
     let snapshots = provider.snapshots().expect("snapshot provider declared");
     let name = unique("sd-live-dockerfile");
-    let mut spec = SnapshotSpec::new(SnapshotSource::Dockerfile {
-        content: r#"FROM debian:stable-slim
+    let dockerfile = r#"FROM debian:stable-slim
 ENTRYPOINT ["/bin/sh", "-c", "echo sandbox-driver-entrypoint; echo sandbox-driver-entrypoint-error >&2; sleep 2"]
-"#
-        .to_owned(),
-    });
-    spec.name = Some(name.clone());
-    spec.resources.cpu_cores = Some(1);
-    spec.resources.memory_mb = Some(1024);
-    spec.resources.disk_mb = Some(1024);
+"#;
+    let vm_spec = SnapshotSpec::new(SnapshotSource::Dockerfile {
+        content: dockerfile.to_owned(),
+    })
+    .sandbox_kind(SandboxKind::VirtualMachine);
+    assert!(matches!(
+        snapshots.create(&vm_spec).await,
+        Err(Error::Unsupported {
+            capability: Capability::SnapshotsVmFromDockerfile,
+        })
+    ));
+
+    let spec = SnapshotSpec::new(SnapshotSource::Dockerfile {
+        content: dockerfile.to_owned(),
+    })
+    .name(name.clone())
+    .sandbox_kind(SandboxKind::Container)
+    .region("us")
+    .resources(snapshot_resources(1024));
     let id = snapshots
         .create(&spec)
         .await
@@ -740,7 +808,10 @@ ENTRYPOINT ["/bin/sh", "-c", "echo sandbox-driver-entrypoint; echo sandbox-drive
 
         let sandbox = provider
             .create(
-                &SandboxSpec::new(SandboxSource::Snapshot { name: name.clone() }).ephemeral(true),
+                &SandboxSpec::new(SandboxSource::Snapshot { id: id.clone() })
+                    .sandbox_kind(SandboxKind::Container)
+                    .region("us")
+                    .ephemeral(true),
                 None,
             )
             .await

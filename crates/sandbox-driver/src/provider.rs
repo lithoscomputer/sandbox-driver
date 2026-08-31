@@ -11,7 +11,7 @@ use crate::event::EventCallback;
 use crate::id::{ProviderKind, SandboxId, SnapshotId, VolumeId};
 use crate::logs::LogSink;
 use crate::sandbox::{Sandbox, SnapshotMode};
-use crate::spec::{Resources, SandboxSpec};
+use crate::spec::{Resources, SandboxKind, SandboxSpec};
 use crate::state::SandboxStatus;
 
 /// A sandbox backend: host, docker, daytona, or a JSON-RPC plugin.
@@ -194,6 +194,13 @@ pub struct SnapshotSpec {
     #[serde(default)]
     pub name:            Option<String>,
     pub source:          SnapshotSource,
+    /// Kind of sandbox that can be created from this snapshot. `None`
+    /// uses the provider default or inherits from a sandbox source.
+    #[serde(default)]
+    pub sandbox_kind:    Option<SandboxKind>,
+    /// Region in which to build the snapshot.
+    #[serde(default)]
+    pub region:          Option<String>,
     #[serde(default)]
     pub resources:       Resources,
     /// Provider-specific options.
@@ -206,9 +213,47 @@ impl SnapshotSpec {
         Self {
             name: None,
             source,
+            sandbox_kind: None,
+            region: None,
             resources: Resources::default(),
             provider_config: serde_json::Value::Null,
         }
+    }
+
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    #[must_use]
+    pub fn sandbox_kind(mut self, sandbox_kind: SandboxKind) -> Self {
+        self.sandbox_kind = Some(sandbox_kind);
+        self
+    }
+
+    #[must_use]
+    pub fn region(mut self, region: impl Into<String>) -> Self {
+        self.region = Some(region.into());
+        self
+    }
+
+    #[must_use]
+    pub fn resources(mut self, resources: Resources) -> Self {
+        self.resources = resources;
+        self
+    }
+
+    /// Checks normalized snapshot creation invariants. Providers add
+    /// their source- and kind-specific validation at the boundary.
+    pub fn validate(&self) -> Result<()> {
+        if self.sandbox_kind == Some(SandboxKind::Unknown) {
+            return Err(Error::invalid_spec("sandbox_kind", "unknown sandbox kind"));
+        }
+        if self.region.as_deref() == Some("") {
+            return Err(Error::invalid_spec("region", "must not be empty"));
+        }
+        Ok(())
     }
 }
 
@@ -234,6 +279,15 @@ pub struct SnapshotStatus {
     #[serde(default)]
     pub name:         Option<String>,
     pub state:        SnapshotState,
+    /// Kind of sandbox that can be created from this snapshot.
+    #[serde(default)]
+    pub sandbox_kind: Option<SandboxKind>,
+    /// Provider regions in which this snapshot is available.
+    #[serde(default)]
+    pub regions:      Vec<String>,
+    /// Default resources encoded in the snapshot.
+    #[serde(default)]
+    pub resources:    Option<Resources>,
     #[serde(default)]
     pub error_reason: Option<String>,
     #[serde(default)]
@@ -248,6 +302,9 @@ impl SnapshotStatus {
             id,
             name: None,
             state,
+            sandbox_kind: None,
+            regions: Vec::new(),
+            resources: None,
             error_reason: None,
             size_bytes: None,
             created_at: None,
@@ -333,5 +390,31 @@ impl VolumeStatus {
             error_reason: None,
             created_at: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_spec_builder_sets_kind_region_and_resources() {
+        let resources = Resources {
+            cpu_cores: Some(2),
+            ..Resources::default()
+        };
+        let spec = SnapshotSpec::new(SnapshotSource::Image {
+            reference: "ubuntu:24.04".to_owned(),
+        })
+        .name("base")
+        .sandbox_kind(SandboxKind::VirtualMachine)
+        .region("eu")
+        .resources(resources);
+
+        assert_eq!(spec.name.as_deref(), Some("base"));
+        assert_eq!(spec.sandbox_kind, Some(SandboxKind::VirtualMachine));
+        assert_eq!(spec.region.as_deref(), Some("eu"));
+        assert_eq!(spec.resources, resources);
+        assert!(spec.validate().is_ok());
     }
 }

@@ -110,6 +110,12 @@ impl SandboxProvider for HostProvider {
         events: Option<EventCallback>,
     ) -> Result<Arc<dyn Sandbox>> {
         spec.validate()?;
+        if spec.sandbox_kind.is_some() {
+            return Err(Error::invalid_spec(
+                "sandbox_kind",
+                "the host provider does not provision containers or virtual machines",
+            ));
+        }
         if !matches!(spec.source, SandboxSource::HostDirectory) {
             return Err(Error::invalid_spec(
                 "source",

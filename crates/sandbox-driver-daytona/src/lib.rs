@@ -57,10 +57,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use daytona_api_client::apis::{Error as ApiError, api_keys_api, sandbox_api, snapshots_api};
 use daytona_api_client::models::api_key_list::Permissions;
-use daytona_api_client::models::sandbox::SandboxClass;
+use daytona_api_client::models::sandbox::SandboxClass as DaytonaSandboxClass;
+use daytona_api_client::models::snapshot_dto::SandboxClass as DaytonaSnapshotClass;
 use daytona_api_client::models::{
-    CreateSandboxSnapshot, SnapshotState as ApiSnapshotState, UpdateSandboxNetworkSettings,
-    VolumeDto, VolumeState as ApiVolumeState,
+    CreateSandboxSnapshot, SandboxClass as DaytonaCreateSandboxClass, SnapshotDto,
+    SnapshotState as ApiSnapshotState, UpdateSandboxNetworkSettings, VolumeDto,
+    VolumeState as ApiVolumeState,
 };
 use daytona_sdk::{
     Client, CreateParams, CreateSandboxOptions, CreateSnapshotParams, DaytonaError, DockerImage,
@@ -71,10 +73,11 @@ use sandbox_driver::{
     Filesystem, ForkOptions, HealthStatus, Isolation, LifecycleAction, LifecycleTimers, LogSink,
     Logs, LogsCaps, NetworkPolicy, PlatformInfo, PreviewUrls, ProviderError, ProviderHealth,
     ProviderKind, Pty, PtyCaps, ResourceKind, Resources, Result, Sandbox, SandboxEvent,
-    SandboxFilter, SandboxId, SandboxProvider, SandboxSnapshotOptions, SandboxSource, SandboxSpec,
-    SandboxState, SandboxStatus, SnapshotCaps, SnapshotFilter, SnapshotId, SnapshotMode,
-    SnapshotProvider, SnapshotSource, SnapshotSpec, SnapshotState, SnapshotStatus, SshAccess, Vnc,
-    VolumeCaps, VolumeId, VolumeProvider, VolumeSpec, VolumeState, VolumeStatus, WebTerminal,
+    SandboxFilter, SandboxId, SandboxKind, SandboxProvider, SandboxSnapshotOptions, SandboxSource,
+    SandboxSpec, SandboxState, SandboxStatus, SnapshotCaps, SnapshotFilter, SnapshotId,
+    SnapshotMode, SnapshotProvider, SnapshotSource, SnapshotSpec, SnapshotState, SnapshotStatus,
+    SshAccess, Vnc, VolumeCaps, VolumeId, VolumeProvider, VolumeSpec, VolumeState, VolumeStatus,
+    WebTerminal,
 };
 use tokio::time;
 
@@ -335,6 +338,34 @@ async fn created_snapshot_id(client: &DaytonaClient, name: &str) -> Result<Snaps
         .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))
 }
 
+fn sandbox_kind_from_sandbox_class(class: DaytonaSandboxClass) -> SandboxKind {
+    match class {
+        DaytonaSandboxClass::CONTAINER => SandboxKind::Container,
+        DaytonaSandboxClass::LINUX_VM
+        | DaytonaSandboxClass::ANDROID
+        | DaytonaSandboxClass::WINDOWS => SandboxKind::VirtualMachine,
+        DaytonaSandboxClass::UnknownDefaultOpenApi => SandboxKind::Unknown,
+    }
+}
+
+fn sandbox_kind_from_snapshot_class(class: DaytonaSnapshotClass) -> SandboxKind {
+    match class {
+        DaytonaSnapshotClass::CONTAINER => SandboxKind::Container,
+        DaytonaSnapshotClass::LINUX_VM
+        | DaytonaSnapshotClass::ANDROID
+        | DaytonaSnapshotClass::WINDOWS => SandboxKind::VirtualMachine,
+        DaytonaSnapshotClass::UnknownDefaultOpenApi => SandboxKind::Unknown,
+    }
+}
+
+fn daytona_snapshot_class(kind: SandboxKind) -> Result<DaytonaCreateSandboxClass> {
+    match kind {
+        SandboxKind::Container => Ok(DaytonaCreateSandboxClass::CONTAINER),
+        SandboxKind::VirtualMachine => Ok(DaytonaCreateSandboxClass::LINUX_VM),
+        _ => Err(Error::invalid_spec("sandbox_kind", "unknown sandbox kind")),
+    }
+}
+
 fn status_from_sdk(
     client: &daytona_sdk::Client,
     sdk: &daytona_sdk::Sandbox,
@@ -344,6 +375,8 @@ fn status_from_sdk(
     let mut status = SandboxStatus::new(id, map_state(sdk.state));
     status.provider_state = sdk.state.map(|state| state.to_string()).unwrap_or_default();
     status.error_reason.clone_from(&sdk.error_reason);
+    status.sandbox_kind = sdk.sandbox_class.map(sandbox_kind_from_sandbox_class);
+    status.region = (!sdk.target.is_empty()).then(|| sdk.target.clone());
     status.labels = sdk
         .labels
         .iter()
@@ -358,6 +391,9 @@ fn status_from_sdk(
         .filter(|cpu| *cpu > 0);
     resources.memory_mb = to_u64(sdk.memory * 1024.0).filter(|mb| *mb > 0);
     resources.disk_mb = to_u64(sdk.disk * 1024.0).filter(|mb| *mb > 0);
+    resources.gpus = to_u64(sdk.gpu)
+        .and_then(|gpu| u32::try_from(gpu).ok())
+        .filter(|gpu| *gpu > 0);
     status.resources = Some(resources);
     Ok(status)
 }
@@ -509,6 +545,44 @@ impl DaytonaProvider {
     ) -> Result<Arc<DaytonaSandbox>> {
         build_handle(&self.client, &self.capabilities, sdk, events).await
     }
+
+    async fn ensure_snapshot_kind(
+        &self,
+        id: &SnapshotId,
+        requested: Option<SandboxKind>,
+    ) -> Result<()> {
+        let Some(requested) = requested else {
+            return Ok(());
+        };
+        let snapshot = self
+            .client
+            .snapshot
+            .get(id.as_str())
+            .await
+            .map_err(|error| {
+                if is_not_found(&error) {
+                    Error::NotFound {
+                        resource: ResourceKind::Snapshot,
+                        id:       id.as_str().to_owned(),
+                    }
+                } else {
+                    daytona_error("fetching snapshot kind", &error)
+                }
+            })?;
+        let Some(actual) = snapshot.sandbox_class.map(sandbox_kind_from_snapshot_class) else {
+            return Err(Error::invalid_spec(
+                "sandbox_kind",
+                "the snapshot does not report a sandbox kind",
+            ));
+        };
+        if actual != requested {
+            return Err(Error::invalid_spec(
+                "sandbox_kind",
+                format!("the snapshot has kind {actual:?}, not {requested:?}"),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Builds a sandbox handle from an SDK sandbox, narrowing the capability
@@ -595,6 +669,9 @@ fn daytona_capabilities() -> Capabilities {
         let mut snapshots = SnapshotCaps::default();
         snapshots.from_image = true;
         snapshots.from_dockerfile = true;
+        snapshots.from_image_kinds.container = true;
+        snapshots.from_image_kinds.virtual_machine = true;
+        snapshots.from_dockerfile_kinds.container = true;
         snapshots.filesystem_from_sandbox = true;
         snapshots.live_process_state_from_sandbox = true;
         snapshots.build_logs = true;
@@ -616,9 +693,12 @@ fn daytona_capabilities() -> Capabilities {
 /// class and remain declared. An unknown or unreported class keeps the
 /// upper bound — the typed `Unsupported`/provider error at the call is
 /// still the enforcement.
-fn narrowed_capabilities(base: &Capabilities, class: Option<SandboxClass>) -> Capabilities {
+fn narrowed_capabilities(base: &Capabilities, class: Option<DaytonaSandboxClass>) -> Capabilities {
     let mut caps = base.clone();
-    if matches!(class, Some(SandboxClass::CONTAINER | SandboxClass::ANDROID)) {
+    if matches!(
+        class,
+        Some(DaytonaSandboxClass::CONTAINER | DaytonaSandboxClass::ANDROID)
+    ) {
         caps.lifecycle.pause = false;
         caps.lifecycle.fork = false;
         if let Some(snapshots) = &mut caps.snapshots {
@@ -627,7 +707,11 @@ fn narrowed_capabilities(base: &Capabilities, class: Option<SandboxClass>) -> Ca
     }
     if matches!(
         class,
-        Some(SandboxClass::LINUX_VM | SandboxClass::ANDROID | SandboxClass::WINDOWS)
+        Some(
+            DaytonaSandboxClass::LINUX_VM
+                | DaytonaSandboxClass::ANDROID
+                | DaytonaSandboxClass::WINDOWS
+        )
     ) {
         caps.lifecycle.archive = false;
     }
@@ -772,20 +856,39 @@ impl SandboxProvider for DaytonaProvider {
         spec.validate()?;
         let base = base_params(spec)?;
         let params = match &spec.source {
-            SandboxSource::Image { reference } => CreateParams::Image(ImageParams {
-                base,
-                image: ImageSource::Name(reference.clone()),
-                resources: sdk_resources(&spec.resources),
-            }),
-            SandboxSource::Dockerfile { content } => CreateParams::Image(ImageParams {
-                base,
-                image: ImageSource::Custom(DockerImage::from_dockerfile(content)),
-                resources: sdk_resources(&spec.resources),
-            }),
-            SandboxSource::Snapshot { name } => CreateParams::Snapshot(SnapshotParams {
-                base,
-                snapshot: name.clone(),
-            }),
+            SandboxSource::Image { reference } => {
+                if spec.sandbox_kind == Some(SandboxKind::VirtualMachine) {
+                    return Err(Error::invalid_spec(
+                        "sandbox_kind",
+                        "Daytona virtual machines must be created from a virtual-machine snapshot",
+                    ));
+                }
+                CreateParams::Image(ImageParams {
+                    base,
+                    image: ImageSource::Name(reference.clone()),
+                    resources: sdk_resources(&spec.resources),
+                })
+            }
+            SandboxSource::Dockerfile { content } => {
+                if spec.sandbox_kind == Some(SandboxKind::VirtualMachine) {
+                    return Err(Error::invalid_spec(
+                        "sandbox_kind",
+                        "Daytona virtual machines must be created from a virtual-machine snapshot",
+                    ));
+                }
+                CreateParams::Image(ImageParams {
+                    base,
+                    image: ImageSource::Custom(DockerImage::from_dockerfile(content)),
+                    resources: sdk_resources(&spec.resources),
+                })
+            }
+            SandboxSource::Snapshot { id } => {
+                self.ensure_snapshot_kind(id, spec.sandbox_kind).await?;
+                CreateParams::Snapshot(SnapshotParams {
+                    base,
+                    snapshot: id.as_str().to_owned(),
+                })
+            }
             SandboxSource::HostDirectory => {
                 return Err(Error::invalid_spec(
                     "source",
@@ -813,6 +916,19 @@ impl SandboxProvider for DaytonaProvider {
         // the fallible section funnels through one outcome.
         let outcome = async {
             let created = self.create_inner(params, budget).await?;
+            if let Some(requested) = spec.sandbox_kind {
+                let actual = created.sandbox_class.map(sandbox_kind_from_sandbox_class);
+                if actual != Some(requested) {
+                    let id = created.id.clone();
+                    let error = Error::invalid_spec(
+                        "sandbox_kind",
+                        format!(
+                            "Daytona created a sandbox with kind {actual:?}, not {requested:?}"
+                        ),
+                    );
+                    return Err(self.cleanup_failed_create(&id, error).await);
+                }
+            }
             self.handle(created, None).await
         }
         .await;
@@ -1508,6 +1624,29 @@ fn map_snapshot_state(state: ApiSnapshotState) -> SnapshotState {
     }
 }
 
+fn snapshot_status(dto: SnapshotDto) -> Result<SnapshotStatus> {
+    let id = SnapshotId::try_new(dto.id)
+        .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))?;
+    let mut resources = Resources::default();
+    resources.cpu_cores = to_u64(dto.cpu)
+        .and_then(|cpu| u32::try_from(cpu).ok())
+        .filter(|cpu| *cpu > 0);
+    resources.memory_mb = to_u64(dto.mem * 1024.0).filter(|mb| *mb > 0);
+    resources.disk_mb = to_u64(dto.disk * 1024.0).filter(|mb| *mb > 0);
+    resources.gpus = to_u64(dto.gpu)
+        .and_then(|gpu| u32::try_from(gpu).ok())
+        .filter(|gpu| *gpu > 0);
+
+    let mut status = SnapshotStatus::new(id, map_snapshot_state(dto.state));
+    status.name = Some(dto.name);
+    status.sandbox_kind = dto.sandbox_class.map(sandbox_kind_from_snapshot_class);
+    status.regions = dto.region_ids.unwrap_or_default();
+    status.resources = (resources != Resources::default()).then_some(resources);
+    status.error_reason = dto.error_reason;
+    status.size_bytes = dto.size.and_then(to_u64);
+    Ok(status)
+}
+
 struct DaytonaSnapshots {
     client: DaytonaClient,
 }
@@ -1515,24 +1654,63 @@ struct DaytonaSnapshots {
 #[async_trait]
 impl SnapshotProvider for DaytonaSnapshots {
     async fn create(&self, spec: &SnapshotSpec) -> Result<SnapshotId> {
+        spec.validate()?;
         let name = spec.name.clone().unwrap_or_else(generated_snapshot_name);
-        let image = match &spec.source {
-            SnapshotSource::Image { reference } => ImageSource::Name(reference.clone()),
+        let (image, sandbox_class) = match &spec.source {
+            SnapshotSource::Image { reference } => (
+                ImageSource::Name(reference.clone()),
+                daytona_snapshot_class(spec.sandbox_kind.unwrap_or(SandboxKind::Container))?,
+            ),
             SnapshotSource::Dockerfile { content } => {
-                ImageSource::Custom(DockerImage::from_dockerfile(content))
+                if spec.sandbox_kind == Some(SandboxKind::VirtualMachine) {
+                    return Err(Error::unsupported(Capability::SnapshotsVmFromDockerfile));
+                }
+                (
+                    ImageSource::Custom(DockerImage::from_dockerfile(content)),
+                    DaytonaCreateSandboxClass::CONTAINER,
+                )
             }
             SnapshotSource::Sandbox { id, mode } => {
-                if *mode == SnapshotMode::LiveProcessState {
-                    let sdk =
-                        self.client.get(id.as_str()).await.map_err(|error| {
-                            daytona_error("fetching sandbox for snapshot", &error)
-                        })?;
-                    if matches!(
-                        sdk.sandbox_class,
-                        Some(SandboxClass::CONTAINER | SandboxClass::ANDROID)
-                    ) {
-                        return Err(Error::unsupported(Capability::SnapshotsLiveProcessState));
+                let sdk = self
+                    .client
+                    .get(id.as_str())
+                    .await
+                    .map_err(|error| daytona_error("fetching sandbox for snapshot", &error))?;
+                let actual_kind = sdk.sandbox_class.map(sandbox_kind_from_sandbox_class);
+                if let Some(requested) = spec.sandbox_kind {
+                    if actual_kind != Some(requested) {
+                        return Err(Error::invalid_spec(
+                            "sandbox_kind",
+                            format!(
+                                "the source sandbox has kind {actual_kind:?}, not {requested:?}"
+                            ),
+                        ));
                     }
+                }
+                if let Some(region) = &spec.region {
+                    if sdk.target != *region {
+                        return Err(Error::invalid_spec(
+                            "region",
+                            format!(
+                                "the source sandbox is in region {}, not {region}",
+                                sdk.target
+                            ),
+                        ));
+                    }
+                }
+                if spec.resources != Resources::default() {
+                    return Err(Error::invalid_spec(
+                        "resources",
+                        "resources are inherited when snapshotting a sandbox",
+                    ));
+                }
+                if *mode == SnapshotMode::LiveProcessState
+                    && matches!(
+                        sdk.sandbox_class,
+                        Some(DaytonaSandboxClass::CONTAINER | DaytonaSandboxClass::ANDROID)
+                    )
+                {
+                    return Err(Error::unsupported(Capability::SnapshotsLiveProcessState));
                 }
                 create_sandbox_snapshot(&self.client, id.as_str(), &name, *mode).await?;
                 return created_snapshot_id(&self.client, &name).await;
@@ -1542,6 +1720,8 @@ impl SnapshotProvider for DaytonaSnapshots {
         let params = CreateSnapshotParams {
             name,
             image,
+            region_id: spec.region.clone(),
+            sandbox_class: Some(sandbox_class),
             resources: sdk_resources(&spec.resources),
             entrypoint: None,
         };
@@ -1571,10 +1751,7 @@ impl SnapshotProvider for DaytonaSnapshots {
                     daytona_error("fetching snapshot", &error)
                 }
             })?;
-        let mut status = SnapshotStatus::new(id.clone(), map_snapshot_state(dto.state));
-        status.name = Some(dto.name);
-        status.error_reason.clone_from(&dto.error_reason);
-        Ok(status)
+        snapshot_status(dto)
     }
 
     async fn list(&self, filter: &SnapshotFilter) -> Result<Vec<SnapshotStatus>> {
@@ -1593,12 +1770,7 @@ impl SnapshotProvider for DaytonaSnapshots {
                         continue;
                     }
                 }
-                let id = SnapshotId::try_new(dto.id)
-                    .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))?;
-                let mut status = SnapshotStatus::new(id, map_snapshot_state(dto.state));
-                status.name = Some(dto.name);
-                status.error_reason.clone_from(&dto.error_reason);
-                statuses.push(status);
+                statuses.push(snapshot_status(dto)?);
             }
             if page.total_pages <= f64::from(page_number) {
                 break;
@@ -1835,20 +2007,63 @@ mod tests {
     fn sandbox_class_narrows_lifecycle_capabilities() {
         let base = daytona_capabilities();
 
-        let container = narrowed_capabilities(&base, Some(SandboxClass::CONTAINER));
+        let container = narrowed_capabilities(&base, Some(DaytonaSandboxClass::CONTAINER));
         assert!(container.lifecycle.archive);
         assert!(!container.lifecycle.pause);
         assert!(!container.lifecycle.fork);
 
-        let linux_vm = narrowed_capabilities(&base, Some(SandboxClass::LINUX_VM));
+        let linux_vm = narrowed_capabilities(&base, Some(DaytonaSandboxClass::LINUX_VM));
         assert!(!linux_vm.lifecycle.archive);
         assert!(linux_vm.lifecycle.pause);
         assert!(linux_vm.lifecycle.fork);
 
-        let android = narrowed_capabilities(&base, Some(SandboxClass::ANDROID));
+        let android = narrowed_capabilities(&base, Some(DaytonaSandboxClass::ANDROID));
         assert!(!android.lifecycle.archive);
         assert!(!android.lifecycle.pause);
         assert!(!android.lifecycle.fork);
+    }
+
+    #[test]
+    fn snapshot_capabilities_distinguish_container_and_vm_builds() {
+        let caps = daytona_capabilities();
+        let snapshots = caps.snapshots.expect("snapshot capabilities");
+        assert!(snapshots.from_image_kinds.container);
+        assert!(snapshots.from_image_kinds.virtual_machine);
+        assert!(snapshots.from_dockerfile_kinds.container);
+        assert!(!snapshots.from_dockerfile_kinds.virtual_machine);
+    }
+
+    #[test]
+    fn snapshot_status_reports_kind_regions_and_resources() {
+        let mut dto = SnapshotDto::new(
+            "snap-1".to_owned(),
+            true,
+            "base".to_owned(),
+            ApiSnapshotState::Active,
+            Some(512.0),
+            None,
+            2.0,
+            1.0,
+            4.0,
+            20.0,
+            None,
+            "2026-01-01".to_owned(),
+            "2026-01-01".to_owned(),
+            None,
+            None,
+        );
+        dto.sandbox_class = Some(DaytonaSnapshotClass::LINUX_VM);
+        dto.region_ids = Some(vec!["eu".to_owned(), "us".to_owned()]);
+
+        let status = snapshot_status(dto).expect("maps snapshot status");
+        assert_eq!(status.sandbox_kind, Some(SandboxKind::VirtualMachine));
+        assert_eq!(status.regions, ["eu", "us"]);
+        let resources = status.resources.expect("snapshot resources");
+        assert_eq!(resources.cpu_cores, Some(2));
+        assert_eq!(resources.memory_mb, Some(4096));
+        assert_eq!(resources.disk_mb, Some(20 * 1024));
+        assert_eq!(resources.gpus, Some(1));
+        assert_eq!(status.size_bytes, Some(512));
     }
 
     #[test]

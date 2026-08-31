@@ -8,7 +8,7 @@ use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sandbox_driver::{SandboxSource, SandboxSpec};
+use sandbox_driver::{SandboxKind, SandboxSource, SandboxSpec, SnapshotId};
 use sandbox_driver_conformance::{Conformance, SpecFactory};
 use sandbox_driver_daytona::DaytonaProvider;
 
@@ -25,8 +25,9 @@ async fn daytona_provider_passes_conformance() {
         .expect("connect with credentials");
     let specs = SpecFactory::new(|| {
         SandboxSpec::new(SandboxSource::Snapshot {
-            name: TEST_SNAPSHOT.to_owned(),
+            id: SnapshotId::try_new(TEST_SNAPSHOT).expect("valid snapshot id"),
         })
+        .sandbox_kind(SandboxKind::Container)
         .ephemeral(true)
     });
     let mut conformance = Conformance::new(Arc::new(provider), specs);
