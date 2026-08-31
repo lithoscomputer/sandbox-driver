@@ -10,8 +10,8 @@ use std::{error, fmt, io};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use sandbox_driver::{
-    AuthError, Capability, Error, ErrorReport, ExecFailure, LifecycleAction, ProviderError,
-    ProviderKind, ResourceKind, SandboxState, Termination, TransportError,
+    Action, AuthError, Capability, Error, ErrorReport, ExecFailure, ProviderError, ProviderKind,
+    ResourceKind, SandboxState, Termination, TransportError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -131,7 +131,7 @@ struct Detail {
     #[serde(skip_serializing_if = "Option::is_none")]
     current:           Option<SandboxState>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    action:            Option<LifecycleAction>,
+    action:            Option<Action>,
     #[serde(skip_serializing_if = "Option::is_none")]
     operation:         Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -394,12 +394,12 @@ mod tests {
 
         let error = Error::InvalidState {
             current: SandboxState::Paused,
-            action:  LifecycleAction::Stop,
+            action:  Action::Stop,
         };
         let back = WireError::from_error(&error).into_error();
         assert!(matches!(back, Error::InvalidState {
             current: SandboxState::Paused,
-            action:  LifecycleAction::Stop,
+            action:  Action::Stop,
         }));
 
         let error = Error::invalid_spec("source", "must be an image");

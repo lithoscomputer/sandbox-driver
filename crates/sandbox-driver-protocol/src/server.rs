@@ -13,10 +13,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use sandbox_driver::{
-    Capability, Error, EventCallback, ExecControls, LogSink, OutputSink, Result, Sandbox,
-    SandboxId, SandboxProvider, SandboxSpec, SandboxStatus, SnapshotId, StderrTail,
-    StdioProcessHandle, TransportError, VolumeId,
+    Capability, Error, Event, EventContext, EventObserver, ExecControls, LogSink, OutputSink,
+    Result, Sandbox, SandboxId, SandboxProvider, SandboxSpec, SandboxStatus, SnapshotId,
+    StderrTail, StdioProcessHandle, TransportError, VolumeId,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -279,35 +280,39 @@ impl ServerState {
             .insert(handle.id().as_str().to_owned(), Arc::clone(handle));
     }
 
-    fn event_callback(
-        &self,
-        sandbox_hint: Arc<Mutex<String>>,
-        operation_id: Option<String>,
-    ) -> EventCallback {
-        let outbound = self.outbound.clone();
-        Arc::new(move |event| {
-            let sandbox_id = sandbox_hint.lock().expect("hint lock").clone();
-            let notification = Message::notification(
-                m::HOST_EVENT,
-                serde_json::to_value(m::HostEventNotification {
-                    sandbox_id,
-                    event,
-                    operation_id: operation_id.clone(),
-                })
-                .expect("host event notification contains serializable values"),
-            );
-            // Best-effort: an overflowing notification queue drops the
-            // event rather than blocking the provider.
-            match outbound.try_send(notification) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    tracing::warn!("host event notification queue full");
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    tracing::debug!("host event notification transport closed");
-                }
+    fn event_context(&self, request: Option<m::EventRequest>) -> Option<EventContext> {
+        request.map(|request| {
+            let mut context = EventContext::new(Arc::new(ProtocolEventObserver {
+                outbound: self.outbound.clone(),
+                route_id: request.route_id,
+            }));
+            if let Some(correlation_id) = request.correlation_id {
+                context = context.correlation_id(correlation_id);
             }
+            context
         })
+    }
+}
+
+struct ProtocolEventObserver {
+    outbound: mpsc::Sender<Message>,
+    route_id: String,
+}
+
+#[async_trait]
+impl EventObserver for ProtocolEventObserver {
+    async fn observe(&self, event: Event) {
+        let notification = Message::notification(
+            m::HOST_EVENT,
+            serde_json::to_value(m::HostEventNotification {
+                event,
+                route_id: Some(self.route_id.clone()),
+            })
+            .expect("host event notification contains serializable values"),
+        );
+        if self.outbound.send(notification).await.is_err() {
+            tracing::debug!("host event notification transport closed");
+        }
     }
 }
 
@@ -451,18 +456,9 @@ async fn dispatch(
         }
         m::SANDBOX_CREATE => {
             let request: m::CreateParams = parse(params)?;
-            // The id exists only after create: the hint is bound late, so
-            // events during create carry an empty id (and the caller's
-            // operation_id, when one was sent, for correlation);
-            // everything after routes correctly.
-            let hint = Arc::new(Mutex::new(String::new()));
-            let callback = state.event_callback(Arc::clone(&hint), request.operation_id.clone());
+            let events = state.event_context(request.events);
             let spec = SandboxSpec::try_from(request.spec)?;
-            let handle = state.provider.create(&spec, Some(callback)).await?;
-            handle
-                .id()
-                .as_str()
-                .clone_into(&mut hint.lock().expect("hint lock"));
+            let handle = state.provider.create(&spec, events).await?;
             state.remember(&handle);
             let status = handle.describe().await?;
             to_value(&handle_info(&handle, status))
@@ -471,9 +467,8 @@ async fn dispatch(
             let request: m::AttachParams = parse(params)?;
             let sandbox_id = SandboxId::try_new(&request.sandbox_id)
                 .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
-            let callback =
-                state.event_callback(Arc::new(Mutex::new(request.sandbox_id.clone())), None);
-            let handle = state.provider.attach(&sandbox_id, Some(callback)).await?;
+            let events = state.event_context(request.events);
+            let handle = state.provider.attach(&sandbox_id, events).await?;
             state.remember(&handle);
             let status = handle.describe().await?;
             to_value(&handle_info(&handle, status))
@@ -523,9 +518,8 @@ async fn dispatch(
             let request: m::AttachParams = parse(params)?;
             let sandbox_id = SandboxId::try_new(&request.sandbox_id)
                 .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
-            let callback =
-                state.event_callback(Arc::new(Mutex::new(request.sandbox_id.clone())), None);
-            let handle = state.provider.undelete(&sandbox_id, Some(callback)).await?;
+            let events = state.event_context(request.events);
+            let handle = state.provider.undelete(&sandbox_id, events).await?;
             state.remember(&handle);
             let status = handle.describe().await?;
             to_value(&handle_info(&handle, status))
@@ -942,6 +936,7 @@ async fn dispatch(
         }
         m::SNAPSHOT_CREATE => {
             let request: m::SnapshotCreateParams = parse(params)?;
+            let events = state.event_context(request.events);
             let spec = request.spec.into();
             let service =
                 state
@@ -950,7 +945,7 @@ async fn dispatch(
                     .ok_or(DispatchError::App(Error::unsupported(
                         Capability::Snapshots,
                     )))?;
-            let id = service.create(&spec).await?;
+            let id = service.create(&spec, events).await?;
             to_value(&m::SnapshotIdResult {
                 snapshot_id: id.as_str().to_owned(),
             })
@@ -999,6 +994,7 @@ async fn dispatch(
         }
         m::SNAPSHOT_DELETE | m::SNAPSHOT_ACTIVATE | m::SNAPSHOT_DEACTIVATE => {
             let request: m::SnapshotIdParams = parse(params)?;
+            let events = state.event_context(request.events);
             let service =
                 state
                     .provider
@@ -1009,9 +1005,9 @@ async fn dispatch(
             let id = SnapshotId::try_new(&request.snapshot_id)
                 .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))?;
             match method {
-                m::SNAPSHOT_ACTIVATE => service.activate(&id).await?,
-                m::SNAPSHOT_DEACTIVATE => service.deactivate(&id).await?,
-                _ => service.delete(&id).await?,
+                m::SNAPSHOT_ACTIVATE => service.activate(&id, events).await?,
+                m::SNAPSHOT_DEACTIVATE => service.deactivate(&id, events).await?,
+                _ => service.delete(&id, events).await?,
             }
             to_value(&m::Empty)
         }
@@ -1021,11 +1017,12 @@ async fn dispatch(
         }
         m::VOLUME_CREATE => {
             let request: m::VolumeCreateParams = parse(params)?;
+            let events = state.event_context(request.events);
             let service = state
                 .provider
                 .volumes()
                 .ok_or(DispatchError::App(Error::unsupported(Capability::Volumes)))?;
-            let id = service.create(&request.spec).await?;
+            let id = service.create(&request.spec, events).await?;
             to_value(&m::VolumeIdResult {
                 volume_id: id.as_str().to_owned(),
             })
@@ -1051,13 +1048,14 @@ async fn dispatch(
         }
         m::VOLUME_DELETE => {
             let request: m::VolumeIdParams = parse(params)?;
+            let events = state.event_context(request.events);
             let service = state
                 .provider
                 .volumes()
                 .ok_or(DispatchError::App(Error::unsupported(Capability::Volumes)))?;
             let id = VolumeId::try_new(&request.volume_id)
                 .map_err(|error| Error::invalid_spec("volume_id", error.to_string()))?;
-            service.delete(&id).await?;
+            service.delete(&id, events).await?;
             to_value(&m::Empty)
         }
         m::ACCESS_PREVIEW_URL => {

@@ -5,7 +5,7 @@ use std::time::Duration;
 use std::{fmt, io};
 
 use crate::capabilities::Capability;
-use crate::event::LifecycleAction;
+use crate::event::Action;
 use crate::exec::Termination;
 use crate::id::ProviderKind;
 use crate::state::SandboxState;
@@ -51,7 +51,7 @@ pub enum Error {
     #[error("cannot {action:?} a sandbox in state {current:?}")]
     InvalidState {
         current: SandboxState,
-        action:  LifecycleAction,
+        action:  Action,
     },
 
     #[error("invalid spec: {field}: {reason}")]

@@ -11,10 +11,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, process};
 
 use sandbox_driver::{
-    Capability, Error, ExecSpec, LifecycleAction, LifecycleTimers, LogSink, LogSource,
-    NetworkPolicy, Resources, SandboxKind, SandboxProvider, SandboxSnapshotOptions, SandboxSource,
-    SandboxSpec, SandboxState, SnapshotId, SnapshotMode, SnapshotSource, SnapshotSpec,
-    SnapshotState, WaitOptions, wait_for_state,
+    Action, Capability, Error, ExecSpec, LifecycleTimers, LogSink, LogSource, NetworkPolicy,
+    Resources, SandboxKind, SandboxProvider, SandboxSnapshotOptions, SandboxSource, SandboxSpec,
+    SandboxState, SnapshotId, SnapshotMode, SnapshotSource, SnapshotSpec, SnapshotState,
+    WaitOptions, wait_for_state,
 };
 use sandbox_driver_daytona::DaytonaProvider;
 use tokio::time;
@@ -354,7 +354,7 @@ async fn fork_and_snapshot_modes_preserve_their_declared_state() {
     .sandbox_kind(SandboxKind::VirtualMachine)
     .region("us-central-1")
     .resources(snapshot_resources(3072));
-    let vm_snapshot_id = match snapshots.create(&vm_snapshot_spec).await {
+    let vm_snapshot_id = match snapshots.create(&vm_snapshot_spec, None).await {
         Ok(id) => id,
         Err(error)
             if error_chain_contains(&error, "No runners are configured")
@@ -375,7 +375,7 @@ async fn fork_and_snapshot_modes_preserve_their_declared_state() {
     if let Err(error) =
         wait_for_snapshot_state(snapshots, &vm_snapshot_id, SnapshotState::Active).await
     {
-        let _ = snapshots.delete(&vm_snapshot_id).await;
+        let _ = snapshots.delete(&vm_snapshot_id, None).await;
         panic!("VM snapshot did not become active: {error}");
     }
     let source_spec = SandboxSpec::new(SandboxSource::Snapshot {
@@ -387,7 +387,7 @@ async fn fork_and_snapshot_modes_preserve_their_declared_state() {
     let source = match provider.create(&source_spec, None).await {
         Ok(source) => source,
         Err(error) => {
-            let _ = snapshots.delete(&vm_snapshot_id).await;
+            let _ = snapshots.delete(&vm_snapshot_id, None).await;
             panic!("create VM: {error}");
         }
     };
@@ -467,7 +467,7 @@ async fn fork_and_snapshot_modes_preserve_their_declared_state() {
             source.snapshot(&cold_while_running).await,
             Err(Error::InvalidState {
                 current: SandboxState::Running,
-                action:  LifecycleAction::SnapshotSandbox,
+                action:  Action::Snapshot,
             })
         ) {
             return Err("filesystem snapshot did not require a stopped sandbox".to_owned());
@@ -484,7 +484,7 @@ async fn fork_and_snapshot_modes_preserve_their_declared_state() {
             source.fork(&sandbox_driver::ForkOptions::default()).await,
             Err(Error::InvalidState {
                 current: SandboxState::Stopped,
-                action:  LifecycleAction::Fork,
+                action:  Action::Fork,
             })
         ) {
             return Err("fork did not require a running source".to_owned());
@@ -539,7 +539,7 @@ async fn fork_and_snapshot_modes_preserve_their_declared_state() {
     }
     let _ = source.delete().await;
     for snapshot in created_snapshots.iter().rev() {
-        let _ = snapshots.delete(snapshot).await;
+        let _ = snapshots.delete(snapshot, None).await;
     }
     outcome.expect("fork and snapshot mode behavior");
 }
@@ -655,7 +655,7 @@ async fn filesystem_snapshot_restores_files_without_processes() {
     }
     let _ = source.delete().await;
     if let Some(snapshot_id) = snapshot_id {
-        let _ = snapshots.delete(&snapshot_id).await;
+        let _ = snapshots.delete(&snapshot_id, None).await;
     }
     outcome.expect("filesystem snapshot behavior");
 }
@@ -706,7 +706,10 @@ async fn snapshot_provider_round_trip() {
     .sandbox_kind(SandboxKind::Container)
     .region("us")
     .resources(snapshot_resources(1024));
-    let id = snapshots.create(&spec).await.expect("snapshot create");
+    let id = snapshots
+        .create(&spec, None)
+        .await
+        .expect("snapshot create");
 
     let outcome = async {
         // Poll until the build settles.
@@ -779,12 +782,12 @@ async fn snapshot_provider_round_trip() {
         }
 
         snapshots
-            .deactivate(&id)
+            .deactivate(&id, None)
             .await
             .map_err(|error| format!("snapshot deactivate: {error}"))?;
         wait_for_snapshot_state(snapshots, &id, SnapshotState::Inactive).await?;
         snapshots
-            .activate(&id)
+            .activate(&id, None)
             .await
             .map_err(|error| format!("snapshot activate: {error}"))?;
         wait_for_snapshot_state(snapshots, &id, SnapshotState::Active).await?;
@@ -792,9 +795,9 @@ async fn snapshot_provider_round_trip() {
     }
     .await;
 
-    snapshots.delete(&id).await.expect("snapshot delete");
+    snapshots.delete(&id, None).await.expect("snapshot delete");
     snapshots
-        .delete(&id)
+        .delete(&id, None)
         .await
         .expect("snapshot delete is idempotent");
     outcome.expect("snapshot round trip");
@@ -817,7 +820,7 @@ ENTRYPOINT ["/bin/sh", "-c", "echo sandbox-driver-entrypoint; echo sandbox-drive
     })
     .sandbox_kind(SandboxKind::VirtualMachine);
     assert!(matches!(
-        snapshots.create(&vm_spec).await,
+        snapshots.create(&vm_spec, None).await,
         Err(Error::Unsupported {
             capability: Capability::SnapshotsVmFromDockerfile,
         })
@@ -831,7 +834,7 @@ ENTRYPOINT ["/bin/sh", "-c", "echo sandbox-driver-entrypoint; echo sandbox-drive
     .region("us")
     .resources(snapshot_resources(1024));
     let id = snapshots
-        .create(&spec)
+        .create(&spec, None)
         .await
         .expect("Dockerfile snapshot create");
 
@@ -881,7 +884,7 @@ ENTRYPOINT ["/bin/sh", "-c", "echo sandbox-driver-entrypoint; echo sandbox-drive
     }
     .await;
 
-    snapshots.delete(&id).await.expect("snapshot delete");
+    snapshots.delete(&id, None).await.expect("snapshot delete");
     outcome.expect("Dockerfile snapshot and entrypoint logs");
 }
 

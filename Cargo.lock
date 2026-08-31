@@ -1693,6 +1693,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "globset",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "thiserror",
@@ -1705,6 +1706,7 @@ dependencies = [
 name = "sandbox-driver-conformance"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "sandbox-driver",
  "tokio",
  "tokio-util",

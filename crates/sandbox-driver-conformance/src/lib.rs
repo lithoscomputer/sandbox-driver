@@ -26,18 +26,31 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{fmt, process};
 
+use async_trait::async_trait;
 use sandbox_driver::{
-    Capability, DerivedSearch, DerivedServices, Error, ExecControls, ExecSpec, GrepOptions,
-    HealthStatus, NetworkPolicy, OutputSanitization, OutputStream, PtyOptions, PtySize, Resources,
-    Sandbox, SandboxEvent, SandboxFilter, SandboxId, SandboxProvider, SandboxSpec, SandboxState,
-    Search, ServiceSpec, Services, SnapshotMode, SpawnSpec, Termination, WaitOptions, activate,
-    wait_for_state,
+    Action, Capability, DerivedSearch, DerivedServices, Error, Event, EventBody, EventContext,
+    EventObserver, ExecControls, ExecSpec, GrepOptions, HealthStatus, NetworkPolicy,
+    OutputSanitization, OutputStream, PtyOptions, PtySize, Resources, Sandbox, SandboxFilter,
+    SandboxId, SandboxProvider, SandboxSpec, SandboxState, Search, ServiceSpec, Services,
+    SnapshotMode, SpawnSpec, Termination, WaitOptions, activate, wait_for_state,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 type SeenChunks = Arc<Mutex<Vec<(OutputStream, Vec<u8>)>>>;
+
+#[derive(Default)]
+struct RecordingEventObserver {
+    events: Mutex<Vec<Event>>,
+}
+
+#[async_trait]
+impl EventObserver for RecordingEventObserver {
+    async fn observe(&self, event: Event) {
+        self.events.lock().expect("events lock").push(event);
+    }
+}
 
 /// Produces a provider-appropriate creation spec for each check.
 pub struct SpecFactory {
@@ -1639,7 +1652,7 @@ async fn volume_round_trip(ctx: &Conformance) -> CheckOutcome {
             .map_or(0, |elapsed| elapsed.subsec_nanos())
     });
     let id = match volumes
-        .create(&sandbox_driver::VolumeSpec::new(name.clone()))
+        .create(&sandbox_driver::VolumeSpec::new(name.clone()), None)
         .await
     {
         Ok(id) => id,
@@ -1667,14 +1680,14 @@ async fn volume_round_trip(ctx: &Conformance) -> CheckOutcome {
         match status.state {
             sandbox_driver::VolumeState::Ready => break,
             sandbox_driver::VolumeState::Error => {
-                let _ = volumes.delete(&id).await;
+                let _ = volumes.delete(&id, None).await;
                 return fail(format!(
                     "volume entered error state: {:?}",
                     status.error_reason
                 ));
             }
             _ if Instant::now() >= deadline => {
-                let _ = volumes.delete(&id).await;
+                let _ = volumes.delete(&id, None).await;
                 return fail("volume never became ready".to_owned());
             }
             _ => time::sleep(Duration::from_secs(2)).await,
@@ -1686,15 +1699,15 @@ async fn volume_round_trip(ctx: &Conformance) -> CheckOutcome {
         .await
         .map_err(|error| format!("volume list failed: {error}"))?;
     if !listed.iter().any(|status| status.id == id) {
-        let _ = volumes.delete(&id).await;
+        let _ = volumes.delete(&id, None).await;
         return fail("created volume missing from list".to_owned());
     }
     volumes
-        .delete(&id)
+        .delete(&id, None)
         .await
         .map_err(|error| format!("volume delete failed: {error}"))?;
     volumes
-        .delete(&id)
+        .delete(&id, None)
         .await
         .map_err(|error| format!("second volume delete failed: {error}"))?;
     PASS
@@ -1922,26 +1935,112 @@ async fn provider_health_answers(ctx: &Conformance) -> CheckOutcome {
 }
 
 async fn create_emits_terminal_events(ctx: &Conformance) -> CheckOutcome {
-    let events: Arc<Mutex<Vec<SandboxEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&events);
-    let callback: sandbox_driver::EventCallback = Arc::new(move |event| {
-        sink.lock().expect("events lock").push(event);
-    });
+    let observer = Arc::new(RecordingEventObserver::default());
+    let context = EventContext::new(observer.clone());
     let sandbox = ctx
         .provider
-        .create(&ctx.specs.spec(), Some(callback))
+        .create(&ctx.specs.spec(), Some(context))
         .await
         .map_err(|error| format!("create failed: {error}"))?;
-    cleanup(&sandbox).await;
-    // Give the async delivery path a moment.
-    time::sleep(Duration::from_millis(200)).await;
-    let seen = events.lock().expect("events lock").clone();
-    if seen.iter().any(SandboxEvent::is_terminal) {
-        PASS
-    } else {
-        fail(format!(
-            "no terminal event observed across create+delete ({} events)",
-            seen.len()
-        ))
+    // The terminal event must already be visible when create returns.
+    let seen = observer.events.lock().expect("events lock").clone();
+    sandbox
+        .delete()
+        .await
+        .map_err(|error| format!("delete failed: {error}"))?;
+    // Delete has the same terminal-before-return contract.
+    let all_seen = observer.events.lock().expect("events lock").clone();
+
+    let Some(first) = seen.first() else {
+        return fail("create emitted no events");
+    };
+    if !matches!(first.body, EventBody::OperationStarted {
+        action: Action::Create,
+    }) {
+        return fail(format!("first create event was {:?}", first.body));
     }
+    let Some(last) = seen.last() else {
+        unreachable!("the first event exists");
+    };
+    if !matches!(last.body, EventBody::OperationCompleted {
+        action: Action::Create,
+        ..
+    }) {
+        return fail(format!(
+            "last create event was not completed: {:?}",
+            last.body
+        ));
+    }
+    if first.operation_id.is_none() || first.operation_id != last.operation_id {
+        return fail("create start and completion have different operation ids");
+    }
+    if !matches!(
+        &last.subject,
+        sandbox_driver::EventSubject::Sandbox { id: Some(id), .. } if id == sandbox.id()
+    ) {
+        return fail("create completion does not identify the created sandbox");
+    }
+    if seen.windows(2).any(|pair| {
+        pair[0].source_id() != pair[1].source_id()
+            || pair[0].sequence().checked_add(1) != Some(pair[1].sequence())
+    }) {
+        return fail("create event source or sequence is not continuous");
+    }
+    let delete_events: Vec<&Event> = all_seen
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.body,
+                EventBody::OperationStarted {
+                    action: Action::Delete,
+                } | EventBody::OperationProgress {
+                    action: Action::Delete,
+                    ..
+                } | EventBody::OperationCompleted {
+                    action: Action::Delete,
+                    ..
+                } | EventBody::OperationFailed {
+                    action: Action::Delete,
+                    ..
+                }
+            )
+        })
+        .collect();
+    let (Some(delete_started), Some(delete_terminal)) =
+        (delete_events.first(), delete_events.last())
+    else {
+        return fail(format!(
+            "delete emitted {} lifecycle events",
+            delete_events.len()
+        ));
+    };
+    if !matches!(delete_started.body, EventBody::OperationStarted {
+        action: Action::Delete,
+    }) || !matches!(delete_terminal.body, EventBody::OperationCompleted {
+        action: Action::Delete,
+        ..
+    }) || delete_started.operation_id != delete_terminal.operation_id
+        || delete_events
+            .iter()
+            .any(|event| event.operation_id != delete_started.operation_id)
+        || delete_events
+            .iter()
+            .filter(|event| matches!(event.body, EventBody::OperationStarted { .. }))
+            .count()
+            != 1
+        || delete_events
+            .iter()
+            .filter(|event| event.body.is_terminal())
+            .count()
+            != 1
+    {
+        return fail("delete start and completion are not a paired operation");
+    }
+    if all_seen.windows(2).any(|pair| {
+        pair[0].source_id() != pair[1].source_id()
+            || pair[0].sequence().checked_add(1) != Some(pair[1].sequence())
+    }) {
+        return fail("event source or sequence changed across create and delete");
+    }
+    PASS
 }

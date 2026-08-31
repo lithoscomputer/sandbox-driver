@@ -10,6 +10,7 @@ description = "Black-box conformance suite for sandbox-driver providers"
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
 sandbox-driver.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync", "time"] }
 tokio-util.workspace = true

@@ -261,8 +261,8 @@ to operate a sandbox without further negotiation:
 
 | method | params | result |
 | --- | --- | --- |
-| `sandbox/create` | `{spec}` — see §8.2 | HandleInfo |
-| `sandbox/attach` | `{sandbox_id}` | HandleInfo |
+| `sandbox/create` | `{spec,events?}` — see §8.2 | HandleInfo |
+| `sandbox/attach` | `{sandbox_id,events?}` | HandleInfo |
 | `sandbox/list` | `{filter:{labels:{…}}}` | `{sandboxes:[status…]}` |
 | `sandbox/describe` | `{sandbox_id}` | `{status}` |
 | `sandbox/platform_info` | `{sandbox_id}` | `{platform:{os,arch,version}}` |
@@ -310,11 +310,18 @@ disables the timer where the provider supports disabling; the plugin
 translates per timer (Daytona: wire `0` for auto-stop, `-1` for
 auto-delete). The same rule applies to `sandbox/set_timers`.
 
-`sandbox/create` accepts an optional `operation_id` (a host-generated
-string, unique per connection): while the create runs, `host/event`
-notifications caused by it echo the id back (§10), so progress is
-attributable before a sandbox id exists. Plugins must treat it as
-opaque; hosts that do not need event correlation omit it.
+`sandbox/create`, `sandbox/attach`, and `sandbox/undelete` accept an
+optional `events` object:
+
+```json
+{"route_id":"event-7","correlation_id":"fabro-run-42"}
+```
+
+`route_id` is host-generated, unique per connection, and used only to
+route `host/event` notifications to the correct observer. This works
+before a provider assigns a resource ID. `correlation_id` is an optional
+opaque application value copied into each emitted `Event`. Plugins must
+not interpret either value. They must not contain secrets.
 
 ### 8.3 Lifecycle
 
@@ -335,7 +342,7 @@ handle, because a deleted sandbox cannot be attached.
 | method | params | result |
 | --- | --- | --- |
 | `sandbox/fork` | `{sandbox_id, options:{name,include_memory}}` | HandleInfo |
-| `sandbox/undelete` | `{sandbox_id}` | HandleInfo |
+| `sandbox/undelete` | `{sandbox_id,events?}` | HandleInfo |
 | `sandbox/resize` | `{sandbox_id, resources}` | `{}` |
 | `sandbox/snapshot` | `{sandbox_id, options:{name,include_memory}}` | `{snapshot_id}` |
 | `sandbox/set_timers` | `{sandbox_id, timers}` | `{}` |
@@ -451,17 +458,17 @@ Deletes must be idempotent, including while deletion is in progress.
 
 | method | params | result |
 | --- | --- | --- |
-| `snapshot/create` | `{spec:{name,source,sandbox_kind,region,resources,provider_config}}` | `{snapshot_id}` |
+| `snapshot/create` | `{spec:{name,source,sandbox_kind,region,resources,provider_config},events?}` | `{snapshot_id}` |
 | `snapshot/get` | `{snapshot_id}` | `{status:{id,name,state,sandbox_kind,regions,resources,error_reason,size_bytes,created_at}}` |
 | `snapshot/list` | `{filter:{name}}` | `{snapshots:[status…]}` |
-| `snapshot/delete` | `{snapshot_id}` | `{}` |
-| `snapshot/activate` | `{snapshot_id}` | `{}` (gated on `snapshots.activation`) |
-| `snapshot/deactivate` | `{snapshot_id}` | `{}` (gated on `snapshots.activation`) |
+| `snapshot/delete` | `{snapshot_id,events?}` | `{}` |
+| `snapshot/activate` | `{snapshot_id,events?}` | `{}` (gated on `snapshots.activation`) |
+| `snapshot/deactivate` | `{snapshot_id,events?}` | `{}` (gated on `snapshots.activation`) |
 | `snapshot/build_logs` | `{snapshot_id, stream_id, follow}` | `{}` after the stream ends |
-| `volume/create` | `{spec:{name,size_mb}}` | `{volume_id}` |
+| `volume/create` | `{spec:{name,size_mb},events?}` | `{volume_id}` |
 | `volume/get` | `{volume_id}` | `{status:{id,name,state,error_reason,created_at}}` |
 | `volume/list` | `{}` | `{volumes:[status…]}` |
-| `volume/delete` | `{volume_id}` | `{}` |
+| `volume/delete` | `{volume_id,events?}` | `{}` |
 
 Snapshot `source` variants: `{"image":{"reference":…}}`,
 `{"dockerfile":{"content":…}}`,
@@ -569,27 +576,78 @@ Rules:
 
 ## 10. Events
 
-The plugin may emit `host/event` notifications carrying sandbox
-progress:
+The plugin emits `host/event` notifications for sandbox, snapshot, and
+volume control-plane operations. Exec output, PTY bytes, file-transfer
+chunks, and logs use their dedicated streams and never use this event
+feed.
 
 ```json
-{"method":"host/event","params":{"sandbox_id":"sb-1",
-  "event":{"type":"action_failed","action":"start",
-            "error":{"kind":"timeout","message":"…","retryable":true,"causes":[]}}}}
+{"method":"host/event","params":{
+  "route_id":"event-7",
+  "event":{
+    "id":{"source_id":"9b2f…","sequence":4},
+    "occurred_at":{"secs_since_epoch":1788206400,"nanos_since_epoch":0},
+    "provider":"daytona",
+    "subject":{"type":"sandbox","id":"sb-1"},
+    "operation_id":"58a1…",
+    "correlation_id":"fabro-run-42",
+    "type":"operation_failed",
+    "action":"start",
+    "duration":{"secs":30,"nanos":0},
+    "error":{"kind":"timeout","message":"…","retryable":true,"causes":[]}
+  }
+}}
 ```
 
-Event `type`s: `action_started`, `action_completed` (+`duration`),
-`action_failed` (+`error` report), `snapshot_building`, `snapshot_ready`,
-`snapshot_failed`, `state_changed` (`from`/`to`), `progress`
-(+`message`). Delivery is best-effort and in-order per sandbox; there
-is no replay — durable state is `sandbox/describe`. Terminal events
-(`action_completed`, `action_failed`, `snapshot_ready`,
-`snapshot_failed`) should never be dropped by either side. Events
-emitted during `sandbox/create`, before an id exists, carry an empty
-`sandbox_id`; when the host supplied an `operation_id` on the create
-(§8.2), the notification carries it back in an optional `operation_id`
-field so those events remain attributable. Hosts without an operation
-to correlate may ignore empty-id events.
+The event envelope fields are:
+
+- `id`: `{source_id,sequence}`. `source_id` identifies one live event
+  source. `sequence` starts at 1 and increases by one for that source.
+- `occurred_at`: the observation time in the structural timestamp form
+  from §6.
+- `provider`: the provider kind.
+- `subject`: `{"type":"provider"}` or a `sandbox`, `snapshot`, or
+  `volume` subject. Resource subjects carry an optional `id` and `name`.
+- `operation_id`: present on operation lifecycle events. It is stable
+  from start through terminal outcome.
+- `correlation_id`: the optional consumer value from the `events`
+  request object.
+- `type` and its body fields.
+
+Event `type` values are:
+
+- `operation_started` with `action`.
+- `operation_progress` with `action` and `progress`. Progress has a
+  stable `code`, an optional display `message`, and optional
+  `completed`, `total`, and `unit` measurements. Consumers must branch
+  on `code`, not `message`.
+- `operation_completed` with `action` and `duration`.
+- `operation_failed` with `action`, `duration`, and the structured error
+  report from §7.
+- `state_observed` with optional `previous` and required `current`
+  resource state.
+- `notice` with a stable `code` and display `message`.
+
+For each accepted operation, the plugin must emit
+`operation_started` and exactly one `operation_completed` or
+`operation_failed`. They must have the same `operation_id`. The terminal
+event must enter the wire before the operation response. A create can
+start with a name-only subject. Its terminal event must include the
+provider-assigned resource ID when one was assigned.
+
+Delivery is ordered and lossless at the sandbox-driver handoff. A
+sender must await bounded transport capacity and must not silently drop
+events. The receiver must observe event notifications in wire order
+before it resolves the corresponding operation response. `route_id` is
+optional in a notification and echoes the request value when present;
+it is transport metadata, not event identity.
+
+The protocol has no event replay or persistence API. The host decides
+whether its observer persists events. `sandbox/describe`,
+`snapshot/get`, and `volume/get` remain authoritative for current
+resource state. A re-attach creates a new live event source. Unknown
+event types and subject kinds must be ignored without closing the
+connection.
 
 `host/log` (`{level, message}`) is reserved: plugins should prefer
 stderr for logs in version 1, and hosts may ignore `host/log`.

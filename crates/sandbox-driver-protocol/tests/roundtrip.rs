@@ -9,9 +9,11 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use sandbox_driver::{
-    Capability, Error, ExecControls, ExecSpec, OutputStream, SandboxProvider, SandboxSource,
-    SandboxSpec, Termination, WaitOptions, activate,
+    Action, Capability, CorrelationId, Error, Event, EventBody, EventContext, EventObserver,
+    ExecControls, ExecSpec, OutputStream, SandboxProvider, SandboxSource, SandboxSpec, Termination,
+    WaitOptions, activate,
 };
 use sandbox_driver_host::HostProvider;
 use sandbox_driver_protocol::{PluginProvider, serve};
@@ -20,6 +22,18 @@ use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 type SeenChunks = Arc<Mutex<Vec<(OutputStream, Vec<u8>)>>>;
+
+#[derive(Default)]
+struct RecordingEventObserver {
+    events: Mutex<Vec<Event>>,
+}
+
+#[async_trait]
+impl EventObserver for RecordingEventObserver {
+    async fn observe(&self, event: Event) {
+        self.events.lock().expect("events lock").push(event);
+    }
+}
 
 async fn connect() -> PluginProvider {
     let (host_side, plugin_side) = duplex(1024 * 1024);
@@ -97,6 +111,51 @@ async fn create_exec_fs_delete_round_trip() {
         !workspace.exists(),
         "managed workspace removed through the wire"
     );
+    provider.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn events_cross_the_wire_before_operations_return() {
+    let provider = connect().await;
+    let observer = Arc::new(RecordingEventObserver::default());
+    let context = EventContext::new(observer.clone())
+        .correlation_id(CorrelationId::new("protocol-roundtrip"));
+
+    let sandbox = provider
+        .create(&host_spec(), Some(context))
+        .await
+        .expect("create");
+    let create_events = observer.events.lock().expect("events lock").clone();
+    assert!(matches!(
+        create_events.first().map(|event| &event.body),
+        Some(EventBody::OperationStarted {
+            action: Action::Create,
+        })
+    ));
+    assert!(matches!(
+        create_events.last().map(|event| &event.body),
+        Some(EventBody::OperationCompleted {
+            action: Action::Create,
+            ..
+        })
+    ));
+    assert!(create_events.iter().all(|event| {
+        event.correlation_id.as_ref().map(CorrelationId::as_str) == Some("protocol-roundtrip")
+    }));
+    assert!(create_events.windows(2).all(|pair| {
+        pair[0].source_id() == pair[1].source_id()
+            && pair[0].sequence().checked_add(1) == Some(pair[1].sequence())
+    }));
+
+    sandbox.delete().await.expect("delete");
+    let all_events = observer.events.lock().expect("events lock").clone();
+    assert!(matches!(
+        all_events.last().map(|event| &event.body),
+        Some(EventBody::OperationCompleted {
+            action: Action::Delete,
+            ..
+        })
+    ));
     provider.shutdown().await.expect("shutdown");
 }
 

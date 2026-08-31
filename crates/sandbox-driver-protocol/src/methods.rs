@@ -9,11 +9,11 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use sandbox_driver::{
-    Capabilities, CaptureStats, DirEntry, Error, ExecResult, ExecSpec, FileMetadata, ForkOptions,
-    LifecycleTimers, LogSource, NetworkPolicy, OutputSanitization, PlatformInfo, ProviderKind,
-    PtyOptions, PtySize, Resources, SandboxEvent, SandboxFilter, SandboxId, SandboxKind,
-    SandboxSnapshotOptions, SandboxSource, SandboxSpec, SandboxStatus, SnapshotId, SnapshotMode,
-    SnapshotSource, SnapshotSpec, SpawnSpec, Termination, VncConnection, VolumeMount,
+    Capabilities, CaptureStats, CorrelationId, DirEntry, Error, Event, ExecResult, ExecSpec,
+    FileMetadata, ForkOptions, LifecycleTimers, LogSource, NetworkPolicy, OutputSanitization,
+    PlatformInfo, ProviderKind, PtyOptions, PtySize, Resources, SandboxFilter, SandboxId,
+    SandboxKind, SandboxSnapshotOptions, SandboxSource, SandboxSpec, SandboxStatus, SnapshotId,
+    SnapshotMode, SnapshotSource, SnapshotSpec, SpawnSpec, Termination, VncConnection, VolumeMount,
 };
 use serde::{Deserialize, Serialize};
 
@@ -118,11 +118,17 @@ pub struct ProviderInfo {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateParams {
-    pub spec:         SandboxSpecDto,
-    /// Host-generated id correlating `host/event` notifications emitted
-    /// while this create runs, before a sandbox id exists.
+    pub spec:   SandboxSpecDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operation_id: Option<String>,
+    pub events: Option<EventRequest>,
+}
+
+/// Routes an event stream back to the requesting host observer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EventRequest {
+    pub route_id:       String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<CorrelationId>,
 }
 
 /// Protocol-v1 sandbox creation shape. Snapshot sources retain the
@@ -242,6 +248,8 @@ impl TryFrom<SandboxSpecDto> for SandboxSpec {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AttachParams {
     pub sandbox_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events:     Option<EventRequest>,
 }
 
 /// Everything a client needs to build a remote sandbox handle.
@@ -665,12 +673,9 @@ pub struct FsSetPermissionsParams {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HostEventNotification {
-    pub sandbox_id:   String,
-    pub event:        SandboxEvent,
-    /// Correlates the event to the long-running request that caused it,
-    /// when the host supplied an `operation_id`.
+    pub event:    Event,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operation_id: Option<String>,
+    pub route_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -681,7 +686,9 @@ pub struct HostLogNotification {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SnapshotCreateParams {
-    pub spec: SnapshotSpecDto,
+    pub spec:   SnapshotSpecDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<EventRequest>,
 }
 
 /// Protocol-v1 snapshot creation shape.
@@ -771,6 +778,8 @@ impl From<SnapshotSpecDto> for SnapshotSpec {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SnapshotIdParams {
     pub snapshot_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events:      Option<EventRequest>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -802,12 +811,16 @@ pub struct SnapshotListResult {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VolumeCreateParams {
-    pub spec: sandbox_driver::VolumeSpec,
+    pub spec:   sandbox_driver::VolumeSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<EventRequest>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VolumeIdParams {
     pub volume_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events:    Option<EventRequest>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

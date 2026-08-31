@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::capabilities::{Capabilities, Capability};
 use crate::error::{Error, Result};
-use crate::event::EventCallback;
+use crate::event::EventContext;
 use crate::id::{ProviderKind, SandboxId, SnapshotId, VolumeId};
 use crate::logs::LogSink;
 use crate::sandbox::{Sandbox, SnapshotMode};
@@ -27,19 +27,19 @@ pub trait SandboxProvider: Send + Sync {
     /// for pre-create decisions. The per-sandbox set is authoritative.
     fn capabilities(&self) -> &Capabilities;
 
-    /// Provisions a sandbox and returns its handle. The event callback is
+    /// Provisions a sandbox and returns its handle. The event context is
     /// scoped to the returned handle's lifetime.
     async fn create(
         &self,
         spec: &SandboxSpec,
-        events: Option<EventCallback>,
+        events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>>;
 
     /// Re-attaches to an existing sandbox by persisted ID.
     async fn attach(
         &self,
         id: &SandboxId,
-        events: Option<EventCallback>,
+        events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>>;
 
     /// Restores a recently deleted sandbox and returns a fresh handle,
@@ -51,7 +51,7 @@ pub trait SandboxProvider: Send + Sync {
     async fn undelete(
         &self,
         id: &SandboxId,
-        events: Option<EventCallback>,
+        events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
         let _ = (id, events);
         Err(Error::unsupported(Capability::LifecycleUndelete))
@@ -137,14 +137,15 @@ impl ProviderHealth {
 pub trait SnapshotProvider: Send + Sync {
     /// Starts creating a snapshot; poll [`SnapshotProvider::get`] or follow
     /// [`SnapshotProvider::build_logs`] for progress.
-    async fn create(&self, spec: &SnapshotSpec) -> Result<SnapshotId>;
+    async fn create(&self, spec: &SnapshotSpec, events: Option<EventContext>)
+    -> Result<SnapshotId>;
 
     async fn get(&self, id: &SnapshotId) -> Result<SnapshotStatus>;
 
     async fn list(&self, filter: &SnapshotFilter) -> Result<Vec<SnapshotStatus>>;
 
     /// Idempotent delete.
-    async fn delete(&self, id: &SnapshotId) -> Result<()>;
+    async fn delete(&self, id: &SnapshotId, events: Option<EventContext>) -> Result<()>;
 
     /// Streams snapshot build output. Capability-gated on
     /// `snapshots.build_logs`.
@@ -156,15 +157,15 @@ pub trait SnapshotProvider: Send + Sync {
     /// Reactivates an inactive snapshot so sandboxes can be created from
     /// it again (Daytona deactivates snapshots unused for two weeks).
     /// Capability-gated on `snapshots.activation`.
-    async fn activate(&self, id: &SnapshotId) -> Result<()> {
-        let _ = id;
+    async fn activate(&self, id: &SnapshotId, events: Option<EventContext>) -> Result<()> {
+        let _ = (id, events);
         Err(Error::unsupported(Capability::SnapshotsActivation))
     }
 
     /// Deactivates an active snapshot, releasing whatever the provider
     /// keeps warm for it. Capability-gated on `snapshots.activation`.
-    async fn deactivate(&self, id: &SnapshotId) -> Result<()> {
-        let _ = id;
+    async fn deactivate(&self, id: &SnapshotId, events: Option<EventContext>) -> Result<()> {
+        let _ = (id, events);
         Err(Error::unsupported(Capability::SnapshotsActivation))
     }
 }
@@ -324,14 +325,14 @@ pub struct SnapshotFilter {
 /// create time only, via [`crate::VolumeMount`].
 #[async_trait]
 pub trait VolumeProvider: Send + Sync {
-    async fn create(&self, spec: &VolumeSpec) -> Result<VolumeId>;
+    async fn create(&self, spec: &VolumeSpec, events: Option<EventContext>) -> Result<VolumeId>;
 
     async fn get(&self, id: &VolumeId) -> Result<VolumeStatus>;
 
     async fn list(&self) -> Result<Vec<VolumeStatus>>;
 
     /// Idempotent delete.
-    async fn delete(&self, id: &VolumeId) -> Result<()>;
+    async fn delete(&self, id: &VolumeId, events: Option<EventContext>) -> Result<()>;
 }
 
 /// Creation request for [`VolumeProvider::create`].

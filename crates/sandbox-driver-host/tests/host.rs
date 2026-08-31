@@ -7,10 +7,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{env, process};
 
+use async_trait::async_trait;
 use sandbox_driver::{
-    DerivedGit, DerivedSearch, Error, EventCallback, ExecControls, ExecSpec, Git, GitCommitOptions,
-    GrepOptions, LifecycleAction, OutputStream, SandboxEvent, SandboxFilter, SandboxId,
-    SandboxProvider, SandboxSource, SandboxSpec, Search, SpawnSpec, StdioProcessHandle,
+    Action, DerivedGit, DerivedSearch, Error, Event, EventBody, EventContext, EventObserver,
+    ExecControls, ExecSpec, Git, GitCommitOptions, GrepOptions, OutputStream, SandboxFilter,
+    SandboxId, SandboxProvider, SandboxSource, SandboxSpec, Search, SpawnSpec, StdioProcessHandle,
     Termination, WaitOptions, WalkOptions, WorkspaceOwnership, activate,
 };
 use sandbox_driver_host::HostProvider;
@@ -19,6 +20,18 @@ use tokio::{fs as tokio_fs, time};
 use tokio_util::sync::CancellationToken;
 
 type SeenChunks = Arc<Mutex<Vec<(OutputStream, Vec<u8>)>>>;
+
+#[derive(Default)]
+struct RecordingEventObserver {
+    events: Mutex<Vec<Event>>,
+}
+
+#[async_trait]
+impl EventObserver for RecordingEventObserver {
+    async fn observe(&self, event: Event) {
+        self.events.lock().expect("events lock").push(event);
+    }
+}
 
 fn host_spec() -> SandboxSpec {
     SandboxSpec::new(SandboxSource::HostDirectory)
@@ -44,27 +57,27 @@ async fn managed_workspace_is_created_and_removed() {
 
 #[tokio::test]
 async fn failed_create_pairs_started_with_failed() {
-    let events: Arc<Mutex<Vec<SandboxEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let seen = Arc::clone(&events);
-    let callback: EventCallback = Arc::new(move |event| {
-        seen.lock().expect("events lock").push(event);
-    });
+    let observer = Arc::new(RecordingEventObserver::default());
+    let context = EventContext::new(observer.clone());
 
     let provider = HostProvider::new();
     let missing = env::temp_dir().join(format!("sd-missing-{}", process::id()));
     let spec = host_spec().working_directory(missing.to_string_lossy());
-    let result = provider.create(&spec, Some(callback)).await;
+    let result = provider.create(&spec, Some(context)).await;
     assert!(
         result.is_err(),
         "create with a missing designated directory must fail"
     );
 
-    let events = events.lock().expect("events lock");
+    let events = observer.events.lock().expect("events lock");
     assert!(
         matches!(
             events.first(),
-            Some(SandboxEvent::ActionStarted {
-                action: LifecycleAction::Create,
+            Some(Event {
+                body: EventBody::OperationStarted {
+                    action: Action::Create,
+                },
+                ..
             })
         ),
         "first event was {:?}",
@@ -73,8 +86,11 @@ async fn failed_create_pairs_started_with_failed() {
     assert!(
         matches!(
             events.last(),
-            Some(SandboxEvent::ActionFailed {
-                action: LifecycleAction::Create,
+            Some(Event {
+                body: EventBody::OperationFailed {
+                    action: Action::Create,
+                    ..
+                },
                 ..
             })
         ),

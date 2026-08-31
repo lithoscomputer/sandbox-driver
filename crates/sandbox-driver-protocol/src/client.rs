@@ -2,7 +2,6 @@
 //! [`SandboxProvider`] / [`Sandbox`] traits.
 
 use std::collections::{BTreeMap, HashMap};
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -11,14 +10,15 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sandbox_driver::{
-    Capabilities, DirEntry, Error, EventCallback, Exec, ExecControls, ExecResult, ExecSpec,
-    ExecStreamingResult, FileMetadata, Filesystem, ForkOptions, HealthStatus, LifecycleTimers,
-    LogSink, LogSource, Logs, NetworkPolicy, OutputStream, PlatformInfo, PreviewUrl, PreviewUrls,
-    ProviderHealth, ProviderKind, Pty, PtyOptions, PtySession, PtySize, Resources, Result, Sandbox,
-    SandboxFilter, SandboxId, SandboxSnapshotOptions, SandboxSpec, SandboxStatus, SnapshotFilter,
-    SnapshotId, SnapshotProvider, SnapshotSpec, SnapshotStatus, SpawnSpec, SshAccess,
-    SshAccessInfo, StderrTail, StdioProcess, StdioProcessHandle, Termination, TransportError, Vnc,
-    VncConnection, VolumeId, VolumeProvider, VolumeSpec, VolumeStatus, WebTerminal,
+    Capabilities, DirEntry, Error, EventContext, EventSubject, Exec, ExecControls, ExecResult,
+    ExecSpec, ExecStreamingResult, FileMetadata, Filesystem, ForkOptions, HealthStatus,
+    LifecycleTimers, LogSink, LogSource, Logs, NetworkPolicy, OutputStream, PlatformInfo,
+    PreviewUrl, PreviewUrls, ProviderHealth, ProviderKind, Pty, PtyOptions, PtySession, PtySize,
+    Resources, Result, Sandbox, SandboxFilter, SandboxId, SandboxSnapshotOptions, SandboxSpec,
+    SandboxStatus, SnapshotFilter, SnapshotId, SnapshotProvider, SnapshotSpec, SnapshotStatus,
+    SpawnSpec, SshAccess, SshAccessInfo, StderrTail, StdioProcess, StdioProcessHandle, Termination,
+    TransportError, Vnc, VncConnection, VolumeId, VolumeProvider, VolumeSpec, VolumeStatus,
+    WebTerminal,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -150,43 +150,44 @@ impl PluginProvider {
     fn wrap_handle(
         &self,
         mut info: m::HandleInfo,
-        events: Option<EventCallback>,
+        events: Option<EventContext>,
     ) -> Arc<dyn Sandbox> {
         mask_wire_capabilities(&mut info.capabilities);
         let id = info.status.id.clone();
-        if let Some(callback) = events {
+        if let Some(context) = &events {
             self.client
-                .event_callbacks
+                .event_contexts
                 .lock()
-                .expect("event callbacks lock")
-                .insert(id.as_str().to_owned(), callback);
+                .expect("event contexts lock")
+                .insert(id.as_str().to_owned(), context.clone());
         }
         Arc::new(SandboxHandle {
-            client:            Arc::clone(&self.client),
-            id:                id.clone(),
-            capabilities:      info.capabilities,
+            client: Arc::clone(&self.client),
+            id: id.clone(),
+            capabilities: info.capabilities,
             working_directory: info.working_directory,
             runtime_directory: info.runtime_directory,
-            exec:              SandboxExec {
+            exec: SandboxExec {
                 client:     Arc::clone(&self.client),
                 sandbox_id: id.clone(),
             },
-            access:            SandboxAccess {
+            access: SandboxAccess {
                 client:     Arc::clone(&self.client),
                 sandbox_id: id.clone(),
             },
-            pty:               SandboxPty {
+            pty: SandboxPty {
                 client:     Arc::clone(&self.client),
                 sandbox_id: id.clone(),
             },
-            logs:              SandboxLogs {
+            logs: SandboxLogs {
                 client:     Arc::clone(&self.client),
                 sandbox_id: id.clone(),
             },
-            fs:                SandboxFs {
+            fs: SandboxFs {
                 client:     Arc::clone(&self.client),
                 sandbox_id: id,
             },
+            events,
         })
     }
 }
@@ -204,67 +205,52 @@ impl sandbox_driver::SandboxProvider for PluginProvider {
     async fn create(
         &self,
         spec: &SandboxSpec,
-        events: Option<EventCallback>,
+        events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
-        // A caller that wants events gets them from the first moment of
-        // the create, before a sandbox id exists: the operation id
-        // routes host/event notifications until wrap_handle re-registers
-        // the callback under the sandbox id.
-        let operation_id = events.as_ref().map(|callback| {
-            let id = format!(
-                "op-{}",
-                self.client.next_operation.fetch_add(1, Ordering::Relaxed)
-            );
-            self.client
-                .operation_callbacks
-                .lock()
-                .expect("operation callbacks lock")
-                .insert(id.clone(), Arc::clone(callback));
-            id
-        });
+        let event_request = self.client.register_events(events.as_ref());
         let outcome: Result<m::HandleInfo> = self
             .client
             .call(m::SANDBOX_CREATE, &m::CreateParams {
-                spec:         m::SandboxSpecDto::try_from(spec)?,
-                operation_id: operation_id.clone(),
+                spec:   m::SandboxSpecDto::try_from(spec)?,
+                events: event_request.clone(),
             })
             .await;
-        if let Some(operation_id) = operation_id {
-            self.client
-                .operation_callbacks
-                .lock()
-                .expect("operation callbacks lock")
-                .remove(&operation_id);
-        }
+        self.client.unregister_events(event_request.as_ref());
         Ok(self.wrap_handle(outcome?, events))
     }
 
     async fn attach(
         &self,
         id: &SandboxId,
-        events: Option<EventCallback>,
+        events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
-        let info: m::HandleInfo = self
+        let event_request = self.client.register_events(events.as_ref());
+        let outcome: Result<m::HandleInfo> = self
             .client
             .call(m::SANDBOX_ATTACH, &m::AttachParams {
                 sandbox_id: id.as_str().to_owned(),
+                events:     event_request.clone(),
             })
-            .await?;
-        Ok(self.wrap_handle(info, events))
+            .await;
+        self.client.unregister_events(event_request.as_ref());
+        Ok(self.wrap_handle(outcome?, events))
     }
 
     async fn undelete(
         &self,
         id: &SandboxId,
-        events: Option<EventCallback>,
+        events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
-        let info: m::HandleInfo = self
+        let event_request = self.client.register_events(events.as_ref());
+        let outcome: Result<m::HandleInfo> = self
             .client
             .call(m::SANDBOX_UNDELETE, &m::AttachParams {
                 sandbox_id: id.as_str().to_owned(),
+                events:     event_request.clone(),
             })
-            .await?;
-        Ok(self.wrap_handle(info, events))
+            .await;
+        self.client.unregister_events(event_request.as_ref());
+        Ok(self.wrap_handle(outcome?, events))
     }
 
     async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>> {
@@ -313,13 +299,21 @@ struct ProviderSnapshots {
 
 #[async_trait]
 impl SnapshotProvider for ProviderSnapshots {
-    async fn create(&self, spec: &SnapshotSpec) -> Result<SnapshotId> {
-        let result: m::SnapshotIdResult = self
+    async fn create(
+        &self,
+        spec: &SnapshotSpec,
+        events: Option<EventContext>,
+    ) -> Result<SnapshotId> {
+        let event_request = self.client.register_events(events.as_ref());
+        let outcome: Result<m::SnapshotIdResult> = self
             .client
             .call(m::SNAPSHOT_CREATE, &m::SnapshotCreateParams {
-                spec: m::SnapshotSpecDto::try_from(spec)?,
+                spec:   m::SnapshotSpecDto::try_from(spec)?,
+                events: event_request.clone(),
             })
-            .await?;
+            .await;
+        self.client.unregister_events(event_request.as_ref());
+        let result = outcome?;
         SnapshotId::try_new(result.snapshot_id)
             .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))
     }
@@ -329,6 +323,7 @@ impl SnapshotProvider for ProviderSnapshots {
             .client
             .call(m::SNAPSHOT_GET, &m::SnapshotIdParams {
                 snapshot_id: id.as_str().to_owned(),
+                events:      None,
             })
             .await?;
         Ok(result.status)
@@ -344,13 +339,17 @@ impl SnapshotProvider for ProviderSnapshots {
         Ok(result.snapshots)
     }
 
-    async fn delete(&self, id: &SnapshotId) -> Result<()> {
-        let _: m::Empty = self
+    async fn delete(&self, id: &SnapshotId, events: Option<EventContext>) -> Result<()> {
+        let event_request = self.client.register_events(events.as_ref());
+        let outcome: Result<m::Empty> = self
             .client
             .call(m::SNAPSHOT_DELETE, &m::SnapshotIdParams {
                 snapshot_id: id.as_str().to_owned(),
+                events:      event_request.clone(),
             })
-            .await?;
+            .await;
+        self.client.unregister_events(event_request.as_ref());
+        outcome?;
         Ok(())
     }
 
@@ -370,23 +369,31 @@ impl SnapshotProvider for ProviderSnapshots {
         .await
     }
 
-    async fn activate(&self, id: &SnapshotId) -> Result<()> {
-        let _: m::Empty = self
+    async fn activate(&self, id: &SnapshotId, events: Option<EventContext>) -> Result<()> {
+        let event_request = self.client.register_events(events.as_ref());
+        let outcome: Result<m::Empty> = self
             .client
             .call(m::SNAPSHOT_ACTIVATE, &m::SnapshotIdParams {
                 snapshot_id: id.as_str().to_owned(),
+                events:      event_request.clone(),
             })
-            .await?;
+            .await;
+        self.client.unregister_events(event_request.as_ref());
+        outcome?;
         Ok(())
     }
 
-    async fn deactivate(&self, id: &SnapshotId) -> Result<()> {
-        let _: m::Empty = self
+    async fn deactivate(&self, id: &SnapshotId, events: Option<EventContext>) -> Result<()> {
+        let event_request = self.client.register_events(events.as_ref());
+        let outcome: Result<m::Empty> = self
             .client
             .call(m::SNAPSHOT_DEACTIVATE, &m::SnapshotIdParams {
                 snapshot_id: id.as_str().to_owned(),
+                events:      event_request.clone(),
             })
-            .await?;
+            .await;
+        self.client.unregister_events(event_request.as_ref());
+        outcome?;
         Ok(())
     }
 }
@@ -398,13 +405,17 @@ struct ProviderVolumes {
 
 #[async_trait]
 impl VolumeProvider for ProviderVolumes {
-    async fn create(&self, spec: &VolumeSpec) -> Result<VolumeId> {
-        let result: m::VolumeIdResult = self
+    async fn create(&self, spec: &VolumeSpec, events: Option<EventContext>) -> Result<VolumeId> {
+        let event_request = self.client.register_events(events.as_ref());
+        let outcome: Result<m::VolumeIdResult> = self
             .client
             .call(m::VOLUME_CREATE, &m::VolumeCreateParams {
-                spec: spec.clone(),
+                spec:   spec.clone(),
+                events: event_request.clone(),
             })
-            .await?;
+            .await;
+        self.client.unregister_events(event_request.as_ref());
+        let result = outcome?;
         VolumeId::try_new(result.volume_id)
             .map_err(|error| Error::invalid_spec("volume_id", error.to_string()))
     }
@@ -414,6 +425,7 @@ impl VolumeProvider for ProviderVolumes {
             .client
             .call(m::VOLUME_GET, &m::VolumeIdParams {
                 volume_id: id.as_str().to_owned(),
+                events:    None,
             })
             .await?;
         Ok(result.status)
@@ -424,13 +436,17 @@ impl VolumeProvider for ProviderVolumes {
         Ok(result.volumes)
     }
 
-    async fn delete(&self, id: &VolumeId) -> Result<()> {
-        let _: m::Empty = self
+    async fn delete(&self, id: &VolumeId, events: Option<EventContext>) -> Result<()> {
+        let event_request = self.client.register_events(events.as_ref());
+        let outcome: Result<m::Empty> = self
             .client
             .call(m::VOLUME_DELETE, &m::VolumeIdParams {
                 volume_id: id.as_str().to_owned(),
+                events:    event_request.clone(),
             })
-            .await?;
+            .await;
+        self.client.unregister_events(event_request.as_ref());
+        outcome?;
         Ok(())
     }
 }
@@ -548,22 +564,22 @@ const EXEC_STREAM_QUEUE: usize = 1024;
 /// per-exec ordered queue drained by a pump task that owns the caller's
 /// sink, so one slow consumer delays only its own stream.
 struct Client {
-    outbound:            mpsc::Sender<Message>,
-    next_id:             AtomicU64,
-    next_exec:           AtomicU64,
-    next_stream:         AtomicU64,
-    next_operation:      AtomicU64,
+    outbound:       mpsc::Sender<Message>,
+    next_id:        AtomicU64,
+    next_exec:      AtomicU64,
+    next_stream:    AtomicU64,
+    next_operation: AtomicU64,
     /// Set when either transport task ends; every pending and future call
     /// fails fast instead of waiting on a dead pipe.
-    closed:              AtomicBool,
-    closed_error:        Mutex<Option<TransportError>>,
-    pending:             Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>,
-    exec_streams:        Mutex<HashMap<String, mpsc::Sender<ExecChunk>>>,
-    log_streams:         Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>,
-    event_callbacks:     Mutex<HashMap<String, EventCallback>>,
-    /// Callbacks for in-flight creates, keyed by operation id, so events
-    /// arrive before a sandbox id exists.
-    operation_callbacks: Mutex<HashMap<String, EventCallback>>,
+    closed:         AtomicBool,
+    closed_error:   Mutex<Option<TransportError>>,
+    pending:        Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>,
+    exec_streams:   Mutex<HashMap<String, mpsc::Sender<ExecChunk>>>,
+    log_streams:    Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>,
+    event_contexts: Mutex<HashMap<String, EventContext>>,
+    /// Contexts for in-flight resource operations, keyed by a wire-only
+    /// route id so events can arrive before a resource id exists.
+    event_routes:   Mutex<HashMap<String, EventContext>>,
 }
 
 impl Client {
@@ -583,8 +599,8 @@ impl Client {
             pending: Mutex::new(HashMap::new()),
             exec_streams: Mutex::new(HashMap::new()),
             log_streams: Mutex::new(HashMap::new()),
-            event_callbacks: Mutex::new(HashMap::new()),
-            operation_callbacks: Mutex::new(HashMap::new()),
+            event_contexts: Mutex::new(HashMap::new()),
+            event_routes: Mutex::new(HashMap::new()),
         });
 
         let writer_client = Arc::clone(&client);
@@ -665,6 +681,11 @@ impl Client {
         }
         self.exec_streams.lock().expect("exec streams lock").clear();
         self.log_streams.lock().expect("log streams lock").clear();
+        self.event_contexts
+            .lock()
+            .expect("event contexts lock")
+            .clear();
+        self.event_routes.lock().expect("event routes lock").clear();
     }
 
     fn closed_error(&self) -> Error {
@@ -682,6 +703,32 @@ impl Client {
             "{prefix}-{}",
             self.next_stream.fetch_add(1, Ordering::Relaxed)
         )
+    }
+
+    fn register_events(&self, events: Option<&EventContext>) -> Option<m::EventRequest> {
+        events.map(|context| {
+            let route_id = format!(
+                "event-{}",
+                self.next_operation.fetch_add(1, Ordering::Relaxed)
+            );
+            self.event_routes
+                .lock()
+                .expect("event routes lock")
+                .insert(route_id.clone(), context.clone());
+            m::EventRequest {
+                route_id,
+                correlation_id: context.correlation_id_ref().cloned(),
+            }
+        })
+    }
+
+    fn unregister_events(&self, request: Option<&m::EventRequest>) {
+        if let Some(request) = request {
+            self.event_routes
+                .lock()
+                .expect("event routes lock")
+                .remove(&request.route_id);
+        }
     }
 
     async fn route(&self, message: Message) -> Result<(), TransportError> {
@@ -751,33 +798,34 @@ impl Client {
                     .map_err(|error| {
                         TransportError::with_source("decoding plugin host event", error)
                     })?;
-                // Operation routing first: during a create the same
-                // callback may be registered under both keys, and the
-                // event must be delivered exactly once.
-                let callback = notification
-                    .operation_id
+                // Route id first: a create event can arrive before a
+                // resource id exists. Established sandbox handles fall
+                // back to the resource id in the event subject.
+                let resource_id = match &notification.event.subject {
+                    EventSubject::Sandbox { id: Some(id), .. } => Some(id.as_str()),
+                    _ => None,
+                };
+                let context = notification
+                    .route_id
                     .as_ref()
-                    .and_then(|operation_id| {
-                        self.operation_callbacks
+                    .and_then(|route_id| {
+                        self.event_routes
                             .lock()
-                            .expect("operation callbacks lock")
-                            .get(operation_id)
+                            .expect("event routes lock")
+                            .get(route_id)
                             .cloned()
                     })
                     .or_else(|| {
-                        self.event_callbacks
-                            .lock()
-                            .expect("event callbacks lock")
-                            .get(&notification.sandbox_id)
-                            .cloned()
+                        resource_id.and_then(|resource_id| {
+                            self.event_contexts
+                                .lock()
+                                .expect("event contexts lock")
+                                .get(resource_id)
+                                .cloned()
+                        })
                     });
-                if let Some(callback) = callback {
-                    if catch_unwind(AssertUnwindSafe(|| callback(notification.event))).is_err() {
-                        tracing::warn!(
-                            sandbox_id = %notification.sandbox_id,
-                            "plugin event callback panicked"
-                        );
-                    }
+                if let Some(context) = context {
+                    context.forward(notification.event).await;
                 }
             }
             _ => {}
@@ -932,6 +980,7 @@ struct SandboxHandle {
     pty:               SandboxPty,
     logs:              SandboxLogs,
     fs:                SandboxFs,
+    events:            Option<EventContext>,
 }
 
 impl SandboxHandle {
@@ -1022,6 +1071,13 @@ impl Sandbox for SandboxHandle {
             })
             .await?;
         let id = info.status.id.clone();
+        if let Some(context) = &self.events {
+            self.client
+                .event_contexts
+                .lock()
+                .expect("event contexts lock")
+                .insert(id.as_str().to_owned(), context.clone());
+        }
         Ok(Arc::new(Self {
             client:            Arc::clone(&self.client),
             id:                id.clone(),
@@ -1048,6 +1104,7 @@ impl Sandbox for SandboxHandle {
                 client:     Arc::clone(&self.client),
                 sandbox_id: id,
             },
+            events:            self.events.clone(),
         }))
     }
 

@@ -25,14 +25,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, io, process};
 
 use async_trait::async_trait;
 use sandbox_driver::{
-    Capabilities, Error, ErrorReport, EventCallback, EventDispatcher, Exec, ExecSpec, Filesystem,
-    HealthStatus, Isolation, LifecycleAction, PlatformInfo, ProviderHealth, ProviderKind,
-    ResourceKind, Result, Sandbox, SandboxEvent, SandboxFilter, SandboxId, SandboxProvider,
+    Action, Capabilities, Error, EventContext, EventEmitter, EventSubject, Exec, ExecSpec,
+    Filesystem, HealthStatus, Isolation, PlatformInfo, Progress, ProgressCode, ProviderHealth,
+    ProviderKind, ResourceKind, Result, Sandbox, SandboxFilter, SandboxId, SandboxProvider,
     SandboxSource, SandboxSpec, SandboxState, SandboxStatus, WorkspaceOwnership,
 };
 use tokio::fs as tokio_fs;
@@ -108,7 +108,7 @@ impl SandboxProvider for HostProvider {
     async fn create(
         &self,
         spec: &SandboxSpec,
-        events: Option<EventCallback>,
+        events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
         spec.validate()?;
         if spec.sandbox_kind.is_some() {
@@ -130,103 +130,73 @@ impl SandboxProvider for HostProvider {
             ));
         }
 
-        let dispatcher = events.map(EventDispatcher::new);
-        if let Some(dispatcher) = &dispatcher {
-            dispatcher
-                .emit(SandboxEvent::ActionStarted {
-                    action: LifecycleAction::Create,
-                })
-                .await;
-        }
-        let started = Instant::now();
-
+        let emitter = EventEmitter::new(self.kind.clone(), events);
         let id = self.next_id();
-        // Every failure after ActionStarted must pair with ActionFailed;
-        // the fallible section funnels through one outcome.
-        let outcome = async {
-            let (workspace, ownership) = if let Some(path) = &spec.working_directory {
-                let path = PathBuf::from(path.as_str());
-                let metadata = tokio_fs::metadata(&path).await.map_err(|error| {
-                    Error::io(
-                        format!("designated directory {} is not usable", path.display()),
-                        error,
-                    )
-                })?;
-                if !metadata.is_dir() {
-                    return Err(Error::invalid_spec(
-                        "working_directory",
-                        "designated path is not a directory",
-                    ));
-                }
-                let path = tokio_fs::canonicalize(&path).await.map_err(|error| {
-                    Error::io(
-                        format!("resolving designated directory {}", path.display()),
-                        error,
-                    )
-                })?;
-                (path, WorkspaceOwnership::Designated)
-            } else {
-                let path = env::temp_dir()
-                    .join("sandbox-driver-host")
-                    .join(id.as_str());
-                tokio_fs::create_dir_all(&path).await.map_err(|error| {
-                    Error::io(
-                        format!("creating managed workspace {}", path.display()),
-                        error,
-                    )
-                })?;
-                let path = tokio_fs::canonicalize(&path).await.map_err(|error| {
-                    Error::io(
-                        format!("resolving managed workspace {}", path.display()),
-                        error,
-                    )
-                })?;
-                (path, WorkspaceOwnership::Managed)
-            };
-            Ok::<_, Error>((workspace, ownership))
-        }
-        .await;
-        let (workspace, ownership) = match outcome {
-            Ok(parts) => parts,
-            Err(error) => {
-                if let Some(dispatcher) = dispatcher {
-                    dispatcher
-                        .emit(SandboxEvent::ActionFailed {
-                            action: LifecycleAction::Create,
-                            error:  ErrorReport::from(&error),
-                        })
-                        .await;
-                    // Join delivery: a failed create's events must be
-                    // observable when the call returns.
-                    dispatcher.shutdown().await;
-                }
-                return Err(error);
-            }
+        let subject = EventSubject::Sandbox {
+            id:   Some(id.clone()),
+            name: spec.name.clone(),
         };
-
-        let sandbox = Arc::new(HostSandbox::new(
-            id.clone(),
-            self.capabilities.clone(),
-            workspace,
-            ownership,
-            spec.env.clone(),
-            spec.labels.clone(),
-            dispatcher,
-        ));
-        self.registry
-            .lock()
-            .expect("registry lock")
-            .insert(id, Arc::clone(&sandbox));
-
-        if let Some(dispatcher) = &sandbox.dispatcher {
-            dispatcher
-                .emit(SandboxEvent::ActionCompleted {
-                    action:   LifecycleAction::Create,
-                    duration: started.elapsed(),
-                })
-                .await;
-        }
-        Ok(sandbox)
+        let handle_emitter = emitter.clone();
+        emitter
+            .run(subject, Action::Create, |reporter| async move {
+                reporter
+                    .progress(Progress::new(ProgressCode::SANDBOX_PROVISION))
+                    .await;
+                let (workspace, ownership) = if let Some(path) = &spec.working_directory {
+                    let path = PathBuf::from(path.as_str());
+                    let metadata = tokio_fs::metadata(&path).await.map_err(|error| {
+                        Error::io(
+                            format!("designated directory {} is not usable", path.display()),
+                            error,
+                        )
+                    })?;
+                    if !metadata.is_dir() {
+                        return Err(Error::invalid_spec(
+                            "working_directory",
+                            "designated path is not a directory",
+                        ));
+                    }
+                    let path = tokio_fs::canonicalize(&path).await.map_err(|error| {
+                        Error::io(
+                            format!("resolving designated directory {}", path.display()),
+                            error,
+                        )
+                    })?;
+                    (path, WorkspaceOwnership::Designated)
+                } else {
+                    let path = env::temp_dir()
+                        .join("sandbox-driver-host")
+                        .join(id.as_str());
+                    tokio_fs::create_dir_all(&path).await.map_err(|error| {
+                        Error::io(
+                            format!("creating managed workspace {}", path.display()),
+                            error,
+                        )
+                    })?;
+                    let path = tokio_fs::canonicalize(&path).await.map_err(|error| {
+                        Error::io(
+                            format!("resolving managed workspace {}", path.display()),
+                            error,
+                        )
+                    })?;
+                    (path, WorkspaceOwnership::Managed)
+                };
+                let sandbox = Arc::new(HostSandbox::new(
+                    id.clone(),
+                    self.capabilities.clone(),
+                    workspace,
+                    ownership,
+                    spec.env.clone(),
+                    spec.labels.clone(),
+                    handle_emitter,
+                ));
+                self.registry
+                    .lock()
+                    .expect("registry lock")
+                    .insert(id, Arc::clone(&sandbox));
+                Ok(sandbox as Arc<dyn Sandbox>)
+            })
+            .await
     }
 
     #[tracing::instrument(
@@ -237,17 +207,28 @@ impl SandboxProvider for HostProvider {
     async fn attach(
         &self,
         id: &SandboxId,
-        _events: Option<EventCallback>,
+        events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
-        let registry = self.registry.lock().expect("registry lock");
-        registry
-            .get(id)
-            .cloned()
-            .map(|sandbox| sandbox as Arc<dyn Sandbox>)
-            .ok_or_else(|| Error::NotFound {
-                resource: ResourceKind::Sandbox,
-                id:       id.as_str().to_owned(),
-            })
+        let emitter = EventEmitter::new(self.kind.clone(), events);
+        let handle_emitter = emitter.clone();
+        emitter
+            .run(
+                EventSubject::sandbox(Some(id.clone())),
+                Action::Attach,
+                |_| async move {
+                    let registry = self.registry.lock().expect("registry lock");
+                    registry
+                        .get(id)
+                        .map(|sandbox| {
+                            Arc::new(sandbox.with_emitter(handle_emitter)) as Arc<dyn Sandbox>
+                        })
+                        .ok_or_else(|| Error::NotFound {
+                            resource: ResourceKind::Sandbox,
+                            id:       id.as_str().to_owned(),
+                        })
+                },
+            )
+            .await
     }
 
     #[tracing::instrument(
@@ -285,10 +266,11 @@ pub struct HostSandbox {
     workspace:         PathBuf,
     ownership:         WorkspaceOwnership,
     labels:            BTreeMap<String, String>,
-    state:             Mutex<SandboxState>,
+    state:             Arc<Mutex<SandboxState>>,
+    env:               BTreeMap<String, String>,
     exec:              HostExec,
     fs:                HostFs,
-    dispatcher:        Option<EventDispatcher>,
+    events:            EventEmitter,
     working_directory: String,
     created_at:        SystemTime,
 }
@@ -301,21 +283,39 @@ impl HostSandbox {
         ownership: WorkspaceOwnership,
         env: BTreeMap<String, String>,
         labels: BTreeMap<String, String>,
-        dispatcher: Option<EventDispatcher>,
+        events: EventEmitter,
     ) -> Self {
         let working_directory = workspace.to_string_lossy().into_owned();
         Self {
             id,
             capabilities,
-            exec: HostExec::new(workspace.clone(), env),
+            exec: HostExec::new(workspace.clone(), env.clone()),
             fs: HostFs::new(workspace.clone()),
             workspace,
             ownership,
             labels,
-            state: Mutex::new(SandboxState::Running),
-            dispatcher,
+            state: Arc::new(Mutex::new(SandboxState::Running)),
+            env,
+            events,
             working_directory,
             created_at: SystemTime::now(),
+        }
+    }
+
+    fn with_emitter(&self, events: EventEmitter) -> Self {
+        Self {
+            id: self.id.clone(),
+            capabilities: self.capabilities.clone(),
+            workspace: self.workspace.clone(),
+            ownership: self.ownership,
+            labels: self.labels.clone(),
+            state: Arc::clone(&self.state),
+            env: self.env.clone(),
+            exec: HostExec::new(self.workspace.clone(), self.env.clone()),
+            fs: HostFs::new(self.workspace.clone()),
+            events,
+            working_directory: self.working_directory.clone(),
+            created_at: self.created_at,
         }
     }
 
@@ -372,53 +372,57 @@ impl Sandbox for HostSandbox {
     /// No-op: the host is always running.
     #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.id), err)]
     async fn start(&self) -> Result<()> {
-        Ok(())
+        self.events
+            .run(
+                EventSubject::sandbox(Some(self.id.clone())),
+                Action::Start,
+                |_| async { Ok(()) },
+            )
+            .await
     }
 
     /// No-op: stopping the caller's own machine is not this crate's job.
     #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.id), err)]
     async fn stop(&self) -> Result<()> {
-        Ok(())
+        self.events
+            .run(
+                EventSubject::sandbox(Some(self.id.clone())),
+                Action::Stop,
+                |_| async { Ok(()) },
+            )
+            .await
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.id), err)]
     async fn delete(&self) -> Result<()> {
-        {
-            let mut state = self.state.lock().expect("state lock");
-            if *state == SandboxState::Deleted {
-                return Ok(());
-            }
-            *state = SandboxState::Deleted;
-        }
-        if let Some(dispatcher) = &self.dispatcher {
-            dispatcher
-                .emit(SandboxEvent::ActionStarted {
-                    action: LifecycleAction::Delete,
-                })
-                .await;
-        }
-        let started = Instant::now();
-        if self.ownership == WorkspaceOwnership::Managed {
-            match tokio_fs::remove_dir_all(&self.workspace).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(Error::io(
-                        format!("removing managed workspace {}", self.workspace.display()),
-                        error,
-                    ));
-                }
-            }
-        }
-        if let Some(dispatcher) = &self.dispatcher {
-            dispatcher
-                .emit(SandboxEvent::ActionCompleted {
-                    action:   LifecycleAction::Delete,
-                    duration: started.elapsed(),
-                })
-                .await;
-        }
-        Ok(())
+        self.events
+            .run(
+                EventSubject::sandbox(Some(self.id.clone())),
+                Action::Delete,
+                |_| async {
+                    if *self.state.lock().expect("state lock") == SandboxState::Deleted {
+                        return Ok(());
+                    }
+                    if self.ownership == WorkspaceOwnership::Managed {
+                        match tokio_fs::remove_dir_all(&self.workspace).await {
+                            Ok(()) => {}
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                            Err(error) => {
+                                return Err(Error::io(
+                                    format!(
+                                        "removing managed workspace {}",
+                                        self.workspace.display()
+                                    ),
+                                    error,
+                                ));
+                            }
+                        }
+                    }
+                    *self.state.lock().expect("state lock") = SandboxState::Deleted;
+                    Ok(())
+                },
+            )
+            .await
     }
 
     fn exec(&self) -> &dyn Exec {

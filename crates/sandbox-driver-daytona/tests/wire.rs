@@ -88,7 +88,7 @@ ENTRYPOINT ["/bin/sh", "-c", "echo wire-entrypoint; echo wire-entrypoint-error >
     snapshot_spec.resources.memory_mb = Some(1024);
     snapshot_spec.resources.disk_mb = Some(1024);
     let snapshot_id = snapshots
-        .create(&snapshot_spec)
+        .create(&snapshot_spec, None)
         .await
         .expect("create Dockerfile snapshot over wire");
 
@@ -175,7 +175,7 @@ ENTRYPOINT ["/bin/sh", "-c", "echo wire-entrypoint; echo wire-entrypoint-error >
     .await;
 
     snapshots
-        .delete(&snapshot_id)
+        .delete(&snapshot_id, None)
         .await
         .expect("delete wire snapshot");
     remote.shutdown().await.expect("shutdown");

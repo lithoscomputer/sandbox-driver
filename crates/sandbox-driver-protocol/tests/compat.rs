@@ -10,9 +10,10 @@
 use std::time::Duration;
 
 use sandbox_driver::{
-    Capabilities, Capability, Error, ErrorReport, ForkOptions, LifecycleAction, ResourceKind,
-    SandboxKind, SandboxSnapshotOptions, SandboxSource, SandboxSpec, SandboxState, SandboxStatus,
-    SnapshotId, SnapshotMode, SnapshotSource, SnapshotSpec, Termination,
+    Action, Capabilities, Capability, Error, ErrorReport, Event, EventBody, EventSubject,
+    ForkOptions, ResourceKind, SandboxKind, SandboxSnapshotOptions, SandboxSource, SandboxSpec,
+    SandboxState, SandboxStatus, SnapshotId, SnapshotMode, SnapshotSource, SnapshotSpec,
+    Termination,
 };
 use sandbox_driver_protocol::methods::{
     ForkOptionsDto, SandboxSnapshotOptionsDto, SandboxSpecDto, SnapshotSourceDto, SnapshotSpecDto,
@@ -150,8 +151,8 @@ fn state_enums_tolerate_unknown_wire_values() {
     let capability: Capability =
         serde_json::from_str("\"lifecycle.checkpoint\"").expect("legacy capability");
     assert_eq!(capability, Capability::Unknown);
-    let action: LifecycleAction = serde_json::from_str("\"checkpoint\"").expect("legacy action");
-    assert_eq!(action, LifecycleAction::Unknown);
+    let action: Action = serde_json::from_str("\"checkpoint\"").expect("legacy action");
+    assert_eq!(action, Action::Unknown);
     let resource: ResourceKind =
         serde_json::from_str("\"checkpoint\"").expect("legacy resource kind");
     assert_eq!(resource, ResourceKind::Unknown);
@@ -169,6 +170,21 @@ fn unknown_object_fields_are_ignored() {
     let report: ErrorReport = serde_json::from_str(json).expect("tolerates unknown fields");
     assert_eq!(report.kind, "provider");
     assert!(report.retryable);
+}
+
+#[test]
+fn unknown_event_and_subject_kinds_are_tolerated() {
+    let event: Event = serde_json::from_value(serde_json::json!({
+        "id": {"source_id": "future-source", "sequence": 9},
+        "occurred_at": {"secs_since_epoch": 1, "nanos_since_epoch": 0},
+        "provider": "host",
+        "subject": {"type": "future_resource", "detail": true},
+        "type": "future_event",
+        "detail": true
+    }))
+    .expect("unknown event kinds decode");
+    assert!(matches!(event.subject, EventSubject::Unknown));
+    assert!(matches!(event.body, EventBody::Unknown));
 }
 
 #[test]

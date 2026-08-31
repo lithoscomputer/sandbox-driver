@@ -70,15 +70,14 @@ use daytona_sdk::{
     ImageParams, ImageSource, SandboxBaseParams, SnapshotParams,
 };
 use sandbox_driver::{
-    AuthError, Capabilities, Capability, Error, ErrorReport, EventCallback, EventDispatcher, Exec,
-    ExecSpec, Filesystem, ForkOptions, HealthStatus, Isolation, LifecycleAction, LifecycleTimers,
-    LogSink, Logs, LogsCaps, NetworkPolicy, PlatformInfo, PreviewUrls, ProviderError,
-    ProviderHealth, ProviderKind, Pty, PtyCaps, ResourceKind, Resources, Result, Sandbox,
-    SandboxEvent, SandboxFilter, SandboxId, SandboxKind, SandboxProvider, SandboxSnapshotOptions,
-    SandboxSource, SandboxSpec, SandboxState, SandboxStatus, SnapshotCaps, SnapshotFilter,
-    SnapshotId, SnapshotMode, SnapshotProvider, SnapshotSource, SnapshotSpec, SnapshotState,
-    SnapshotStatus, SshAccess, Vnc, VolumeCaps, VolumeId, VolumeProvider, VolumeSpec, VolumeState,
-    VolumeStatus, WebTerminal,
+    Action, AuthError, Capabilities, Capability, Error, EventContext, EventEmitter, EventSubject,
+    Exec, ExecSpec, Filesystem, ForkOptions, HealthStatus, Isolation, LifecycleTimers, LogSink,
+    Logs, LogsCaps, NetworkPolicy, PlatformInfo, PreviewUrls, ProviderError, ProviderHealth,
+    ProviderKind, Pty, PtyCaps, ResourceKind, Resources, Result, Sandbox, SandboxFilter, SandboxId,
+    SandboxKind, SandboxProvider, SandboxSnapshotOptions, SandboxSource, SandboxSpec, SandboxState,
+    SandboxStatus, SnapshotCaps, SnapshotFilter, SnapshotId, SnapshotMode, SnapshotProvider,
+    SnapshotSource, SnapshotSpec, SnapshotState, SnapshotStatus, SshAccess, Vnc, VolumeCaps,
+    VolumeId, VolumeProvider, VolumeSpec, VolumeState, VolumeStatus, WebTerminal,
 };
 use tokio::time;
 
@@ -301,7 +300,7 @@ async fn create_sandbox_snapshot(
     if current != required {
         return Err(Error::InvalidState {
             current,
-            action: LifecycleAction::SnapshotSandbox,
+            action: Action::Snapshot,
         });
     }
 
@@ -470,14 +469,17 @@ impl DaytonaProvider {
             .await
             .map_err(|error| daytona_error("connecting to daytona", error))?;
         let client = Arc::new(client);
+        let kind = ProviderKind::try_new("daytona").expect("static kind is valid");
         Ok(Self {
-            kind: ProviderKind::try_new("daytona").expect("static kind is valid"),
+            kind: kind.clone(),
             capabilities: daytona_capabilities(),
             snapshots: DaytonaSnapshots {
                 client: Arc::clone(&client),
+                kind:   kind.clone(),
             },
             volumes: DaytonaVolumes {
                 client: Arc::clone(&client),
+                kind,
             },
             client,
         })
@@ -566,7 +568,7 @@ impl DaytonaProvider {
     async fn handle(
         &self,
         sdk: daytona_sdk::Sandbox,
-        events: Option<EventCallback>,
+        events: EventEmitter,
     ) -> Result<Arc<DaytonaSandbox>> {
         build_handle(&self.client, &self.capabilities, sdk, events).await
     }
@@ -617,7 +619,7 @@ async fn build_handle(
     client: &DaytonaClient,
     base_capabilities: &Capabilities,
     sdk: daytona_sdk::Sandbox,
-    events: Option<EventCallback>,
+    events: EventEmitter,
 ) -> Result<Arc<DaytonaSandbox>> {
     let working_dir = match sdk.get_working_dir().await {
         Ok(dir) => dir,
@@ -638,7 +640,7 @@ async fn build_handle(
         client: Arc::clone(client),
         sdk_id: sdk.id,
         working_dir,
-        dispatcher: events.map(EventDispatcher::new),
+        events,
     }))
 }
 
@@ -877,7 +879,7 @@ impl SandboxProvider for DaytonaProvider {
     async fn create(
         &self,
         spec: &SandboxSpec,
-        events: Option<EventCallback>,
+        events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
         spec.validate()?;
         let base = base_params(spec)?;
@@ -924,73 +926,40 @@ impl SandboxProvider for DaytonaProvider {
             _ => return Err(Error::invalid_spec("source", "unsupported sandbox source")),
         };
 
-        let dispatcher = events.map(EventDispatcher::new);
-        if let Some(dispatcher) = &dispatcher {
-            dispatcher
-                .emit(SandboxEvent::ActionStarted {
-                    action: LifecycleAction::Create,
-                })
-                .await;
-        }
-        let started = Instant::now();
         let budget = if matches!(spec.source, SandboxSource::Dockerfile { .. }) {
             DOCKERFILE_CREATE_TIMEOUT
         } else {
             CREATE_TIMEOUT
         };
-        // Every failure after ActionStarted must pair with ActionFailed;
-        // the fallible section funnels through one outcome.
-        let outcome = async {
-            let created = self.create_inner(params, budget).await?;
-            if let Some(requested) = spec.sandbox_kind {
-                let actual = created.sandbox_class.map(sandbox_kind_from_sandbox_class);
-                if actual != Some(requested) {
-                    let id = created.id.clone();
-                    let error = Error::invalid_spec(
-                        "sandbox_kind",
-                        format!(
-                            "Daytona created a sandbox with kind {actual:?}, not {requested:?}"
-                        ),
-                    );
-                    return Err(self.cleanup_failed_create(&id, error).await);
-                }
-            }
-            self.handle(created, None).await
-        }
-        .await;
-        let handle = match outcome {
-            Ok(handle) => handle,
-            Err(error) => {
-                if let Some(dispatcher) = dispatcher {
-                    dispatcher
-                        .emit(SandboxEvent::ActionFailed {
-                            action: LifecycleAction::Create,
-                            error:  ErrorReport::from(&error),
-                        })
-                        .await;
-                    // Join delivery: a failed create's events must be
-                    // observable when the call returns.
-                    dispatcher.shutdown().await;
-                }
-                return Err(error);
-            }
-        };
-        if let Some(dispatcher) = dispatcher {
-            dispatcher
-                .emit(SandboxEvent::ActionCompleted {
-                    action:   LifecycleAction::Create,
-                    duration: started.elapsed(),
-                })
-                .await;
-            let handle = Arc::into_inner(handle)
-                .map(|mut sandbox| {
-                    sandbox.dispatcher = Some(dispatcher);
-                    Arc::new(sandbox)
-                })
-                .expect("handle has a single owner at creation");
-            return Ok(handle);
-        }
-        Ok(handle)
+        let emitter = EventEmitter::new(self.kind.clone(), events);
+        let handle_emitter = emitter.clone();
+        emitter
+            .run(
+                EventSubject::pending_sandbox(spec.name.clone()),
+                Action::Create,
+                |reporter| async move {
+                    let created = self.create_inner(params, budget).await?;
+                    let event_id = SandboxId::try_new(created.id.clone())
+                        .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
+                    reporter.set_subject(EventSubject::sandbox(Some(event_id)));
+                    if let Some(requested) = spec.sandbox_kind {
+                        let actual = created.sandbox_class.map(sandbox_kind_from_sandbox_class);
+                        if actual != Some(requested) {
+                            let id = created.id.clone();
+                            let error = Error::invalid_spec(
+                                "sandbox_kind",
+                                format!(
+                                    "Daytona created a sandbox with kind {actual:?}, not \
+                                     {requested:?}"
+                                ),
+                            );
+                            return Err(self.cleanup_failed_create(&id, error).await);
+                        }
+                    }
+                    Ok(self.handle(created, handle_emitter).await? as Arc<dyn Sandbox>)
+                },
+            )
+            .await
     }
 
     #[tracing::instrument(
@@ -1001,25 +970,35 @@ impl SandboxProvider for DaytonaProvider {
     async fn attach(
         &self,
         id: &SandboxId,
-        events: Option<EventCallback>,
+        events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
-        let sdk = match self.client.get(id.as_str()).await {
-            Ok(sdk) => sdk,
-            Err(error) if is_not_found(&error) => {
-                return Err(Error::NotFound {
-                    resource: ResourceKind::Sandbox,
-                    id:       id.as_str().to_owned(),
-                });
-            }
-            Err(error) => return Err(daytona_error("fetching sandbox", error)),
-        };
-        if sdk.labels.get(MANAGED_LABEL).map(String::as_str) != Some("true") {
-            return Err(Error::NotFound {
-                resource: ResourceKind::Sandbox,
-                id:       id.as_str().to_owned(),
-            });
-        }
-        Ok(self.handle(sdk, events).await?)
+        let emitter = EventEmitter::new(self.kind.clone(), events);
+        let handle_emitter = emitter.clone();
+        emitter
+            .run(
+                EventSubject::sandbox(Some(id.clone())),
+                Action::Attach,
+                |_| async move {
+                    let sdk = match self.client.get(id.as_str()).await {
+                        Ok(sdk) => sdk,
+                        Err(error) if is_not_found(&error) => {
+                            return Err(Error::NotFound {
+                                resource: ResourceKind::Sandbox,
+                                id:       id.as_str().to_owned(),
+                            });
+                        }
+                        Err(error) => return Err(daytona_error("fetching sandbox", error)),
+                    };
+                    if sdk.labels.get(MANAGED_LABEL).map(String::as_str) != Some("true") {
+                        return Err(Error::NotFound {
+                            resource: ResourceKind::Sandbox,
+                            id:       id.as_str().to_owned(),
+                        });
+                    }
+                    Ok(self.handle(sdk, handle_emitter).await? as Arc<dyn Sandbox>)
+                },
+            )
+            .await
     }
 
     #[tracing::instrument(
@@ -1030,35 +1009,45 @@ impl SandboxProvider for DaytonaProvider {
     async fn undelete(
         &self,
         id: &SandboxId,
-        events: Option<EventCallback>,
+        events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
-        // Daytona names this "recover": a deleted sandbox stays
-        // restorable for 24 hours.
-        let mut sdk = match self.client.get(id.as_str()).await {
-            Ok(sdk) => sdk,
-            Err(error) if is_not_found(&error) => {
-                return Err(Error::NotFound {
-                    resource: ResourceKind::Sandbox,
-                    id:       id.as_str().to_owned(),
-                });
-            }
-            Err(error) => return Err(daytona_error("fetching sandbox", error)),
-        };
-        if sdk.labels.get(MANAGED_LABEL).map(String::as_str) != Some("true") {
-            return Err(Error::NotFound {
-                resource: ResourceKind::Sandbox,
-                id:       id.as_str().to_owned(),
-            });
-        }
-        sdk.recover()
+        let emitter = EventEmitter::new(self.kind.clone(), events);
+        let handle_emitter = emitter.clone();
+        emitter
+            .run(
+                EventSubject::sandbox(Some(id.clone())),
+                Action::Undelete,
+                |_| async move {
+                    // Daytona names this "recover": a deleted sandbox stays
+                    // restorable for 24 hours.
+                    let mut sdk = match self.client.get(id.as_str()).await {
+                        Ok(sdk) => sdk,
+                        Err(error) if is_not_found(&error) => {
+                            return Err(Error::NotFound {
+                                resource: ResourceKind::Sandbox,
+                                id:       id.as_str().to_owned(),
+                            });
+                        }
+                        Err(error) => return Err(daytona_error("fetching sandbox", error)),
+                    };
+                    if sdk.labels.get(MANAGED_LABEL).map(String::as_str) != Some("true") {
+                        return Err(Error::NotFound {
+                            resource: ResourceKind::Sandbox,
+                            id:       id.as_str().to_owned(),
+                        });
+                    }
+                    sdk.recover()
+                        .await
+                        .map_err(|error| daytona_error("undeleting sandbox", error))?;
+                    let refreshed = self
+                        .client
+                        .get(id.as_str())
+                        .await
+                        .map_err(|error| daytona_error("fetching undeleted sandbox", error))?;
+                    Ok(self.handle(refreshed, handle_emitter).await? as Arc<dyn Sandbox>)
+                },
+            )
             .await
-            .map_err(|error| daytona_error("undeleting sandbox", error))?;
-        let refreshed = self
-            .client
-            .get(id.as_str())
-            .await
-            .map_err(|error| daytona_error("fetching undeleted sandbox", error))?;
-        Ok(self.handle(refreshed, events).await?)
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = %self.kind), err)]
@@ -1162,7 +1151,7 @@ pub struct DaytonaSandbox {
     access:       DaytonaAccess,
     logs:         DaytonaLogs,
     pty:          DaytonaPty,
-    dispatcher:   Option<EventDispatcher>,
+    events:       EventEmitter,
 }
 
 impl DaytonaSandbox {
@@ -1328,30 +1317,6 @@ impl DaytonaSandbox {
             }
         }
     }
-
-    async fn emit_action(&self, action: LifecycleAction, outcome: &Result<()>) {
-        let Some(dispatcher) = &self.dispatcher else {
-            return;
-        };
-        match outcome {
-            Ok(()) => {
-                dispatcher
-                    .emit(SandboxEvent::ActionCompleted {
-                        action,
-                        duration: Duration::ZERO,
-                    })
-                    .await;
-            }
-            Err(error) => {
-                dispatcher
-                    .emit(SandboxEvent::ActionFailed {
-                        action,
-                        error: ErrorReport::from(error),
-                    })
-                    .await;
-            }
-        }
-    }
 }
 
 #[async_trait]
@@ -1397,23 +1362,35 @@ impl Sandbox for DaytonaSandbox {
 
     #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
     async fn start(&self) -> Result<()> {
-        let outcome = self.start_inner().await;
-        self.emit_action(LifecycleAction::Start, &outcome).await;
-        outcome
+        self.events
+            .run(
+                EventSubject::sandbox(Some(self.id.clone())),
+                Action::Start,
+                |_| self.start_inner(),
+            )
+            .await
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
     async fn stop(&self) -> Result<()> {
-        let outcome = self.stop_inner().await;
-        self.emit_action(LifecycleAction::Stop, &outcome).await;
-        outcome
+        self.events
+            .run(
+                EventSubject::sandbox(Some(self.id.clone())),
+                Action::Stop,
+                |_| self.stop_inner(),
+            )
+            .await
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
     async fn delete(&self) -> Result<()> {
-        let outcome = self.delete_inner().await;
-        self.emit_action(LifecycleAction::Delete, &outcome).await;
-        outcome
+        self.events
+            .run(
+                EventSubject::sandbox(Some(self.id.clone())),
+                Action::Delete,
+                |_| self.delete_inner(),
+            )
+            .await
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
@@ -1421,15 +1398,18 @@ impl Sandbox for DaytonaSandbox {
         if !self.capabilities.lifecycle.archive {
             return Err(Error::unsupported(Capability::LifecycleArchive));
         }
-        let outcome = async {
-            let mut sdk = self.sdk().await?;
-            sdk.archive()
-                .await
-                .map_err(|error| daytona_error("archiving sandbox", error))
-        }
-        .await;
-        self.emit_action(LifecycleAction::Archive, &outcome).await;
-        outcome
+        self.events
+            .run(
+                EventSubject::sandbox(Some(self.id.clone())),
+                Action::Archive,
+                |_| async {
+                    let mut sdk = self.sdk().await?;
+                    sdk.archive()
+                        .await
+                        .map_err(|error| daytona_error("archiving sandbox", error))
+                },
+            )
+            .await
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
@@ -1441,15 +1421,18 @@ impl Sandbox for DaytonaSandbox {
         // the sandbox has left the pausing state, not only on exactly
         // Paused. VM classes only; the per-sandbox capability set masks
         // it elsewhere and the server enforces it regardless.
-        let outcome = async {
-            let mut sdk = self.sdk().await?;
-            sdk.pause_with_timeout(TRANSITION_BUDGET)
-                .await
-                .map_err(|error| daytona_error("pausing sandbox", error))
-        }
-        .await;
-        self.emit_action(LifecycleAction::Pause, &outcome).await;
-        outcome
+        self.events
+            .run(
+                EventSubject::sandbox(Some(self.id.clone())),
+                Action::Pause,
+                |_| async {
+                    let mut sdk = self.sdk().await?;
+                    sdk.pause_with_timeout(TRANSITION_BUDGET)
+                        .await
+                        .map_err(|error| daytona_error("pausing sandbox", error))
+                },
+            )
+            .await
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
@@ -1459,9 +1442,13 @@ impl Sandbox for DaytonaSandbox {
         }
         // Daytona has no separate resume endpoint: start resumes a
         // paused sandbox.
-        let outcome = self.start_inner().await;
-        self.emit_action(LifecycleAction::Resume, &outcome).await;
-        outcome
+        self.events
+            .run(
+                EventSubject::sandbox(Some(self.id.clone())),
+                Action::Resume,
+                |_| self.start_inner(),
+            )
+            .await
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
@@ -1469,28 +1456,42 @@ impl Sandbox for DaytonaSandbox {
         if !self.capabilities.lifecycle.fork {
             return Err(Error::unsupported(Capability::LifecycleFork));
         }
-        let sdk = self.sdk().await?;
-        let current = map_state(sdk.state);
-        if current != SandboxState::Running {
-            return Err(Error::InvalidState {
-                current,
-                action: LifecycleAction::Fork,
-            });
-        }
-        let forked = sdk
-            .fork_with_timeout(options.name.as_deref(), CREATE_TIMEOUT)
+        self.events
+            .run(
+                EventSubject::sandbox(Some(self.id.clone())),
+                Action::Fork,
+                |_| async {
+                    let sdk = self.sdk().await?;
+                    let current = map_state(sdk.state);
+                    if current != SandboxState::Running {
+                        return Err(Error::InvalidState {
+                            current,
+                            action: Action::Fork,
+                        });
+                    }
+                    let forked = sdk
+                        .fork_with_timeout(options.name.as_deref(), CREATE_TIMEOUT)
+                        .await
+                        .map_err(|error| daytona_error("forking sandbox", error))?;
+                    let child_state = map_state(forked.state);
+                    if child_state != SandboxState::Running {
+                        return Err(Error::InvalidState {
+                            current: child_state,
+                            action:  Action::Fork,
+                        });
+                    }
+                    // The child shares the parent's class, so the parent's (already
+                    // narrowed) capability set is the right base.
+                    Ok(build_handle(
+                        &self.client,
+                        &self.capabilities,
+                        forked,
+                        self.events.clone(),
+                    )
+                    .await? as Arc<dyn Sandbox>)
+                },
+            )
             .await
-            .map_err(|error| daytona_error("forking sandbox", error))?;
-        let child_state = map_state(forked.state);
-        if child_state != SandboxState::Running {
-            return Err(Error::InvalidState {
-                current: child_state,
-                action:  LifecycleAction::Fork,
-            });
-        }
-        // The child shares the parent's class, so the parent's (already
-        // narrowed) capability set is the right base.
-        Ok(build_handle(&self.client, &self.capabilities, forked, None).await?)
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
@@ -1519,12 +1520,17 @@ impl Sandbox for DaytonaSandbox {
             return Err(Error::unsupported(capability));
         }
         let name = options.name.clone().unwrap_or_else(generated_snapshot_name);
-        let outcome =
-            create_sandbox_snapshot(&self.client, &self.sdk_id, &name, options.mode).await;
-        self.emit_action(LifecycleAction::SnapshotSandbox, &outcome)
-            .await;
-        outcome?;
-        created_snapshot_id(&self.client, &name).await
+        self.events
+            .run(
+                EventSubject::sandbox(Some(self.id.clone())),
+                Action::Snapshot,
+                |_| async {
+                    create_sandbox_snapshot(&self.client, &self.sdk_id, &name, options.mode)
+                        .await?;
+                    created_snapshot_id(&self.client, &name).await
+                },
+            )
+            .await
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
@@ -1547,16 +1553,18 @@ impl Sandbox for DaytonaSandbox {
             }
             _ => return Err(Error::invalid_spec("network", "unsupported network policy")),
         }
-        let outcome = async {
-            let mut sdk = self.sdk().await?;
-            sdk.update_network_settings(settings)
-                .await
-                .map_err(|error| daytona_error("updating network settings", error))
-        }
-        .await;
-        self.emit_action(LifecycleAction::UpdateNetwork, &outcome)
-            .await;
-        outcome
+        self.events
+            .run(
+                EventSubject::sandbox(Some(self.id.clone())),
+                Action::UpdateNetwork,
+                |_| async {
+                    let mut sdk = self.sdk().await?;
+                    sdk.update_network_settings(settings)
+                        .await
+                        .map_err(|error| daytona_error("updating network settings", error))
+                },
+            )
+            .await
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
@@ -1564,16 +1572,24 @@ impl Sandbox for DaytonaSandbox {
         // A trivial exec is genuine activity and resets the idle timers.
         // (The pinned SDK's update_last_activity now sends a valid body;
         // the exec keeps this path independent of that endpoint.)
-        let spec = ExecSpec::new("true").timeout(Duration::from_secs(30));
-        let result = self.exec.run(&spec).await?;
-        if result.success() {
-            Ok(())
-        } else {
-            Err(Error::invalid_spec(
-                "refresh_activity",
-                "keepalive command failed",
-            ))
-        }
+        self.events
+            .run(
+                EventSubject::sandbox(Some(self.id.clone())),
+                Action::RefreshActivity,
+                |_| async {
+                    let spec = ExecSpec::new("true").timeout(Duration::from_secs(30));
+                    let result = self.exec.run(&spec).await?;
+                    if result.success() {
+                        Ok(())
+                    } else {
+                        Err(Error::invalid_spec(
+                            "refresh_activity",
+                            "keepalive command failed",
+                        ))
+                    }
+                },
+            )
+            .await
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
@@ -1595,44 +1611,52 @@ impl Sandbox for DaytonaSandbox {
                  set at most one to a non-zero value",
             ));
         }
-        let mut sdk = self.sdk().await?;
-        // Enabling auto-pause requires auto-stop be disabled first (the
-        // server allows at most one non-zero); when the caller enables
-        // auto-pause without saying anything about auto-stop, disable it
-        // for them — the documented upstream sequence.
-        if auto_pause.is_some_and(|interval| interval != 0) && auto_stop.is_none() {
-            sdk.set_autostop_interval(0)
-                .await
-                .map_err(|error| daytona_error("disabling auto-stop", error))?;
-        }
-        if let Some(idle) = auto_stop {
-            sdk.set_autostop_interval(idle)
-                .await
-                .map_err(|error| daytona_error("setting auto-stop", error))?;
-        }
-        if let Some(pause) = auto_pause {
-            sdk.set_auto_pause_interval(pause)
-                .await
-                .map_err(|error| daytona_error("setting auto-pause", error))?;
-        }
-        if let Some(archive) = timers.auto_archive_after_stop {
-            sdk.set_auto_archive_interval(minutes(archive))
-                .await
-                .map_err(|error| daytona_error("setting auto-archive", error))?;
-        }
-        if let Some(delete) = timers.auto_delete_after_stop {
-            sdk.set_auto_delete_interval(auto_delete_minutes(delete))
-                .await
-                .map_err(|error| daytona_error("setting auto-delete", error))?;
-        }
-        if let Some(ttl) = timers.ttl {
-            // The deadline re-anchors from now; zero disables (subject to
-            // the org/region maximum lifespan).
-            sdk.set_ttl(minutes(ttl))
-                .await
-                .map_err(|error| daytona_error("setting ttl", error))?;
-        }
-        Ok(())
+        self.events
+            .run(
+                EventSubject::sandbox(Some(self.id.clone())),
+                Action::SetTimers,
+                |_| async {
+                    let mut sdk = self.sdk().await?;
+                    // Enabling auto-pause requires auto-stop be disabled first (the
+                    // server allows at most one non-zero); when the caller enables
+                    // auto-pause without saying anything about auto-stop, disable it
+                    // for them — the documented upstream sequence.
+                    if auto_pause.is_some_and(|interval| interval != 0) && auto_stop.is_none() {
+                        sdk.set_autostop_interval(0)
+                            .await
+                            .map_err(|error| daytona_error("disabling auto-stop", error))?;
+                    }
+                    if let Some(idle) = auto_stop {
+                        sdk.set_autostop_interval(idle)
+                            .await
+                            .map_err(|error| daytona_error("setting auto-stop", error))?;
+                    }
+                    if let Some(pause) = auto_pause {
+                        sdk.set_auto_pause_interval(pause)
+                            .await
+                            .map_err(|error| daytona_error("setting auto-pause", error))?;
+                    }
+                    if let Some(archive) = timers.auto_archive_after_stop {
+                        sdk.set_auto_archive_interval(minutes(archive))
+                            .await
+                            .map_err(|error| daytona_error("setting auto-archive", error))?;
+                    }
+                    if let Some(delete) = timers.auto_delete_after_stop {
+                        sdk.set_auto_delete_interval(auto_delete_minutes(delete))
+                            .await
+                            .map_err(|error| daytona_error("setting auto-delete", error))?;
+                    }
+                    if let Some(ttl) = timers.ttl {
+                        // The deadline re-anchors from now; zero disables (subject to
+                        // the org/region maximum lifespan).
+                        sdk.set_ttl(minutes(ttl))
+                            .await
+                            .map_err(|error| daytona_error("setting ttl", error))?;
+                    }
+                    Ok(())
+                },
+            )
+            .await
     }
 
     #[tracing::instrument(
@@ -1650,11 +1674,19 @@ impl Sandbox for DaytonaSandbox {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         all.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
-        let mut sdk = self.sdk().await?;
-        sdk.set_labels(all)
+        self.events
+            .run(
+                EventSubject::sandbox(Some(self.id.clone())),
+                Action::SetLabels,
+                |_| async {
+                    let mut sdk = self.sdk().await?;
+                    sdk.set_labels(all)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| daytona_error("setting labels", error))
+                },
+            )
             .await
-            .map(|_| ())
-            .map_err(|error| daytona_error("setting labels", error))
     }
 
     fn exec(&self) -> &dyn Exec {
@@ -1727,15 +1759,31 @@ fn snapshot_status(dto: SnapshotDto) -> Result<SnapshotStatus> {
 
 struct DaytonaSnapshots {
     client: DaytonaClient,
+    kind:   ProviderKind,
 }
 
 #[async_trait]
 impl SnapshotProvider for DaytonaSnapshots {
     #[tracing::instrument(skip_all, fields(provider_kind = "daytona"), err)]
-    async fn create(&self, spec: &SnapshotSpec) -> Result<SnapshotId> {
+    async fn create(
+        &self,
+        spec: &SnapshotSpec,
+        events: Option<EventContext>,
+    ) -> Result<SnapshotId> {
         spec.validate()?;
         let name = spec.name.clone().unwrap_or_else(generated_snapshot_name);
-        let (image, sandbox_class) = match &spec.source {
+        let emitter = EventEmitter::new(self.kind.clone(), events);
+        emitter
+            .run(
+                EventSubject::pending_snapshot(Some(name.clone())),
+                Action::Create,
+                |reporter| async move {
+                    reporter
+                        .progress(sandbox_driver::Progress::new(
+                            sandbox_driver::ProgressCode::SNAPSHOT_BUILD,
+                        ))
+                        .await;
+                    let (image, sandbox_class) = match &spec.source {
             SnapshotSource::Image { reference } => (
                 ImageSource::Name(reference.clone()),
                 daytona_snapshot_class(spec.sandbox_kind.unwrap_or(SandboxKind::Container))?,
@@ -1792,26 +1840,33 @@ impl SnapshotProvider for DaytonaSnapshots {
                     return Err(Error::unsupported(Capability::SnapshotsLiveProcessState));
                 }
                 create_sandbox_snapshot(&self.client, id.as_str(), &name, *mode).await?;
-                return created_snapshot_id(&self.client, &name).await;
+                let created = created_snapshot_id(&self.client, &name).await?;
+                reporter.set_subject(EventSubject::snapshot(Some(created.clone())));
+                return Ok(created);
             }
             _ => return Err(Error::invalid_spec("source", "unsupported snapshot source")),
         };
-        let params = CreateSnapshotParams {
-            name,
-            image,
-            region_id: spec.region.clone(),
-            sandbox_class: Some(sandbox_class),
-            resources: sdk_resources(&spec.resources),
-            entrypoint: None,
-        };
-        let created = self
-            .client
-            .snapshot
-            .create(&params)
+                    let params = CreateSnapshotParams {
+                        name,
+                        image,
+                        region_id: spec.region.clone(),
+                        sandbox_class: Some(sandbox_class),
+                        resources: sdk_resources(&spec.resources),
+                        entrypoint: None,
+                    };
+                    let created = self
+                        .client
+                        .snapshot
+                        .create(&params)
+                        .await
+                        .map_err(|error| daytona_error("creating snapshot", error))?;
+                    let id = SnapshotId::try_new(created.id)
+                        .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))?;
+                    reporter.set_subject(EventSubject::snapshot(Some(id.clone())));
+                    Ok(id)
+                },
+            )
             .await
-            .map_err(|error| daytona_error("creating snapshot", error))?;
-        SnapshotId::try_new(created.id)
-            .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))
     }
 
     #[tracing::instrument(
@@ -1875,20 +1930,28 @@ impl SnapshotProvider for DaytonaSnapshots {
         fields(provider_kind = "daytona", snapshot_id = %id),
         err
     )]
-    async fn delete(&self, id: &SnapshotId) -> Result<()> {
-        match self.client.snapshot.delete(id.as_str()).await {
-            Ok(()) => Ok(()),
-            Err(error) if is_not_found(&error) => Ok(()),
-            Err(error) => {
-                // Same asynchronous-deletion idempotency as volumes.
-                if let Ok(dto) = self.client.snapshot.get(id.as_str()).await {
-                    if map_snapshot_state(dto.state) == SnapshotState::Deleting {
-                        return Ok(());
+    async fn delete(&self, id: &SnapshotId, events: Option<EventContext>) -> Result<()> {
+        EventEmitter::new(self.kind.clone(), events)
+            .run(
+                EventSubject::snapshot(Some(id.clone())),
+                Action::Delete,
+                |_| async {
+                    match self.client.snapshot.delete(id.as_str()).await {
+                        Ok(()) => Ok(()),
+                        Err(error) if is_not_found(&error) => Ok(()),
+                        Err(error) => {
+                            // Same asynchronous-deletion idempotency as volumes.
+                            if let Ok(dto) = self.client.snapshot.get(id.as_str()).await {
+                                if map_snapshot_state(dto.state) == SnapshotState::Deleting {
+                                    return Ok(());
+                                }
+                            }
+                            Err(daytona_error("deleting snapshot", error))
+                        }
                     }
-                }
-                Err(daytona_error("deleting snapshot", error))
-            }
-        }
+                },
+            )
+            .await
     }
 
     #[tracing::instrument(
@@ -1925,34 +1988,44 @@ impl SnapshotProvider for DaytonaSnapshots {
         fields(provider_kind = "daytona", snapshot_id = %id),
         err
     )]
-    async fn activate(&self, id: &SnapshotId) -> Result<()> {
-        // The SDK resolves ids and names against the ID-only endpoint.
-        let started = Instant::now();
-        let mut attempt = 0_u64;
-        loop {
-            attempt += 1;
-            tracing::debug!(attempt, "snapshot activation requested");
-            match self.client.snapshot.activate(id.as_str()).await {
-                Ok(_) => return Ok(()),
-                Err(error) if is_not_found(&error) => {
-                    return Err(Error::NotFound {
-                        resource: ResourceKind::Snapshot,
-                        id:       id.as_str().to_owned(),
-                    });
-                }
-                Err(error) if is_snapshot_deactivation_in_progress(&error) => {
-                    let elapsed = started.elapsed();
-                    if elapsed >= SNAPSHOT_ACTIVATE_BUDGET {
-                        return Err(Error::Timeout {
-                            operation: "waiting to activate snapshot".to_owned(),
-                            elapsed,
-                        });
+    async fn activate(&self, id: &SnapshotId, events: Option<EventContext>) -> Result<()> {
+        EventEmitter::new(self.kind.clone(), events)
+            .run(
+                EventSubject::snapshot(Some(id.clone())),
+                Action::Activate,
+                |_| async {
+                    // The SDK resolves ids and names against the ID-only endpoint.
+                    let started = Instant::now();
+                    let mut attempt = 0_u64;
+                    loop {
+                        attempt += 1;
+                        tracing::debug!(attempt, "snapshot activation requested");
+                        match self.client.snapshot.activate(id.as_str()).await {
+                            Ok(_) => return Ok(()),
+                            Err(error) if is_not_found(&error) => {
+                                return Err(Error::NotFound {
+                                    resource: ResourceKind::Snapshot,
+                                    id:       id.as_str().to_owned(),
+                                });
+                            }
+                            Err(error) if is_snapshot_deactivation_in_progress(&error) => {
+                                let elapsed = started.elapsed();
+                                if elapsed >= SNAPSHOT_ACTIVATE_BUDGET {
+                                    return Err(Error::Timeout {
+                                        operation: "waiting to activate snapshot".to_owned(),
+                                        elapsed,
+                                    });
+                                }
+                                time::sleep(SNAPSHOT_ACTIVATE_POLL).await;
+                            }
+                            Err(error) => {
+                                return Err(daytona_error("activating snapshot", error));
+                            }
+                        }
                     }
-                    time::sleep(SNAPSHOT_ACTIVATE_POLL).await;
-                }
-                Err(error) => return Err(daytona_error("activating snapshot", error)),
-            }
-        }
+                },
+            )
+            .await
     }
 
     #[tracing::instrument(
@@ -1960,30 +2033,46 @@ impl SnapshotProvider for DaytonaSnapshots {
         fields(provider_kind = "daytona", snapshot_id = %id),
         err
     )]
-    async fn deactivate(&self, id: &SnapshotId) -> Result<()> {
-        // Deactivation is unwrapped by the reference SDKs (the generated
-        // client has it); the endpoint is ID-only, so resolve a name
-        // through get first, mirroring the SDK's activate resolution.
-        let configuration = self.client.api_configuration();
-        let organization = self.client.organization_id();
-        match snapshots_api::deactivate_snapshot(configuration, id.as_str(), organization).await {
-            Ok(()) => return Ok(()),
-            Err(error) if is_generated_not_found(&error) => {}
-            Err(error) => return Err(generated_error("deactivating snapshot", error)),
-        }
-        let resolved = match self.client.snapshot.get(id.as_str()).await {
-            Ok(dto) => dto.id,
-            Err(error) if is_not_found(&error) => {
-                return Err(Error::NotFound {
-                    resource: ResourceKind::Snapshot,
-                    id:       id.as_str().to_owned(),
-                });
-            }
-            Err(error) => return Err(daytona_error("fetching snapshot", error)),
-        };
-        snapshots_api::deactivate_snapshot(configuration, &resolved, organization)
+    async fn deactivate(&self, id: &SnapshotId, events: Option<EventContext>) -> Result<()> {
+        EventEmitter::new(self.kind.clone(), events)
+            .run(
+                EventSubject::snapshot(Some(id.clone())),
+                Action::Deactivate,
+                |_| async {
+                    // Deactivation is unwrapped by the reference SDKs (the generated
+                    // client has it); the endpoint is ID-only, so resolve a name
+                    // through get first, mirroring the SDK's activate resolution.
+                    let configuration = self.client.api_configuration();
+                    let organization = self.client.organization_id();
+                    match snapshots_api::deactivate_snapshot(
+                        configuration,
+                        id.as_str(),
+                        organization,
+                    )
+                    .await
+                    {
+                        Ok(()) => return Ok(()),
+                        Err(error) if is_generated_not_found(&error) => {}
+                        Err(error) => {
+                            return Err(generated_error("deactivating snapshot", error));
+                        }
+                    }
+                    let resolved = match self.client.snapshot.get(id.as_str()).await {
+                        Ok(dto) => dto.id,
+                        Err(error) if is_not_found(&error) => {
+                            return Err(Error::NotFound {
+                                resource: ResourceKind::Snapshot,
+                                id:       id.as_str().to_owned(),
+                            });
+                        }
+                        Err(error) => return Err(daytona_error("fetching snapshot", error)),
+                    };
+                    snapshots_api::deactivate_snapshot(configuration, &resolved, organization)
+                        .await
+                        .map_err(|error| generated_error("deactivating snapshot", error))
+                },
+            )
             .await
-            .map_err(|error| generated_error("deactivating snapshot", error))
     }
 }
 
@@ -2010,21 +2099,32 @@ fn volume_status(dto: VolumeDto) -> Result<VolumeStatus> {
 
 struct DaytonaVolumes {
     client: DaytonaClient,
+    kind:   ProviderKind,
 }
 
 #[async_trait]
 impl VolumeProvider for DaytonaVolumes {
     #[tracing::instrument(skip_all, fields(provider_kind = "daytona"), err)]
-    async fn create(&self, spec: &VolumeSpec) -> Result<VolumeId> {
-        // Daytona volumes are elastic; a requested size is ignored.
-        let dto = self
-            .client
-            .volume
-            .create(&spec.name)
+    async fn create(&self, spec: &VolumeSpec, events: Option<EventContext>) -> Result<VolumeId> {
+        EventEmitter::new(self.kind.clone(), events)
+            .run(
+                EventSubject::pending_volume(Some(spec.name.clone())),
+                Action::Create,
+                |reporter| async move {
+                    // Daytona volumes are elastic; a requested size is ignored.
+                    let dto = self
+                        .client
+                        .volume
+                        .create(&spec.name)
+                        .await
+                        .map_err(|error| daytona_error("creating volume", error))?;
+                    let id = VolumeId::try_new(dto.id)
+                        .map_err(|error| Error::invalid_spec("volume_id", error.to_string()))?;
+                    reporter.set_subject(EventSubject::volume(Some(id.clone())));
+                    Ok(id)
+                },
+            )
             .await
-            .map_err(|error| daytona_error("creating volume", error))?;
-        VolumeId::try_new(dto.id)
-            .map_err(|error| Error::invalid_spec("volume_id", error.to_string()))
     }
 
     #[tracing::instrument(
@@ -2062,25 +2162,33 @@ impl VolumeProvider for DaytonaVolumes {
         fields(provider_kind = "daytona", volume_id = %id),
         err
     )]
-    async fn delete(&self, id: &VolumeId) -> Result<()> {
-        match self.client.volume.delete(id.as_str()).await {
-            Ok(()) => Ok(()),
-            Err(error) if is_not_found(&error) => Ok(()),
-            Err(error) => {
-                // Deletion is asynchronous: a repeat delete while the
-                // first is processing is rejected. Idempotency means
-                // checking whether deletion is already underway.
-                if let Ok(dto) = self.client.volume.get(id.as_str()).await {
-                    if matches!(
-                        map_volume_state(dto.state),
-                        VolumeState::Deleting | VolumeState::Deleted
-                    ) {
-                        return Ok(());
+    async fn delete(&self, id: &VolumeId, events: Option<EventContext>) -> Result<()> {
+        EventEmitter::new(self.kind.clone(), events)
+            .run(
+                EventSubject::volume(Some(id.clone())),
+                Action::Delete,
+                |_| async {
+                    match self.client.volume.delete(id.as_str()).await {
+                        Ok(()) => Ok(()),
+                        Err(error) if is_not_found(&error) => Ok(()),
+                        Err(error) => {
+                            // Deletion is asynchronous: a repeat delete while the
+                            // first is processing is rejected. Idempotency means
+                            // checking whether deletion is already underway.
+                            if let Ok(dto) = self.client.volume.get(id.as_str()).await {
+                                if matches!(
+                                    map_volume_state(dto.state),
+                                    VolumeState::Deleting | VolumeState::Deleted
+                                ) {
+                                    return Ok(());
+                                }
+                            }
+                            Err(daytona_error("deleting volume", error))
+                        }
                     }
-                }
-                Err(daytona_error("deleting volume", error))
-            }
-        }
+                },
+            )
+            .await
     }
 }
 

@@ -27,7 +27,7 @@ mod fs;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bollard::Docker;
@@ -39,11 +39,11 @@ use bollard::image::CreateImageOptions;
 use bollard::models::{ContainerInspectResponse, ContainerStateStatusEnum, HostConfig};
 use futures_util::StreamExt;
 use sandbox_driver::{
-    Capabilities, Error, ErrorReport, EventCallback, EventDispatcher, Exec, ExecSpec, Filesystem,
-    HealthStatus, Isolation, LifecycleAction, NetworkPolicy, PlatformInfo, ProviderError,
-    ProviderHealth, ProviderKind, ResourceKind, Result, Sandbox, SandboxEvent, SandboxFilter,
-    SandboxId, SandboxKind, SandboxProvider, SandboxSource, SandboxSpec, SandboxState,
-    SandboxStatus,
+    Action, Capabilities, Error, EventContext, EventEmitter, EventSubject, Exec, ExecSpec,
+    Filesystem, HealthStatus, Isolation, NetworkPolicy, OperationReporter, PlatformInfo, Progress,
+    ProgressCode, ProviderError, ProviderHealth, ProviderKind, ResourceKind, Result, Sandbox,
+    SandboxFilter, SandboxId, SandboxKind, SandboxProvider, SandboxSource, SandboxSpec,
+    SandboxState, SandboxStatus,
 };
 
 pub use crate::exec::DockerExec;
@@ -122,7 +122,7 @@ impl DockerProvider {
         &self,
         reference: &str,
         auto_pull: bool,
-        dispatcher: Option<&EventDispatcher>,
+        reporter: &OperationReporter,
     ) -> Result<()> {
         match self.docker.inspect_image(reference).await {
             Ok(_) => return Ok(()),
@@ -140,14 +140,12 @@ impl DockerProvider {
                 ),
             )));
         }
-        if let Some(dispatcher) = dispatcher {
-            dispatcher
-                .emit(SandboxEvent::Progress {
-                    action:  LifecycleAction::Create,
-                    message: format!("pulling image {reference}"),
-                })
-                .await;
-        }
+        reporter
+            .progress(
+                Progress::new(ProgressCode::IMAGE_PULL)
+                    .message(format!("pulling image {reference}")),
+            )
+            .await;
         let mut stream = self
             .docker
             .create_image(Some(pull_options(reference)), None, None);
@@ -184,7 +182,7 @@ impl DockerProvider {
         working_dir: String,
         labels: BTreeMap<String, String>,
         env: BTreeMap<String, String>,
-        events: Option<EventCallback>,
+        events: EventEmitter,
     ) -> Arc<DockerSandbox> {
         let exec = Arc::new(DockerExec::new(
             self.docker.clone(),
@@ -206,7 +204,7 @@ impl DockerProvider {
             labels,
             exec,
             fs,
-            dispatcher: events.map(EventDispatcher::new),
+            events,
         })
     }
 }
@@ -324,7 +322,7 @@ impl SandboxProvider for DockerProvider {
     async fn create(
         &self,
         spec: &SandboxSpec,
-        events: Option<EventCallback>,
+        events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
         spec.validate()?;
         if matches!(spec.sandbox_kind, Some(kind) if kind != SandboxKind::Container) {
@@ -348,137 +346,103 @@ impl SandboxProvider for DockerProvider {
         let config_options = provider_config(&spec.provider_config)?;
         let network = network_mode(&spec.network)?;
 
-        let dispatcher = events.map(EventDispatcher::new);
-        if let Some(dispatcher) = &dispatcher {
-            dispatcher
-                .emit(SandboxEvent::ActionStarted {
-                    action: LifecycleAction::Create,
-                })
-                .await;
-        }
-        let started = Instant::now();
-        // Every failure after ActionStarted must pair with ActionFailed;
-        // the fallible section funnels through one outcome.
-        let outcome = async {
-            self.ensure_image(reference, config_options.auto_pull, dispatcher.as_ref())
-                .await?;
+        let emitter = EventEmitter::new(self.kind.clone(), events);
+        let handle_emitter = emitter.clone();
+        emitter
+            .run(
+                EventSubject::pending_sandbox(spec.name.clone()),
+                Action::Create,
+                |reporter| async move {
+                    self.ensure_image(reference, config_options.auto_pull, &reporter)
+                        .await?;
 
-            let working_dir = spec
-                .working_directory
-                .clone()
-                .unwrap_or_else(|| DEFAULT_WORKING_DIRECTORY.to_owned());
-            let mut labels: HashMap<String, String> = spec
-                .labels
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect();
-            labels.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
+                    let working_dir = spec
+                        .working_directory
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_WORKING_DIRECTORY.to_owned());
+                    let mut labels: HashMap<String, String> = spec
+                        .labels
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect();
+                    labels.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
 
-            let host_config = HostConfig {
-                network_mode: network,
-                memory: spec
-                    .resources
-                    .memory_mb
-                    .and_then(|mb| i64::try_from(mb).ok())
-                    .map(|mb| mb * 1024 * 1024),
-                cpu_quota: spec
-                    .resources
-                    .cpu_cores
-                    .map(|cores| i64::from(cores) * 100_000),
-                ..Default::default()
-            };
-            // Blank BASH_ENV at the container level too: an image (or spec)
-            // startup file would otherwise run inside the init command below
-            // and can kill the container the moment it starts.
-            let mut env_entries: Vec<String> = spec
-                .env
-                .iter()
-                .filter(|(key, _)| key.as_str() != BASH_ENV_VAR)
-                .map(|(key, value)| format!("{key}={value}"))
-                .collect();
-            env_entries.push(format!("{BASH_ENV_VAR}="));
-            let config = Config {
-                image: Some(reference.clone()),
-                cmd: Some(vec![
-                    "/bin/bash".to_owned(),
-                    "-c".to_owned(),
-                    format!(
-                        "mkdir -p {} && exec sleep infinity",
-                        shell_quote(&working_dir)
-                    ),
-                ]),
-                working_dir: Some(working_dir.clone()),
-                env: Some(env_entries),
-                labels: Some(labels),
-                host_config: Some(host_config),
-                ..Default::default()
-            };
-            let options = spec.name.clone().map(|name| CreateContainerOptions {
-                name,
-                platform: None,
-            });
-            let created = self
-                .docker
-                .create_container(options, config)
-                .await
-                .map_err(|error| {
-                    // A name collision is a caller-actionable branch, not
-                    // an opaque daemon failure.
-                    if is_conflict(&error) && spec.name.is_some() {
-                        Error::invalid_spec("name", "a container with this name already exists")
-                    } else {
-                        docker_error("creating container", error)
-                    }
-                })?;
-            self.docker
-                .start_container(&created.id, None::<StartContainerOptions<String>>)
-                .await
-                .map_err(|error| docker_error("starting container", error))?;
-            Ok::<_, Error>((created.id, working_dir))
-        }
-        .await;
-        let (container_id, working_dir) = match outcome {
-            Ok(parts) => parts,
-            Err(error) => {
-                if let Some(dispatcher) = dispatcher {
-                    dispatcher
-                        .emit(SandboxEvent::ActionFailed {
-                            action: LifecycleAction::Create,
-                            error:  ErrorReport::from(&error),
-                        })
-                        .await;
-                    // Join delivery: a failed create's events must be
-                    // observable when the call returns.
-                    dispatcher.shutdown().await;
-                }
-                return Err(error);
-            }
-        };
-
-        let handle = self.handle(
-            container_id,
-            working_dir,
-            spec.labels.clone(),
-            spec.env.clone(),
-            None,
-        );
-        if let Some(dispatcher) = dispatcher {
-            dispatcher
-                .emit(SandboxEvent::ActionCompleted {
-                    action:   LifecycleAction::Create,
-                    duration: started.elapsed(),
-                })
-                .await;
-            // Hand the dispatcher to the sandbox for its later actions.
-            let handle = Arc::into_inner(handle)
-                .map(|mut sandbox| {
-                    sandbox.dispatcher = Some(dispatcher);
-                    Arc::new(sandbox)
-                })
-                .expect("handle has a single owner at creation");
-            return Ok(handle);
-        }
-        Ok(handle)
+                    let host_config = HostConfig {
+                        network_mode: network,
+                        memory: spec
+                            .resources
+                            .memory_mb
+                            .and_then(|mb| i64::try_from(mb).ok())
+                            .map(|mb| mb * 1024 * 1024),
+                        cpu_quota: spec
+                            .resources
+                            .cpu_cores
+                            .map(|cores| i64::from(cores) * 100_000),
+                        ..Default::default()
+                    };
+                    // Blank BASH_ENV at the container level too: an image (or spec)
+                    // startup file would otherwise run inside the init command below
+                    // and can kill the container the moment it starts.
+                    let mut env_entries: Vec<String> = spec
+                        .env
+                        .iter()
+                        .filter(|(key, _)| key.as_str() != BASH_ENV_VAR)
+                        .map(|(key, value)| format!("{key}={value}"))
+                        .collect();
+                    env_entries.push(format!("{BASH_ENV_VAR}="));
+                    let config = Config {
+                        image: Some(reference.clone()),
+                        cmd: Some(vec![
+                            "/bin/bash".to_owned(),
+                            "-c".to_owned(),
+                            format!(
+                                "mkdir -p {} && exec sleep infinity",
+                                shell_quote(&working_dir)
+                            ),
+                        ]),
+                        working_dir: Some(working_dir.clone()),
+                        env: Some(env_entries),
+                        labels: Some(labels),
+                        host_config: Some(host_config),
+                        ..Default::default()
+                    };
+                    let options = spec.name.clone().map(|name| CreateContainerOptions {
+                        name,
+                        platform: None,
+                    });
+                    let created = self
+                        .docker
+                        .create_container(options, config)
+                        .await
+                        .map_err(|error| {
+                            // A name collision is a caller-actionable branch, not
+                            // an opaque daemon failure.
+                            if is_conflict(&error) && spec.name.is_some() {
+                                Error::invalid_spec(
+                                    "name",
+                                    "a container with this name already exists",
+                                )
+                            } else {
+                                docker_error("creating container", error)
+                            }
+                        })?;
+                    let event_id = SandboxId::try_new(created.id.clone())
+                        .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
+                    reporter.set_subject(EventSubject::sandbox(Some(event_id)));
+                    self.docker
+                        .start_container(&created.id, None::<StartContainerOptions<String>>)
+                        .await
+                        .map_err(|error| docker_error("starting container", error))?;
+                    Ok(self.handle(
+                        created.id,
+                        working_dir,
+                        spec.labels.clone(),
+                        spec.env.clone(),
+                        handle_emitter,
+                    ) as Arc<dyn Sandbox>)
+                },
+            )
+            .await
     }
 
     #[tracing::instrument(
@@ -489,40 +453,50 @@ impl SandboxProvider for DockerProvider {
     async fn attach(
         &self,
         id: &SandboxId,
-        events: Option<EventCallback>,
+        events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
-        let inspect = self.inspect(id.as_str()).await?;
-        let config = inspect.config.as_ref();
-        let labels = config.and_then(|config| config.labels.as_ref());
-        if labels
-            .and_then(|labels| labels.get(MANAGED_LABEL))
-            .map(String::as_str)
-            != Some("true")
-        {
-            return Err(Error::NotFound {
-                resource: ResourceKind::Sandbox,
-                id:       id.as_str().to_owned(),
-            });
-        }
-        let working_dir = config
-            .and_then(|config| config.working_dir.clone())
-            .unwrap_or_else(|| DEFAULT_WORKING_DIRECTORY.to_owned());
-        let user_labels: BTreeMap<String, String> = labels
-            .map(|labels| {
-                labels
-                    .iter()
-                    .filter(|(key, _)| *key != MANAGED_LABEL)
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(self.handle(
-            inspect.id.clone().unwrap_or_else(|| id.as_str().to_owned()),
-            working_dir,
-            user_labels,
-            BTreeMap::new(),
-            events,
-        ))
+        let emitter = EventEmitter::new(self.kind.clone(), events);
+        let handle_emitter = emitter.clone();
+        emitter
+            .run(
+                EventSubject::sandbox(Some(id.clone())),
+                Action::Attach,
+                |_| async move {
+                    let inspect = self.inspect(id.as_str()).await?;
+                    let config = inspect.config.as_ref();
+                    let labels = config.and_then(|config| config.labels.as_ref());
+                    if labels
+                        .and_then(|labels| labels.get(MANAGED_LABEL))
+                        .map(String::as_str)
+                        != Some("true")
+                    {
+                        return Err(Error::NotFound {
+                            resource: ResourceKind::Sandbox,
+                            id:       id.as_str().to_owned(),
+                        });
+                    }
+                    let working_dir = config
+                        .and_then(|config| config.working_dir.clone())
+                        .unwrap_or_else(|| DEFAULT_WORKING_DIRECTORY.to_owned());
+                    let user_labels: BTreeMap<String, String> = labels
+                        .map(|labels| {
+                            labels
+                                .iter()
+                                .filter(|(key, _)| *key != MANAGED_LABEL)
+                                .map(|(key, value)| (key.clone(), value.clone()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Ok(self.handle(
+                        inspect.id.clone().unwrap_or_else(|| id.as_str().to_owned()),
+                        working_dir,
+                        user_labels,
+                        BTreeMap::new(),
+                        handle_emitter,
+                    ) as Arc<dyn Sandbox>)
+                },
+            )
+            .await
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = %self.kind), err)]
@@ -589,33 +563,7 @@ pub struct DockerSandbox {
     labels:       BTreeMap<String, String>,
     exec:         Arc<DockerExec>,
     fs:           DockerFs,
-    dispatcher:   Option<EventDispatcher>,
-}
-
-impl DockerSandbox {
-    async fn emit_action(&self, action: LifecycleAction, outcome: &Result<()>) {
-        let Some(dispatcher) = &self.dispatcher else {
-            return;
-        };
-        match outcome {
-            Ok(()) => {
-                dispatcher
-                    .emit(SandboxEvent::ActionCompleted {
-                        action,
-                        duration: Duration::ZERO,
-                    })
-                    .await;
-            }
-            Err(error) => {
-                dispatcher
-                    .emit(SandboxEvent::ActionFailed {
-                        action,
-                        error: ErrorReport::from(error),
-                    })
-                    .await;
-            }
-        }
-    }
+    events:       EventEmitter,
 }
 
 #[async_trait]
@@ -673,36 +621,42 @@ impl Sandbox for DockerSandbox {
 
     #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.id), err)]
     async fn start(&self) -> Result<()> {
-        let inspect = self
-            .docker
-            .inspect_container(self.id.as_str(), None::<InspectContainerOptions>)
+        self.events
+            .run(
+                EventSubject::sandbox(Some(self.id.clone())),
+                Action::Start,
+                |_| async {
+                    let inspect = self
+                        .docker
+                        .inspect_container(self.id.as_str(), None::<InspectContainerOptions>)
+                        .await
+                        .map_err(|error| docker_error("inspecting container", error))?;
+                    if inspect.state.as_ref().and_then(|state| state.paused) == Some(true) {
+                        return self
+                            .docker
+                            .unpause_container(self.id.as_str())
+                            .await
+                            .map_err(|error| docker_error("unpausing container", error));
+                    }
+                    // Already-running (304) is success; a vanished container is
+                    // not — start's postcondition is a running sandbox, so 404
+                    // must surface, unlike stop/delete where gone is the goal.
+                    match self
+                        .docker
+                        .start_container(self.id.as_str(), None::<StartContainerOptions<String>>)
+                        .await
+                    {
+                        Ok(()) => Ok(()),
+                        Err(error) if is_not_modified(&error) => Ok(()),
+                        Err(error) if is_not_found(&error) => Err(Error::NotFound {
+                            resource: ResourceKind::Sandbox,
+                            id:       self.id.as_str().to_owned(),
+                        }),
+                        Err(error) => Err(docker_error("starting container", error)),
+                    }
+                },
+            )
             .await
-            .map_err(|error| docker_error("inspecting container", error))?;
-        let outcome = if inspect.state.as_ref().and_then(|state| state.paused) == Some(true) {
-            self.docker
-                .unpause_container(self.id.as_str())
-                .await
-                .map_err(|error| docker_error("unpausing container", error))
-        } else {
-            // Already-running (304) is success; a vanished container is
-            // not — start's postcondition is a running sandbox, so 404
-            // must surface, unlike stop/delete where gone is the goal.
-            match self
-                .docker
-                .start_container(self.id.as_str(), None::<StartContainerOptions<String>>)
-                .await
-            {
-                Ok(()) => Ok(()),
-                Err(error) if is_not_modified(&error) => Ok(()),
-                Err(error) if is_not_found(&error) => Err(Error::NotFound {
-                    resource: ResourceKind::Sandbox,
-                    id:       self.id.as_str().to_owned(),
-                }),
-                Err(error) => Err(docker_error("starting container", error)),
-            }
-        };
-        self.emit_action(LifecycleAction::Start, &outcome).await;
-        outcome
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.id), err)]
@@ -713,14 +667,20 @@ impl Sandbox for DockerSandbox {
         // waited out in full, buying nothing. Workload processes get
         // their SIGTERM-grace-SIGKILL sequence from the exec watcher,
         // not from `docker stop`. Keep the grace at fabro's 1 second.
-        let outcome = tolerate_not_modified(
-            self.docker
-                .stop_container(self.id.as_str(), Some(StopContainerOptions { t: 1 }))
-                .await,
-            "stopping container",
-        );
-        self.emit_action(LifecycleAction::Stop, &outcome).await;
-        outcome
+        self.events
+            .run(
+                EventSubject::sandbox(Some(self.id.clone())),
+                Action::Stop,
+                |_| async {
+                    tolerate_not_modified(
+                        self.docker
+                            .stop_container(self.id.as_str(), Some(StopContainerOptions { t: 1 }))
+                            .await,
+                        "stopping container",
+                    )
+                },
+            )
+            .await
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.id), err)]
@@ -729,39 +689,55 @@ impl Sandbox for DockerSandbox {
             force: true,
             ..Default::default()
         };
-        let outcome = match self
-            .docker
-            .remove_container(self.id.as_str(), Some(options))
+        self.events
+            .run(
+                EventSubject::sandbox(Some(self.id.clone())),
+                Action::Delete,
+                |_| async {
+                    match self
+                        .docker
+                        .remove_container(self.id.as_str(), Some(options))
+                        .await
+                    {
+                        Ok(()) => Ok(()),
+                        Err(error) if is_not_found(&error) => Ok(()),
+                        Err(error) => Err(docker_error("removing container", error)),
+                    }
+                },
+            )
             .await
-        {
-            Ok(()) => Ok(()),
-            Err(error) if is_not_found(&error) => Ok(()),
-            Err(error) => Err(docker_error("removing container", error)),
-        };
-        self.emit_action(LifecycleAction::Delete, &outcome).await;
-        outcome
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.id), err)]
     async fn pause(&self) -> Result<()> {
-        let outcome = self
-            .docker
-            .pause_container(self.id.as_str())
+        self.events
+            .run(
+                EventSubject::sandbox(Some(self.id.clone())),
+                Action::Pause,
+                |_| async {
+                    self.docker
+                        .pause_container(self.id.as_str())
+                        .await
+                        .map_err(|error| docker_error("pausing container", error))
+                },
+            )
             .await
-            .map_err(|error| docker_error("pausing container", error));
-        self.emit_action(LifecycleAction::Pause, &outcome).await;
-        outcome
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.id), err)]
     async fn resume(&self) -> Result<()> {
-        let outcome = self
-            .docker
-            .unpause_container(self.id.as_str())
+        self.events
+            .run(
+                EventSubject::sandbox(Some(self.id.clone())),
+                Action::Resume,
+                |_| async {
+                    self.docker
+                        .unpause_container(self.id.as_str())
+                        .await
+                        .map_err(|error| docker_error("unpausing container", error))
+                },
+            )
             .await
-            .map_err(|error| docker_error("unpausing container", error));
-        self.emit_action(LifecycleAction::Resume, &outcome).await;
-        outcome
     }
 
     fn exec(&self) -> &dyn Exec {

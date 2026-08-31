@@ -83,7 +83,7 @@ The full vocabulary. **Core** actions are required of every provider. Everything
 | `archive` | Stopped → cold storage; `start` restores | opt | — | — | ✔ (container class; per-sandbox caps mask it on VM/android/windows) | — |
 | `fork` | Clone a Running sandbox → new Running sandbox; preserve filesystem, memory, running processes, and PIDs | opt | — | — | ✔ (VM classes) | ✔ |
 | `resize` | Change cpu/memory/disk | opt | — | \~ (`docker update`, cpu/mem only) | —² | ? |
-| `snapshot_sandbox` | Capture a sandbox in `Filesystem` or `LiveProcessState` mode → SnapshotProvider | opt | — | \~ (`docker commit`) | ✔ (cold/hot) | ✔ |
+| `snapshot` | Capture a sandbox in `Filesystem` or `LiveProcessState` mode → SnapshotProvider | opt | — | \~ (`docker commit`) | ✔ (cold/hot) | ✔ |
 | `recover` | Provider-assisted recovery from Error state | opt | — | — | — | — |
 | `undelete` | Restore a deleted sandbox within the recovery window; provider-level (a deleted sandbox cannot be attached), returns a fresh handle | opt | — | — | ✔ (24h, Daytona's "recover") | — |
 | `refresh_activity` | Keepalive; reset idle timers | opt | no-op | no-op | ✔ | ? |
@@ -191,7 +191,7 @@ The protocol crate owns wire compatibility; domain types never absorb a wire bre
 
 Sketches, not final signatures. All async via `async_trait`, all object-safe (`dyn`-usable — required for the plugin boundary), all `Send + Sync`. Open for external implementation (that is the point of the crate), so every public type they touch follows semver discipline: `#[non_exhaustive]` on growable structs/enums, builder-style spec construction.
 
-**Runtime contract.** The crates are async on **Tokio** (1.x); the caller creates the runtime. Tokio appears in the public API deliberately and minimally: `StdioProcess` carries `tokio::io::{AsyncRead, AsyncWrite}` streams, and `ExecControls` carries `tokio_util::sync::CancellationToken`. The core crate spawns exactly one kind of task — the `EventDispatcher` delivery worker, which is owned (ends on drop, joinable via `shutdown`), never detached — and does no blocking I/O. Provider crates document their own spawning and blocking behavior.
+**Runtime contract.** The crates are async on **Tokio** (1.x); the caller creates the runtime. Tokio appears in the public API deliberately and minimally: `StdioProcess` carries `tokio::io::{AsyncRead, AsyncWrite}` streams, and `ExecControls` carries `tokio_util::sync::CancellationToken`. The core crate spawns no tasks and does no blocking I/O. Event observation is awaited directly. Provider and protocol crates document their own task and blocking behavior.
 
 **Workspace and dependency rules.** Provider and protocol crates depend on `sandbox-driver` (core); the graph is acyclic and core depends on no provider or protocol crate. Concrete SDK types (Daytona SDK, Docker client) never appear in core's public API — provider detail crosses boundaries as `ProviderError`/`provider_config` values. Features stay minimal and additive; each public item has one canonical path (the crate root re-export). All crates share the workspace MSRV (Rust 1.85) and version; everything is `publish = false` today, and publishability to crates.io is a pending decision recorded in the open questions, not an accident of config.
 
@@ -203,11 +203,11 @@ pub trait SandboxProvider: Send + Sync {
     fn kind(&self) -> &ProviderKind;                     // open string newtype, not an enum
     fn capabilities(&self) -> &Capabilities;
 
-    async fn create(&self, spec: &SandboxSpec, events: Option<EventCallback>)
+    async fn create(&self, spec: &SandboxSpec, events: Option<EventContext>)
         -> Result<Arc<dyn Sandbox>, Error>;
-    async fn attach(&self, id: &SandboxId, events: Option<EventCallback>)
+    async fn attach(&self, id: &SandboxId, events: Option<EventContext>)
         -> Result<Arc<dyn Sandbox>, Error>;               // re-attach by persisted ID
-    async fn undelete(&self, id: &SandboxId, events: Option<EventCallback>)
+    async fn undelete(&self, id: &SandboxId, events: Option<EventContext>)
         -> Result<Arc<dyn Sandbox>, Error>;               // optional; restore a deleted sandbox
     async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>, Error>;
 
@@ -380,24 +380,42 @@ pub struct SandboxSpec {
 
 ```rust
 #[non_exhaustive]
-pub enum SandboxEvent {
-    ActionStarted   { action: LifecycleAction },
-    ActionCompleted { action: LifecycleAction, duration: Duration },
-    ActionFailed    { action: LifecycleAction, error: String, causes: Vec<String> },
-    SnapshotBuilding { name: String },
-    SnapshotReady    { name: String, duration: Duration },
-    SnapshotFailed   { name: String, error: String },
-    StateChanged     { from: SandboxState, to: SandboxState },
-    Progress         { action: LifecycleAction, message: String },   // image pull, snapshot poll…
+pub struct Event {
+    pub id: EventId,                    // source_id + monotonic sequence
+    pub occurred_at: SystemTime,
+    pub provider: ProviderKind,
+    pub subject: EventSubject,          // provider | sandbox | snapshot | volume
+    pub operation_id: Option<OperationId>,
+    pub correlation_id: Option<CorrelationId>,
+    pub body: EventBody,
 }
-pub type EventCallback = Arc<dyn Fn(SandboxEvent) + Send + Sync>;
+
+#[non_exhaustive]
+pub enum EventBody {
+    OperationStarted { action: Action },
+    OperationProgress { action: Action, progress: Progress },
+    OperationCompleted { action: Action, duration: Duration },
+    OperationFailed { action: Action, duration: Duration, error: ErrorReport },
+    StateObserved { previous: Option<ResourceState>, current: ResourceState },
+    Notice { code: String, message: String },
+    Unknown,
+}
+
+#[async_trait]
+pub trait EventObserver: Send + Sync {
+    async fn observe(&self, event: Event);
+}
 ```
 
-Callback-based (fabro's model; each event maps 1:1 to a JSON-RPC notification), and the attachment is explicit in the API: `create` and `attach` take an `Option<EventCallback>` scoped to that handle for its lifetime. Failure payloads are not flat strings: `ActionFailed` and `SnapshotFailed` carry a bounded, serializable `ErrorReport { kind, message, retryable, causes }` projected from the error taxonomy (`kind` is the stable snake\_case code; raw command output never enters it), so the taxonomy survives the event and wire boundary.
+`Event` is the one public event type for all sandbox-driver control-plane facts. Consumers can qualify it as `sandbox_driver::Event` or alias the import. Exec output, PTY bytes, file-transfer chunks, and logs stay on their dedicated streaming APIs.
 
-Delivery has one concrete mechanism, not a convention: the library's `EventDispatcher`, owned by the provider's sandbox handle. A bounded queue (256) feeds a single worker task that invokes the callback: a slow callback backpressures only the queue, never provider internals; overflow drops only non-terminal events (`Progress`, `StateChanged`) while terminal `ActionCompleted`/`ActionFailed`/`Snapshot*` events await space and are never dropped; a panicking callback stops further delivery while the worker keeps draining so nothing blocks; the worker is owned — it ends when the dispatcher drops and is joinable via `shutdown()` — never detached. Ordering is per-sandbox in-order; no replay on re-attach (events are progress signals, not a durable log — durable state is `describe()`).
+The attachment is explicit. `create`, `attach`, and `undelete` take an optional `EventContext`, which the returned sandbox handle retains. Snapshot and volume mutation methods also take an optional context. Clones of one context share an event source and sequence space. A consumer can add an opaque `CorrelationId` to associate events with its run, job, or request.
 
-This replaces fabro's 20-variant enum with a uniform action-scoped shape; fabro's git-clone events move up with the clone logic, and long operations get `Progress` instead of only start/end.
+`EventEmitter::run` is the provider-side lifecycle boundary. Once an operation is accepted, it emits `OperationStarted` and exactly one `OperationCompleted` or `OperationFailed` with the same `OperationId`. The terminal event is observed before the method returns. Durations measure the real operation. A create operation starts with a name-only subject when necessary and updates the terminal subject after the provider assigns the resource ID. Long operations use structured `Progress` values with stable codes; display messages are not control data. Failures carry a bounded `ErrorReport { kind, message, retryable, causes }`, so the error taxonomy survives the event and wire boundary.
+
+Delivery is direct and ordered. `EventContext` assigns a monotonic sequence and awaits the async observer. It has no hidden queue, worker, detached task, overflow policy, or silent drop path. A slow observer therefore applies backpressure at the documented handoff boundary. The observer decides whether that handoff means an in-memory enqueue, durable persistence, or immediate processing.
+
+sandbox-driver does not store or replay events. A consumer that needs a durable event log persists events in its observer. Re-attach starts a new live source. `describe()` and the snapshot and volume status methods remain authoritative for current durable resource state. This keeps operation telemetry separate from state reconciliation.
 
 ## Errors
 
@@ -408,7 +426,7 @@ Per the style guide (library errors, taxonomy at layer boundaries):
 pub enum Error {
     NotFound { resource: ResourceKind, id: String },
     Unsupported { capability: CapabilityPath },        // machine-readable, preflightable
-    InvalidState { current: SandboxState, action: LifecycleAction },
+    InvalidState { current: SandboxState, action: Action },
     InvalidSpec { field: String, reason: String },
     Timeout { operation: String, elapsed: Duration },
     Auth(AuthError),
@@ -453,7 +471,7 @@ Each of these is implementable over `Exec`/`Git`/core — the fabro survey confi
 | get\_preview\_url | `Access` facet (`PreviewUrls`) |
 | setup\_git, git\_push\_ref, refresh\_push\_credentials, push\_token\_source, resume\_setup\_commands, origin\_url | **stays in fabro**, over `Exec` + `Git` |
 | `TerminalSession` (terminal.rs) | `Pty` facet |
-| `SandboxEvent` + callback | events (uniform shape) |
+| sandbox events + callback | `Event` + `EventObserver` (uniform resource shape) |
 | `SandboxProvider` + registry | `SandboxProvider` (create now returns the handle); registry stays caller-side |
 
 ## Verification and compatibility gates
@@ -477,5 +495,5 @@ Each of these is implementable over `Exec`/`Git`/core — the fabro survey confi
 9. **The Docker image contract requires `setsid`** alongside bash, `stat`, `find`, and `base64` — reliable kill semantics need a separate session, and an image without it fails every exec with a clear message rather than degrading silently.
 10. **`recover` and `undelete` are separate verbs.** `recover` repairs a live sandbox in the `Error` state; `undelete` (provider-level, returns a fresh handle) restores a deleted one. Daytona's "recover" endpoint is our `undelete`; it declares `lifecycle.recover: false`.
 11. **Chunked file transfer is `read_range`/`write_append`**, not a streaming transfer protocol: stateless, additive on `fs/read`/`fs/write`, with efficient overrides per provider (seek on Host, `tail`/`>>` on exec-derived) and correct read-and-slice / read-concat-write defaults everywhere else.
-12. **`operation_id` correlates create progress on the wire.** Host-generated, echoed on `host/event`, create-only in v1 (fork events flow through the parent handle's callback and stay attributable by sandbox id). Cancellation of long operations is a later additive step.
+12. **The event envelope owns operation identity.** Each accepted operation gets an `OperationId`; a wire-only `route_id` sends early create events to the correct observer before a resource ID exists. The optional consumer `CorrelationId` crosses the wire unchanged. Cancellation of long operations is a later additive step.
 13. **Provider health is a report, not an error**: `health()` always answers; non-`ok` statuses (`unreachable`, `unauthorized` with `missing_permissions`) are successful responses, and `Err` is reserved for the check itself failing.

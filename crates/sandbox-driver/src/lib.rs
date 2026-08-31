@@ -15,11 +15,9 @@
 //! its own — the caller owns runtime creation. Tokio appears in the
 //! public API: [`StdioProcess`] carries `tokio::io::{AsyncRead,
 //! AsyncWrite}` streams, and [`ExecControls`] carries
-//! `tokio_util::sync::CancellationToken`. The core crate itself spawns
-//! exactly one kind of task: the [`EventDispatcher`] delivery worker,
-//! which is owned by its dispatcher (ends on drop, joinable via
-//! `shutdown`) — never detached. Core does no blocking I/O; provider
-//! crates document their own spawning and blocking behavior.
+//! `tokio_util::sync::CancellationToken`. Event observation is awaited
+//! directly and creates no hidden delivery task. Core does no blocking I/O;
+//! provider crates document their own spawning and blocking behavior.
 //!
 //! # Compatibility
 //!
@@ -75,7 +73,11 @@ pub use derived::{DerivedFs, DerivedGit, DerivedSearch, DerivedServices};
 pub use error::{
     AuthError, Error, ExecFailure, ProviderError, ResourceKind, Result, TransportError,
 };
-pub use event::{ErrorReport, EventCallback, EventDispatcher, LifecycleAction, SandboxEvent};
+pub use event::{
+    Action, CorrelationId, ErrorReport, Event, EventBody, EventContext, EventEmitter, EventId,
+    EventObserver, EventSourceId, EventSubject, OperationId, OperationReporter, Progress,
+    ProgressCode, ProgressUnit, ResourceState,
+};
 pub use exec::{
     CaptureStats, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputSink,
     OutputStream, SpawnSpec, StderrTail, StdioProcess, StdioProcessHandle, Termination,
