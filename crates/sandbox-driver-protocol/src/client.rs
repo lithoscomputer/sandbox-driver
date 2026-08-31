@@ -12,16 +12,16 @@ use async_trait::async_trait;
 use sandbox_driver::{
     Capabilities, Capability, CheckpointId, CheckpointOptions, DirEntry, Error, EventCallback,
     Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, FileMetadata, Filesystem,
-    ForkOptions, LifecycleTimers, NetworkPolicy, OutputStream, PlatformInfo, PreviewUrl,
-    PreviewUrls, ProviderKind, Resources, Result, Sandbox, SandboxFilter, SandboxId,
-    SandboxSnapshotOptions, SandboxSpec, SandboxStatus, SnapshotFilter, SnapshotId,
-    SnapshotProvider, SnapshotSpec, SnapshotStatus, SpawnSpec, SshAccess, SshAccessInfo,
-    StdioProcess, VolumeId, VolumeProvider, VolumeSpec, VolumeStatus,
+    ForkOptions, HealthStatus, LifecycleTimers, NetworkPolicy, OutputStream, PlatformInfo,
+    PreviewUrl, PreviewUrls, ProviderHealth, ProviderKind, Resources, Result, Sandbox,
+    SandboxFilter, SandboxId, SandboxSnapshotOptions, SandboxSpec, SandboxStatus, SnapshotFilter,
+    SnapshotId, SnapshotProvider, SnapshotSpec, SnapshotStatus, SpawnSpec, SshAccess,
+    SshAccessInfo, StdioProcess, VolumeId, VolumeProvider, VolumeSpec, VolumeStatus,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 use tokio::{fs as tokio_fs, time};
@@ -178,11 +178,37 @@ impl sandbox_driver::SandboxProvider for PluginProvider {
         spec: &SandboxSpec,
         events: Option<EventCallback>,
     ) -> Result<Arc<dyn Sandbox>> {
-        let info: m::HandleInfo = self
+        // A caller that wants events gets them from the first moment of
+        // the create, before a sandbox id exists: the operation id
+        // routes host/event notifications until wrap_handle re-registers
+        // the callback under the sandbox id.
+        let operation_id = events.as_ref().map(|callback| {
+            let id = format!(
+                "op-{}",
+                self.client.next_operation.fetch_add(1, Ordering::Relaxed)
+            );
+            self.client
+                .operation_callbacks
+                .lock()
+                .expect("operation callbacks lock")
+                .insert(id.clone(), Arc::clone(callback));
+            id
+        });
+        let outcome: Result<m::HandleInfo> = self
             .client
-            .call(m::SANDBOX_CREATE, &m::CreateParams { spec: spec.clone() })
-            .await?;
-        Ok(self.wrap_handle(info, events))
+            .call(m::SANDBOX_CREATE, &m::CreateParams {
+                spec:         spec.clone(),
+                operation_id: operation_id.clone(),
+            })
+            .await;
+        if let Some(operation_id) = operation_id {
+            self.client
+                .operation_callbacks
+                .lock()
+                .expect("operation callbacks lock")
+                .remove(&operation_id);
+        }
+        Ok(self.wrap_handle(outcome?, events))
     }
 
     async fn attach(
@@ -199,6 +225,20 @@ impl sandbox_driver::SandboxProvider for PluginProvider {
         Ok(self.wrap_handle(info, events))
     }
 
+    async fn undelete(
+        &self,
+        id: &SandboxId,
+        events: Option<EventCallback>,
+    ) -> Result<Arc<dyn Sandbox>> {
+        let info: m::HandleInfo = self
+            .client
+            .call(m::SANDBOX_UNDELETE, &m::AttachParams {
+                sandbox_id: id.as_str().to_owned(),
+            })
+            .await?;
+        Ok(self.wrap_handle(info, events))
+    }
+
     async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>> {
         let result: m::ListResult = self
             .client
@@ -207,6 +247,22 @@ impl sandbox_driver::SandboxProvider for PluginProvider {
             })
             .await?;
         Ok(result.sandboxes)
+    }
+
+    async fn health(&self) -> Result<ProviderHealth> {
+        match self
+            .client
+            .call::<_, m::HealthResult>(m::PROVIDER_HEALTH, &m::Empty)
+            .await
+        {
+            Ok(result) => Ok(result.health),
+            // An older plugin without provider/health answers -32601;
+            // that is "no health check", not a failed one.
+            Err(Error::Provider(provider)) if provider.code.as_deref() == Some("-32601") => {
+                Ok(ProviderHealth::new(HealthStatus::Unknown))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn snapshots(&self) -> Option<&dyn SnapshotProvider> {
@@ -264,6 +320,26 @@ impl SnapshotProvider for ProviderSnapshots {
         let _: m::Empty = self
             .client
             .call(m::SNAPSHOT_DELETE, &m::SnapshotIdParams {
+                snapshot_id: id.as_str().to_owned(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn activate(&self, id: &SnapshotId) -> Result<()> {
+        let _: m::Empty = self
+            .client
+            .call(m::SNAPSHOT_ACTIVATE, &m::SnapshotIdParams {
+                snapshot_id: id.as_str().to_owned(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn deactivate(&self, id: &SnapshotId) -> Result<()> {
+        let _: m::Empty = self
+            .client
+            .call(m::SNAPSHOT_DEACTIVATE, &m::SnapshotIdParams {
                 snapshot_id: id.as_str().to_owned(),
             })
             .await?;
@@ -383,6 +459,7 @@ fn mask_wire_capabilities(capabilities: &mut Capabilities) {
     capabilities.logs = None;
     capabilities.search.native = false;
     capabilities.git.native = false;
+    capabilities.services.native = false;
     capabilities.access.shell_command = false;
     capabilities.access.web_terminal = false;
     capabilities.access.vnc = false;
@@ -391,6 +468,10 @@ fn mask_wire_capabilities(capabilities: &mut Capabilities) {
 
 /// One in-flight chunk of streamed exec output.
 type ExecChunk = (OutputStream, Vec<u8>);
+
+/// Raw bytes per fs/read / fs/write message during composed uploads and
+/// downloads (the base64 payload is 4/3 of this on the wire).
+const TRANSFER_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 /// Chunks buffered per exec before the reader backpressures. Deep enough
 /// that a slow consumer of one stream cannot stall unrelated responses in
@@ -404,15 +485,19 @@ const EXEC_STREAM_QUEUE: usize = 1024;
 /// per-exec ordered queue drained by a pump task that owns the caller's
 /// sink, so one slow consumer delays only its own stream.
 struct Client {
-    outbound:        mpsc::Sender<Message>,
-    next_id:         AtomicU64,
-    next_exec:       AtomicU64,
+    outbound:            mpsc::Sender<Message>,
+    next_id:             AtomicU64,
+    next_exec:           AtomicU64,
+    next_operation:      AtomicU64,
     /// Set when either transport task ends; every pending and future call
     /// fails fast instead of waiting on a dead pipe.
-    closed:          AtomicBool,
-    pending:         Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>,
-    exec_streams:    Mutex<HashMap<String, mpsc::Sender<ExecChunk>>>,
-    event_callbacks: Mutex<HashMap<String, EventCallback>>,
+    closed:              AtomicBool,
+    pending:             Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>,
+    exec_streams:        Mutex<HashMap<String, mpsc::Sender<ExecChunk>>>,
+    event_callbacks:     Mutex<HashMap<String, EventCallback>>,
+    /// Callbacks for in-flight creates, keyed by operation id, so events
+    /// arrive before a sandbox id exists.
+    operation_callbacks: Mutex<HashMap<String, EventCallback>>,
 }
 
 impl Client {
@@ -425,10 +510,12 @@ impl Client {
             outbound,
             next_id: AtomicU64::new(1),
             next_exec: AtomicU64::new(1),
+            next_operation: AtomicU64::new(1),
             closed: AtomicBool::new(false),
             pending: Mutex::new(HashMap::new()),
             exec_streams: Mutex::new(HashMap::new()),
             event_callbacks: Mutex::new(HashMap::new()),
+            operation_callbacks: Mutex::new(HashMap::new()),
         });
 
         let writer_client = Arc::clone(&client);
@@ -519,12 +606,26 @@ impl Client {
                 else {
                     return;
                 };
-                let callback = self
-                    .event_callbacks
-                    .lock()
-                    .expect("event callbacks lock")
-                    .get(&notification.sandbox_id)
-                    .cloned();
+                // Operation routing first: during a create the same
+                // callback may be registered under both keys, and the
+                // event must be delivered exactly once.
+                let callback = notification
+                    .operation_id
+                    .as_ref()
+                    .and_then(|operation_id| {
+                        self.operation_callbacks
+                            .lock()
+                            .expect("operation callbacks lock")
+                            .get(operation_id)
+                            .cloned()
+                    })
+                    .or_else(|| {
+                        self.event_callbacks
+                            .lock()
+                            .expect("event callbacks lock")
+                            .get(&notification.sandbox_id)
+                            .cloned()
+                    });
                 if let Some(callback) = callback {
                     callback(notification.event);
                 }
@@ -899,7 +1000,25 @@ impl Filesystem for SandboxFs {
     async fn read(&self, path: &str) -> Result<Vec<u8>> {
         let result: m::FsReadResult = self
             .client
-            .call(m::FS_READ, &self.path_params(path))
+            .call(m::FS_READ, &m::FsReadParams {
+                sandbox_id: self.sandbox_id.as_str().to_owned(),
+                path:       path.to_owned(),
+                offset:     None,
+                length:     None,
+            })
+            .await?;
+        decode_bytes(&result.content_b64)
+    }
+
+    async fn read_range(&self, path: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+        let result: m::FsReadResult = self
+            .client
+            .call(m::FS_READ, &m::FsReadParams {
+                sandbox_id: self.sandbox_id.as_str().to_owned(),
+                path: path.to_owned(),
+                offset: Some(offset),
+                length,
+            })
             .await?;
         decode_bytes(&result.content_b64)
     }
@@ -911,6 +1030,20 @@ impl Filesystem for SandboxFs {
                 sandbox_id:  self.sandbox_id.as_str().to_owned(),
                 path:        path.to_owned(),
                 content_b64: encode_bytes(content),
+                append:      false,
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn write_append(&self, path: &str, content: &[u8]) -> Result<()> {
+        let _: m::Empty = self
+            .client
+            .call(m::FS_WRITE, &m::FsWriteParams {
+                sandbox_id:  self.sandbox_id.as_str().to_owned(),
+                path:        path.to_owned(),
+                content_b64: encode_bytes(content),
+                append:      true,
             })
             .await?;
         Ok(())
@@ -989,20 +1122,56 @@ impl Filesystem for SandboxFs {
     }
 
     async fn upload(&self, local: &Path, remote: &str) -> Result<()> {
-        let content = tokio_fs::read(local)
+        // Bounded chunks: a large file must never become one NDJSON line
+        // buffered whole on both sides of the pipe.
+        let mut file = tokio_fs::File::open(local)
             .await
             .map_err(|error| Error::io(format!("reading {}", local.display()), error))?;
-        self.write(remote, &content).await
+        let mut first = true;
+        loop {
+            let mut chunk = Vec::with_capacity(TRANSFER_CHUNK_BYTES);
+            let read = (&mut file)
+                .take(TRANSFER_CHUNK_BYTES as u64)
+                .read_to_end(&mut chunk)
+                .await
+                .map_err(|error| Error::io(format!("reading {}", local.display()), error))?;
+            if first {
+                // The first chunk truncates and creates parents; an
+                // empty file is one empty write.
+                self.write(remote, &chunk).await?;
+                first = false;
+            } else if read > 0 {
+                self.write_append(remote, &chunk).await?;
+            }
+            if read < TRANSFER_CHUNK_BYTES {
+                return Ok(());
+            }
+        }
     }
 
     async fn download(&self, remote: &str, local: &Path) -> Result<()> {
-        let content = self.read(remote).await?;
         if let Some(parent) = local.parent() {
             tokio_fs::create_dir_all(parent).await.map_err(|error| {
                 Error::io(format!("creating parent of {}", local.display()), error)
             })?;
         }
-        tokio_fs::write(local, content)
+        let mut file = tokio_fs::File::create(local)
+            .await
+            .map_err(|error| Error::io(format!("writing {}", local.display()), error))?;
+        let mut offset: u64 = 0;
+        loop {
+            let chunk = self
+                .read_range(remote, offset, Some(TRANSFER_CHUNK_BYTES as u64))
+                .await?;
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| Error::io(format!("writing {}", local.display()), error))?;
+            offset += chunk.len() as u64;
+            if chunk.len() < TRANSFER_CHUNK_BYTES {
+                break;
+            }
+        }
+        file.flush()
             .await
             .map_err(|error| Error::io(format!("writing {}", local.display()), error))
     }

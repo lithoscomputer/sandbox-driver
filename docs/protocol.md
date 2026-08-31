@@ -112,7 +112,8 @@ for the connection. Per-sandbox capability sets travel in every
 {
   "isolation": "none | container | vm",
   "lifecycle": {"pause":false,"archive":false,"fork":false,"checkpoint":false,
-                 "resize":false,"recover":false,"refresh_activity":false,
+                 "resize":false,"recover":false,"undelete":false,
+                 "refresh_activity":false,
                  "timers":false,"labels":false,"update_network":false,
                  "snapshot_sandbox":false},
   "exec": {"live_streaming":false,"streams_separated":false,"stdin":false,
@@ -120,6 +121,7 @@ for the connection. Per-sandbox capability sets travel in every
   "fs": {"native":false,"upload":false,"download":false,"permissions":false},
   "search": {"native":false},
   "git": {"native":false},
+  "services": {"native":false},
   "pty": null,
   "logs": null,
   "access": {"preview_urls":false,"signed_preview_urls":false,"ssh":false,
@@ -138,15 +140,20 @@ Rules:
   kind (§7). Capabilities optimize failure timing; the error is still
   the enforcement.
 - **The version-1 mask.** The wire cannot carry long-lived stdio
-  processes, PTY, provider logs, or native search/git passthrough, and
-  the `shell_command`, `web_terminal`, `vnc`, and `vpn` access facets
-  are reserved. A host must treat these as absent regardless of what the
-  plugin declares: force `exec.stdio_process` to false, `pty` and `logs`
-  to null, `search.native` and `git.native` to false, and the four
-  reserved access booleans to false. A plugin should not declare them.
+  processes, PTY, provider logs, or native search/git/services
+  passthrough, and the `shell_command`, `web_terminal`, `vnc`, and
+  `vpn` access facets are reserved. A host must treat these as absent
+  regardless of what the plugin declares: force `exec.stdio_process` to
+  false, `pty` and `logs` to null, `search.native`, `git.native`, and
+  `services.native` to false, and the four reserved access booleans to
+  false. A plugin should not declare them. (Background services still
+  work over the wire — hosts run the exec-derived implementation over
+  `exec/run`; only a provider-native override cannot pass through.)
 - `capabilities.snapshots`/`volumes` being non-null is what authorizes
-  the `snapshot/*` and `volume/*` methods; `access.preview_urls` and
-  `access.ssh` authorize the `access/*` methods.
+  the `snapshot/*` and `volume/*` methods (`snapshot/activate` and
+  `snapshot/deactivate` additionally require `snapshots.activation`);
+  `access.preview_urls` and `access.ssh` authorize the `access/*`
+  methods.
 
 ## 6. Data conventions
 
@@ -268,6 +275,18 @@ to operate a sandbox without further negotiation:
 `{"domain_allow_list":{"domains":[…]}}`. `provider_config` is an opaque
 JSON value the plugin defines and documents.
 
+Timer semantics: a `null` timer defers to the provider's default. A
+**zero duration** (`{"secs":0,"nanos":0}`) is the explicit "never" — it
+disables the timer where the provider supports disabling; the plugin
+translates per timer (Daytona: wire `0` for auto-stop, `-1` for
+auto-delete). The same rule applies to `sandbox/set_timers`.
+
+`sandbox/create` accepts an optional `operation_id` (a host-generated
+string, unique per connection): while the create runs, `host/event`
+notifications caused by it echo the id back (§10), so progress is
+attributable before a sandbox id exists. Plugins must treat it as
+opaque; hosts that do not need event correlation omit it.
+
 ### 8.3 Lifecycle
 
 All take `{sandbox_id}` and return `{}` unless noted. Optional verbs are
@@ -278,9 +297,16 @@ unknown or already-deleting sandbox succeeds).
 `sandbox/resume`, `sandbox/archive`, `sandbox/recover`,
 `sandbox/refresh_activity`.
 
+`sandbox/recover` is provider-assisted recovery of a live sandbox from
+the `error` state. `sandbox/undelete` (gated on `lifecycle.undelete`)
+restores a **deleted** sandbox within the provider's recovery window and
+returns a fresh HandleInfo — it addresses the provider, not a live
+handle, because a deleted sandbox cannot be attached.
+
 | method | params | result |
 | --- | --- | --- |
 | `sandbox/fork` | `{sandbox_id, options:{name,include_memory}}` | HandleInfo |
+| `sandbox/undelete` | `{sandbox_id}` | HandleInfo |
 | `sandbox/checkpoint` | `{sandbox_id, options:{name}}` | `{checkpoint_id}` |
 | `sandbox/restore_checkpoint` | `{sandbox_id, checkpoint_id}` | `{}` |
 | `sandbox/resize` | `{sandbox_id, resources}` | `{}` |
@@ -328,8 +354,8 @@ sandbox working directory.
 
 | method | params | result |
 | --- | --- | --- |
-| `fs/read` | `{sandbox_id, path}` | `{content_b64}` |
-| `fs/write` | `{sandbox_id, path, content_b64}` | `{}` (creates parents) |
+| `fs/read` | `{sandbox_id, path, offset?, length?}` | `{content_b64}` |
+| `fs/write` | `{sandbox_id, path, content_b64, append?}` | `{}` (creates parents) |
 | `fs/delete` | `{sandbox_id, path, recursive}` | `{}` |
 | `fs/exists` | `{sandbox_id, path}` | `{exists}` |
 | `fs/metadata` | `{sandbox_id, path}` | `{metadata:{kind,size,mode,modified_at}}` |
@@ -338,8 +364,18 @@ sandbox working directory.
 | `fs/rename` | `{sandbox_id, from, to}` | `{}` |
 | `fs/set_permissions` | `{sandbox_id, path, mode}` | `{}` (mode is numeric POSIX) |
 
-`kind` ∈ `file directory symlink other`. Upload/download have no wire
-methods: the host composes them from local I/O plus `fs/read`/`fs/write`.
+`kind` ∈ `file directory symlink other`. `fs/read` takes an optional
+byte `offset` (default `0`) and `length` (default: to end of file);
+reading at or past the end returns empty content. `fs/write` takes an
+optional `append` (default `false`) that appends instead of truncating,
+creating the file when missing. Both fields were added within version 1;
+readers ignore them when absent.
+
+Upload/download have no wire methods: the host composes them from local
+I/O plus `fs/read`/`fs/write` — in **bounded chunks** (the reference
+implementation uses 4 MiB), using `offset`/`length` to page reads and
+`append` to page writes, so a large file never crosses as a single
+message buffered whole on both sides.
 
 ### 8.6 Snapshots and volumes
 
@@ -352,6 +388,8 @@ Deletes must be idempotent, including while deletion is in progress.
 | `snapshot/get` | `{snapshot_id}` | `{status:{id,name,state,error_reason,size_bytes,created_at}}` |
 | `snapshot/list` | `{filter:{name}}` | `{snapshots:[status…]}` |
 | `snapshot/delete` | `{snapshot_id}` | `{}` |
+| `snapshot/activate` | `{snapshot_id}` | `{}` (gated on `snapshots.activation`) |
+| `snapshot/deactivate` | `{snapshot_id}` | `{}` (gated on `snapshots.activation`) |
 | `volume/create` | `{spec:{name,size_mb}}` | `{volume_id}` |
 | `volume/get` | `{volume_id}` | `{status:{id,name,state,error_reason,created_at}}` |
 | `volume/list` | `{}` | `{volumes:[status…]}` |
@@ -370,7 +408,25 @@ Snapshot `source` variants: `{"image":{"reference":…}}`,
 | `access/ssh_create` | `{sandbox_id, ttl_ms}` | `{access:{command,token,expires_at}}` |
 | `access/ssh_revoke` | `{sandbox_id, token}` | `{}` |
 
-### 8.8 Shutdown
+### 8.8 Provider health
+
+`provider/health` (params `{}`) reports whether the provider's backend
+is reachable and its credential accepted, for host preflight and
+diagnostics:
+
+```json
+{"health":{"status":"ok","message":null,"missing_permissions":[]}}
+```
+
+`status` ∈ `ok unreachable unauthorized unknown` (readers map unknown
+values to `unknown`). `missing_permissions` names credential scopes the
+provider knows are absent (e.g. Daytona API-key scopes). An unhealthy
+provider is a **successful** response with a non-`ok` status — errors
+are reserved for failures of the check itself. Hosts must treat a
+`-32601` reply (a plugin predating this method) as
+`{"status":"unknown"}`.
+
+### 8.9 Shutdown
 
 `shutdown` (params `{}`) asks the plugin to exit. The plugin must answer
 the request, then stop reading and exit promptly. A plugin must also
@@ -445,8 +501,11 @@ Event `type`s: `action_started`, `action_completed` (+`duration`),
 is no replay — durable state is `sandbox/describe`. Terminal events
 (`action_completed`, `action_failed`, `snapshot_ready`,
 `snapshot_failed`) should never be dropped by either side. Events
-emitted during `sandbox/create`, before an id exists, may carry an empty
-`sandbox_id`; hosts may ignore those.
+emitted during `sandbox/create`, before an id exists, carry an empty
+`sandbox_id`; when the host supplied an `operation_id` on the create
+(§8.2), the notification carries it back in an optional `operation_id`
+field so those events remain attributable. Hosts without an operation
+to correlate may ignore empty-id events.
 
 `host/log` (`{level, message}`) is reserved: plugins should prefer
 stderr for logs in version 1, and hosts may ignore `host/log`.
@@ -498,8 +557,8 @@ not re-pinned.
 ## 14. Deferred beyond version 1
 
 Long-lived bidirectional stdio (`exec.stdio_process`) and its
-side-channel transport; PTY; provider log streaming; native search/git
-passthrough; the `shell_command`, `web_terminal`, `vnc`, and `vpn`
-access facets; snapshot build-log streaming; and `host/credentials`
-(per-call secret fetches from the host). All are masked or absent in
-version 1 per §5.
+side-channel transport; PTY; provider log streaming; native
+search/git/services passthrough; the `shell_command`, `web_terminal`,
+`vnc`, and `vpn` access facets; snapshot build-log streaming; and
+`host/credentials` (per-call secret fetches from the host). All are
+masked or absent in version 1 per §5.

@@ -35,6 +35,7 @@ pub const SANDBOX_PAUSE: &str = "sandbox/pause";
 pub const SANDBOX_RESUME: &str = "sandbox/resume";
 pub const SANDBOX_ARCHIVE: &str = "sandbox/archive";
 pub const SANDBOX_RECOVER: &str = "sandbox/recover";
+pub const SANDBOX_UNDELETE: &str = "sandbox/undelete";
 pub const SANDBOX_REFRESH_ACTIVITY: &str = "sandbox/refresh_activity";
 pub const SANDBOX_FORK: &str = "sandbox/fork";
 pub const SANDBOX_CHECKPOINT: &str = "sandbox/checkpoint";
@@ -61,6 +62,9 @@ pub const SNAPSHOT_CREATE: &str = "snapshot/create";
 pub const SNAPSHOT_GET: &str = "snapshot/get";
 pub const SNAPSHOT_LIST: &str = "snapshot/list";
 pub const SNAPSHOT_DELETE: &str = "snapshot/delete";
+pub const SNAPSHOT_ACTIVATE: &str = "snapshot/activate";
+pub const SNAPSHOT_DEACTIVATE: &str = "snapshot/deactivate";
+pub const PROVIDER_HEALTH: &str = "provider/health";
 pub const VOLUME_CREATE: &str = "volume/create";
 pub const VOLUME_GET: &str = "volume/get";
 pub const VOLUME_LIST: &str = "volume/list";
@@ -95,7 +99,11 @@ pub struct ProviderInfo {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateParams {
-    pub spec: SandboxSpec,
+    pub spec:         SandboxSpec,
+    /// Host-generated id correlating `host/event` notifications emitted
+    /// while this create runs, before a sandbox id exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -312,6 +320,18 @@ pub struct FsPathParams {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct FsReadParams {
+    pub sandbox_id: String,
+    pub path:       String,
+    /// Byte offset to start reading at; whole-file read when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset:     Option<u64>,
+    /// Maximum bytes to read; to end of file when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length:     Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct FsReadResult {
     pub content_b64: String,
 }
@@ -321,6 +341,9 @@ pub struct FsWriteParams {
     pub sandbox_id:  String,
     pub path:        String,
     pub content_b64: String,
+    /// Append instead of truncating, for chunked uploads.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub append:      bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -368,8 +391,12 @@ pub struct FsSetPermissionsParams {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HostEventNotification {
-    pub sandbox_id: String,
-    pub event:      SandboxEvent,
+    pub sandbox_id:   String,
+    pub event:        SandboxEvent,
+    /// Correlates the event to the long-running request that caused it,
+    /// when the host supplied an `operation_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -466,6 +493,11 @@ pub struct SshCreateResult {
 pub struct SshRevokeParams {
     pub sandbox_id: String,
     pub token:      String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HealthResult {
+    pub health: sandbox_driver::ProviderHealth,
 }
 
 /// Empty result for side-effect-only methods.

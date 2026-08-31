@@ -163,14 +163,22 @@ impl ServerState {
             .insert(handle.id().as_str().to_owned(), Arc::clone(handle));
     }
 
-    fn event_callback(&self, sandbox_hint: Arc<Mutex<String>>) -> EventCallback {
+    fn event_callback(
+        &self,
+        sandbox_hint: Arc<Mutex<String>>,
+        operation_id: Option<String>,
+    ) -> EventCallback {
         let outbound = self.outbound.clone();
         Arc::new(move |event| {
             let sandbox_id = sandbox_hint.lock().expect("hint lock").clone();
             let notification = Message::notification(
                 m::HOST_EVENT,
-                serde_json::to_value(m::HostEventNotification { sandbox_id, event })
-                    .unwrap_or(Value::Null),
+                serde_json::to_value(m::HostEventNotification {
+                    sandbox_id,
+                    event,
+                    operation_id: operation_id.clone(),
+                })
+                .unwrap_or(Value::Null),
             );
             // Best-effort: an overflowing notification queue drops the
             // event rather than blocking the provider.
@@ -238,10 +246,11 @@ async fn dispatch(
         m::SANDBOX_CREATE => {
             let request: m::CreateParams = parse(params)?;
             // The id exists only after create: the hint is bound late, so
-            // events during create carry an empty id, everything after
-            // routes correctly.
+            // events during create carry an empty id (and the caller's
+            // operation_id, when one was sent, for correlation);
+            // everything after routes correctly.
             let hint = Arc::new(Mutex::new(String::new()));
-            let callback = state.event_callback(Arc::clone(&hint));
+            let callback = state.event_callback(Arc::clone(&hint), request.operation_id.clone());
             let handle = state.provider.create(&request.spec, Some(callback)).await?;
             handle
                 .id()
@@ -255,7 +264,8 @@ async fn dispatch(
             let request: m::AttachParams = parse(params)?;
             let sandbox_id = SandboxId::try_new(&request.sandbox_id)
                 .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
-            let callback = state.event_callback(Arc::new(Mutex::new(request.sandbox_id.clone())));
+            let callback =
+                state.event_callback(Arc::new(Mutex::new(request.sandbox_id.clone())), None);
             let handle = state.provider.attach(&sandbox_id, Some(callback)).await?;
             state.remember(&handle);
             let status = handle.describe().await?;
@@ -301,6 +311,17 @@ async fn dispatch(
                 _ => handle.refresh_activity().await?,
             }
             to_value(&m::Empty)
+        }
+        m::SANDBOX_UNDELETE => {
+            let request: m::AttachParams = parse(params)?;
+            let sandbox_id = SandboxId::try_new(&request.sandbox_id)
+                .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
+            let callback =
+                state.event_callback(Arc::new(Mutex::new(request.sandbox_id.clone())), None);
+            let handle = state.provider.undelete(&sandbox_id, Some(callback)).await?;
+            state.remember(&handle);
+            let status = handle.describe().await?;
+            to_value(&handle_info(&handle, status))
         }
         m::SANDBOX_FORK => {
             let request: m::ForkParams = parse(params)?;
@@ -446,13 +467,16 @@ async fn dispatch(
             to_value(&m::Empty)
         }
         m::FS_READ => {
-            let request: m::FsPathParams = parse(params)?;
-            let content = state
-                .sandbox(&request.sandbox_id)
-                .await?
-                .fs()
-                .read(&request.path)
-                .await?;
+            let request: m::FsReadParams = parse(params)?;
+            let handle = state.sandbox(&request.sandbox_id).await?;
+            let content = if request.offset.is_some() || request.length.is_some() {
+                handle
+                    .fs()
+                    .read_range(&request.path, request.offset.unwrap_or(0), request.length)
+                    .await?
+            } else {
+                handle.fs().read(&request.path).await?
+            };
             to_value(&m::FsReadResult {
                 content_b64: encode_bytes(&content),
             })
@@ -460,12 +484,12 @@ async fn dispatch(
         m::FS_WRITE => {
             let request: m::FsWriteParams = parse(params)?;
             let content = decode_bytes(&request.content_b64)?;
-            state
-                .sandbox(&request.sandbox_id)
-                .await?
-                .fs()
-                .write(&request.path, &content)
-                .await?;
+            let handle = state.sandbox(&request.sandbox_id).await?;
+            if request.append {
+                handle.fs().write_append(&request.path, &content).await?;
+            } else {
+                handle.fs().write(&request.path, &content).await?;
+            }
             to_value(&m::Empty)
         }
         m::FS_DELETE => {
@@ -578,7 +602,7 @@ async fn dispatch(
             let snapshots = service.list(&request.filter).await?;
             to_value(&m::SnapshotListResult { snapshots })
         }
-        m::SNAPSHOT_DELETE => {
+        m::SNAPSHOT_DELETE | m::SNAPSHOT_ACTIVATE | m::SNAPSHOT_DEACTIVATE => {
             let request: m::SnapshotIdParams = parse(params)?;
             let service =
                 state
@@ -589,8 +613,16 @@ async fn dispatch(
                     )))?;
             let id = SnapshotId::try_new(&request.snapshot_id)
                 .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))?;
-            service.delete(&id).await?;
+            match method {
+                m::SNAPSHOT_ACTIVATE => service.activate(&id).await?,
+                m::SNAPSHOT_DEACTIVATE => service.deactivate(&id).await?,
+                _ => service.delete(&id).await?,
+            }
             to_value(&m::Empty)
+        }
+        m::PROVIDER_HEALTH => {
+            let health = state.provider.health().await?;
+            to_value(&m::HealthResult { health })
         }
         m::VOLUME_CREATE => {
             let request: m::VolumeCreateParams = parse(params)?;
