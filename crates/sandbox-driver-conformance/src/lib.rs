@@ -202,6 +202,9 @@ impl Conformance {
             ("ssh_access_matches_capabilities", |ctx| {
                 Box::pin(ssh_access_matches_capabilities(ctx))
             }),
+            ("shell_command_access_matches_capabilities", |ctx| {
+                Box::pin(shell_command_access_matches_capabilities(ctx))
+            }),
             ("exec_rejects_undeclared_stdin_and_cancel", |ctx| {
                 Box::pin(exec_rejects_undeclared_stdin_and_cancel(ctx))
             }),
@@ -1654,6 +1657,9 @@ async fn services_match_capabilities(ctx: &Conformance) -> CheckOutcome {
     if sandbox_caps.access.ssh != sandbox.ssh().is_some() {
         wrong.push("ssh facet presence disagrees with capabilities".to_owned());
     }
+    if sandbox_caps.access.shell_command != sandbox.shell_command().is_some() {
+        wrong.push("shell_command facet presence disagrees with capabilities".to_owned());
+    }
     if sandbox_caps.pty.is_some() != sandbox.pty().is_some() {
         wrong.push("pty facet presence disagrees with capabilities".to_owned());
     }
@@ -1729,6 +1735,31 @@ async fn ssh_access_matches_capabilities(ctx: &Conformance) -> CheckOutcome {
                 Ok(()) => fail("undeclared SSH revoke succeeded"),
             }
         }
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn shell_command_access_matches_capabilities(ctx: &Conformance) -> CheckOutcome {
+    if !ctx.caps().access.shell_command {
+        return Ok(Some(
+            "capability access.shell_command not declared".to_owned(),
+        ));
+    }
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let Some(access) = sandbox.shell_command() else {
+            return fail("access.shell_command is declared but the ShellCommand facet is absent");
+        };
+        let command = access
+            .shell_command()
+            .await
+            .map_err(|error| format!("shell command access failed: {error}"))?;
+        if command.trim().is_empty() {
+            return fail("ShellCommand returned an empty command");
+        }
+        PASS
     }
     .await;
     cleanup(&sandbox).await;

@@ -22,8 +22,10 @@
 //! sandbox registry — handles re-attach by container id across process
 //! restarts.
 
+mod access;
 mod exec;
 mod fs;
+mod pty;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -41,17 +43,19 @@ use futures_util::StreamExt;
 use sandbox_driver::{
     Action, Capabilities, Error, EventContext, EventEmitter, EventSubject, Exec, ExecSpec,
     Filesystem, HealthStatus, Isolation, NetworkPolicy, OperationReporter, PlatformInfo, Progress,
-    ProgressCode, ProviderError, ProviderHealth, ProviderKind, ResourceKind, Result, Sandbox,
-    SandboxFilter, SandboxId, SandboxKind, SandboxProvider, SandboxSource, SandboxSpec,
-    SandboxState, SandboxStatus,
+    ProgressCode, ProviderError, ProviderHealth, ProviderKind, Pty, PtyCaps, ResourceKind, Result,
+    Sandbox, SandboxFilter, SandboxId, SandboxKind, SandboxProvider, SandboxSource, SandboxSpec,
+    SandboxState, SandboxStatus, ShellCommand,
 };
 
+use crate::access::DockerShellCommand;
 pub use crate::exec::DockerExec;
 use crate::exec::{
     BASH_ENV_VAR, docker_error, is_conflict, is_not_found, is_not_modified, shell_quote,
     tolerate_not_modified,
 };
 use crate::fs::DockerFs;
+use crate::pty::DockerPty;
 
 const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
 const DEFAULT_WORKING_DIRECTORY: &str = "/workspace";
@@ -184,6 +188,12 @@ impl DockerProvider {
         env: BTreeMap<String, String>,
         events: EventEmitter,
     ) -> Arc<DockerSandbox> {
+        let pty = DockerPty::new(
+            self.docker.clone(),
+            container_id.clone(),
+            working_dir.clone(),
+        );
+        let shell_command = DockerShellCommand::new(container_id.clone(), working_dir.clone());
         let exec = Arc::new(DockerExec::new(
             self.docker.clone(),
             container_id.clone(),
@@ -204,6 +214,8 @@ impl DockerProvider {
             labels,
             exec,
             fs,
+            pty,
+            shell_command,
             events,
         })
     }
@@ -240,6 +252,10 @@ fn docker_capabilities() -> Capabilities {
     caps.exec.stdin = true;
     caps.exec.cancel = true;
     caps.exec.stdio_process = true;
+    let mut pty = PtyCaps::default();
+    pty.resize = true;
+    caps.pty = Some(pty);
+    caps.access.shell_command = true;
     caps.fs.native = false;
     caps.fs.upload = true;
     caps.fs.download = true;
@@ -556,14 +572,16 @@ impl SandboxProvider for DockerProvider {
 
 /// A container-backed sandbox.
 pub struct DockerSandbox {
-    id:           SandboxId,
-    capabilities: Capabilities,
-    docker:       Docker,
-    working_dir:  String,
-    labels:       BTreeMap<String, String>,
-    exec:         Arc<DockerExec>,
-    fs:           DockerFs,
-    events:       EventEmitter,
+    id:            SandboxId,
+    capabilities:  Capabilities,
+    docker:        Docker,
+    working_dir:   String,
+    labels:        BTreeMap<String, String>,
+    exec:          Arc<DockerExec>,
+    fs:            DockerFs,
+    pty:           DockerPty,
+    shell_command: DockerShellCommand,
+    events:        EventEmitter,
 }
 
 #[async_trait]
@@ -746,6 +764,14 @@ impl Sandbox for DockerSandbox {
 
     fn fs(&self) -> &dyn Filesystem {
         &self.fs
+    }
+
+    fn pty(&self) -> Option<&dyn Pty> {
+        Some(&self.pty)
+    }
+
+    fn shell_command(&self) -> Option<&dyn ShellCommand> {
+        Some(&self.shell_command)
     }
 }
 
