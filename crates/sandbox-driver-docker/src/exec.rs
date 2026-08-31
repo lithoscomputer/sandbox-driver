@@ -61,6 +61,13 @@ pub(crate) fn is_not_modified(error: &DockerApiError) -> bool {
     })
 }
 
+pub(crate) fn is_conflict(error: &DockerApiError) -> bool {
+    matches!(error, DockerApiError::DockerResponseServerError {
+        status_code: 409,
+        ..
+    })
+}
+
 pub(crate) fn tolerate_not_modified(
     outcome: StdResult<(), DockerApiError>,
     context: &str,

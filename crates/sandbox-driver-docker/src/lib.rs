@@ -40,19 +40,57 @@ use bollard::models::{ContainerInspectResponse, ContainerStateStatusEnum, HostCo
 use futures_util::StreamExt;
 use sandbox_driver::{
     Capabilities, Error, ErrorReport, EventCallback, EventDispatcher, Exec, ExecSpec, Filesystem,
-    Isolation, LifecycleAction, NetworkPolicy, PlatformInfo, ProviderKind, ResourceKind, Result,
-    Sandbox, SandboxEvent, SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec,
-    SandboxState, SandboxStatus,
+    HealthStatus, Isolation, LifecycleAction, NetworkPolicy, PlatformInfo, ProviderError,
+    ProviderHealth, ProviderKind, ResourceKind, Result, Sandbox, SandboxEvent, SandboxFilter,
+    SandboxId, SandboxProvider, SandboxSource, SandboxSpec, SandboxState, SandboxStatus,
 };
 
 pub use crate::exec::DockerExec;
 use crate::exec::{
-    BASH_ENV_VAR, docker_error, is_not_found, is_not_modified, shell_quote, tolerate_not_modified,
+    BASH_ENV_VAR, docker_error, is_conflict, is_not_found, is_not_modified, shell_quote,
+    tolerate_not_modified,
 };
 use crate::fs::DockerFs;
 
 const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
 const DEFAULT_WORKING_DIRECTORY: &str = "/workspace";
+
+/// Options the Docker provider reads from `SandboxSpec::provider_config`.
+///
+/// Schema: `{"auto_pull": bool}` — whether a missing image may be pulled
+/// during create (default `true`). Unknown fields are rejected so typos
+/// fail loudly instead of silently using defaults.
+struct DockerProviderConfig {
+    auto_pull: bool,
+}
+
+fn provider_config(value: &serde_json::Value) -> Result<DockerProviderConfig> {
+    let mut config = DockerProviderConfig { auto_pull: true };
+    match value {
+        serde_json::Value::Null => {}
+        serde_json::Value::Object(fields) => {
+            for (key, field) in fields {
+                match key.as_str() {
+                    "auto_pull" => {
+                        config.auto_pull = field.as_bool().ok_or_else(|| {
+                            Error::invalid_spec("provider_config.auto_pull", "expected a boolean")
+                        })?;
+                    }
+                    other => {
+                        return Err(Error::invalid_spec(
+                            "provider_config",
+                            format!("unknown field {other:?}"),
+                        ));
+                    }
+                }
+            }
+        }
+        _ => {
+            return Err(Error::invalid_spec("provider_config", "expected an object"));
+        }
+    }
+    Ok(config)
+}
 
 /// The Docker provider. One per process, sharing one daemon connection.
 pub struct DockerProvider {
@@ -80,6 +118,7 @@ impl DockerProvider {
     async fn ensure_image(
         &self,
         reference: &str,
+        auto_pull: bool,
         dispatcher: Option<&EventDispatcher>,
     ) -> Result<()> {
         match self.docker.inspect_image(reference).await {
@@ -88,6 +127,15 @@ impl DockerProvider {
             // or transport failure must surface as what it is.
             Err(error) if is_not_found(&error) => {}
             Err(error) => return Err(docker_error("inspecting image", &error)),
+        }
+        if !auto_pull {
+            return Err(Error::Provider(ProviderError::new(
+                self.kind.clone(),
+                format!(
+                    "image {reference} is not present locally and \
+                     provider_config.auto_pull is false"
+                ),
+            )));
         }
         if let Some(dispatcher) = dispatcher {
             dispatcher
@@ -281,6 +329,7 @@ impl SandboxProvider for DockerProvider {
                 "the docker provider does not support volumes yet",
             ));
         }
+        let config_options = provider_config(&spec.provider_config)?;
         let network = network_mode(&spec.network)?;
 
         let dispatcher = events.map(EventDispatcher::new);
@@ -295,7 +344,8 @@ impl SandboxProvider for DockerProvider {
         // Every failure after ActionStarted must pair with ActionFailed;
         // the fallible section funnels through one outcome.
         let outcome = async {
-            self.ensure_image(reference, dispatcher.as_ref()).await?;
+            self.ensure_image(reference, config_options.auto_pull, dispatcher.as_ref())
+                .await?;
 
             let working_dir = spec
                 .working_directory
@@ -355,7 +405,15 @@ impl SandboxProvider for DockerProvider {
                 .docker
                 .create_container(options, config)
                 .await
-                .map_err(|error| docker_error("creating container", &error))?;
+                .map_err(|error| {
+                    // A name collision is a caller-actionable branch, not
+                    // an opaque daemon failure.
+                    if is_conflict(&error) && spec.name.is_some() {
+                        Error::invalid_spec("name", "a container with this name already exists")
+                    } else {
+                        docker_error("creating container", &error)
+                    }
+                })?;
             self.docker
                 .start_container(&created.id, None::<StartContainerOptions<String>>)
                 .await
@@ -444,6 +502,17 @@ impl SandboxProvider for DockerProvider {
             BTreeMap::new(),
             events,
         ))
+    }
+
+    async fn health(&self) -> Result<ProviderHealth> {
+        match self.docker.ping().await {
+            Ok(_) => Ok(ProviderHealth::new(HealthStatus::Ok)),
+            Err(error) => {
+                let mut health = ProviderHealth::new(HealthStatus::Unreachable);
+                health.message = Some(format!("pinging the docker daemon failed: {error}"));
+                Ok(health)
+            }
+        }
     }
 
     async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>> {

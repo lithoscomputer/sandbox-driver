@@ -56,6 +56,28 @@ impl Filesystem for HostFs {
             .map_err(io_error(format!("reading {}", full.display())))
     }
 
+    async fn read_range(&self, path: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let full = self.resolve(path);
+        let context = io_error(format!("reading {}", full.display()));
+        let outcome = async {
+            let mut file = fs::File::open(&full).await?;
+            file.seek(io::SeekFrom::Start(offset)).await?;
+            let mut content = Vec::new();
+            match length {
+                Some(length) => {
+                    file.take(length).read_to_end(&mut content).await?;
+                }
+                None => {
+                    file.read_to_end(&mut content).await?;
+                }
+            }
+            Ok::<_, io::Error>(content)
+        }
+        .await;
+        outcome.map_err(context)
+    }
+
     async fn write(&self, path: &str, content: &[u8]) -> Result<()> {
         let full = self.resolve(path);
         if let Some(parent) = full.parent() {
@@ -66,6 +88,29 @@ impl Filesystem for HostFs {
         fs::write(&full, content)
             .await
             .map_err(io_error(format!("writing {}", full.display())))
+    }
+
+    async fn write_append(&self, path: &str, content: &[u8]) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let full = self.resolve(path);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(io_error(format!("creating parent of {}", full.display())))?;
+        }
+        let context = io_error(format!("appending to {}", full.display()));
+        let outcome = async {
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&full)
+                .await?;
+            file.write_all(content).await?;
+            file.flush().await?;
+            Ok::<_, io::Error>(())
+        }
+        .await;
+        outcome.map_err(context)
     }
 
     async fn delete(&self, path: &str, recursive: bool) -> Result<()> {

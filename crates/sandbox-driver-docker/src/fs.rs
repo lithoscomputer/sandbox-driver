@@ -196,6 +196,16 @@ impl Filesystem for DockerFs {
         self.derived.set_permissions(path, mode).await
     }
 
+    async fn read_range(&self, path: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
+        // The archive API only moves whole files; the exec-derived range
+        // read avoids materializing the file for one slice.
+        self.derived.read_range(path, offset, length).await
+    }
+
+    async fn write_append(&self, path: &str, content: &[u8]) -> Result<()> {
+        self.derived.write_append(path, content).await
+    }
+
     async fn upload(&self, local: &Path, remote: &str) -> Result<()> {
         let bytes = fs::read(local)
             .await

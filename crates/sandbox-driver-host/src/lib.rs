@@ -31,9 +31,9 @@ use std::{env, io, process};
 use async_trait::async_trait;
 use sandbox_driver::{
     Capabilities, Error, ErrorReport, EventCallback, EventDispatcher, Exec, ExecSpec, Filesystem,
-    Isolation, LifecycleAction, PlatformInfo, ProviderKind, ResourceKind, Result, Sandbox,
-    SandboxEvent, SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec,
-    SandboxState, SandboxStatus, WorkspaceOwnership,
+    HealthStatus, Isolation, LifecycleAction, PlatformInfo, ProviderHealth, ProviderKind,
+    ResourceKind, Result, Sandbox, SandboxEvent, SandboxFilter, SandboxId, SandboxProvider,
+    SandboxSource, SandboxSpec, SandboxState, SandboxStatus, WorkspaceOwnership,
 };
 use tokio::fs as tokio_fs;
 
@@ -96,6 +96,12 @@ impl SandboxProvider for HostProvider {
 
     fn capabilities(&self) -> &Capabilities {
         &self.capabilities
+    }
+
+    async fn health(&self) -> Result<ProviderHealth> {
+        // The host is its own backend; if this code runs, it is
+        // reachable and authorized.
+        Ok(ProviderHealth::new(HealthStatus::Ok))
     }
 
     async fn create(

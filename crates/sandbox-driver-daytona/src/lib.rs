@@ -4,10 +4,12 @@
 //! plane and per-sandbox toolbox daemon, with snapshots and volumes as
 //! first-class services and preview-URL/SSH access facets.
 //!
-//! Protocol v1 scope, wrapped-SDK surface only: archive, resize, recover,
-//! refresh-activity, timers, and labels are supported; pause/resume,
-//! fork, checkpoints, live-sandbox snapshots, and runtime network updates
-//! are not declared and return `Unsupported`. Plain execs run buffered
+//! Protocol v1 scope: archive, resize, undelete (Daytona's "recover" —
+//! restore within 24 hours of deletion), refresh-activity, timers,
+//! labels, and snapshot activation are supported; pause/resume, fork,
+//! checkpoints, live-sandbox snapshots, TTL, domain allow lists, and
+//! runtime network updates are absent from the pinned SDK, undeclared,
+//! and return `Unsupported`. Plain execs run buffered
 //! through the toolbox's one-shot endpoint; a sink or cancel token
 //! routes through a command session, which streams logs live with
 //! separated stdout/stderr, kills on cancel/timeout by deleting the
@@ -35,6 +37,7 @@
 mod access;
 mod exec;
 mod fs;
+mod raw;
 mod session;
 
 use std::collections::{BTreeMap, HashMap};
@@ -43,6 +46,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use daytona_api_client::apis::{api_keys_api, snapshots_api};
+use daytona_api_client::models::api_key_list::Permissions;
 use daytona_api_client::models::{
     SnapshotState as ApiSnapshotState, VolumeDto, VolumeState as ApiVolumeState,
 };
@@ -52,12 +57,12 @@ use daytona_sdk::{
 };
 use sandbox_driver::{
     Capabilities, Error, ErrorReport, EventCallback, EventDispatcher, Exec, ExecSpec, Filesystem,
-    Isolation, LifecycleAction, LifecycleTimers, NetworkPolicy, PlatformInfo, PreviewUrls,
-    ProviderError, ProviderKind, ResourceKind, Resources, Result, Sandbox, SandboxEvent,
-    SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec, SandboxState,
-    SandboxStatus, SnapshotCaps, SnapshotFilter, SnapshotId, SnapshotProvider, SnapshotSource,
-    SnapshotSpec, SnapshotState, SnapshotStatus, SshAccess, VolumeCaps, VolumeId, VolumeProvider,
-    VolumeSpec, VolumeState, VolumeStatus,
+    HealthStatus, Isolation, LifecycleAction, LifecycleTimers, NetworkPolicy, PlatformInfo,
+    PreviewUrls, ProviderError, ProviderHealth, ProviderKind, ResourceKind, Resources, Result,
+    Sandbox, SandboxEvent, SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec,
+    SandboxState, SandboxStatus, SnapshotCaps, SnapshotFilter, SnapshotId, SnapshotProvider,
+    SnapshotSource, SnapshotSpec, SnapshotState, SnapshotStatus, SshAccess, VolumeCaps, VolumeId,
+    VolumeProvider, VolumeSpec, VolumeState, VolumeStatus,
 };
 use tokio::time;
 
@@ -84,6 +89,15 @@ const TRANSITION_POLL: Duration = Duration::from_secs(1);
 /// paginated endpoints truncate an unpaged request to their own default
 /// page size, so listings must walk `total_pages` explicitly.
 const LIST_PAGE_SIZE: i32 = 100;
+
+/// Scopes every sandbox-driver Daytona operation may need, paired with
+/// their wire names for [`ProviderHealth::missing_permissions`].
+const REQUIRED_PERMISSIONS: &[(Permissions, &str)] = &[
+    (Permissions::WRITE_SANDBOXES, "write:sandboxes"),
+    (Permissions::DELETE_SANDBOXES, "delete:sandboxes"),
+    (Permissions::WRITE_SNAPSHOTS, "write:snapshots"),
+    (Permissions::DELETE_SNAPSHOTS, "delete:snapshots"),
+];
 
 pub(crate) type DaytonaClient = Arc<Client>;
 
@@ -190,6 +204,7 @@ fn status_from_sdk(sdk: &daytona_sdk::Sandbox) -> Result<SandboxStatus> {
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     status.source.clone_from(&sdk.snapshot);
+    status.web_url = raw::dashboard_url().map(str::to_owned);
     let mut resources = Resources::default();
     resources.cpu_cores = to_u64(sdk.cpu)
         .and_then(|cpu| u32::try_from(cpu).ok())
@@ -378,7 +393,10 @@ impl DaytonaProvider {
 fn daytona_capabilities() -> Capabilities {
     let mut caps = Capabilities::minimal(Isolation::Vm);
     caps.lifecycle.archive = true;
-    caps.lifecycle.recover = true;
+    // Daytona's "recover" endpoint is an undelete (restore within 24
+    // hours of deletion), not recovery from the Error state.
+    caps.lifecycle.undelete = true;
+    caps.lifecycle.resize = true;
     caps.lifecycle.refresh_activity = true;
     caps.lifecycle.timers = true;
     caps.lifecycle.labels = true;
@@ -400,6 +418,7 @@ fn daytona_capabilities() -> Capabilities {
         let mut snapshots = SnapshotCaps::default();
         snapshots.from_image = true;
         snapshots.from_dockerfile = true;
+        snapshots.activation = true;
         snapshots
     });
     caps.volumes = Some({
@@ -610,6 +629,81 @@ impl SandboxProvider for DaytonaProvider {
             });
         }
         Ok(self.handle(sdk, events).await?)
+    }
+
+    async fn undelete(
+        &self,
+        id: &SandboxId,
+        events: Option<EventCallback>,
+    ) -> Result<Arc<dyn Sandbox>> {
+        // Daytona names this "recover": a deleted sandbox stays
+        // restorable for 24 hours.
+        let mut sdk = match self.client.get(id.as_str()).await {
+            Ok(sdk) => sdk,
+            Err(error) if is_not_found(&error) => {
+                return Err(Error::NotFound {
+                    resource: ResourceKind::Sandbox,
+                    id:       id.as_str().to_owned(),
+                });
+            }
+            Err(error) => return Err(daytona_error("fetching sandbox", &error)),
+        };
+        if sdk.labels.get(MANAGED_LABEL).map(String::as_str) != Some("true") {
+            return Err(Error::NotFound {
+                resource: ResourceKind::Sandbox,
+                id:       id.as_str().to_owned(),
+            });
+        }
+        sdk.recover()
+            .await
+            .map_err(|error| daytona_error("undeleting sandbox", &error))?;
+        let refreshed = self
+            .client
+            .get(id.as_str())
+            .await
+            .map_err(|error| daytona_error("fetching undeleted sandbox", &error))?;
+        Ok(self.handle(refreshed, events).await?)
+    }
+
+    async fn health(&self) -> Result<ProviderHealth> {
+        // Reachability and credential acceptance: the cheapest
+        // authenticated call.
+        if let Err(error) = self.client.list(None, Some(1), Some(1)).await {
+            let status = match &error {
+                DaytonaError::Api {
+                    status_code: 401 | 403,
+                    ..
+                } => HealthStatus::Unauthorized,
+                _ => HealthStatus::Unreachable,
+            };
+            let mut health = ProviderHealth::new(status);
+            health.message = Some(format!("listing sandboxes failed: {error}"));
+            return Ok(health);
+        }
+        let mut health = ProviderHealth::new(HealthStatus::Ok);
+        // Scope enumeration works only for API-key credentials; a JWT
+        // credential proved itself above and skips it, as does a control
+        // plane without key introspection.
+        if let Ok(raw) = raw::raw_api() {
+            if let Ok(key) = api_keys_api::get_current_api_key(
+                &raw.configuration,
+                raw.organization_id.as_deref(),
+            )
+            .await
+            {
+                health.missing_permissions = REQUIRED_PERMISSIONS
+                    .iter()
+                    .filter(|(permission, _)| !key.permissions.contains(permission))
+                    .map(|(_, name)| (*name).to_owned())
+                    .collect();
+                if !health.missing_permissions.is_empty() {
+                    health.status = HealthStatus::Unauthorized;
+                    health.message =
+                        Some(format!("API key {:?} is missing required scopes", key.name));
+                }
+            }
+        }
+        Ok(health)
     }
 
     async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>> {
@@ -915,13 +1009,6 @@ impl Sandbox for DaytonaSandbox {
         outcome
     }
 
-    async fn recover(&self) -> Result<()> {
-        let mut sdk = self.sdk().await?;
-        sdk.recover()
-            .await
-            .map_err(|error| daytona_error("recovering sandbox", &error))
-    }
-
     async fn refresh_activity(&self) -> Result<()> {
         // A trivial exec is genuine activity and resets the idle timers.
         // (The pinned SDK's update_last_activity now sends a valid body;
@@ -1134,6 +1221,42 @@ impl SnapshotProvider for DaytonaSnapshots {
                 }
                 Err(daytona_error("deleting snapshot", &error))
             }
+        }
+    }
+
+    async fn activate(&self, id: &SnapshotId) -> Result<()> {
+        let raw = raw::raw_api()?;
+        match snapshots_api::activate_snapshot(
+            &raw.configuration,
+            id.as_str(),
+            raw.organization_id.as_deref(),
+        )
+        .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if raw::is_raw_not_found(&error) => Err(Error::NotFound {
+                resource: ResourceKind::Snapshot,
+                id:       id.as_str().to_owned(),
+            }),
+            Err(error) => Err(raw::raw_error("activating snapshot", &error)),
+        }
+    }
+
+    async fn deactivate(&self, id: &SnapshotId) -> Result<()> {
+        let raw = raw::raw_api()?;
+        match snapshots_api::deactivate_snapshot(
+            &raw.configuration,
+            id.as_str(),
+            raw.organization_id.as_deref(),
+        )
+        .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) if raw::is_raw_not_found(&error) => Err(Error::NotFound {
+                resource: ResourceKind::Snapshot,
+                id:       id.as_str().to_owned(),
+            }),
+            Err(error) => Err(raw::raw_error("deactivating snapshot", &error)),
         }
     }
 }
