@@ -176,6 +176,44 @@ async fn labels_timers_access_round_trip() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn wall_clock_ttl_and_container_auto_pause_behavior() {
+    if env::var("DAYTONA_API_KEY").is_err() {
+        return;
+    }
+    init_diagnostics();
+    let provider = DaytonaProvider::connect().await.expect("connect");
+    let spec = SandboxSpec::new(SandboxSource::Snapshot {
+        id: SnapshotId::try_new(TEST_SNAPSHOT).expect("valid snapshot id"),
+    })
+    .ephemeral(true);
+    let sandbox = provider.create(&spec, None).await.expect("create");
+
+    let outcome = async {
+        let mut ttl = LifecycleTimers::default();
+        ttl.ttl = Some(Duration::from_secs(2 * 60 * 60));
+        sandbox
+            .set_timers(&ttl)
+            .await
+            .map_err(|error| format!("set wall-clock ttl: {error}"))?;
+
+        let mut auto_pause = LifecycleTimers::default();
+        auto_pause.auto_pause_after_idle = Some(Duration::from_secs(30 * 60));
+        match sandbox.set_timers(&auto_pause).await {
+            Err(error) if error_chain_contains(&error, "not supported for sandbox class") => Ok(()),
+            Err(error) => Err(format!(
+                "container auto-pause returned an unexpected error: {}",
+                format_error_chain(&error)
+            )),
+            Ok(()) => Err("container auto-pause unexpectedly succeeded".to_owned()),
+        }
+    }
+    .await;
+
+    sandbox.delete().await.expect("delete");
+    outcome.expect("live lifecycle timer behavior");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn cidr_egress_limits_apply_at_create_and_runtime() {
     if env::var("DAYTONA_API_KEY").is_err() {
         return;
