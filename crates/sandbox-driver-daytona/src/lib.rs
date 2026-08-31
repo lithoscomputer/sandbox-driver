@@ -4,13 +4,17 @@
 //! plane and per-sandbox toolbox daemon, with snapshots and volumes as
 //! first-class services and preview-URL/SSH access facets.
 //!
-//! Protocol v1 scope: archive, resize, undelete (Daytona's "recover" —
-//! restore within 24 hours of deletion), refresh-activity, timers,
-//! labels, and snapshot activation are supported; pause/resume, fork,
-//! checkpoints, live-sandbox snapshots, TTL, domain allow lists, and
-//! runtime network updates are absent from the pinned SDK, undeclared,
-//! and return `Unsupported`. Plain execs run buffered
-//! through the toolbox's one-shot endpoint; a sink or cancel token
+//! Lifecycle: archive, resize, undelete (Daytona's "recover" — restore
+//! within 24 hours of deletion), refresh-activity, all five timers (TTL
+//! and auto-pause included), labels, runtime network updates, and — on
+//! VM sandbox classes, narrowed per sandbox — pause/resume, fork, and
+//! sandbox-to-snapshot. Checkpoints remain unsupported (Daytona has no
+//! identity-preserving rewind). The PTY facet rides the toolbox
+//! WebSocket; `spawn_stdio` rides command sessions and is UTF-8-only
+//! (see the stdio module). The outbound proxy is `provider_config`
+//! (`{"outbound_proxy_url": …}`), composing with a domain allow list as
+//! upstream intends rather than competing as a network policy. Plain execs run
+//! buffered through the toolbox's one-shot endpoint; a sink or cancel token
 //! routes through a command session, which streams logs live with
 //! separated stdout/stderr, kills on cancel/timeout by deleting the
 //! session, and preserves partial output on timeout. Stdin is delivered
@@ -37,8 +41,9 @@
 mod access;
 mod exec;
 mod fs;
-mod raw;
+mod pty;
 mod session;
+mod stdio;
 
 use std::collections::{BTreeMap, HashMap};
 use std::result::Result as StdResult;
@@ -46,29 +51,33 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use daytona_api_client::apis::{api_keys_api, snapshots_api};
+use daytona_api_client::apis::{Error as ApiError, api_keys_api, snapshots_api};
 use daytona_api_client::models::api_key_list::Permissions;
+use daytona_api_client::models::sandbox::SandboxClass;
 use daytona_api_client::models::{
-    SnapshotState as ApiSnapshotState, VolumeDto, VolumeState as ApiVolumeState,
+    SnapshotState as ApiSnapshotState, UpdateSandboxNetworkSettings, VolumeDto,
+    VolumeState as ApiVolumeState,
 };
 use daytona_sdk::{
     Client, CreateParams, CreateSandboxOptions, CreateSnapshotParams, DaytonaError, DockerImage,
     ImageParams, ImageSource, SandboxBaseParams, SnapshotParams,
 };
 use sandbox_driver::{
-    Capabilities, Error, ErrorReport, EventCallback, EventDispatcher, Exec, ExecSpec, Filesystem,
-    HealthStatus, Isolation, LifecycleAction, LifecycleTimers, NetworkPolicy, PlatformInfo,
-    PreviewUrls, ProviderError, ProviderHealth, ProviderKind, ResourceKind, Resources, Result,
-    Sandbox, SandboxEvent, SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec,
-    SandboxState, SandboxStatus, SnapshotCaps, SnapshotFilter, SnapshotId, SnapshotProvider,
-    SnapshotSource, SnapshotSpec, SnapshotState, SnapshotStatus, SshAccess, VolumeCaps, VolumeId,
-    VolumeProvider, VolumeSpec, VolumeState, VolumeStatus,
+    Capabilities, Capability, Error, ErrorReport, EventCallback, EventDispatcher, Exec, ExecSpec,
+    Filesystem, ForkOptions, HealthStatus, Isolation, LifecycleAction, LifecycleTimers,
+    NetworkPolicy, PlatformInfo, PreviewUrls, ProviderError, ProviderHealth, ProviderKind, Pty,
+    PtyCaps, ResourceKind, Resources, Result, Sandbox, SandboxEvent, SandboxFilter, SandboxId,
+    SandboxProvider, SandboxSnapshotOptions, SandboxSource, SandboxSpec, SandboxState,
+    SandboxStatus, SnapshotCaps, SnapshotFilter, SnapshotId, SnapshotProvider, SnapshotSource,
+    SnapshotSpec, SnapshotState, SnapshotStatus, SshAccess, VolumeCaps, VolumeId, VolumeProvider,
+    VolumeSpec, VolumeState, VolumeStatus,
 };
 use tokio::time;
 
 pub use crate::access::DaytonaAccess;
 pub use crate::exec::DaytonaExec;
 pub use crate::fs::DaytonaFs;
+pub use crate::pty::DaytonaPty;
 
 const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
 const FALLBACK_WORKING_DIR: &str = "/home/daytona";
@@ -143,6 +152,35 @@ pub(crate) fn is_state_change_in_progress(error: &DaytonaError) -> bool {
     )
 }
 
+/// Maps a generated-client error for the few control-plane endpoints the
+/// wrapped SDK does not cover (snapshot deactivation, API-key
+/// introspection).
+fn generated_error<T>(context: &str, error: &ApiError<T>) -> Error {
+    let kind = ProviderKind::try_new("daytona").expect("static kind is valid");
+    let mut provider = ProviderError::new(kind, format!("{context}: {error}"));
+    if let ApiError::ResponseError(content) = error {
+        provider.code = Some(content.status.as_u16().to_string());
+        provider.retryable = content.status.is_server_error();
+    }
+    Error::Provider(provider)
+}
+
+fn is_generated_not_found<T>(error: &ApiError<T>) -> bool {
+    matches!(error, ApiError::ResponseError(content) if content.status.as_u16() == 404)
+}
+
+/// The console page listing sandboxes, derived from the API base path —
+/// the hosted control plane serves the API under `/api` next to the
+/// dashboard. A differently shaped deployment gets no link rather than
+/// a guessed one.
+fn dashboard_url(client: &daytona_sdk::Client) -> Option<String> {
+    client
+        .api_configuration()
+        .base_path
+        .strip_suffix("/api")
+        .map(|base| format!("{base}/dashboard/sandboxes"))
+}
+
 pub(crate) fn daytona_error(context: &str, error: &DaytonaError) -> Error {
     let kind = ProviderKind::try_new("daytona").expect("static kind is valid");
     match error {
@@ -191,7 +229,10 @@ fn map_state(state: Option<daytona_sdk::SandboxState>) -> SandboxState {
     }
 }
 
-fn status_from_sdk(sdk: &daytona_sdk::Sandbox) -> Result<SandboxStatus> {
+fn status_from_sdk(
+    client: &daytona_sdk::Client,
+    sdk: &daytona_sdk::Sandbox,
+) -> Result<SandboxStatus> {
     let id = SandboxId::try_new(&sdk.id)
         .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
     let mut status = SandboxStatus::new(id, map_state(sdk.state));
@@ -204,7 +245,7 @@ fn status_from_sdk(sdk: &daytona_sdk::Sandbox) -> Result<SandboxStatus> {
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     status.source.clone_from(&sdk.snapshot);
-    status.web_url = raw::dashboard_url().map(str::to_owned);
+    status.web_url = dashboard_url(client);
     let mut resources = Resources::default();
     resources.cpu_cores = to_u64(sdk.cpu)
         .and_then(|cpu| u32::try_from(cpu).ok())
@@ -360,39 +401,49 @@ impl DaytonaProvider {
         sdk: daytona_sdk::Sandbox,
         events: Option<EventCallback>,
     ) -> Result<Arc<DaytonaSandbox>> {
-        let working_dir = match sdk.get_working_dir().await {
-            Ok(dir) => dir,
-            // A stopped sandbox has no reachable toolbox; use the
-            // conventional home until the next exec resolves it.
-            Err(_) => FALLBACK_WORKING_DIR.to_owned(),
-        };
-        let id = SandboxId::try_new(&sdk.id)
-            .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
-        Ok(Arc::new(DaytonaSandbox {
-            exec: DaytonaExec::new(
-                Arc::clone(&self.client),
-                sdk.id.clone(),
-                working_dir.clone(),
-            ),
-            fs: DaytonaFs::new(
-                Arc::clone(&self.client),
-                sdk.id.clone(),
-                working_dir.clone(),
-            ),
-            access: DaytonaAccess::new(Arc::clone(&self.client), sdk.id.clone()),
-            id,
-            capabilities: self.capabilities.clone(),
-            client: Arc::clone(&self.client),
-            sdk_id: sdk.id,
-            working_dir,
-            dispatcher: events.map(EventDispatcher::new),
-        }))
+        build_handle(&self.client, &self.capabilities, sdk, events).await
     }
+}
+
+/// Builds a sandbox handle from an SDK sandbox, narrowing the capability
+/// set by sandbox class. Shared by the provider (create/attach/undelete)
+/// and by `fork`, which builds the child's handle from an existing one.
+async fn build_handle(
+    client: &DaytonaClient,
+    base_capabilities: &Capabilities,
+    sdk: daytona_sdk::Sandbox,
+    events: Option<EventCallback>,
+) -> Result<Arc<DaytonaSandbox>> {
+    let working_dir = match sdk.get_working_dir().await {
+        Ok(dir) => dir,
+        // A stopped sandbox has no reachable toolbox; use the
+        // conventional home until the next exec resolves it.
+        Err(_) => FALLBACK_WORKING_DIR.to_owned(),
+    };
+    let id = SandboxId::try_new(&sdk.id)
+        .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
+    Ok(Arc::new(DaytonaSandbox {
+        exec: DaytonaExec::new(Arc::clone(client), sdk.id.clone(), working_dir.clone()),
+        fs: DaytonaFs::new(Arc::clone(client), sdk.id.clone(), working_dir.clone()),
+        access: DaytonaAccess::new(Arc::clone(client), sdk.id.clone()),
+        pty: DaytonaPty::new(Arc::clone(client), sdk.id.clone(), working_dir.clone()),
+        id,
+        capabilities: narrowed_capabilities(base_capabilities, sdk.sandbox_class),
+        client: Arc::clone(client),
+        sdk_id: sdk.id,
+        working_dir,
+        dispatcher: events.map(EventDispatcher::new),
+    }))
 }
 
 fn daytona_capabilities() -> Capabilities {
     let mut caps = Capabilities::minimal(Isolation::Vm);
     caps.lifecycle.archive = true;
+    // VM-class-only verbs are declared at the provider level (the upper
+    // bound); the per-sandbox set narrows them by class.
+    caps.lifecycle.pause = true;
+    caps.lifecycle.fork = true;
+    caps.lifecycle.snapshot_sandbox = true;
     // Daytona's "recover" endpoint is an undelete (restore within 24
     // hours of deletion), not recovery from the Error state.
     caps.lifecycle.undelete = true;
@@ -400,24 +451,35 @@ fn daytona_capabilities() -> Capabilities {
     caps.lifecycle.refresh_activity = true;
     caps.lifecycle.timers = true;
     caps.lifecycle.labels = true;
+    caps.lifecycle.update_network = true;
     caps.exec.stdin = true;
     caps.exec.cancel = true;
     caps.exec.live_streaming = true;
     caps.exec.streams_separated = true;
+    // Session-backed; UTF-8 payloads only (the ACP use case) — see the
+    // stdio module.
+    caps.exec.stdio_process = true;
     caps.fs.native = true;
     caps.fs.upload = true;
     caps.fs.download = true;
     caps.fs.permissions = true;
+    caps.pty = Some({
+        let mut pty = PtyCaps::default();
+        pty.resize = true;
+        pty
+    });
     caps.access.preview_urls = true;
     caps.access.signed_preview_urls = true;
     caps.access.ssh = true;
     caps.network.allow_all = true;
     caps.network.block_all = true;
     caps.network.cidr_allow_list = true;
+    caps.network.domain_allow_list = true;
     caps.snapshots = Some({
         let mut snapshots = SnapshotCaps::default();
         snapshots.from_image = true;
         snapshots.from_dockerfile = true;
+        snapshots.from_sandbox = true;
         snapshots.activation = true;
         snapshots
     });
@@ -429,30 +491,80 @@ fn daytona_capabilities() -> Capabilities {
     caps
 }
 
-fn base_params(spec: &SandboxSpec) -> Result<SandboxBaseParams> {
-    if spec.timers.ttl.is_some() {
-        return Err(Error::invalid_spec(
-            "timers",
-            "daytona does not support a wall-clock ttl",
-        ));
+/// Narrows the provider's upper-bound capability set to one sandbox.
+///
+/// Pause, fork, and sandbox snapshots are VM-class operations: container
+/// and android sandboxes get them masked. An unknown or unreported class
+/// keeps the upper bound — the typed `Unsupported`/provider error at the
+/// call is still the enforcement.
+fn narrowed_capabilities(base: &Capabilities, class: Option<SandboxClass>) -> Capabilities {
+    let mut caps = base.clone();
+    if matches!(class, Some(SandboxClass::CONTAINER | SandboxClass::ANDROID)) {
+        caps.lifecycle.pause = false;
+        caps.lifecycle.fork = false;
+        caps.lifecycle.snapshot_sandbox = false;
     }
-    if spec.timers.auto_pause_after_idle.is_some() {
-        return Err(Error::invalid_spec(
-            "timers",
-            "auto_pause is not supported by this provider version",
-        ));
-    }
-    let (network_block_all, network_allow_list) = match &spec.network {
-        NetworkPolicy::ProviderDefault => (None, None),
-        NetworkPolicy::AllowAll => (Some(false), None),
-        NetworkPolicy::Block => (Some(true), None),
-        NetworkPolicy::CidrAllowList { cidrs } => (None, Some(cidrs.clone())),
-        NetworkPolicy::DomainAllowList { .. } => {
-            return Err(Error::invalid_spec(
-                "network",
-                "domain allow lists are not exposed by the daytona provider yet",
-            ));
+    caps
+}
+
+/// Options the Daytona provider reads from `SandboxSpec::provider_config`.
+///
+/// Schema: `{"outbound_proxy_url": string}` — routes the sandbox's
+/// HTTP(S) traffic through the proxy via the standard proxy environment
+/// variables at creation (convenience routing; combine with a domain
+/// allow list for network-layer enforcement). A separate concern from
+/// `NetworkPolicy`, matching the upstream API where the proxy composes
+/// with an allow list. Unknown fields are rejected so typos fail loudly.
+struct DaytonaProviderConfig {
+    outbound_proxy_url: Option<String>,
+}
+
+fn provider_config(value: &serde_json::Value) -> Result<DaytonaProviderConfig> {
+    let mut config = DaytonaProviderConfig {
+        outbound_proxy_url: None,
+    };
+    match value {
+        serde_json::Value::Null => {}
+        serde_json::Value::Object(fields) => {
+            for (key, field) in fields {
+                match key.as_str() {
+                    "outbound_proxy_url" => {
+                        config.outbound_proxy_url = Some(
+                            field
+                                .as_str()
+                                .ok_or_else(|| {
+                                    Error::invalid_spec(
+                                        "provider_config.outbound_proxy_url",
+                                        "expected a string",
+                                    )
+                                })?
+                                .to_owned(),
+                        );
+                    }
+                    other => {
+                        return Err(Error::invalid_spec(
+                            "provider_config",
+                            format!("unknown field {other:?}"),
+                        ));
+                    }
+                }
+            }
         }
+        _ => {
+            return Err(Error::invalid_spec("provider_config", "expected an object"));
+        }
+    }
+    Ok(config)
+}
+
+fn base_params(spec: &SandboxSpec) -> Result<SandboxBaseParams> {
+    let config = provider_config(&spec.provider_config)?;
+    let (network_block_all, network_allow_list, domain_allow_list) = match &spec.network {
+        NetworkPolicy::ProviderDefault => (None, None, None),
+        NetworkPolicy::AllowAll => (Some(false), None, None),
+        NetworkPolicy::Block => (Some(true), None, None),
+        NetworkPolicy::CidrAllowList { cidrs } => (None, Some(cidrs.clone()), None),
+        NetworkPolicy::DomainAllowList { domains } => (None, None, Some(domains.clone())),
         _ => return Err(Error::invalid_spec("network", "unsupported network policy")),
     };
     let mut labels: HashMap<String, String> = spec
@@ -474,12 +586,14 @@ fn base_params(spec: &SandboxSpec) -> Result<SandboxBaseParams> {
         labels: Some(labels),
         public: spec.public,
         auto_stop_interval: spec.timers.auto_stop_after_idle.map(minutes),
+        auto_pause_interval: spec.timers.auto_pause_after_idle.map(minutes),
         auto_archive_interval: spec.timers.auto_archive_after_stop.map(minutes),
         auto_delete_interval: spec
             .timers
             .auto_delete_after_stop
             .map(auto_delete_minutes)
             .or(if spec.ephemeral { Some(0) } else { None }),
+        ttl_minutes: spec.timers.ttl.map(minutes),
         volumes: (!spec.volumes.is_empty()).then(|| {
             spec.volumes
                 .iter()
@@ -492,6 +606,8 @@ fn base_params(spec: &SandboxSpec) -> Result<SandboxBaseParams> {
         }),
         network_block_all,
         network_allow_list,
+        domain_allow_list,
+        outbound_proxy_url: config.outbound_proxy_url,
         ephemeral: spec.ephemeral.then_some(true),
     })
 }
@@ -684,23 +800,20 @@ impl SandboxProvider for DaytonaProvider {
         // Scope enumeration works only for API-key credentials; a JWT
         // credential proved itself above and skips it, as does a control
         // plane without key introspection.
-        if let Ok(raw) = raw::raw_api() {
-            if let Ok(key) = api_keys_api::get_current_api_key(
-                &raw.configuration,
-                raw.organization_id.as_deref(),
-            )
-            .await
-            {
-                health.missing_permissions = REQUIRED_PERMISSIONS
-                    .iter()
-                    .filter(|(permission, _)| !key.permissions.contains(permission))
-                    .map(|(_, name)| (*name).to_owned())
-                    .collect();
-                if !health.missing_permissions.is_empty() {
-                    health.status = HealthStatus::Unauthorized;
-                    health.message =
-                        Some(format!("API key {:?} is missing required scopes", key.name));
-                }
+        if let Ok(key) = api_keys_api::get_current_api_key(
+            self.client.api_configuration(),
+            self.client.organization_id(),
+        )
+        .await
+        {
+            health.missing_permissions = REQUIRED_PERMISSIONS
+                .iter()
+                .filter(|(permission, _)| !key.permissions.contains(permission))
+                .map(|(_, name)| (*name).to_owned())
+                .collect();
+            if !health.missing_permissions.is_empty() {
+                health.status = HealthStatus::Unauthorized;
+                health.message = Some(format!("API key {:?} is missing required scopes", key.name));
             }
         }
         Ok(health)
@@ -722,7 +835,7 @@ impl SandboxProvider for DaytonaProvider {
                 .await
                 .map_err(|error| daytona_error("listing sandboxes", &error))?;
             for item in &page.items {
-                statuses.push(status_from_sdk(item)?);
+                statuses.push(status_from_sdk(&self.client, item)?);
             }
             if page.total_pages <= i64::from(page_number) {
                 break;
@@ -751,6 +864,7 @@ pub struct DaytonaSandbox {
     exec:         DaytonaExec,
     fs:           DaytonaFs,
     access:       DaytonaAccess,
+    pty:          DaytonaPty,
     dispatcher:   Option<EventDispatcher>,
 }
 
@@ -952,7 +1066,7 @@ impl Sandbox for DaytonaSandbox {
 
     async fn describe(&self) -> Result<SandboxStatus> {
         match self.client.get(&self.sdk_id).await {
-            Ok(sdk) => status_from_sdk(&sdk),
+            Ok(sdk) => status_from_sdk(&self.client, &sdk),
             Err(error) if is_not_found(&error) => {
                 Ok(SandboxStatus::new(self.id.clone(), SandboxState::Deleted))
             }
@@ -1009,6 +1123,111 @@ impl Sandbox for DaytonaSandbox {
         outcome
     }
 
+    async fn pause(&self) -> Result<()> {
+        // The SDK applies the upstream contract: the pause completes when
+        // the sandbox has left the pausing state, not only on exactly
+        // Paused. VM classes only; the per-sandbox capability set masks
+        // it elsewhere and the server enforces it regardless.
+        let outcome = async {
+            let mut sdk = self.sdk().await?;
+            sdk.pause_with_timeout(TRANSITION_BUDGET)
+                .await
+                .map_err(|error| daytona_error("pausing sandbox", &error))
+        }
+        .await;
+        self.emit_action(LifecycleAction::Pause, &outcome).await;
+        outcome
+    }
+
+    async fn resume(&self) -> Result<()> {
+        // Daytona has no separate resume endpoint: start resumes a
+        // paused sandbox.
+        let outcome = self.start_inner().await;
+        self.emit_action(LifecycleAction::Resume, &outcome).await;
+        outcome
+    }
+
+    async fn fork(&self, options: &ForkOptions) -> Result<Arc<dyn Sandbox>> {
+        if options.include_memory {
+            return Err(Error::invalid_spec(
+                "include_memory",
+                "daytona fork does not take a memory option",
+            ));
+        }
+        let sdk = self.sdk().await?;
+        let forked = sdk
+            .fork_with_timeout(options.name.as_deref(), CREATE_TIMEOUT)
+            .await
+            .map_err(|error| daytona_error("forking sandbox", &error))?;
+        // The child shares the parent's class, so the parent's (already
+        // narrowed) capability set is the right base.
+        Ok(build_handle(&self.client, &self.capabilities, forked, None).await?)
+    }
+
+    async fn snapshot(&self, options: &SandboxSnapshotOptions) -> Result<SnapshotId> {
+        if options.include_memory {
+            // On the wire upstream, but exposed by no reference SDK.
+            return Err(Error::unsupported(Capability::SnapshotsIncludeMemory));
+        }
+        let name = options.name.clone().unwrap_or_else(|| {
+            format!(
+                "sandbox-driver-{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_secs())
+            )
+        });
+        let outcome = async {
+            let mut sdk = self.sdk().await?;
+            sdk.create_snapshot_with_timeout(&name, CREATE_TIMEOUT)
+                .await
+                .map_err(|error| daytona_error("snapshotting sandbox", &error))
+        }
+        .await;
+        self.emit_action(LifecycleAction::SnapshotSandbox, &outcome)
+            .await;
+        outcome?;
+        let dto = self
+            .client
+            .snapshot
+            .get(&name)
+            .await
+            .map_err(|error| daytona_error("fetching created snapshot", &error))?;
+        SnapshotId::try_new(dto.id)
+            .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))
+    }
+
+    async fn update_network(&self, policy: &NetworkPolicy) -> Result<()> {
+        let mut settings = UpdateSandboxNetworkSettings::new();
+        match policy {
+            NetworkPolicy::AllowAll => settings.network_block_all = Some(false),
+            NetworkPolicy::Block => settings.network_block_all = Some(true),
+            NetworkPolicy::CidrAllowList { cidrs } => {
+                settings.network_allow_list = Some(cidrs.join(","));
+            }
+            NetworkPolicy::DomainAllowList { domains } => {
+                settings.domain_allow_list = Some(domains.join(","));
+            }
+            NetworkPolicy::ProviderDefault => {
+                return Err(Error::invalid_spec(
+                    "network",
+                    "provider_default names no concrete policy to apply at runtime",
+                ));
+            }
+            _ => return Err(Error::invalid_spec("network", "unsupported network policy")),
+        }
+        let outcome = async {
+            let mut sdk = self.sdk().await?;
+            sdk.update_network_settings(settings)
+                .await
+                .map_err(|error| daytona_error("updating network settings", &error))
+        }
+        .await;
+        self.emit_action(LifecycleAction::UpdateNetwork, &outcome)
+            .await;
+        outcome
+    }
+
     async fn refresh_activity(&self) -> Result<()> {
         // A trivial exec is genuine activity and resets the idle timers.
         // (The pinned SDK's update_last_activity now sends a valid body;
@@ -1044,17 +1263,36 @@ impl Sandbox for DaytonaSandbox {
     }
 
     async fn set_timers(&self, timers: &LifecycleTimers) -> Result<()> {
-        if timers.ttl.is_some() || timers.auto_pause_after_idle.is_some() {
+        let auto_stop = timers.auto_stop_after_idle.map(minutes);
+        let auto_pause = timers.auto_pause_after_idle.map(minutes);
+        if auto_stop.is_some_and(|interval| interval != 0)
+            && auto_pause.is_some_and(|interval| interval != 0)
+        {
             return Err(Error::invalid_spec(
                 "timers",
-                "ttl and auto_pause are not supported by this provider version",
+                "auto_stop and auto_pause are mutually exclusive; \
+                 set at most one to a non-zero value",
             ));
         }
         let mut sdk = self.sdk().await?;
-        if let Some(idle) = timers.auto_stop_after_idle {
-            sdk.set_autostop_interval(minutes(idle))
+        // Enabling auto-pause requires auto-stop be disabled first (the
+        // server allows at most one non-zero); when the caller enables
+        // auto-pause without saying anything about auto-stop, disable it
+        // for them — the documented upstream sequence.
+        if auto_pause.is_some_and(|interval| interval != 0) && auto_stop.is_none() {
+            sdk.set_autostop_interval(0)
+                .await
+                .map_err(|error| daytona_error("disabling auto-stop", &error))?;
+        }
+        if let Some(idle) = auto_stop {
+            sdk.set_autostop_interval(idle)
                 .await
                 .map_err(|error| daytona_error("setting auto-stop", &error))?;
+        }
+        if let Some(pause) = auto_pause {
+            sdk.set_auto_pause_interval(pause)
+                .await
+                .map_err(|error| daytona_error("setting auto-pause", &error))?;
         }
         if let Some(archive) = timers.auto_archive_after_stop {
             sdk.set_auto_archive_interval(minutes(archive))
@@ -1065,6 +1303,13 @@ impl Sandbox for DaytonaSandbox {
             sdk.set_auto_delete_interval(auto_delete_minutes(delete))
                 .await
                 .map_err(|error| daytona_error("setting auto-delete", &error))?;
+        }
+        if let Some(ttl) = timers.ttl {
+            // The deadline re-anchors from now; zero disables (subject to
+            // the org/region maximum lifespan).
+            sdk.set_ttl(minutes(ttl))
+                .await
+                .map_err(|error| daytona_error("setting ttl", &error))?;
         }
         Ok(())
     }
@@ -1096,6 +1341,10 @@ impl Sandbox for DaytonaSandbox {
 
     fn ssh(&self) -> Option<&dyn SshAccess> {
         Some(&self.access)
+    }
+
+    fn pty(&self) -> Option<&dyn Pty> {
+        Some(&self.pty)
     }
 }
 
@@ -1225,39 +1474,41 @@ impl SnapshotProvider for DaytonaSnapshots {
     }
 
     async fn activate(&self, id: &SnapshotId) -> Result<()> {
-        let raw = raw::raw_api()?;
-        match snapshots_api::activate_snapshot(
-            &raw.configuration,
-            id.as_str(),
-            raw.organization_id.as_deref(),
-        )
-        .await
-        {
+        // The SDK resolves ids and names against the ID-only endpoint.
+        match self.client.snapshot.activate(id.as_str()).await {
             Ok(_) => Ok(()),
-            Err(error) if raw::is_raw_not_found(&error) => Err(Error::NotFound {
+            Err(error) if is_not_found(&error) => Err(Error::NotFound {
                 resource: ResourceKind::Snapshot,
                 id:       id.as_str().to_owned(),
             }),
-            Err(error) => Err(raw::raw_error("activating snapshot", &error)),
+            Err(error) => Err(daytona_error("activating snapshot", &error)),
         }
     }
 
     async fn deactivate(&self, id: &SnapshotId) -> Result<()> {
-        let raw = raw::raw_api()?;
-        match snapshots_api::deactivate_snapshot(
-            &raw.configuration,
-            id.as_str(),
-            raw.organization_id.as_deref(),
-        )
-        .await
-        {
-            Ok(()) => Ok(()),
-            Err(error) if raw::is_raw_not_found(&error) => Err(Error::NotFound {
-                resource: ResourceKind::Snapshot,
-                id:       id.as_str().to_owned(),
-            }),
-            Err(error) => Err(raw::raw_error("deactivating snapshot", &error)),
+        // Deactivation is unwrapped by the reference SDKs (the generated
+        // client has it); the endpoint is ID-only, so resolve a name
+        // through get first, mirroring the SDK's activate resolution.
+        let configuration = self.client.api_configuration();
+        let organization = self.client.organization_id();
+        match snapshots_api::deactivate_snapshot(configuration, id.as_str(), organization).await {
+            Ok(()) => return Ok(()),
+            Err(error) if is_generated_not_found(&error) => {}
+            Err(error) => return Err(generated_error("deactivating snapshot", &error)),
         }
+        let resolved = match self.client.snapshot.get(id.as_str()).await {
+            Ok(dto) => dto.id,
+            Err(error) if is_not_found(&error) => {
+                return Err(Error::NotFound {
+                    resource: ResourceKind::Snapshot,
+                    id:       id.as_str().to_owned(),
+                });
+            }
+            Err(error) => return Err(daytona_error("fetching snapshot", &error)),
+        };
+        snapshots_api::deactivate_snapshot(configuration, &resolved, organization)
+            .await
+            .map_err(|error| generated_error("deactivating snapshot", &error))
     }
 }
 

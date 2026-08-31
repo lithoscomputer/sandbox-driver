@@ -14,9 +14,8 @@ async-trait.workspace = true
 daytona-api-client.workspace = true
 daytona-sdk.workspace = true
 rand.workspace = true
-reqwest.workspace = true
-reqwest-middleware.workspace = true
 sandbox-driver.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 tokio-util.workspace = true
 

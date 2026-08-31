@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use daytona_sdk::{DaytonaError, ExecuteCommandOptions, FileSystemService, ProcessService};
 use sandbox_driver::{
     Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputCaptureBuffer, OutputSink,
-    OutputStream, Result, Termination,
+    OutputStream, Result, SpawnSpec, StdioProcess, Termination,
 };
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, OnceCell};
@@ -17,7 +17,7 @@ use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 use crate::session::{Session, missing_suffix, wait_for_completion};
-use crate::{DaytonaClient, daytona_error, is_server_timeout, shell_quote};
+use crate::{DaytonaClient, daytona_error, is_server_timeout, shell_quote, stdio};
 
 /// Bound on waiting for the log stream to close after the command has
 /// its outcome; a stream that will not end is abandoned.
@@ -207,6 +207,16 @@ impl Exec for DaytonaExec {
             return self.run_session(spec, controls).await;
         }
         self.run_buffered(spec, &controls).await
+    }
+
+    async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
+        stdio::spawn(
+            &self.client,
+            &self.sandbox_id,
+            &self.resolve_dir(spec.working_dir.as_deref()),
+            spec,
+        )
+        .await
     }
 }
 
@@ -525,7 +535,11 @@ impl StreamSide {
 /// directory, blank `BASH_ENV` (overriding any caller value), export
 /// the spec env with both halves quoted, then run the command in a
 /// subshell so its exit status is the script's.
-fn build_session_script(cwd: &str, env: &BTreeMap<String, String>, command: &str) -> String {
+pub(crate) fn build_session_script(
+    cwd: &str,
+    env: &BTreeMap<String, String>,
+    command: &str,
+) -> String {
     let mut lines = vec![format!("cd {} || exit $?", shell_quote(cwd))];
     lines.push("export BASH_ENV=''".to_owned());
     for (key, value) in env {
@@ -547,7 +561,7 @@ fn build_session_script(cwd: &str, env: &BTreeMap<String, String>, command: &str
 /// The command handed to the session: one quoted `/bin/bash -c` so the
 /// caller's source stays inert until Bash evaluates it, and the session
 /// shell resumes afterwards to drain logs and record the exit code.
-fn wrap_session_script(script: &str) -> String {
+pub(crate) fn wrap_session_script(script: &str) -> String {
     format!("/bin/bash -c {}", shell_quote(script))
 }
 
