@@ -72,7 +72,9 @@ pub use capabilities::{
 };
 pub use capture::OutputCaptureBuffer;
 pub use derived::{DerivedFs, DerivedGit, DerivedSearch, DerivedServices};
-pub use error::{AuthError, Error, ExecFailure, ProviderError, ResourceKind, Result};
+pub use error::{
+    AuthError, Error, ExecFailure, ProviderError, ResourceKind, Result, TransportError,
+};
 pub use event::{ErrorReport, EventCallback, EventDispatcher, LifecycleAction, SandboxEvent};
 pub use exec::{
     CaptureStats, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputSink,

@@ -79,10 +79,11 @@ impl From<&Error> for ErrorReport {
             Error::RateLimited { .. } => "rate_limited",
             Error::Exec(_) => "exec",
             Error::Provider(_) => "provider",
+            Error::Transport(_) => "transport",
             Error::Io { .. } => "io",
         };
         let retryable = match error {
-            Error::Timeout { .. } | Error::RateLimited { .. } => true,
+            Error::Timeout { .. } | Error::RateLimited { .. } | Error::Transport(_) => true,
             Error::Provider(provider) => provider.retryable,
             _ => false,
         };

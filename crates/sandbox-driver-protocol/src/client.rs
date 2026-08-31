@@ -16,8 +16,8 @@ use sandbox_driver::{
     ProviderHealth, ProviderKind, Pty, PtyOptions, PtySession, PtySize, Resources, Result, Sandbox,
     SandboxFilter, SandboxId, SandboxSnapshotOptions, SandboxSpec, SandboxStatus, SnapshotFilter,
     SnapshotId, SnapshotProvider, SnapshotSpec, SnapshotStatus, SpawnSpec, SshAccess,
-    SshAccessInfo, StderrTail, StdioProcess, StdioProcessHandle, Termination, Vnc, VncConnection,
-    VolumeId, VolumeProvider, VolumeSpec, VolumeStatus, WebTerminal,
+    SshAccessInfo, StderrTail, StdioProcess, StdioProcessHandle, Termination, TransportError, Vnc,
+    VncConnection, VolumeId, VolumeProvider, VolumeSpec, VolumeStatus, WebTerminal,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -541,6 +541,7 @@ struct Client {
     /// Set when either transport task ends; every pending and future call
     /// fails fast instead of waiting on a dead pipe.
     closed:              AtomicBool,
+    closed_error:        Mutex<Option<TransportError>>,
     pending:             Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>,
     exec_streams:        Mutex<HashMap<String, mpsc::Sender<ExecChunk>>>,
     log_streams:         Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>,
@@ -563,6 +564,7 @@ impl Client {
             next_stream: AtomicU64::new(1),
             next_operation: AtomicU64::new(1),
             closed: AtomicBool::new(false),
+            closed_error: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             exec_streams: Mutex::new(HashMap::new()),
             log_streams: Mutex::new(HashMap::new()),
@@ -573,32 +575,55 @@ impl Client {
         let writer_client = Arc::clone(&client);
         tokio::spawn(async move {
             let mut writer = writer;
-            while let Some(message) = outbound_rx.recv().await {
-                let Ok(mut line) = serde_json::to_string(&message) else {
-                    continue;
-                };
-                line.push('\n');
-                if writer.write_all(line.as_bytes()).await.is_err() {
-                    break;
+            let outcome: Result<(), TransportError> = async {
+                while let Some(message) = outbound_rx.recv().await {
+                    let mut line = serde_json::to_string(&message).map_err(|error| {
+                        TransportError::with_source("serializing plugin request", error)
+                    })?;
+                    line.push('\n');
+                    writer.write_all(line.as_bytes()).await.map_err(|error| {
+                        TransportError::with_source("writing plugin request", error)
+                    })?;
                 }
+                writer.shutdown().await.map_err(|error| {
+                    TransportError::with_source("shutting down plugin writer", error)
+                })?;
+                Ok(())
             }
-            let _ = writer.shutdown().await;
-            writer_client.mark_closed();
+            .await;
+            writer_client.mark_closed(
+                outcome
+                    .err()
+                    .unwrap_or_else(|| TransportError::new("plugin request transport closed")),
+            );
         });
 
         let reader_client = Arc::clone(&client);
         tokio::spawn(async move {
             let mut lines = BufReader::new(reader).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if line.trim().is_empty() {
-                    continue;
+            let outcome: Result<(), TransportError> = async {
+                loop {
+                    let Some(line) = lines.next_line().await.map_err(|error| {
+                        TransportError::with_source("reading plugin response", error)
+                    })?
+                    else {
+                        return Ok(());
+                    };
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let message = serde_json::from_str::<Message>(&line).map_err(|error| {
+                        TransportError::with_source("decoding plugin response", error)
+                    })?;
+                    reader_client.route(message).await?;
                 }
-                let Ok(message) = serde_json::from_str::<Message>(&line) else {
-                    continue;
-                };
-                reader_client.route(message).await;
             }
-            reader_client.mark_closed();
+            .await;
+            reader_client.mark_closed(
+                outcome
+                    .err()
+                    .unwrap_or_else(|| TransportError::new("plugin response transport closed")),
+            );
         });
 
         client
@@ -607,17 +632,31 @@ impl Client {
     /// Marks the transport dead and fails everything pending. Called by
     /// both transport tasks; also re-checked by `call` after registering,
     /// closing the race where a call lands just after the drain.
-    fn mark_closed(&self) {
+    fn mark_closed(&self, error: TransportError) {
         self.closed.store(true, Ordering::SeqCst);
+        let error = {
+            let mut closed_error = self.closed_error.lock().expect("closed error lock");
+            closed_error.get_or_insert(error).clone()
+        };
         let pending: Vec<_> = {
             let mut pending = self.pending.lock().expect("pending lock");
             pending.drain().collect()
         };
         for (_, sender) in pending {
-            let _ = sender.send(Err(Error::invalid_spec("transport", "connection closed")));
+            let _ = sender.send(Err(Error::Transport(error.clone())));
         }
         self.exec_streams.lock().expect("exec streams lock").clear();
         self.log_streams.lock().expect("log streams lock").clear();
+    }
+
+    fn closed_error(&self) -> Error {
+        let error = self
+            .closed_error
+            .lock()
+            .expect("closed error lock")
+            .clone()
+            .unwrap_or_else(|| TransportError::new("plugin transport closed"));
+        Error::Transport(error)
     }
 
     fn next_stream_id(&self, prefix: &str) -> String {
@@ -627,7 +666,7 @@ impl Client {
         )
     }
 
-    async fn route(&self, message: Message) {
+    async fn route(&self, message: Message) -> Result<(), TransportError> {
         if let Some(id) = message.id {
             let sender = self.pending.lock().expect("pending lock").remove(&id);
             if let Some(sender) = sender {
@@ -638,50 +677,62 @@ impl Client {
                 };
                 let _ = sender.send(outcome);
             }
-            return;
+            return Ok(());
         }
         let Some(method) = message.method.as_deref() else {
-            return;
+            return Ok(());
         };
         let params = message.params.unwrap_or(Value::Null);
         match method {
             m::EXEC_OUTPUT => {
-                let Ok(notification) = serde_json::from_value::<m::ExecOutputNotification>(params)
-                else {
-                    return;
-                };
+                let notification = serde_json::from_value::<m::ExecOutputNotification>(params)
+                    .map_err(|error| {
+                        TransportError::with_source(
+                            "decoding plugin exec output notification",
+                            error,
+                        )
+                    })?;
                 let queue = self
                     .exec_streams
                     .lock()
                     .expect("exec streams lock")
                     .get(&notification.exec_id)
                     .cloned();
-                if let (Some(queue), Ok(chunk)) = (queue, decode_bytes(&notification.data_b64)) {
+                if let Some(queue) = queue {
+                    let chunk = decode_bytes(&notification.data_b64).map_err(|error| {
+                        TransportError::with_source("decoding plugin exec output", error)
+                    })?;
                     // A send failure means the exec already resolved and
                     // unregistered; dropping the late chunk is correct.
                     let _ = queue.send((notification.stream, chunk)).await;
                 }
             }
             m::LOG_OUTPUT => {
-                let Ok(notification) = serde_json::from_value::<m::LogOutputNotification>(params)
-                else {
-                    return;
-                };
+                let notification = serde_json::from_value::<m::LogOutputNotification>(params)
+                    .map_err(|error| {
+                        TransportError::with_source(
+                            "decoding plugin log output notification",
+                            error,
+                        )
+                    })?;
                 let queue = self
                     .log_streams
                     .lock()
                     .expect("log streams lock")
                     .get(&notification.stream_id)
                     .cloned();
-                if let (Some(queue), Ok(chunk)) = (queue, decode_bytes(&notification.data_b64)) {
+                if let Some(queue) = queue {
+                    let chunk = decode_bytes(&notification.data_b64).map_err(|error| {
+                        TransportError::with_source("decoding plugin log output", error)
+                    })?;
                     let _ = queue.send(chunk).await;
                 }
             }
             m::HOST_EVENT => {
-                let Ok(notification) = serde_json::from_value::<m::HostEventNotification>(params)
-                else {
-                    return;
-                };
+                let notification = serde_json::from_value::<m::HostEventNotification>(params)
+                    .map_err(|error| {
+                        TransportError::with_source("decoding plugin host event", error)
+                    })?;
                 // Operation routing first: during a create the same
                 // callback may be registered under both keys, and the
                 // event must be delivered exactly once.
@@ -708,12 +759,17 @@ impl Client {
             }
             _ => {}
         }
+        Ok(())
     }
 
     async fn call<P: Serialize, R: DeserializeOwned>(&self, method: &str, params: &P) -> Result<R> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let params = serde_json::to_value(params)
-            .map_err(|error| Error::invalid_spec("params", error.to_string()))?;
+        let params = serde_json::to_value(params).map_err(|error| {
+            Error::Transport(TransportError::with_source(
+                "encoding plugin request parameters",
+                error,
+            ))
+        })?;
         let (sender, receiver) = oneshot::channel();
         self.pending
             .lock()
@@ -722,21 +778,32 @@ impl Client {
         if self.closed.load(Ordering::SeqCst) {
             // The transport may have died between the drain and our
             // registration; drain again so this call cannot hang.
-            self.mark_closed();
+            self.pending.lock().expect("pending lock").remove(&id);
+            return Err(self.closed_error());
         }
-        if let Err(_send_error) = self
+        if let Err(send_error) = self
             .outbound
             .send(Message::request(id, method, params))
             .await
         {
             self.pending.lock().expect("pending lock").remove(&id);
-            return Err(Error::invalid_spec("transport", "connection closed"));
+            return Err(Error::Transport(TransportError::with_source(
+                "sending plugin request",
+                send_error,
+            )));
         }
-        let value = receiver
-            .await
-            .map_err(|_| Error::invalid_spec("transport", "connection closed"))??;
-        serde_json::from_value(value)
-            .map_err(|error| Error::invalid_spec("result", error.to_string()))
+        let value = receiver.await.map_err(|error| {
+            Error::Transport(TransportError::with_source(
+                "receiving plugin response",
+                error,
+            ))
+        })??;
+        serde_json::from_value(value).map_err(|error| {
+            Error::Transport(TransportError::with_source(
+                "decoding plugin response result",
+                error,
+            ))
+        })
     }
 }
 

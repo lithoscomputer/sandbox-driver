@@ -214,17 +214,24 @@ method, `-32000` application failure. Application failures carry `data`:
 
 `report.kind` is the stable machine-readable classification:
 `not_found`, `unsupported`, `invalid_state`, `invalid_spec`, `timeout`,
-`auth`, `rate_limited`, `exec`, `provider`, `io`. `report.causes` is a
-bounded rendered source chain. `detail` carries kind-specific fields for
-faithful reconstruction:
+`auth`, `rate_limited`, `exec`, `provider`, `transport`, `io`.
+`report.causes` is a bounded rendered source chain. A receiver restores
+these rendered causes as an opaque remote source chain. `detail` carries
+kind-specific fields for faithful reconstruction:
 
 | kind | detail fields |
 | --- | --- |
 | `unsupported` | `capability` (dotted path, e.g. `"exec.stdio_process"`) |
 | `not_found` | `resource` (`sandbox`/`snapshot`/`volume`/`plugin`), `id` |
 | `invalid_spec` | `field`, `reason` |
+| `invalid_state` | `current`, `action` |
+| `timeout` | `operation`, `elapsed` |
+| `auth` | `auth` object: `{provider, reason}` |
+| `rate_limited` | `retry_after` (optional) |
 | `provider` | `provider` object: `{provider, code, message, retryable, detail}` |
 | `exec` | `exec` object: `{label, termination, exit_code, stdout_b64, stderr_b64}` |
+| `transport` | `transport_context` |
+| `io` | `io_context` |
 
 Raw command output appears only inside the `exec` detail — never in
 `message` or `report`. Secret redaction is the host's responsibility.

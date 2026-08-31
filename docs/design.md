@@ -409,15 +409,23 @@ pub enum Error {
     NotFound { resource: ResourceKind, id: String },
     Unsupported { capability: CapabilityPath },        // machine-readable, preflightable
     InvalidState { current: SandboxState, action: LifecycleAction },
+    InvalidSpec { field: String, reason: String },
     Timeout { operation: String, elapsed: Duration },
     Auth(AuthError),
     RateLimited { retry_after: Option<Duration> },
     Exec(ExecError),                                    // bounded, classified; raw output behind accessors
     Provider(ProviderError),                            // structured provider detail, serializable
+    Transport(TransportError),                          // out-of-process provider communication
+    Io { context: String, source: io::Error },          // local filesystem and process I/O
 }
 ```
 
 The `Exec` variant preserves fabro's redaction boundary: `Display` shows bounded classified metadata only; raw stdout/stderr is available through explicit accessors so callers control exposure. Redaction hooks stay caller-side (fabro keeps `fabro_redact`).
+
+Provider adapters retain SDK errors as opaque sources on `AuthError` and
+`ProviderError`. The protocol adapter classifies framing, encoding, and
+connection failures as `Transport`. It reconstructs every public error
+variant and its rendered remote source chain at the process boundary.
 
 ## What deliberately stays out of this crate
 

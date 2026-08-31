@@ -4,10 +4,14 @@
 //! id; notifications carry none. Out-of-order responses are expected —
 //! the protocol itself never serializes concurrent calls.
 
+use std::time::Duration;
+use std::{error, fmt, io};
+
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use sandbox_driver::{
-    Capability, Error, ErrorReport, ExecFailure, ProviderError, ResourceKind, Termination,
+    AuthError, Capability, Error, ErrorReport, ExecFailure, LifecycleAction, ProviderError,
+    ProviderKind, ResourceKind, SandboxState, Termination, TransportError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -115,19 +119,41 @@ pub(crate) fn decode_bytes(text: &str) -> Result<Vec<u8>, Error> {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Detail {
     #[serde(skip_serializing_if = "Option::is_none")]
-    capability: Option<Capability>,
+    capability:        Option<Capability>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    resource:   Option<ResourceKind>,
+    resource:          Option<ResourceKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    id:         Option<String>,
+    id:                Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    field:      Option<String>,
+    field:             Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reason:     Option<String>,
+    reason:            Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    provider:   Option<ProviderError>,
+    current:           Option<SandboxState>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    exec:       Option<ExecDetail>,
+    action:            Option<LifecycleAction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation:         Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elapsed:           Option<Duration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth:              Option<AuthDetail>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_after:       Option<Duration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider:          Option<ProviderError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exec:              Option<ExecDetail>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    io_context:        Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transport_context: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AuthDetail {
+    provider: ProviderKind,
+    reason:   String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -137,6 +163,35 @@ struct ExecDetail {
     exit_code:   Option<i32>,
     stdout_b64:  String,
     stderr_b64:  String,
+}
+
+#[derive(Debug)]
+struct RemoteCause {
+    message: String,
+    source:  Option<Box<Self>>,
+}
+
+impl fmt::Display for RemoteCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl error::Error for RemoteCause {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn error::Error + 'static))
+    }
+}
+
+fn remote_cause(messages: &[String]) -> Option<RemoteCause> {
+    messages.iter().rev().fold(None, |source, message| {
+        Some(RemoteCause {
+            message: message.clone(),
+            source:  source.map(Box::new),
+        })
+    })
 }
 
 impl WireError {
@@ -155,6 +210,21 @@ impl WireError {
                 detail.field = Some(field.clone());
                 detail.reason = Some(reason.clone());
             }
+            Error::InvalidState { current, action } => {
+                detail.current = Some(*current);
+                detail.action = Some(*action);
+            }
+            Error::Timeout { operation, elapsed } => {
+                detail.operation = Some(operation.clone());
+                detail.elapsed = Some(*elapsed);
+            }
+            Error::Auth(auth) => {
+                detail.auth = Some(AuthDetail {
+                    provider: auth.provider.clone(),
+                    reason:   auth.reason.clone(),
+                });
+            }
+            Error::RateLimited { retry_after } => detail.retry_after = *retry_after,
             Error::Provider(provider) => {
                 let mut copy =
                     ProviderError::new(provider.provider.clone(), provider.message.clone());
@@ -172,6 +242,10 @@ impl WireError {
                     stderr_b64:  encode_bytes(failure.stderr()),
                 });
             }
+            Error::Io { context, .. } => detail.io_context = Some(context.clone()),
+            Error::Transport(transport) => {
+                detail.transport_context = Some(transport.context.clone());
+            }
             _ => {}
         }
         Self {
@@ -179,7 +253,8 @@ impl WireError {
             message: report.message.clone(),
             data:    Some(WireErrorData {
                 report,
-                detail: serde_json::to_value(detail).unwrap_or(Value::Null),
+                detail: serde_json::to_value(detail)
+                    .expect("wire error detail contains only serializable values"),
             }),
         }
     }
@@ -211,20 +286,76 @@ impl WireError {
                     return Error::InvalidSpec { field, reason };
                 }
             }
+            "invalid_state" => {
+                if let (Some(current), Some(action)) = (detail.current, detail.action) {
+                    return Error::InvalidState { current, action };
+                }
+            }
+            "timeout" => {
+                if let (Some(operation), Some(elapsed)) = (detail.operation, detail.elapsed) {
+                    return Error::Timeout { operation, elapsed };
+                }
+            }
+            "auth" => {
+                if let Some(auth) = detail.auth {
+                    let auth = match remote_cause(&data.report.causes) {
+                        Some(source) => AuthError::with_source(auth.provider, auth.reason, source),
+                        None => AuthError::new(auth.provider, auth.reason),
+                    };
+                    return Error::Auth(auth);
+                }
+            }
+            "rate_limited" => {
+                return Error::RateLimited {
+                    retry_after: detail.retry_after,
+                };
+            }
             "provider" => {
                 if let Some(provider) = detail.provider {
-                    return Error::Provider(provider);
+                    let mut copy = match remote_cause(&data.report.causes) {
+                        Some(source) => {
+                            ProviderError::with_source(provider.provider, provider.message, source)
+                        }
+                        None => ProviderError::new(provider.provider, provider.message),
+                    };
+                    copy.code = provider.code;
+                    copy.retryable = provider.retryable;
+                    copy.detail = provider.detail;
+                    return Error::Provider(copy);
                 }
             }
             "exec" => {
                 if let Some(exec) = detail.exec {
-                    return Error::Exec(ExecFailure::new(
-                        exec.label,
-                        exec.termination,
-                        exec.exit_code,
-                        decode_bytes(&exec.stdout_b64).unwrap_or_default(),
-                        decode_bytes(&exec.stderr_b64).unwrap_or_default(),
-                    ));
+                    if let (Ok(stdout), Ok(stderr)) = (
+                        decode_bytes(&exec.stdout_b64),
+                        decode_bytes(&exec.stderr_b64),
+                    ) {
+                        return Error::Exec(ExecFailure::new(
+                            exec.label,
+                            exec.termination,
+                            exec.exit_code,
+                            stdout,
+                            stderr,
+                        ));
+                    }
+                }
+            }
+            "io" => {
+                if let Some(context) = detail.io_context {
+                    let source = remote_cause(&data.report.causes).unwrap_or_else(|| RemoteCause {
+                        message: "remote I/O failure".to_owned(),
+                        source:  None,
+                    });
+                    return Error::io(context, io::Error::other(source));
+                }
+            }
+            "transport" => {
+                if let Some(context) = detail.transport_context {
+                    let transport = match remote_cause(&data.report.causes) {
+                        Some(source) => TransportError::with_source(context, source),
+                        None => TransportError::new(context),
+                    };
+                    return Error::Transport(transport);
                 }
             }
             _ => {}
@@ -242,6 +373,8 @@ fn unknown_kind() -> sandbox_driver::ProviderKind {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
+
     use super::*;
 
     #[test]
@@ -259,6 +392,74 @@ mod tests {
         let back = WireError::from_error(&error).into_error();
         assert!(matches!(back, Error::NotFound { .. }));
 
+        let error = Error::InvalidState {
+            current: SandboxState::Paused,
+            action:  LifecycleAction::Stop,
+        };
+        let back = WireError::from_error(&error).into_error();
+        assert!(matches!(back, Error::InvalidState {
+            current: SandboxState::Paused,
+            action:  LifecycleAction::Stop,
+        }));
+
+        let error = Error::invalid_spec("source", "must be an image");
+        let back = WireError::from_error(&error).into_error();
+        assert!(matches!(back, Error::InvalidSpec { field, reason }
+            if field == "source" && reason == "must be an image"));
+
+        let error = Error::Timeout {
+            operation: "creating sandbox".into(),
+            elapsed:   Duration::from_secs(7),
+        };
+        let back = WireError::from_error(&error).into_error();
+        assert!(matches!(back, Error::Timeout { operation, elapsed }
+            if operation == "creating sandbox" && elapsed == Duration::from_secs(7)));
+
+        let provider = ProviderKind::try_new("test").expect("static provider kind is valid");
+        let error = Error::Auth(AuthError::with_source(
+            provider.clone(),
+            "token expired",
+            io::Error::new(io::ErrorKind::PermissionDenied, "remote rejected token"),
+        ));
+        let Error::Auth(auth) = WireError::from_error(&error).into_error() else {
+            panic!("expected auth failure");
+        };
+        assert_eq!(auth.provider, provider);
+        assert_eq!(auth.reason, "token expired");
+        assert_eq!(
+            auth.source().expect("remote auth cause").to_string(),
+            "remote rejected token"
+        );
+
+        let error = Error::RateLimited {
+            retry_after: Some(Duration::from_millis(250)),
+        };
+        let back = WireError::from_error(&error).into_error();
+        assert!(matches!(back, Error::RateLimited { retry_after }
+            if retry_after == Some(Duration::from_millis(250))));
+
+        let mut provider_error = ProviderError::with_source(
+            provider.clone(),
+            "listing sandboxes",
+            io::Error::new(io::ErrorKind::ConnectionReset, "daemon disconnected"),
+        );
+        provider_error.code = Some("backend_unavailable".into());
+        provider_error.retryable = true;
+        let error = Error::Provider(provider_error);
+        let Error::Provider(provider_error) = WireError::from_error(&error).into_error() else {
+            panic!("expected provider failure");
+        };
+        assert_eq!(provider_error.provider, provider);
+        assert_eq!(provider_error.code.as_deref(), Some("backend_unavailable"));
+        assert!(provider_error.retryable);
+        assert_eq!(
+            provider_error
+                .source()
+                .expect("remote provider cause")
+                .to_string(),
+            "daemon disconnected"
+        );
+
         let error = Error::Exec(ExecFailure::new(
             "probe",
             Termination::Exited,
@@ -272,5 +473,31 @@ mod tests {
         assert_eq!(failure.label(), "probe");
         assert_eq!(failure.exit_code(), Some(3));
         assert_eq!(failure.stdout(), b"out");
+
+        let error = Error::io(
+            "reading plugin executable",
+            io::Error::new(io::ErrorKind::NotFound, "binary disappeared"),
+        );
+        let Error::Io { context, source } = WireError::from_error(&error).into_error() else {
+            panic!("expected I/O failure");
+        };
+        assert_eq!(context, "reading plugin executable");
+        assert_eq!(source.to_string(), "binary disappeared");
+
+        let error = Error::Transport(TransportError::with_source(
+            "reading plugin response",
+            io::Error::new(io::ErrorKind::BrokenPipe, "pipe closed"),
+        ));
+        let Error::Transport(transport) = WireError::from_error(&error).into_error() else {
+            panic!("expected transport failure");
+        };
+        assert_eq!(transport.context, "reading plugin response");
+        assert_eq!(
+            transport
+                .source()
+                .expect("remote transport cause")
+                .to_string(),
+            "pipe closed"
+        );
     }
 }

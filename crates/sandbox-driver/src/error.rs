@@ -1,5 +1,6 @@
 use std::error::Error as StdError;
 use std::result::Result as StdResult;
+use std::sync::Arc;
 use std::time::Duration;
 use std::{fmt, io};
 
@@ -76,6 +77,10 @@ pub enum Error {
     #[error(transparent)]
     Provider(#[from] ProviderError),
 
+    /// Communication with an out-of-process provider failed.
+    #[error(transparent)]
+    Transport(#[from] TransportError),
+
     /// Local I/O failure (uploads, downloads, spawning).
     #[error("{context}")]
     Io {
@@ -118,8 +123,8 @@ pub struct AuthError {
     source:       Option<Box<OpaqueSource>>,
 }
 
-#[derive(Debug)]
-struct OpaqueSource(Box<dyn StdError + Send + Sync>);
+#[derive(Clone, Debug)]
+struct OpaqueSource(Arc<dyn StdError + Send + Sync>);
 
 impl fmt::Display for AuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -157,7 +162,7 @@ impl AuthError {
         Self {
             provider,
             reason: reason.into(),
-            source: Some(Box::new(OpaqueSource(Box::new(source)))),
+            source: Some(Box::new(OpaqueSource(Arc::new(source)))),
         }
     }
 }
@@ -310,7 +315,50 @@ impl ProviderError {
             message: message.into(),
             retryable: false,
             detail: None,
-            source: Some(Box::new(OpaqueSource(Box::new(source)))),
+            source: Some(Box::new(OpaqueSource(Arc::new(source)))),
+        }
+    }
+}
+
+/// Failure while exchanging requests, responses, or notifications with an
+/// out-of-process provider.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct TransportError {
+    pub context: String,
+    source:      Option<Box<OpaqueSource>>,
+}
+
+impl fmt::Display for TransportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.context)
+    }
+}
+
+impl StdError for TransportError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source.0.as_ref() as &(dyn StdError + 'static))
+    }
+}
+
+impl TransportError {
+    pub fn new(context: impl Into<String>) -> Self {
+        Self {
+            context: context.into(),
+            source:  None,
+        }
+    }
+
+    /// Creates a transport failure while preserving its infrastructure cause.
+    pub fn with_source<E>(context: impl Into<String>, source: E) -> Self
+    where
+        E: StdError + Send + Sync + 'static,
+    {
+        Self {
+            context: context.into(),
+            source:  Some(Box::new(OpaqueSource(Arc::new(source)))),
         }
     }
 }

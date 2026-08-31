@@ -16,7 +16,7 @@ use std::time::Duration;
 use sandbox_driver::{
     Capability, Error, EventCallback, ExecControls, LogSink, OutputSink, Result, Sandbox,
     SandboxId, SandboxProvider, SandboxSpec, SandboxStatus, SnapshotId, StderrTail,
-    StdioProcessHandle, VolumeId,
+    StdioProcessHandle, TransportError, VolumeId,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -58,18 +58,29 @@ pub async fn serve(
     writer: impl AsyncWrite + Unpin + Send + 'static,
 ) -> Result<()> {
     let (outbound, mut outbound_rx) = mpsc::channel::<Message>(256);
-    let writer_task = tokio::spawn(async move {
+    let mut writer_task = tokio::spawn(async move {
         let mut writer = writer;
         while let Some(message) = outbound_rx.recv().await {
-            let Ok(mut line) = serde_json::to_string(&message) else {
-                continue;
-            };
+            let mut line = serde_json::to_string(&message).map_err(|error| {
+                Error::Transport(TransportError::with_source(
+                    "encoding plugin response",
+                    error,
+                ))
+            })?;
             line.push('\n');
-            if writer.write_all(line.as_bytes()).await.is_err() {
-                break;
-            }
+            writer.write_all(line.as_bytes()).await.map_err(|error| {
+                Error::Transport(TransportError::with_source(
+                    "writing plugin response",
+                    error,
+                ))
+            })?;
         }
-        let _ = writer.shutdown().await;
+        writer.shutdown().await.map_err(|error| {
+            Error::Transport(TransportError::with_source(
+                "closing plugin response transport",
+                error,
+            ))
+        })
     });
 
     let state = Arc::new(ServerState {
@@ -84,12 +95,32 @@ pub async fn serve(
 
     let shutdown = CancellationToken::new();
     let mut lines = BufReader::new(reader).lines();
-    loop {
+    let mut writer_finished = false;
+    let outcome = loop {
         let line = tokio::select! {
             line = lines.next_line() => line,
-            () = shutdown.cancelled() => break,
+            writer_result = &mut writer_task => {
+                writer_finished = true;
+                break match writer_result {
+                    Ok(result) => result,
+                    Err(error) => Err(Error::Transport(TransportError::with_source(
+                        "joining plugin response writer",
+                        error,
+                    ))),
+                };
+            }
+            () = shutdown.cancelled() => break Ok(()),
         };
-        let Ok(Some(line)) = line else { break };
+        let line = match line {
+            Ok(Some(line)) => line,
+            Ok(None) => break Ok(()),
+            Err(error) => {
+                break Err(Error::Transport(TransportError::with_source(
+                    "reading plugin request",
+                    error,
+                )));
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -136,13 +167,23 @@ pub async fn serve(
             };
             let _ = state.outbound.send(reply).await;
         });
-    }
+    };
 
     state.close_sessions().await;
     drop(outbound);
     drop(state);
-    let _ = writer_task.await;
-    Ok(())
+    let writer_outcome = if writer_finished {
+        Ok(())
+    } else {
+        writer_task.await.map_err(|error| {
+            Error::Transport(TransportError::with_source(
+                "joining plugin response writer",
+                error,
+            ))
+        })?
+    };
+    outcome?;
+    writer_outcome
 }
 
 struct ServerState {

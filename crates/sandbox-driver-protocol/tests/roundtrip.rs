@@ -2,8 +2,11 @@
 //! JSON-RPC must behave like the Host provider in-process. Also proves
 //! the interleaving requirement — a slow call must not block a fast one.
 
+use std::io;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use sandbox_driver::{
@@ -12,7 +15,7 @@ use sandbox_driver::{
 };
 use sandbox_driver_host::HostProvider;
 use sandbox_driver_protocol::{PluginProvider, serve};
-use tokio::io::{duplex, split};
+use tokio::io::{AsyncWrite, AsyncWriteExt, duplex, split};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
@@ -193,4 +196,77 @@ async fn attach_and_list_work_over_the_wire() {
 
     sandbox.delete().await.expect("delete");
     provider.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn closed_plugin_transport_is_classified() {
+    let (host_side, plugin_side) = duplex(1024);
+    drop(plugin_side);
+    let (host_read, host_write) = split(host_side);
+
+    let Err(error) = PluginProvider::connect(host_read, host_write).await else {
+        panic!("closed transport must fail the handshake");
+    };
+    assert!(matches!(error, Error::Transport(_)), "{error:?}");
+}
+
+#[tokio::test]
+async fn malformed_plugin_response_is_classified() {
+    let (host_side, mut plugin_side) = duplex(1024);
+    tokio::spawn(async move {
+        plugin_side
+            .write_all(b"this is not JSON\n")
+            .await
+            .expect("write malformed response");
+        time::sleep(Duration::from_secs(1)).await;
+    });
+    let (host_read, host_write) = split(host_side);
+
+    let Err(error) = PluginProvider::connect(host_read, host_write).await else {
+        panic!("malformed response must fail the handshake");
+    };
+    let Error::Transport(transport) = error else {
+        panic!("expected transport failure");
+    };
+    assert_eq!(transport.context, "decoding plugin response");
+}
+
+#[tokio::test]
+async fn plugin_response_write_failure_is_returned() {
+    const SHUTDOWN_REQUEST: &[u8] = b"{\"id\":1,\"method\":\"shutdown\",\"params\":{}}\n";
+
+    let error = serve(
+        Arc::new(HostProvider::new()),
+        SHUTDOWN_REQUEST,
+        FailingWriter,
+    )
+    .await
+    .expect_err("response write must fail");
+    let Error::Transport(transport) = error else {
+        panic!("expected transport failure");
+    };
+    assert_eq!(transport.context, "writing plugin response");
+}
+
+struct FailingWriter;
+
+impl AsyncWrite for FailingWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "test writer failed",
+        )))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
 }
