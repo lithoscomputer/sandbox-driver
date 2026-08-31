@@ -187,7 +187,12 @@ impl WireError {
     /// Reconstructs the closest typed [`Error`] from the wire.
     pub fn into_error(self) -> Error {
         let Some(data) = self.data else {
-            return Error::Provider(ProviderError::new(unknown_kind(), self.message));
+            // Envelope-level failures (unknown method, malformed params)
+            // carry no data; keep the JSON-RPC code so callers can
+            // branch on it (e.g. -32601 from an older plugin).
+            let mut provider = ProviderError::new(unknown_kind(), self.message);
+            provider.code = Some(self.code.to_string());
+            return Error::Provider(provider);
         };
         let detail: Detail = serde_json::from_value(data.detail).unwrap_or_default();
         match data.report.kind.as_str() {
