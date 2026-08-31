@@ -14,9 +14,10 @@ Authoritative documents:
   lifecycle actions, facets, capability discovery, and what stays out of
   this library.
 - `docs/protocol.md` — the normative plugin wire protocol (version 1),
-  written for implementers in any language. The golden tests in
-  `crates/sandbox-driver-protocol` pin its shapes; a golden-test failure
-  is a wire break to redesign, not re-pin.
+  written for implementers in any language. The compatibility tests in
+  `crates/sandbox-driver-protocol` verify its encodings and tolerance
+  rules behaviorally (era-JSON decoding, unknown-value handling) — not
+  full-shape pins, which are change-detector tests and unwanted.
 - `crates/sandbox-driver-conformance` — the black-box suite defining
   provider correctness; every provider, in-process or plugin, must pass
   it.
