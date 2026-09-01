@@ -274,7 +274,11 @@ fn map_state(state: Option<daytona_sdk::SandboxState>) -> SandboxState {
             Ds::Archiving => SandboxState::Archiving,
             Ds::Archived => SandboxState::Archived,
             Ds::Resizing => SandboxState::Resizing,
-            Ds::Snapshotting => SandboxState::Snapshotting,
+            // A snapshotting sandbox stays fully usable (fabro mapped it
+            // to Running deliberately); reporting it transitional makes
+            // activation and waits stall through a multi-minute snapshot.
+            // The raw string still reaches callers via provider_state.
+            Ds::Snapshotting => SandboxState::Running,
             Ds::Forking => SandboxState::Forking,
             Ds::Pausing => SandboxState::Pausing,
             Ds::Paused => SandboxState::Paused,
@@ -343,16 +347,19 @@ async fn create_sandbox_snapshot(
             .get(sandbox_id)
             .await
             .map_err(|error| daytona_error("waiting for sandbox snapshot", error))?;
-        match map_state(sdk.state) {
-            SandboxState::Snapshotting => {}
-            SandboxState::Error => {
-                return Err(Error::Provider(ProviderError::new(
-                    ProviderKind::try_new("daytona").expect("static kind is valid"),
-                    sdk.error_reason
-                        .unwrap_or_else(|| "sandbox snapshot failed".to_owned()),
-                )));
-            }
-            _ => return Ok(()),
+        // The raw state, not map_state: the mapped view reports a
+        // snapshotting sandbox as Running (it stays usable), while this
+        // loop specifically waits out the snapshot itself.
+        if sdk.state == Some(daytona_sdk::SandboxState::Snapshotting) {
+            // Still snapshotting; keep waiting.
+        } else if map_state(sdk.state) == SandboxState::Error {
+            return Err(Error::Provider(ProviderError::new(
+                ProviderKind::try_new("daytona").expect("static kind is valid"),
+                sdk.error_reason
+                    .unwrap_or_else(|| "sandbox snapshot failed".to_owned()),
+            )));
+        } else {
+            return Ok(());
         }
         let elapsed = started.elapsed();
         if elapsed >= CREATE_TIMEOUT {
@@ -2472,6 +2479,16 @@ mod tests {
             Some("/workspace/final")
         );
         assert_eq!(labels.get(MANAGED_LABEL).map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn snapshotting_sandboxes_report_running() {
+        // Usable during a snapshot: activation and waits must not stall
+        // through it.
+        assert_eq!(
+            map_state(Some(daytona_sdk::SandboxState::Snapshotting)),
+            SandboxState::Running
+        );
     }
 
     #[test]
