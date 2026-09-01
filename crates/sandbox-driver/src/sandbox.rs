@@ -14,7 +14,7 @@ use crate::id::{SandboxId, SnapshotId};
 use crate::logs::Logs;
 use crate::pty::Pty;
 use crate::search::Search;
-use crate::service::Services;
+use crate::service::{Services, ServicesFacet};
 use crate::spec::{LifecycleTimers, NetworkPolicy, PlatformInfo, Resources};
 use crate::state::SandboxStatus;
 
@@ -188,10 +188,28 @@ pub trait Sandbox: Send + Sync {
         None
     }
 
-    /// Native background-service management, when the provider has one.
-    /// `None` means use the library's exec-derived implementation
-    /// ([`crate::DerivedServices`]).
-    fn services(&self) -> Option<&dyn Services> {
+    /// Complete background-service management, when available.
+    ///
+    /// The provider chooses native or derived behavior. Callers do not select
+    /// the implementation. The returned facade is absent exactly when
+    /// [`Capabilities::services`](crate::Capabilities::services) reports that
+    /// services are unsupported.
+    fn services(&self) -> Option<ServicesFacet<'_>> {
+        if !self.capabilities().services.supported {
+            return None;
+        }
+        Some(match self.provider_services() {
+            Some(services) => ServicesFacet::provider(services),
+            None => ServicesFacet::derived(self.exec()),
+        })
+    }
+
+    /// Provider implementation hook for native background services.
+    ///
+    /// Consumers call [`Sandbox::services`]. Providers override this method
+    /// when service operations do not use [`crate::DerivedServices`].
+    #[doc(hidden)]
+    fn provider_services(&self) -> Option<&dyn Services> {
         None
     }
 

@@ -21,7 +21,9 @@
 //! through a temp-file redirection inside the sandbox on both paths.
 //! Git follows Fabro's hybrid path: clone uses the native toolbox API;
 //! worktree and remote operations use the shared exec-derived implementation.
-//! Snapshots used with the Git facet must therefore provide `git` on `PATH`.
+//! Daytona derives background-service management through exec. Snapshots used
+//! with these facets must therefore provide `git` and the service commands
+//! documented by [`sandbox_driver::Services`] on `PATH`.
 //! Resize remains in the normalized interface, but the current hosted
 //! Daytona API and official SDK do not expose a working resize route, so
 //! this provider does not declare it.
@@ -746,6 +748,7 @@ fn daytona_capabilities() -> Capabilities {
     caps.fs.permissions = true;
     caps.git.supported = true;
     caps.git.native = true;
+    caps.services.supported = true;
     caps.pty = Some({
         let mut pty = PtyCaps::default();
         pty.resize = true;

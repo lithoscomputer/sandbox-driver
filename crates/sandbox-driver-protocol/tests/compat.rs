@@ -12,8 +12,8 @@ use std::time::Duration;
 use sandbox_driver::{
     Action, Capabilities, Capability, Error, ErrorReport, Event, EventBody, EventSubject,
     ForkOptions, ResourceKind, SandboxKind, SandboxSnapshotOptions, SandboxSource, SandboxSpec,
-    SandboxState, SandboxStatus, SnapshotId, SnapshotMode, SnapshotSource, SnapshotSpec,
-    Termination,
+    SandboxState, SandboxStatus, ServiceCaps, SnapshotId, SnapshotMode, SnapshotSource,
+    SnapshotSpec, Termination,
 };
 use sandbox_driver_protocol::methods::{
     ForkOptionsDto, SandboxSnapshotOptionsDto, SandboxSpecDto, SnapshotSourceDto, SnapshotSpecDto,
@@ -55,10 +55,23 @@ fn launch_era_capabilities_still_decode() {
         "the old native=false shape implied exec-derived git"
     );
     assert!(!caps.services.native, "absent group defaults");
+    assert!(!caps.services.supported, "absent group is unsupported");
     let snapshots = caps.snapshots.expect("snapshots present");
     assert!(snapshots.from_image);
     assert!(!snapshots.from_image_kinds.container);
     assert!(!snapshots.from_image_kinds.virtual_machine);
+}
+
+#[test]
+fn pre_normalization_service_capabilities_still_decode() {
+    let legacy: ServiceCaps =
+        serde_json::from_str(r#"{"native":false}"#).expect("legacy service capabilities decode");
+    assert!(legacy.supported, "native=false meant use derived services");
+    assert!(!legacy.native);
+
+    let unavailable: ServiceCaps = serde_json::from_str(r#"{"supported":false,"native":false}"#)
+        .expect("normalized service capabilities decode");
+    assert!(!unavailable.supported);
 }
 
 /// A launch-era creation spec — written by hand the way a non-Rust host

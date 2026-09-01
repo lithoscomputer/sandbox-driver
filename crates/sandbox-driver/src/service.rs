@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::derived::DerivedServices;
 use crate::error::Result;
+use crate::exec::Exec;
 use crate::id::ServiceId;
 
 /// Long-lived background processes inside a sandbox — an MCP server, a
@@ -11,9 +13,14 @@ use crate::id::ServiceId;
 ///
 /// Distinct from [`crate::Exec`]: an exec is awaited to completion; a
 /// service is started, observed, and stopped. The library ships an
-/// exec-derived implementation ([`crate::DerivedServices`], the
+/// exec-derived implementation ([`DerivedServices`], the
 /// `setsid`-and-pidfile pattern); a provider with a native mechanism may
-/// implement this directly and declare `Capabilities::services.native`.
+/// implement this directly. [`crate::Sandbox::services`] hides that choice
+/// from callers.
+///
+/// A sandbox that derives this facet must provide `bash`, `mktemp`, `basename`,
+/// `cat`, `tail`, `seq`, and `sleep`. `setsid` is optional; when absent, stop
+/// falls back to signaling the service leader instead of its process group.
 ///
 /// Service state is per-boot: services do not survive a sandbox stop or
 /// restart, and ids from a previous boot resolve to "not running".
@@ -37,6 +44,59 @@ pub trait Services: Send + Sync {
     /// grace period, then KILL. Idempotent — stopping an unknown or
     /// already-stopped service succeeds.
     async fn stop(&self, id: &ServiceId) -> Result<()>;
+}
+
+/// A sandbox's normalized background-services facet.
+///
+/// This facade hides whether the provider supplies a native implementation or
+/// uses the shared exec-derived implementation.
+pub struct ServicesFacet<'a> {
+    implementation: ServicesImplementation<'a>,
+}
+
+enum ServicesImplementation<'a> {
+    Provider(&'a dyn Services),
+    Derived(DerivedServices<'a>),
+}
+
+impl<'a> ServicesFacet<'a> {
+    pub(crate) fn provider(services: &'a dyn Services) -> Self {
+        Self {
+            implementation: ServicesImplementation::Provider(services),
+        }
+    }
+
+    pub(crate) fn derived(exec: &'a dyn Exec) -> Self {
+        Self {
+            implementation: ServicesImplementation::Derived(DerivedServices::new(exec)),
+        }
+    }
+
+    fn implementation(&self) -> &dyn Services {
+        match &self.implementation {
+            ServicesImplementation::Provider(services) => *services,
+            ServicesImplementation::Derived(services) => services,
+        }
+    }
+}
+
+#[async_trait]
+impl Services for ServicesFacet<'_> {
+    async fn spawn(&self, spec: &ServiceSpec) -> Result<ServiceId> {
+        self.implementation().spawn(spec).await
+    }
+
+    async fn status(&self, id: &ServiceId) -> Result<ServiceStatus> {
+        self.implementation().status(id).await
+    }
+
+    async fn logs(&self, id: &ServiceId, tail_bytes: usize) -> Result<Vec<u8>> {
+        self.implementation().logs(id, tail_bytes).await
+    }
+
+    async fn stop(&self, id: &ServiceId) -> Result<()> {
+        self.implementation().stop(id).await
+    }
 }
 
 /// Spawn request for [`Services::spawn`].

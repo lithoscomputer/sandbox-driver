@@ -3,9 +3,9 @@
 //! A [`SandboxProvider`] manages three resource types: sandboxes, snapshots,
 //! and volumes. A [`Sandbox`] is a stateless handle — an ID plus a provider
 //! connection — whose functionality is grouped into facet traits ([`Exec`],
-//! [`Filesystem`], [`Search`], [`Git`], [`Pty`], [`Logs`], and the access
-//! facets). Optional functionality is capability-gated: absence is visible
-//! both in the type system (`Option` accessors) and in the serializable
+//! [`Filesystem`], [`Search`], [`Git`], [`Services`], [`Pty`], [`Logs`], and
+//! the access facets). Optional functionality is capability-gated: absence is
+//! visible both in the type system (`Option` accessors) and in the serializable
 //! [`Capabilities`] structure used for preflight checks and the JSON-RPC
 //! plugin handshake.
 //!
@@ -99,7 +99,7 @@ pub use pty::{Pty, PtyOptions, PtySession, PtySize};
 pub use sandbox::{ForkOptions, Sandbox, SandboxSnapshotOptions, SnapshotMode, WorkspaceOwnership};
 pub use sanitize::{OutputSanitization, OutputSanitizer};
 pub use search::{GrepMatch, GrepOptions, Search, WalkOptions, WalkedFile};
-pub use service::{ServiceSpec, ServiceStatus, Services};
+pub use service::{ServiceSpec, ServiceStatus, Services, ServicesFacet};
 pub use spec::{
     LifecycleTimers, NetworkPolicy, PlatformInfo, Resources, SandboxKind, SandboxSource,
     SandboxSpec, VolumeMount,

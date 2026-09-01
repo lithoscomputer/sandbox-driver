@@ -9,8 +9,9 @@
 //! touches its contents) or **managed** (a temporary directory this crate
 //! creates and removes on `delete`).
 //!
-//! The Host provider advertises the normalized Git facet. The host environment
-//! must therefore provide a `git` executable on `PATH`.
+//! The Host provider advertises normalized Git and background-services facets.
+//! The host environment must therefore provide `git` and the service commands
+//! documented by [`sandbox_driver::Services`] on `PATH`.
 //!
 //! # Runtime behavior
 //!
@@ -90,6 +91,7 @@ fn host_capabilities() -> Capabilities {
     caps.fs.download = true;
     caps.fs.permissions = true;
     caps.git.supported = true;
+    caps.services.supported = true;
     caps
 }
 

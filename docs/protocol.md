@@ -122,7 +122,7 @@ for the connection. Per-sandbox capability sets travel in every
   "fs": {"native":false,"upload":false,"download":false,"permissions":false},
   "search": {"native":false},
   "git": {"supported":false,"native":false},
-  "services": {"native":false},
+  "services": {"supported":false,"native":false},
   "pty": null,
   "logs": null,
   "access": {"preview_urls":false,"signed_preview_urls":false,"ssh":false,
@@ -149,13 +149,14 @@ Rules:
 - **The version-1 mask.** Native search/git/service passthrough and local
   shell commands do not cross the wire. A host forces `search.native`,
   `git.native`, `services.native`, and `access.shell_command` to false.
-  `git.supported` remains true when the complete facet can run through
-  `exec/run`; the host then selects the exec-derived implementation.
-  Background services work through the same composition.
-- Older peers send `git` as `{"native":false}`. Hosts read that shape as
-  `supported:true` because `native:false` originally instructed the caller to
-  use exec-derived git. An explicitly sent `supported:false` means the complete
-  facet is unavailable.
+  `git.supported` and `services.supported` remain true when the complete facets
+  can run through `exec/run`; the host then selects the exec-derived
+  implementations.
+- Older peers send `git` and `services` groups as `{"native":false}`. Hosts
+  read those groups as `supported:true` because `native:false` originally
+  instructed the caller to use an exec-derived implementation. An explicitly
+  sent `supported:false` means the complete facet is unavailable. An absent
+  group also remains unsupported.
 - The serialized `access.vpn` field is a compatibility tombstone. It is
   always false. VPN clients such as Tailscale are guest software managed
   through exec and are not a sandbox-driver capability.

@@ -28,12 +28,12 @@ use std::{fmt, process};
 
 use async_trait::async_trait;
 use sandbox_driver::{
-    Action, Capability, DerivedSearch, DerivedServices, Error, Event, EventBody, EventContext,
-    EventObserver, ExecControls, ExecSpec, Git, GitCloneOptions, GitCommitOptions, GitPushOptions,
-    GrepOptions, HealthStatus, LogSink, LogSource, NetworkPolicy, OutputSanitization, OutputStream,
-    PtyOptions, PtySize, Resources, Sandbox, SandboxFilter, SandboxId, SandboxProvider,
-    SandboxSpec, SandboxState, Search, ServiceSpec, Services, SnapshotMode, SpawnSpec, Termination,
-    WaitOptions, activate, wait_for_state,
+    Action, Capability, DerivedSearch, Error, Event, EventBody, EventContext, EventObserver,
+    ExecControls, ExecSpec, Git, GitCloneOptions, GitCommitOptions, GitPushOptions, GrepOptions,
+    HealthStatus, LogSink, LogSource, NetworkPolicy, OutputSanitization, OutputStream, PtyOptions,
+    PtySize, Resources, Sandbox, SandboxFilter, SandboxId, SandboxProvider, SandboxSpec,
+    SandboxState, Search, ServiceSpec, Services, SnapshotMode, SpawnSpec, Termination, WaitOptions,
+    activate, wait_for_state,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time;
@@ -2015,6 +2015,12 @@ async fn services_match_capabilities(ctx: &Conformance) -> CheckOutcome {
     if sandbox_caps.git.native != sandbox.provider_git().is_some() {
         wrong.push("git provider override disagrees with git.native".to_owned());
     }
+    if sandbox_caps.supports(Capability::Services) != sandbox.services().is_some() {
+        wrong.push("services facet presence disagrees with capabilities".to_owned());
+    }
+    if sandbox_caps.services.native != sandbox.provider_services().is_some() {
+        wrong.push("services provider override disagrees with services.native".to_owned());
+    }
     if sandbox_caps.access.web_terminal != sandbox.web_terminal().is_some() {
         wrong.push("web_terminal facet presence disagrees with capabilities".to_owned());
     }
@@ -2298,20 +2304,15 @@ async fn fs_range_and_append_round_trip(ctx: &Conformance) -> CheckOutcome {
 }
 
 /// Background services: spawn outlives its exec, reports status, serves
-/// logs, and stops idempotently — via the native facet when declared,
-/// otherwise the library's derived implementation.
+/// logs, and stops idempotently through the provider-selected implementation.
 async fn background_services_round_trip(ctx: &Conformance) -> CheckOutcome {
     let sandbox = ctx.ready().await?;
     let outcome = async {
-        if sandbox.capabilities().supports(Capability::Services) != sandbox.services().is_some() {
-            return fail("services facet presence disagrees with services.native");
+        if !sandbox.capabilities().supports(Capability::Services) {
+            return Ok(Some("capability services not declared".to_owned()));
         }
-        let derived;
-        let services: &dyn Services = if let Some(native) = sandbox.services() {
-            native
-        } else {
-            derived = DerivedServices::new(sandbox.exec());
-            &derived
+        let Some(services) = sandbox.services() else {
+            return fail("services are declared but the facet is absent");
         };
 
         let spec = ServiceSpec::new("while true; do echo tick; sleep 0.2; done");

@@ -232,7 +232,7 @@ impl Capabilities {
                 self.snapshots.as_ref().is_some_and(|caps| caps.activation)
             }
             Capability::Git => self.git.supported,
-            Capability::Services => self.services.native,
+            Capability::Services => self.services.supported,
             Capability::Volumes => self.volumes.is_some(),
             Capability::Sessions | Capability::Unknown => false,
         }
@@ -318,9 +318,17 @@ const fn default_true() -> bool {
 #[serde(default)]
 #[non_exhaustive]
 pub struct ServiceCaps {
-    /// Provider overrides the exec-derived services implementation
-    /// natively.
-    pub native: bool,
+    /// The complete background-services facet is available.
+    ///
+    /// The wire default is `true` when an older peer sends the original
+    /// `{"native": false}` shape: that shape meant callers should use the
+    /// exec-derived implementation. `ServiceCaps::default()` remains
+    /// unsupported for a newly constructed minimal capability set.
+    #[serde(default = "default_true")]
+    pub supported: bool,
+    /// The provider implements service operations natively instead of using
+    /// the shared exec-derived implementation.
+    pub native:    bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -561,7 +569,9 @@ mod tests {
                 });
             }),
             (Capability::Git, |caps| caps.git.supported = true),
-            (Capability::Services, |caps| caps.services.native = true),
+            (Capability::Services, |caps| {
+                caps.services.supported = true;
+            }),
             (Capability::Volumes, |caps| {
                 caps.volumes = Some(VolumeCaps::default());
             }),
