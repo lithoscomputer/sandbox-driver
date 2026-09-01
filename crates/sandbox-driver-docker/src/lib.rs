@@ -63,7 +63,7 @@ use crate::pty::DockerPty;
 const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
 const DEFAULT_WORKING_DIRECTORY: &str = "/workspace";
 const RUNTIME_DIRECTORY_PARENT: &str = "/tmp/sandbox-driver";
-const RUNTIME_DIRECTORY: &str = "/tmp/sandbox-driver/runtime";
+pub(crate) const RUNTIME_DIRECTORY: &str = "/tmp/sandbox-driver/runtime";
 
 /// Options the Docker provider reads from `SandboxSpec::provider_config`.
 ///

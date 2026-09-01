@@ -88,6 +88,13 @@ fn split_container_path(container_path: &str) -> Result<(String, String)> {
     Ok((parent, file_name))
 }
 
+/// Whether `container_path` lies in the runtime directory tree.
+fn is_runtime_path(container_path: &str) -> bool {
+    container_path
+        .strip_prefix(crate::RUNTIME_DIRECTORY)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
 /// One regular file, tar-encoded for the archive upload.
 fn single_file_tar(file_name: &str, bytes: &[u8], mode: u32) -> Result<Vec<u8>> {
     let tar_io = |error| Error::io("building upload archive", error);
@@ -159,13 +166,22 @@ impl Filesystem for DockerFs {
     async fn write(&self, path: &str, content: &[u8]) -> Result<()> {
         let container_path = self.resolve(path);
         let (parent, file_name) = split_container_path(&container_path)?;
-        let archive = single_file_tar(&file_name, content, 0o644)?;
+        // Runtime files stay owner-private (fabro's rule): they can hold
+        // materialized secrets, and per-file 0600 keeps protecting them
+        // even if an ancestor's 0700 is ever loosened.
+        let runtime_path = is_runtime_path(&container_path);
+        let mode = if runtime_path { 0o600 } else { 0o644 };
+        let archive = single_file_tar(&file_name, content, mode)?;
         match self.upload_tar(&parent, archive.clone()).await {
             Ok(()) => Ok(()),
             // Missing parent directories: create them (needs exec, so a
             // running container) and retry once.
             Err(error) if is_not_found(&error) => {
-                let mkdir = format!("mkdir -p -- {}", shell_quote(&parent));
+                let mkdir = if runtime_path {
+                    format!("umask 077 && mkdir -p -- {}", shell_quote(&parent))
+                } else {
+                    format!("mkdir -p -- {}", shell_quote(&parent))
+                };
                 let spec = ExecSpec::new(mkdir).timeout(MKDIR_TIMEOUT);
                 let result = self.exec.run(&spec).await?;
                 if !result.success() {
@@ -272,5 +288,33 @@ impl Filesystem for DockerFs {
         fs::write(local, bytes)
             .await
             .map_err(|error| Error::io(format!("writing {}", local.display()), error))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_paths_are_detected_by_tree_membership() {
+        assert!(is_runtime_path("/tmp/sandbox-driver/runtime"));
+        assert!(is_runtime_path("/tmp/sandbox-driver/runtime/blob.json"));
+        assert!(!is_runtime_path("/tmp/sandbox-driver/runtime-extra/x"));
+        assert!(!is_runtime_path("/workspace/file.txt"));
+    }
+
+    #[test]
+    fn single_file_tar_carries_the_requested_mode() {
+        for mode in [0o600, 0o644] {
+            let bytes = single_file_tar("blob.json", b"{}", mode).expect("tar builds");
+            let mut archive = tar::Archive::new(bytes.as_slice());
+            let entry = archive
+                .entries()
+                .expect("entries")
+                .next()
+                .expect("one entry")
+                .expect("valid entry");
+            assert_eq!(entry.header().mode().expect("mode"), mode);
+        }
     }
 }
