@@ -902,12 +902,19 @@ fn base_params(spec: &SandboxSpec) -> Result<SandboxBaseParams> {
         name: spec.name.clone(),
         user: spec.user.clone(),
         language: None,
-        env_vars: Some(
-            spec.env
+        env_vars: Some({
+            let mut env: HashMap<String, String> = spec
+                .env
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        ),
+                .collect();
+            // Blank BASH_ENV in the sandbox's own environment, overriding
+            // any caller or snapshot value. The per-exec strip is not
+            // enough: the inner bash of every session exec sources
+            // $BASH_ENV at startup, before the stripped script runs.
+            env.insert("BASH_ENV".to_owned(), String::new());
+            env
+        }),
         labels: Some(labels),
         public: spec.public,
         target: spec.region.clone(),
@@ -2465,6 +2472,22 @@ mod tests {
             Some("/workspace/final")
         );
         assert_eq!(labels.get(MANAGED_LABEL).map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn base_params_blank_bash_env_over_any_caller_value() {
+        let spec = SandboxSpec::new(SandboxSource::Image {
+            reference: "debian:stable-slim".to_owned(),
+        })
+        .env_var("BASH_ENV", "/etc/injected.sh")
+        .env_var("KEEP", "1");
+
+        let base = base_params(&spec).expect("valid base params");
+        let env = base.env_vars.expect("env vars");
+        // Sandbox-level blank: the inner bash of a session exec sources
+        // $BASH_ENV at startup, before any per-exec strip can run.
+        assert_eq!(env.get("BASH_ENV").map(String::as_str), Some(""));
+        assert_eq!(env.get("KEEP").map(String::as_str), Some("1"));
     }
 
     #[test]
