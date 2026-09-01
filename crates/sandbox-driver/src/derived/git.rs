@@ -8,6 +8,7 @@ use crate::error::{Error, ExecFailure, Result};
 use crate::exec::{Exec, ExecResult, ExecSpec};
 use crate::git::{
     Git, GitBranches, GitCloneOptions, GitCommitOptions, GitCredentials, GitPushOptions, GitStatus,
+    validate_branch_name,
 };
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -379,7 +380,7 @@ impl Git for DerivedGit<'_> {
     }
 
     async fn checkout(&self, repo_path: &str, branch: &str, create: bool) -> Result<()> {
-        crate::git::validate_branch_name(branch)?;
+        validate_branch_name(branch)?;
         let mut args: Vec<String> = vec!["checkout".into()];
         if create {
             args.push("-b".into());
@@ -580,7 +581,11 @@ mod tests {
             .expect("pinned clone succeeds");
 
         let commands = exec.commands();
-        assert!(commands[0].contains("'init' '--' '/dst'"), "{}", commands[0]);
+        assert!(
+            commands[0].contains("'init' '--' '/dst'"),
+            "{}",
+            commands[0]
+        );
         assert!(
             commands[1].contains("'remote' 'add' '--' 'origin' 'https://github.com/org/repo.git'"),
             "{}",
@@ -597,7 +602,9 @@ mod tests {
             commands[2]
         );
         assert!(
-            commands[2].contains(&format!("'fetch' '--depth' '1' '--no-tags' 'origin' '--' '{sha}'")),
+            commands[2].contains(&format!(
+                "'fetch' '--depth' '1' '--no-tags' 'origin' '--' '{sha}'"
+            )),
             "{}",
             commands[2]
         );

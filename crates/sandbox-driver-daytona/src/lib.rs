@@ -272,17 +272,16 @@ fn map_state(state: Option<daytona_sdk::SandboxState>) -> SandboxState {
                 SandboxState::Creating
             }
             Ds::Restoring | Ds::Starting => SandboxState::Starting,
-            Ds::Started => SandboxState::Running,
+            // A snapshotting sandbox stays fully usable (fabro mapped it
+            // to Running deliberately); reporting it transitional makes
+            // activation and waits stall through a multi-minute snapshot.
+            // The raw string still reaches callers via provider_state.
+            Ds::Started | Ds::Snapshotting => SandboxState::Running,
             Ds::Stopping => SandboxState::Stopping,
             Ds::Stopped => SandboxState::Stopped,
             Ds::Archiving => SandboxState::Archiving,
             Ds::Archived => SandboxState::Archived,
             Ds::Resizing => SandboxState::Resizing,
-            // A snapshotting sandbox stays fully usable (fabro mapped it
-            // to Running deliberately); reporting it transitional makes
-            // activation and waits stall through a multi-minute snapshot.
-            // The raw string still reaches callers via provider_state.
-            Ds::Snapshotting => SandboxState::Running,
             Ds::Forking => SandboxState::Forking,
             Ds::Pausing => SandboxState::Pausing,
             Ds::Paused => SandboxState::Paused,

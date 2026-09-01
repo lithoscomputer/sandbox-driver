@@ -89,12 +89,7 @@ impl Services for DerivedServices<'_> {
         for (key, value) in &spec.env {
             // Quote the key as well as the value: a malformed key must
             // corrupt nothing but its own export, never the script.
-            let _ = writeln!(
-                script,
-                "export {}={}",
-                shell_quote(key),
-                shell_quote(value)
-            );
+            let _ = writeln!(script, "export {}={}", shell_quote(key), shell_quote(value));
         }
         script.push_str("export SANDBOX_DRIVER_SERVICE_DIR=\"$dir\"\n");
         // The exit record is what status trusts: a sandbox whose PID 1

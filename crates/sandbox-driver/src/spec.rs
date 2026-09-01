@@ -461,8 +461,8 @@ mod tests {
             Err(crate::Error::InvalidSpec { .. })
         ));
 
-        let populated = SandboxSpec::new(SandboxSource::HostDirectory)
-            .network(NetworkPolicy::CidrAllowList {
+        let populated =
+            SandboxSpec::new(SandboxSource::HostDirectory).network(NetworkPolicy::CidrAllowList {
                 cidrs: vec!["10.0.0.0/8".into()],
             });
         assert!(populated.validate().is_ok());

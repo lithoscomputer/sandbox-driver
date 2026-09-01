@@ -4,7 +4,7 @@ use std::pin::pin;
 use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-use std::{env, future, io};
+use std::{env, fs, future, io};
 
 use async_trait::async_trait;
 #[cfg(unix)]
@@ -71,14 +71,14 @@ fn inherited_var_is_sensitive(key: &str) -> bool {
 /// credentials never reach sandboxed commands. Processes run in their own
 /// process group so cancellation and timeouts kill the whole tree.
 pub struct HostExec {
-    working_dir: PathBuf,
-    base_env:    BTreeMap<String, String>,
+    working_dir:                PathBuf,
+    base_env:                   BTreeMap<String, String>,
     /// Managed workspaces live under the OS temp directory, which the
     /// OS cleans periodically; recreate rather than failing every exec
     /// forever. Designated directories stay caller-owned and are never
     /// created here.
     recreate_missing_workspace: bool,
-    bash_path:   OnceLock<PathBuf>,
+    bash_path:                  OnceLock<PathBuf>,
 }
 
 impl HostExec {
@@ -133,7 +133,7 @@ impl HostExec {
         env: &BTreeMap<String, String>,
     ) -> Result<Command> {
         if self.recreate_missing_workspace && !self.working_dir.exists() {
-            std::fs::create_dir_all(&self.working_dir)
+            fs::create_dir_all(&self.working_dir)
                 .map_err(|error| Error::io("recreating managed workspace", error))?;
         }
         let mut command = Command::new(self.bash()?);
