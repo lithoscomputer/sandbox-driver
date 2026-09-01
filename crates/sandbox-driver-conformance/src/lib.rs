@@ -2065,7 +2065,7 @@ async fn fs_range_and_append_round_trip(ctx: &Conformance) -> CheckOutcome {
 async fn background_services_round_trip(ctx: &Conformance) -> CheckOutcome {
     let sandbox = ctx.ready().await?;
     let outcome = async {
-        if sandbox.capabilities().services.native != sandbox.services().is_some() {
+        if sandbox.capabilities().supports(Capability::Services) != sandbox.services().is_some() {
             return fail("services facet presence disagrees with services.native");
         }
         let derived;

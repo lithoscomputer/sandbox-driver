@@ -182,6 +182,8 @@ pub struct Capabilities {
 
 The contract, taken from CSI and the prior fabro plan: **capabilities are load-bearing.** A missing capability changes behavior at *preflight* (the caller adapts, derives, or refuses with a message naming the provider) — never as a mid-run `Err("not supported")`, which is what fabro's silent `Ok(None)` defaults produce today and which is indistinguishable from "supported, nothing to report."
 
+Callers use `Capabilities::supports(Capability)` for a consistent preflight check. The method maps the public capability vocabulary to the nested capability fields. Reserved or unknown capabilities return `false`.
+
 Capabilities are **negotiated metadata, not live state**. They are captured once, at `create`/`attach` (for plugin providers, that is the JSON-RPC `initialize` handshake), and are immutable for the life of the handle — the one piece of data a handle carries besides its ID. Re-attaching yields a fresh set; that is how a provider upgrade is observed. `resize` does not change capabilities: they describe supported operations, not current resources. `SandboxProvider::capabilities()` is the provider's **upper bound** — the union of what it can offer, for pre-create decisions; the per-sandbox set (`Sandbox::capabilities()`) is authoritative and may be narrower depending on the spec (Daytona: linux-vm vs container vs android classes). Preflight catches predictable mismatches, but every capability-gated method still returns a structured `Unsupported` when a stale or misreported capability meets reality — capabilities optimize failure timing; they are not the enforcement mechanism.
 
 ### Wire compatibility

@@ -169,6 +169,71 @@ impl Capabilities {
             volumes: None,
         }
     }
+
+    /// Returns whether this set declares the requested optional capability.
+    #[must_use]
+    pub fn supports(&self, capability: Capability) -> bool {
+        match capability {
+            Capability::LifecyclePause => self.lifecycle.pause,
+            Capability::LifecycleArchive => self.lifecycle.archive,
+            Capability::LifecycleFork => self.lifecycle.fork,
+            Capability::LifecycleResize => self.lifecycle.resize,
+            Capability::LifecycleRecover => self.lifecycle.recover,
+            Capability::LifecycleUndelete => self.lifecycle.undelete,
+            Capability::LifecycleRefreshActivity => self.lifecycle.refresh_activity,
+            Capability::LifecycleTimers => self.lifecycle.timers,
+            Capability::LifecycleLabels => self.lifecycle.labels,
+            Capability::LifecycleUpdateNetwork => self.lifecycle.update_network,
+            Capability::LifecycleSnapshotSandbox => self.lifecycle.snapshot_sandbox,
+            Capability::ExecStdin => self.exec.stdin,
+            Capability::ExecCancel => self.exec.cancel,
+            Capability::ExecStdioProcess => self.exec.stdio_process,
+            Capability::FsUpload => self.fs.upload,
+            Capability::FsDownload => self.fs.download,
+            Capability::FsPermissions => self.fs.permissions,
+            Capability::Pty => self.pty.is_some(),
+            Capability::Logs => self.logs.is_some(),
+            Capability::PreviewUrls => self.access.preview_urls,
+            Capability::SignedPreviewUrls => self.access.signed_preview_urls,
+            Capability::Ssh => self.access.ssh,
+            Capability::SshTtl => self.access.ssh_ttl,
+            Capability::SshRevoke => self.access.ssh_revoke,
+            Capability::ShellCommandAccess => self.access.shell_command,
+            Capability::WebTerminalAccess => self.access.web_terminal,
+            Capability::VncAccess => self.access.vnc,
+            Capability::Snapshots => self.snapshots.is_some(),
+            Capability::SnapshotsContainerFromImage => self
+                .snapshots
+                .as_ref()
+                .is_some_and(|caps| caps.from_image_kinds.container),
+            Capability::SnapshotsVmFromImage => self
+                .snapshots
+                .as_ref()
+                .is_some_and(|caps| caps.from_image_kinds.virtual_machine),
+            Capability::SnapshotsContainerFromDockerfile => self
+                .snapshots
+                .as_ref()
+                .is_some_and(|caps| caps.from_dockerfile_kinds.container),
+            Capability::SnapshotsVmFromDockerfile => self
+                .snapshots
+                .as_ref()
+                .is_some_and(|caps| caps.from_dockerfile_kinds.virtual_machine),
+            Capability::SnapshotsFilesystem => self
+                .snapshots
+                .as_ref()
+                .is_some_and(|caps| caps.filesystem_from_sandbox),
+            Capability::SnapshotsLiveProcessState => self
+                .snapshots
+                .as_ref()
+                .is_some_and(|caps| caps.live_process_state_from_sandbox),
+            Capability::SnapshotsActivation => {
+                self.snapshots.as_ref().is_some_and(|caps| caps.activation)
+            }
+            Capability::Services => self.services.native,
+            Capability::Volumes => self.volumes.is_some(),
+            Capability::Sessions | Capability::Unknown => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -343,6 +408,8 @@ pub struct VolumeCaps {
 mod tests {
     use super::*;
 
+    type CapabilityEnabler = fn(&mut Capabilities);
+
     #[test]
     fn capability_serializes_as_dotted_path() {
         let json = serde_json::to_string(&Capability::ExecStdioProcess).expect("serializes");
@@ -356,6 +423,144 @@ mod tests {
         assert!(caps.pty.is_none());
         assert!(caps.snapshots.is_none());
         assert!(!caps.lifecycle.pause);
+    }
+
+    #[test]
+    fn supports_maps_every_public_capability() {
+        let cases: &[(Capability, CapabilityEnabler)] = &[
+            (Capability::LifecyclePause, |caps| {
+                caps.lifecycle.pause = true;
+            }),
+            (Capability::LifecycleArchive, |caps| {
+                caps.lifecycle.archive = true;
+            }),
+            (Capability::LifecycleFork, |caps| caps.lifecycle.fork = true),
+            (Capability::LifecycleResize, |caps| {
+                caps.lifecycle.resize = true;
+            }),
+            (Capability::LifecycleRecover, |caps| {
+                caps.lifecycle.recover = true;
+            }),
+            (Capability::LifecycleUndelete, |caps| {
+                caps.lifecycle.undelete = true;
+            }),
+            (Capability::LifecycleRefreshActivity, |caps| {
+                caps.lifecycle.refresh_activity = true;
+            }),
+            (Capability::LifecycleTimers, |caps| {
+                caps.lifecycle.timers = true;
+            }),
+            (Capability::LifecycleLabels, |caps| {
+                caps.lifecycle.labels = true;
+            }),
+            (Capability::LifecycleUpdateNetwork, |caps| {
+                caps.lifecycle.update_network = true;
+            }),
+            (Capability::LifecycleSnapshotSandbox, |caps| {
+                caps.lifecycle.snapshot_sandbox = true;
+            }),
+            (Capability::ExecStdin, |caps| caps.exec.stdin = true),
+            (Capability::ExecCancel, |caps| caps.exec.cancel = true),
+            (Capability::ExecStdioProcess, |caps| {
+                caps.exec.stdio_process = true;
+            }),
+            (Capability::FsUpload, |caps| caps.fs.upload = true),
+            (Capability::FsDownload, |caps| caps.fs.download = true),
+            (Capability::FsPermissions, |caps| caps.fs.permissions = true),
+            (Capability::Pty, |caps| caps.pty = Some(PtyCaps::default())),
+            (Capability::Logs, |caps| {
+                caps.logs = Some(LogsCaps::default());
+            }),
+            (Capability::PreviewUrls, |caps| {
+                caps.access.preview_urls = true;
+            }),
+            (Capability::SignedPreviewUrls, |caps| {
+                caps.access.signed_preview_urls = true;
+            }),
+            (Capability::Ssh, |caps| caps.access.ssh = true),
+            (Capability::SshTtl, |caps| caps.access.ssh_ttl = true),
+            (Capability::SshRevoke, |caps| caps.access.ssh_revoke = true),
+            (Capability::ShellCommandAccess, |caps| {
+                caps.access.shell_command = true;
+            }),
+            (Capability::WebTerminalAccess, |caps| {
+                caps.access.web_terminal = true;
+            }),
+            (Capability::VncAccess, |caps| caps.access.vnc = true),
+            (Capability::Snapshots, |caps| {
+                caps.snapshots = Some(SnapshotCaps::default());
+            }),
+            (Capability::SnapshotsContainerFromImage, |caps| {
+                caps.snapshots = Some(SnapshotCaps {
+                    from_image_kinds: SandboxKindSupport {
+                        container: true,
+                        ..SandboxKindSupport::default()
+                    },
+                    ..SnapshotCaps::default()
+                });
+            }),
+            (Capability::SnapshotsVmFromImage, |caps| {
+                caps.snapshots = Some(SnapshotCaps {
+                    from_image_kinds: SandboxKindSupport {
+                        virtual_machine: true,
+                        ..SandboxKindSupport::default()
+                    },
+                    ..SnapshotCaps::default()
+                });
+            }),
+            (Capability::SnapshotsContainerFromDockerfile, |caps| {
+                caps.snapshots = Some(SnapshotCaps {
+                    from_dockerfile_kinds: SandboxKindSupport {
+                        container: true,
+                        ..SandboxKindSupport::default()
+                    },
+                    ..SnapshotCaps::default()
+                });
+            }),
+            (Capability::SnapshotsVmFromDockerfile, |caps| {
+                caps.snapshots = Some(SnapshotCaps {
+                    from_dockerfile_kinds: SandboxKindSupport {
+                        virtual_machine: true,
+                        ..SandboxKindSupport::default()
+                    },
+                    ..SnapshotCaps::default()
+                });
+            }),
+            (Capability::SnapshotsFilesystem, |caps| {
+                caps.snapshots = Some(SnapshotCaps {
+                    filesystem_from_sandbox: true,
+                    ..SnapshotCaps::default()
+                });
+            }),
+            (Capability::SnapshotsLiveProcessState, |caps| {
+                caps.snapshots = Some(SnapshotCaps {
+                    live_process_state_from_sandbox: true,
+                    ..SnapshotCaps::default()
+                });
+            }),
+            (Capability::SnapshotsActivation, |caps| {
+                caps.snapshots = Some(SnapshotCaps {
+                    activation: true,
+                    ..SnapshotCaps::default()
+                });
+            }),
+            (Capability::Services, |caps| caps.services.native = true),
+            (Capability::Volumes, |caps| {
+                caps.volumes = Some(VolumeCaps::default());
+            }),
+        ];
+        for &(capability, enable) in cases {
+            let mut caps = Capabilities::minimal(Isolation::Vm);
+            assert!(!caps.supports(capability), "{capability} starts absent");
+            enable(&mut caps);
+            assert!(
+                caps.supports(capability),
+                "{capability} should be supported"
+            );
+        }
+        let caps = Capabilities::minimal(Isolation::Vm);
+        assert!(!caps.supports(Capability::Sessions));
+        assert!(!caps.supports(Capability::Unknown));
     }
 
     #[test]
