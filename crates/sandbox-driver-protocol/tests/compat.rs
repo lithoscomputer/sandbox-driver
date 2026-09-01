@@ -50,6 +50,10 @@ fn launch_era_capabilities_still_decode() {
     let caps: Capabilities = serde_json::from_str(json).expect("launch-era capabilities decode");
     assert!(caps.lifecycle.archive);
     assert!(!caps.lifecycle.undelete, "absent field defaults to false");
+    assert!(
+        caps.git.supported,
+        "the old native=false shape implied exec-derived git"
+    );
     assert!(!caps.services.native, "absent group defaults");
     let snapshots = caps.snapshots.expect("snapshots present");
     assert!(snapshots.from_image);

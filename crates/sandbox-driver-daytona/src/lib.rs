@@ -19,6 +19,9 @@
 //! separated stdout/stderr, kills on cancel/timeout by deleting the
 //! session, and preserves partial output on timeout. Stdin is delivered
 //! through a temp-file redirection inside the sandbox on both paths.
+//! Git follows Fabro's hybrid path: clone uses the native toolbox API;
+//! worktree and remote operations use the shared exec-derived implementation.
+//! Snapshots used with the Git facet must therefore provide `git` on `PATH`.
 //! Resize remains in the normalized interface, but the current hosted
 //! Daytona API and official SDK do not expose a working resize route, so
 //! this provider does not declare it.
@@ -47,6 +50,7 @@
 mod access;
 mod exec;
 mod fs;
+mod git;
 mod logs;
 mod pty;
 mod session;
@@ -75,19 +79,21 @@ use daytona_sdk::{
 };
 use sandbox_driver::{
     Action, AuthError, Capabilities, Capability, Error, EventContext, EventEmitter, EventSubject,
-    Exec, ExecSpec, Filesystem, ForkOptions, HealthStatus, Isolation, LifecycleTimers, LogSink,
-    Logs, LogsCaps, NetworkPolicy, PlatformInfo, PreviewUrls, ProviderError, ProviderHealth,
-    ProviderKind, Pty, PtyCaps, ResourceKind, Resources, Result, Sandbox, SandboxFilter, SandboxId,
-    SandboxKind, SandboxProvider, SandboxSnapshotOptions, SandboxSource, SandboxSpec, SandboxState,
-    SandboxStatus, SnapshotCaps, SnapshotFilter, SnapshotId, SnapshotMode, SnapshotProvider,
-    SnapshotSource, SnapshotSpec, SnapshotState, SnapshotStatus, SshAccess, Vnc, VolumeCaps,
-    VolumeId, VolumeProvider, VolumeSpec, VolumeState, VolumeStatus, WebTerminal,
+    Exec, ExecSpec, Filesystem, ForkOptions, Git, HealthStatus, Isolation, LifecycleTimers,
+    LogSink, Logs, LogsCaps, NetworkPolicy, PlatformInfo, PreviewUrls, ProviderError,
+    ProviderHealth, ProviderKind, Pty, PtyCaps, ResourceKind, Resources, Result, Sandbox,
+    SandboxFilter, SandboxId, SandboxKind, SandboxProvider, SandboxSnapshotOptions, SandboxSource,
+    SandboxSpec, SandboxState, SandboxStatus, SnapshotCaps, SnapshotFilter, SnapshotId,
+    SnapshotMode, SnapshotProvider, SnapshotSource, SnapshotSpec, SnapshotState, SnapshotStatus,
+    SshAccess, Vnc, VolumeCaps, VolumeId, VolumeProvider, VolumeSpec, VolumeState, VolumeStatus,
+    WebTerminal,
 };
 use tokio::time;
 
 pub use crate::access::DaytonaAccess;
 pub use crate::exec::DaytonaExec;
 pub use crate::fs::DaytonaFs;
+pub use crate::git::DaytonaGit;
 pub use crate::logs::DaytonaLogs;
 pub use crate::pty::DaytonaPty;
 
@@ -668,6 +674,7 @@ async fn build_handle(
         .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
     Ok(Arc::new(DaytonaSandbox {
         exec: DaytonaExec::new(Arc::clone(client), sdk.id.clone(), working_dir.clone()),
+        git: DaytonaGit::new(Arc::clone(client), sdk.id.clone(), working_dir.clone()),
         fs: DaytonaFs::new(Arc::clone(client), sdk.id.clone(), working_dir.clone()),
         access: DaytonaAccess::new(Arc::clone(client), sdk.id.clone()),
         logs: DaytonaLogs::new(Arc::clone(client), sdk.id.clone()),
@@ -737,6 +744,8 @@ fn daytona_capabilities() -> Capabilities {
     caps.fs.upload = true;
     caps.fs.download = true;
     caps.fs.permissions = true;
+    caps.git.supported = true;
+    caps.git.native = true;
     caps.pty = Some({
         let mut pty = PtyCaps::default();
         pty.resize = true;
@@ -1239,6 +1248,7 @@ pub struct DaytonaSandbox {
     sdk_id:       String,
     working_dir:  String,
     exec:         DaytonaExec,
+    git:          DaytonaGit,
     fs:           DaytonaFs,
     access:       DaytonaAccess,
     logs:         DaytonaLogs,
@@ -1795,6 +1805,10 @@ impl Sandbox for DaytonaSandbox {
 
     fn fs(&self) -> &dyn Filesystem {
         &self.fs
+    }
+
+    fn provider_git(&self) -> Option<&dyn Git> {
+        Some(&self.git)
     }
 
     fn preview_urls(&self) -> Option<&dyn PreviewUrls> {

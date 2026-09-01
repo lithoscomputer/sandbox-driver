@@ -121,7 +121,7 @@ for the connection. Per-sandbox capability sets travel in every
             "cancel":false,"stdio_process":false},
   "fs": {"native":false,"upload":false,"download":false,"permissions":false},
   "search": {"native":false},
-  "git": {"native":false},
+  "git": {"supported":false,"native":false},
   "services": {"native":false},
   "pty": null,
   "logs": null,
@@ -149,8 +149,13 @@ Rules:
 - **The version-1 mask.** Native search/git/service passthrough and local
   shell commands do not cross the wire. A host forces `search.native`,
   `git.native`, `services.native`, and `access.shell_command` to false.
-  Background services still work because the host runs the exec-derived
-  implementation over `exec/run`.
+  `git.supported` remains true when the complete facet can run through
+  `exec/run`; the host then selects the exec-derived implementation.
+  Background services work through the same composition.
+- Older peers send `git` as `{"native":false}`. Hosts read that shape as
+  `supported:true` because `native:false` originally instructed the caller to
+  use exec-derived git. An explicitly sent `supported:false` means the complete
+  facet is unavailable.
 - The serialized `access.vpn` field is a compatibility tombstone. It is
   always false. VPN clients such as Tailscale are guest software managed
   through exec and are not a sandbox-driver capability.

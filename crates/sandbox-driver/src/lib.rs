@@ -84,7 +84,8 @@ pub use exec::{
 };
 pub use fs::{DirEntry, FileKind, FileMetadata, Filesystem};
 pub use git::{
-    Git, GitBranches, GitCloneOptions, GitCommitOptions, GitCredentials, GitPushOptions, GitStatus,
+    Git, GitBranches, GitCloneOptions, GitCommitOptions, GitCredentials, GitFacet, GitPushOptions,
+    GitStatus,
 };
 pub use id::{InvalidIdError, ProviderKind, SandboxId, ServiceId, SnapshotId, VolumeId};
 pub use logs::{LogSink, LogSource, Logs};

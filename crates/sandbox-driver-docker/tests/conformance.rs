@@ -9,7 +9,9 @@ use sandbox_driver::{SandboxSource, SandboxSpec};
 use sandbox_driver_conformance::{Conformance, SpecFactory};
 use sandbox_driver_docker::DockerProvider;
 
-const TEST_IMAGE: &str = "debian:stable-slim";
+/// The conformance image must satisfy the provider's documented data-plane
+/// contract, including `git` for the normalized Git facet.
+const TEST_IMAGE: &str = "buildpack-deps:noble";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn docker_provider_passes_conformance() {

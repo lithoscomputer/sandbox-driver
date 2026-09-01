@@ -9,6 +9,9 @@
 //! touches its contents) or **managed** (a temporary directory this crate
 //! creates and removes on `delete`).
 //!
+//! The Host provider advertises the normalized Git facet. The host environment
+//! must therefore provide a `git` executable on `PATH`.
+//!
 //! # Runtime behavior
 //!
 //! Async on Tokio; the caller owns the runtime. This crate spawns tasks
@@ -86,6 +89,7 @@ fn host_capabilities() -> Capabilities {
     caps.fs.upload = true;
     caps.fs.download = true;
     caps.fs.permissions = true;
+    caps.git.supported = true;
     caps
 }
 

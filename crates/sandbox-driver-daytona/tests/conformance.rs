@@ -17,6 +17,7 @@ mod support;
 use support::init_diagnostics;
 
 const TEST_SNAPSHOT: &str = "daytona-medium";
+const TEST_GIT_REPOSITORY: &str = "https://github.com/octocat/Hello-World.git";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn daytona_provider_passes_conformance() {
@@ -28,7 +29,9 @@ async fn daytona_provider_passes_conformance() {
     let provider = DaytonaProvider::connect()
         .await
         .expect("connect with credentials");
-    let specs = SpecFactory::new(default_spec).with_entrypoint_logs(entrypoint_logs_spec);
+    let specs = SpecFactory::new(default_spec)
+        .with_git_clone_url(TEST_GIT_REPOSITORY)
+        .with_entrypoint_logs(entrypoint_logs_spec);
     let mut conformance = Conformance::new(Arc::new(provider), specs);
     conformance.check_timeout = Duration::from_secs(900);
     conformance.wait.deadline = Some(Duration::from_secs(300));

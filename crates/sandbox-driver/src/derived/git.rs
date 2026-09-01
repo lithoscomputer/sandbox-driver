@@ -19,6 +19,8 @@ const GIT: &str = "git -c maintenance.auto=0 -c gc.auto=0";
 
 /// Exec-derived [`Git`]: plumbing over the `git` CLI.
 ///
+/// The sandbox environment must provide a `git` executable on `PATH`.
+///
 /// Credentials are applied per call. For `https` remotes they are
 /// embedded into the URL used for that one network operation — never
 /// written into the repository configuration.

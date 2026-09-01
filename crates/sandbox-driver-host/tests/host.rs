@@ -9,7 +9,7 @@ use std::{env, process};
 
 use async_trait::async_trait;
 use sandbox_driver::{
-    Action, DerivedGit, DerivedSearch, Error, Event, EventBody, EventContext, EventObserver,
+    Action, Capability, DerivedSearch, Error, Event, EventBody, EventContext, EventObserver,
     ExecControls, ExecSpec, Git, GitCommitOptions, GrepOptions, NetworkPolicy, OutputStream,
     SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec, Search, SpawnSpec,
     StdioProcessHandle, Termination, WaitOptions, WalkOptions, WorkspaceOwnership, activate,
@@ -551,7 +551,7 @@ async fn derived_search_works_over_host_exec() {
 }
 
 #[tokio::test]
-async fn derived_git_drives_a_real_repository() {
+async fn normalized_git_drives_a_real_repository() {
     let provider = HostProvider::new();
     let sandbox = provider.create(&host_spec(), None).await.expect("create");
     let exec = sandbox.exec();
@@ -562,7 +562,9 @@ async fn derived_git_drives_a_real_repository() {
     assert!(result.success(), "stderr: {}", result.stderr_lossy());
     let repo = format!("{workspace}/repo");
 
-    let git = DerivedGit::new(exec);
+    assert!(sandbox.capabilities().supports(Capability::Git));
+    assert!(!sandbox.capabilities().git.native);
+    let git = sandbox.git().expect("git facet");
     sandbox
         .fs()
         .write("repo/hello.txt", b"hi\n")

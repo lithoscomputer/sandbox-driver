@@ -11,7 +11,8 @@
 //! Every image must provide `/bin/bash` (the
 //! Bash contract) and a Linux userland with `stat`, `find`, `base64`,
 //! and `setsid` (kill semantics need a separate session; an image
-//! without it fails every exec with a clear message).
+//! without it fails every exec with a clear message). Because Docker advertises
+//! the normalized Git facet, the image must also provide `git` on `PATH`.
 //!
 //! # Runtime behavior
 //!
@@ -264,6 +265,7 @@ fn docker_capabilities() -> Capabilities {
     caps.fs.upload = true;
     caps.fs.download = true;
     caps.fs.permissions = true;
+    caps.git.supported = true;
     caps.network.allow_all = true;
     caps.network.block_all = true;
     caps

@@ -92,6 +92,8 @@ pub enum Capability {
     SnapshotsLiveProcessState,
     #[serde(rename = "snapshots.activation")]
     SnapshotsActivation,
+    #[serde(rename = "git")]
+    Git,
     #[serde(rename = "services")]
     Services,
     #[serde(rename = "volumes")]
@@ -229,6 +231,7 @@ impl Capabilities {
             Capability::SnapshotsActivation => {
                 self.snapshots.as_ref().is_some_and(|caps| caps.activation)
             }
+            Capability::Git => self.git.supported,
             Capability::Services => self.services.native,
             Capability::Volumes => self.volumes.is_some(),
             Capability::Sessions | Capability::Unknown => false,
@@ -294,8 +297,21 @@ pub struct SearchCaps {
 #[serde(default)]
 #[non_exhaustive]
 pub struct GitCaps {
-    /// Provider overrides the exec-derived git implementation natively.
-    pub native: bool,
+    /// The complete git facet is available.
+    ///
+    /// The wire default is `true` when an older peer sends the original
+    /// `{"native": false}` shape: that shape meant callers should use the
+    /// exec-derived implementation. `GitCaps::default()` remains unsupported
+    /// for a newly constructed minimal capability set.
+    #[serde(default = "default_true")]
+    pub supported: bool,
+    /// The provider contributes at least one native operation instead of
+    /// using the exec-derived implementation for every operation.
+    pub native:    bool,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -544,6 +560,7 @@ mod tests {
                     ..SnapshotCaps::default()
                 });
             }),
+            (Capability::Git, |caps| caps.git.supported = true),
             (Capability::Services, |caps| caps.services.native = true),
             (Capability::Volumes, |caps| {
                 caps.volumes = Some(VolumeCaps::default());

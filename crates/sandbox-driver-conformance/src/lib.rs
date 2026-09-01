@@ -29,10 +29,11 @@ use std::{fmt, process};
 use async_trait::async_trait;
 use sandbox_driver::{
     Action, Capability, DerivedSearch, DerivedServices, Error, Event, EventBody, EventContext,
-    EventObserver, ExecControls, ExecSpec, GrepOptions, HealthStatus, LogSink, LogSource,
-    NetworkPolicy, OutputSanitization, OutputStream, PtyOptions, PtySize, Resources, Sandbox,
-    SandboxFilter, SandboxId, SandboxProvider, SandboxSpec, SandboxState, Search, ServiceSpec,
-    Services, SnapshotMode, SpawnSpec, Termination, WaitOptions, activate, wait_for_state,
+    EventObserver, ExecControls, ExecSpec, Git, GitCloneOptions, GitCommitOptions, GitPushOptions,
+    GrepOptions, HealthStatus, LogSink, LogSource, NetworkPolicy, OutputSanitization, OutputStream,
+    PtyOptions, PtySize, Resources, Sandbox, SandboxFilter, SandboxId, SandboxProvider,
+    SandboxSpec, SandboxState, Search, ServiceSpec, Services, SnapshotMode, SpawnSpec, Termination,
+    WaitOptions, activate, wait_for_state,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time;
@@ -56,6 +57,7 @@ impl EventObserver for RecordingEventObserver {
 pub struct SpecFactory {
     make:                 Box<dyn Fn() -> SandboxSpec + Send + Sync>,
     make_entrypoint_logs: Option<Box<dyn Fn() -> SandboxSpec + Send + Sync>>,
+    git_clone_url:        Option<String>,
 }
 
 impl SpecFactory {
@@ -63,6 +65,7 @@ impl SpecFactory {
         Self {
             make:                 Box::new(make),
             make_entrypoint_logs: None,
+            git_clone_url:        None,
         }
     }
 
@@ -78,12 +81,27 @@ impl SpecFactory {
         self
     }
 
+    /// Overrides the sandbox-local `file://` clone fixture.
+    ///
+    /// Use this for providers whose native Git API accepts remote repository
+    /// URLs only. The repository needs no specific contents or default branch;
+    /// the check normalizes the clone before testing worktree operations.
+    #[must_use]
+    pub fn with_git_clone_url(mut self, url: impl Into<String>) -> Self {
+        self.git_clone_url = Some(url.into());
+        self
+    }
+
     fn spec(&self) -> SandboxSpec {
         (self.make)()
     }
 
     fn entrypoint_logs_spec(&self) -> Option<SandboxSpec> {
         self.make_entrypoint_logs.as_ref().map(|make| make())
+    }
+
+    fn git_clone_url(&self) -> Option<&str> {
+        self.git_clone_url.as_deref()
     }
 }
 
@@ -172,6 +190,7 @@ impl Conformance {
             ("search_greps_directories_and_single_files", |ctx| {
                 Box::pin(search_greps_directories_and_single_files(ctx))
             }),
+            ("git_round_trip", |ctx| Box::pin(git_round_trip(ctx))),
             ("unsupported_actions_say_so", |ctx| {
                 Box::pin(unsupported_actions_say_so(ctx))
             }),
@@ -1229,6 +1248,219 @@ async fn search_greps_directories_and_single_files(ctx: &Conformance) -> CheckOu
     outcome
 }
 
+/// Git uses a sandbox-local bare remote so every operation can run without
+/// external credentials or network access. Providers still choose their
+/// native, derived, or hybrid implementation behind the normalized facet.
+async fn git_round_trip(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        if !sandbox.capabilities().supports(Capability::Git) {
+            return Ok(Some("capability git not declared".to_owned()));
+        }
+        let Some(git) = sandbox.git() else {
+            return fail("git is declared but the facet is absent");
+        };
+
+        let setup = sandbox
+            .exec()
+            .run(
+                &ExecSpec::new(
+                    "rm -rf conformance-git && \
+                     mkdir conformance-git && \
+                     cd conformance-git && \
+                     git init -q --bare remote.git && \
+                     git init -q -b main seed && \
+                     cd seed && \
+                     printf 'seed\\n' > seed.txt && \
+                     git add -- seed.txt && \
+                     git -c user.name=Conformance \
+                         -c user.email=conformance@example.com \
+                         commit -q -m seed && \
+                     git remote add origin ../remote.git && \
+                     git push -q origin main && \
+                     git --git-dir=../remote.git symbolic-ref HEAD refs/heads/main",
+                )
+                .timeout(Duration::from_secs(60)),
+            )
+            .await
+            .map_err(|error| format!("git fixture setup failed: {error}"))?;
+        if !setup.success() {
+            return fail(format!(
+                "git fixture setup exited {:?}: {}",
+                setup.exit_code,
+                setup.stderr_lossy()
+            ));
+        }
+
+        let root = sandbox.working_directory().trim_end_matches('/');
+        let local_remote_path = format!("{root}/conformance-git/remote.git");
+        let local_remote_url = format!("file://{local_remote_path}");
+        let clone_url = ctx.specs.git_clone_url().unwrap_or(&local_remote_url);
+        git.clone_repo(
+            clone_url,
+            "conformance-git/clone",
+            &GitCloneOptions::default(),
+        )
+        .await
+        .map_err(|error| format!("clone failed: {error}"))?;
+
+        // A provider-specific clone fixture can have arbitrary content and a
+        // different default branch. Normalize it onto the sandbox-local bare
+        // remote before testing the rest of the Git contract.
+        let origin = sandbox
+            .exec()
+            .run(
+                &ExecSpec::new(
+                    "git remote set-url origin \"$CONFORMANCE_REMOTE\" && \
+                     git fetch -q origin \
+                         +refs/heads/main:refs/remotes/origin/main && \
+                     git checkout -q -B main origin/main",
+                )
+                .env_var("CONFORMANCE_REMOTE", local_remote_path)
+                .working_dir("conformance-git/clone")
+                .timeout(Duration::from_secs(30)),
+            )
+            .await
+            .map_err(|error| format!("local origin setup failed: {error}"))?;
+        if !origin.success() {
+            return fail(format!(
+                "local origin setup exited {:?}: stdout={:?}, stderr={:?}",
+                origin.exit_code,
+                origin.stdout_lossy(),
+                origin.stderr_lossy()
+            ));
+        }
+
+        let repo = "conformance-git/clone";
+        let status = git
+            .status(repo)
+            .await
+            .map_err(|error| format!("initial status failed: {error}"))?;
+        if status.current_branch.as_deref() != Some("main")
+            || status.detached
+            || !status.dirty_paths.is_empty()
+        {
+            return fail(format!("initial clone status is wrong: {status:?}"));
+        }
+
+        git.checkout(repo, "feature", true)
+            .await
+            .map_err(|error| format!("create feature branch failed: {error}"))?;
+        sandbox
+            .fs()
+            .write("conformance-git/clone/feature.txt", b"feature\n")
+            .await
+            .map_err(|error| format!("write feature file failed: {error}"))?;
+        let status = git
+            .status(repo)
+            .await
+            .map_err(|error| format!("dirty status failed: {error}"))?;
+        if status.current_branch.as_deref() != Some("feature")
+            || !status.dirty_paths.iter().any(|path| path == "feature.txt")
+        {
+            return fail(format!("dirty feature status is wrong: {status:?}"));
+        }
+
+        git.add(repo, &["feature.txt".to_owned()])
+            .await
+            .map_err(|error| format!("add failed: {error}"))?;
+        let sha = git
+            .commit(
+                repo,
+                &GitCommitOptions::new("feature commit", "Conformance", "conformance@example.com"),
+            )
+            .await
+            .map_err(|error| format!("commit failed: {error}"))?;
+        if sha.len() != 40 {
+            return fail(format!("commit returned an invalid SHA: {sha:?}"));
+        }
+
+        let branches = git
+            .branches(repo)
+            .await
+            .map_err(|error| format!("branches failed: {error}"))?;
+        if branches.current.as_deref() != Some("feature")
+            || !branches.branches.iter().any(|branch| branch == "main")
+            || !branches.branches.iter().any(|branch| branch == "feature")
+        {
+            return fail(format!("branch list is wrong: {branches:?}"));
+        }
+
+        let mut push = GitPushOptions::default();
+        push.remote = Some("origin".to_owned());
+        push.branch = Some("feature".to_owned());
+        push.set_upstream = true;
+        git.push(repo, &push)
+            .await
+            .map_err(|error| format!("push failed: {error}"))?;
+        let remote_feature = sandbox
+            .exec()
+            .run(
+                &ExecSpec::new("git --git-dir=remote.git rev-parse refs/heads/feature")
+                    .working_dir("conformance-git")
+                    .timeout(Duration::from_secs(30)),
+            )
+            .await
+            .map_err(|error| format!("remote feature check failed: {error}"))?;
+        if !remote_feature.success() || remote_feature.stdout_lossy().trim() != sha {
+            return fail(format!(
+                "remote feature is wrong: stdout={:?}, stderr={:?}",
+                remote_feature.stdout_lossy(),
+                remote_feature.stderr_lossy()
+            ));
+        }
+
+        git.checkout(repo, "main", false)
+            .await
+            .map_err(|error| format!("checkout main failed: {error}"))?;
+        let upstream = sandbox
+            .exec()
+            .run(
+                &ExecSpec::new(
+                    "printf 'upstream\\n' > upstream.txt && \
+                     git add -- upstream.txt && \
+                     git -c user.name=Conformance \
+                         -c user.email=conformance@example.com \
+                         commit -q -m upstream && \
+                     git push -q origin main",
+                )
+                .working_dir("conformance-git/seed")
+                .timeout(Duration::from_secs(60)),
+            )
+            .await
+            .map_err(|error| format!("upstream update failed: {error}"))?;
+        if !upstream.success() {
+            return fail(format!(
+                "upstream update exited {:?}: {}",
+                upstream.exit_code,
+                upstream.stderr_lossy()
+            ));
+        }
+        git.pull(repo, None)
+            .await
+            .map_err(|error| format!("pull failed: {error}"))?;
+        let pulled = sandbox
+            .fs()
+            .read("conformance-git/clone/upstream.txt")
+            .await
+            .map_err(|error| format!("read pulled file failed: {error}"))?;
+        if pulled != b"upstream\n" {
+            return fail(format!("pulled file has wrong content: {pulled:?}"));
+        }
+        let status = git
+            .status(repo)
+            .await
+            .map_err(|error| format!("final status failed: {error}"))?;
+        if status.current_branch.as_deref() != Some("main") || !status.dirty_paths.is_empty() {
+            return fail(format!("final status is wrong: {status:?}"));
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
 async fn unsupported_actions_say_so(ctx: &Conformance) -> CheckOutcome {
     let sandbox = ctx.create().await?;
     // The per-sandbox set is authoritative: a provider may narrow its
@@ -1776,6 +2008,12 @@ async fn services_match_capabilities(ctx: &Conformance) -> CheckOutcome {
     }
     if sandbox_caps.logs.is_some() != sandbox.logs().is_some() {
         wrong.push("logs facet presence disagrees with capabilities".to_owned());
+    }
+    if sandbox_caps.supports(Capability::Git) != sandbox.git().is_some() {
+        wrong.push("git facet presence disagrees with capabilities".to_owned());
+    }
+    if sandbox_caps.git.native != sandbox.provider_git().is_some() {
+        wrong.push("git provider override disagrees with git.native".to_owned());
     }
     if sandbox_caps.access.web_terminal != sandbox.web_terminal().is_some() {
         wrong.push("web_terminal facet presence disagrees with capabilities".to_owned());

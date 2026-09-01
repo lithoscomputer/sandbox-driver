@@ -3,14 +3,21 @@ use std::fmt;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::derived::DerivedGit;
 use crate::error::Result;
+use crate::exec::Exec;
 
 /// Low-level git plumbing inside a sandbox, with per-call credentials.
 ///
 /// This is deliberately plumbing only: credential leasing, push retry
 /// engines, clone orchestration, and repo layout live above this crate.
-/// The library will ship an exec-derived implementation; providers with a
-/// native git API declare `Capabilities::git.native = true`.
+/// Providers own the choice of transport. They can use their native API,
+/// [`DerivedGit`], or a hybrid of both without exposing that choice to callers.
+///
+/// When a sandbox declares `Capabilities::git.supported`, its image, snapshot,
+/// or host environment must provide a `git` executable on `PATH`. Providers do
+/// not probe for it. This prerequisite also applies to hybrid providers because
+/// any operation they derive through [`crate::Exec`] invokes that executable.
 #[async_trait]
 pub trait Git: Send + Sync {
     async fn clone_repo(
@@ -34,6 +41,84 @@ pub trait Git: Send + Sync {
     async fn branches(&self, repo_path: &str) -> Result<GitBranches>;
 
     async fn checkout(&self, repo_path: &str, branch: &str, create: bool) -> Result<()>;
+}
+
+/// A sandbox's normalized git facet.
+///
+/// This facade hides whether the provider supplies a custom native or hybrid
+/// implementation, or uses the shared exec-derived implementation.
+pub struct GitFacet<'a> {
+    implementation: GitImplementation<'a>,
+}
+
+enum GitImplementation<'a> {
+    Provider(&'a dyn Git),
+    Derived(DerivedGit<'a>),
+}
+
+impl<'a> GitFacet<'a> {
+    pub(crate) fn provider(git: &'a dyn Git) -> Self {
+        Self {
+            implementation: GitImplementation::Provider(git),
+        }
+    }
+
+    pub(crate) fn derived(exec: &'a dyn Exec) -> Self {
+        Self {
+            implementation: GitImplementation::Derived(DerivedGit::new(exec)),
+        }
+    }
+
+    fn implementation(&self) -> &dyn Git {
+        match &self.implementation {
+            GitImplementation::Provider(git) => *git,
+            GitImplementation::Derived(git) => git,
+        }
+    }
+}
+
+#[async_trait]
+impl Git for GitFacet<'_> {
+    async fn clone_repo(
+        &self,
+        url: &str,
+        target_path: &str,
+        options: &GitCloneOptions,
+    ) -> Result<()> {
+        self.implementation()
+            .clone_repo(url, target_path, options)
+            .await
+    }
+
+    async fn status(&self, repo_path: &str) -> Result<GitStatus> {
+        self.implementation().status(repo_path).await
+    }
+
+    async fn add(&self, repo_path: &str, paths: &[String]) -> Result<()> {
+        self.implementation().add(repo_path, paths).await
+    }
+
+    async fn commit(&self, repo_path: &str, options: &GitCommitOptions) -> Result<String> {
+        self.implementation().commit(repo_path, options).await
+    }
+
+    async fn push(&self, repo_path: &str, options: &GitPushOptions) -> Result<()> {
+        self.implementation().push(repo_path, options).await
+    }
+
+    async fn pull(&self, repo_path: &str, credentials: Option<&GitCredentials>) -> Result<()> {
+        self.implementation().pull(repo_path, credentials).await
+    }
+
+    async fn branches(&self, repo_path: &str) -> Result<GitBranches> {
+        self.implementation().branches(repo_path).await
+    }
+
+    async fn checkout(&self, repo_path: &str, branch: &str, create: bool) -> Result<()> {
+        self.implementation()
+            .checkout(repo_path, branch, create)
+            .await
+    }
 }
 
 /// Per-call git credentials (a PAT travels as the password).

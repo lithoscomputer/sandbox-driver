@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use sandbox_driver::{
     Action, Capability, CorrelationId, Error, Event, EventBody, EventContext, EventObserver,
-    ExecControls, ExecSpec, OutputStream, SandboxProvider, SandboxSource, SandboxSpec, Termination,
-    WaitOptions, activate,
+    ExecControls, ExecSpec, Git, GitCommitOptions, OutputStream, SandboxProvider, SandboxSource,
+    SandboxSpec, Termination, WaitOptions, activate,
 };
 use sandbox_driver_host::HostProvider;
 use sandbox_driver_protocol::{PluginProvider, serve};
@@ -111,6 +111,42 @@ async fn create_exec_fs_delete_round_trip() {
         !workspace.exists(),
         "managed workspace removed through the wire"
     );
+    provider.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn derived_git_is_selected_transparently_over_the_wire() {
+    let provider = connect().await;
+    assert!(provider.capabilities().supports(Capability::Git));
+    assert!(!provider.capabilities().git.native);
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+
+    let result = sandbox
+        .exec()
+        .run(&ExecSpec::new("git init -q -b main repo"))
+        .await
+        .expect("git init over wire");
+    assert!(result.success(), "stderr: {}", result.stderr_lossy());
+    sandbox
+        .fs()
+        .write("repo/wire.txt", b"derived over wire\n")
+        .await
+        .expect("write worktree file");
+
+    let git = sandbox.git().expect("normalized git facet");
+    git.add("repo", &["wire.txt".to_owned()])
+        .await
+        .expect("git add over wire");
+    let sha = git
+        .commit(
+            "repo",
+            &GitCommitOptions::new("wire git", "Test", "test@example.com"),
+        )
+        .await
+        .expect("git commit over wire");
+    assert_eq!(sha.len(), 40, "sha: {sha}");
+
+    sandbox.delete().await.expect("delete");
     provider.shutdown().await.expect("shutdown");
 }
 

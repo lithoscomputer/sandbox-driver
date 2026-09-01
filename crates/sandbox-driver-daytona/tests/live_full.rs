@@ -11,10 +11,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, process};
 
 use sandbox_driver::{
-    Action, Capability, Error, ExecSpec, LifecycleTimers, LogSink, LogSource, NetworkPolicy,
-    Resources, SandboxKind, SandboxProvider, SandboxSnapshotOptions, SandboxSource, SandboxSpec,
-    SandboxState, SnapshotId, SnapshotMode, SnapshotSource, SnapshotSpec, SnapshotState,
-    WaitOptions, wait_for_state,
+    Action, Capability, Error, ExecSpec, Git, GitCloneOptions, GitCommitOptions, LifecycleTimers,
+    LogSink, LogSource, NetworkPolicy, Resources, SandboxKind, SandboxProvider,
+    SandboxSnapshotOptions, SandboxSource, SandboxSpec, SandboxState, SnapshotId, SnapshotMode,
+    SnapshotSource, SnapshotSpec, SnapshotState, WaitOptions, wait_for_state,
 };
 use sandbox_driver_daytona::DaytonaProvider;
 use tokio::time;
@@ -181,6 +181,87 @@ async fn requested_working_directory_is_created_and_survives_attach() {
 
     sandbox.delete().await.expect("delete");
     outcome.expect("live requested working directory");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hybrid_git_uses_native_clone_and_derived_worktree_operations() {
+    if env::var("DAYTONA_API_KEY").is_err() {
+        return;
+    }
+    init_diagnostics();
+    let provider = DaytonaProvider::connect().await.expect("connect");
+    let working_directory = format!("/home/daytona/{}", unique("sd-hybrid-git"));
+    let spec = SandboxSpec::new(SandboxSource::Snapshot {
+        id: SnapshotId::try_new(TEST_SNAPSHOT).expect("valid snapshot id"),
+    })
+    .working_directory(&working_directory)
+    .ephemeral(true);
+    let sandbox = provider.create(&spec, None).await.expect("create");
+
+    let outcome = async {
+        if !sandbox.capabilities().supports(Capability::Git) || !sandbox.capabilities().git.native {
+            return Err("Daytona did not declare its hybrid git facet".to_owned());
+        }
+        let git = sandbox.git().ok_or("git facet missing")?;
+        let mut clone = GitCloneOptions::default();
+        clone.depth = Some(1);
+        git.clone_repo(
+            "https://github.com/octocat/Hello-World.git",
+            "hybrid-repo",
+            &clone,
+        )
+        .await
+        .map_err(|error| format!("native clone: {error}"))?;
+
+        sandbox
+            .fs()
+            .write("hybrid-repo/sandbox-driver.txt", b"hybrid git\n")
+            .await
+            .map_err(|error| format!("write worktree file: {error}"))?;
+        let status = git
+            .status("hybrid-repo")
+            .await
+            .map_err(|error| format!("derived status: {error}"))?;
+        if !status
+            .dirty_paths
+            .iter()
+            .any(|path| path == "sandbox-driver.txt")
+        {
+            return Err(format!("status did not report new file: {status:?}"));
+        }
+        git.add("hybrid-repo", &["sandbox-driver.txt".to_owned()])
+            .await
+            .map_err(|error| format!("derived add: {error}"))?;
+        let sha = git
+            .commit(
+                "hybrid-repo",
+                &GitCommitOptions::new(
+                    "test hybrid git",
+                    "sandbox-driver",
+                    "sandbox-driver@example.com",
+                ),
+            )
+            .await
+            .map_err(|error| format!("derived commit: {error}"))?;
+        if sha.len() != 40 {
+            return Err(format!("commit returned an unexpected SHA: {sha:?}"));
+        }
+        git.checkout("hybrid-repo", "sandbox-driver-test", true)
+            .await
+            .map_err(|error| format!("derived checkout: {error}"))?;
+        let branches = git
+            .branches("hybrid-repo")
+            .await
+            .map_err(|error| format!("derived branches: {error}"))?;
+        if branches.current.as_deref() != Some("sandbox-driver-test") {
+            return Err(format!("checkout did not select new branch: {branches:?}"));
+        }
+        Ok(())
+    }
+    .await;
+
+    sandbox.delete().await.expect("delete");
+    outcome.expect("live hybrid git");
 }
 
 #[tokio::test(flavor = "multi_thread")]

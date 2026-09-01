@@ -9,7 +9,7 @@ use crate::capabilities::{Capabilities, Capability};
 use crate::error::{Error, Result};
 use crate::exec::Exec;
 use crate::fs::Filesystem;
-use crate::git::Git;
+use crate::git::{Git, GitFacet};
 use crate::id::{SandboxId, SnapshotId};
 use crate::logs::Logs;
 use crate::pty::Pty;
@@ -163,9 +163,28 @@ pub trait Sandbox: Send + Sync {
         None
     }
 
-    /// Native git, when the provider has one. `None` means use the
-    /// library's exec-derived implementation.
-    fn git(&self) -> Option<&dyn Git> {
+    /// The complete git facet, when available.
+    ///
+    /// The provider chooses native, derived, or hybrid behavior. Callers do
+    /// not select the implementation. The returned facade is absent exactly
+    /// when [`Capabilities::git`](crate::Capabilities::git) reports that git
+    /// is unsupported.
+    fn git(&self) -> Option<GitFacet<'_>> {
+        if !self.capabilities().git.supported {
+            return None;
+        }
+        Some(match self.provider_git() {
+            Some(git) => GitFacet::provider(git),
+            None => GitFacet::derived(self.exec()),
+        })
+    }
+
+    /// Provider implementation hook for a native or hybrid git facet.
+    ///
+    /// Consumers call [`Sandbox::git`]. Providers override this method when
+    /// some or all git operations do not use [`crate::DerivedGit`].
+    #[doc(hidden)]
+    fn provider_git(&self) -> Option<&dyn Git> {
         None
     }
 
