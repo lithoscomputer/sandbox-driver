@@ -76,6 +76,9 @@ pub trait Exec: Send + Sync {
 pub struct ExecSpec {
     /// Bash source; see the trait-level contract.
     pub command:             String,
+    /// `None` waits forever. [`ExecSpec::new`] starts at
+    /// [`ExecSpec::DEFAULT_TIMEOUT`]; opt out with
+    /// [`ExecSpec::no_timeout`].
     pub timeout:             Option<Duration>,
     pub working_dir:         Option<String>,
     pub env:                 BTreeMap<String, String>,
@@ -89,15 +92,28 @@ pub struct ExecSpec {
 }
 
 impl ExecSpec {
+    /// Applied by [`ExecSpec::new`]: generous enough for a long build,
+    /// but a wedged command cannot hang a caller forever. fabro's exec
+    /// API made every caller pick a timeout; the default keeps that
+    /// fail-safe without forcing the choice.
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3600);
+
     pub fn new(command: impl Into<String>) -> Self {
         Self {
             command:             command.into(),
-            timeout:             None,
+            timeout:             Some(Self::DEFAULT_TIMEOUT),
             working_dir:         None,
             env:                 BTreeMap::new(),
             stdin:               None,
             output_sanitization: OutputSanitization::Raw,
         }
+    }
+
+    /// Deliberately unbounded: wait forever on the command.
+    #[must_use]
+    pub fn no_timeout(mut self) -> Self {
+        self.timeout = None;
+        self
     }
 
     #[must_use]
@@ -434,6 +450,13 @@ impl Default for StderrTail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_spec_defaults_to_a_bounded_timeout() {
+        let spec = ExecSpec::new("true");
+        assert_eq!(spec.timeout, Some(ExecSpec::DEFAULT_TIMEOUT));
+        assert_eq!(ExecSpec::new("true").no_timeout().timeout, None);
+    }
 
     #[test]
     fn exec_and_spawn_spec_debug_redact_secrets() {

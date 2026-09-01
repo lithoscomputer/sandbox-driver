@@ -422,9 +422,9 @@ impl ExecSpecDto {
 
     pub fn into_spec(self) -> Result<ExecSpec, sandbox_driver::Error> {
         let mut spec = ExecSpec::new(self.command);
-        if let Some(timeout_ms) = self.timeout_ms {
-            spec = spec.timeout(Duration::from_millis(timeout_ms));
-        }
+        // Wire semantics are authoritative: an absent timeout means
+        // unbounded, so the constructor's default must not leak in.
+        spec.timeout = self.timeout_ms.map(Duration::from_millis);
         if let Some(dir) = self.working_dir {
             spec = spec.working_dir(dir);
         }
