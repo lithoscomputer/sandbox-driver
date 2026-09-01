@@ -160,6 +160,40 @@ pub struct GitCloneOptions {
     pub credentials: Option<GitCredentials>,
 }
 
+impl GitCloneOptions {
+    /// Checks the options' own invariants: a pinned commit must be a
+    /// full 40-hex SHA, and a branch cannot be flag-shaped.
+    /// Implementations call this before running anything, so a bad pin
+    /// fails immediately instead of after the network operation — and a
+    /// flag-shaped value can never be read as an option.
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        if let Some(commit) = &self.commit {
+            if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(crate::Error::invalid_spec(
+                    "commit",
+                    "must be a full 40-character hex commit SHA",
+                ));
+            }
+        }
+        if let Some(branch) = &self.branch {
+            validate_branch_name(branch)?;
+        }
+        Ok(())
+    }
+}
+
+/// Rejects branch names git itself would refuse, before they can be
+/// read as flags: empty, or beginning with `-` (never a valid ref).
+pub(crate) fn validate_branch_name(branch: &str) -> Result<(), crate::Error> {
+    if branch.is_empty() || branch.starts_with('-') {
+        return Err(crate::Error::invalid_spec(
+            "branch",
+            "must not be empty or begin with '-'",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct GitCommitOptions {

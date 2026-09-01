@@ -150,7 +150,14 @@ impl DerivedGit<'_> {
         self.run(
             "git checkout",
             Some(target_path),
-            &["checkout".into(), "--detach".into(), commit.to_owned()],
+            &[
+                "checkout".into(),
+                "--detach".into(),
+                commit.to_owned(),
+                // Forces revision interpretation: a bare name that also
+                // matches a path would otherwise be ambiguous.
+                "--".into(),
+            ],
             GIT_TIMEOUT,
         )
         .await?;
@@ -201,6 +208,7 @@ impl Git for DerivedGit<'_> {
         target_path: &str,
         options: &GitCloneOptions,
     ) -> Result<()> {
+        options.validate()?;
         // Credentials travel in a per-call insteadOf rewrite, exactly as
         // push/pull do. The rewrite applies wherever the plain URL is
         // fetched from — positional or via the configured remote — while
@@ -371,11 +379,15 @@ impl Git for DerivedGit<'_> {
     }
 
     async fn checkout(&self, repo_path: &str, branch: &str, create: bool) -> Result<()> {
+        crate::git::validate_branch_name(branch)?;
         let mut args: Vec<String> = vec!["checkout".into()];
         if create {
             args.push("-b".into());
         }
         args.push(branch.to_owned());
+        // Forces branch interpretation: a branch that also matches a
+        // path would otherwise restore the file instead.
+        args.push("--".into());
         self.run("git checkout", Some(repo_path), &args, GIT_TIMEOUT)
             .await?;
         Ok(())
@@ -590,10 +602,42 @@ mod tests {
             commands[2]
         );
         assert!(
-            commands[3].contains(&format!("'checkout' '--detach' '{sha}'")),
+            commands[3].contains(&format!("'checkout' '--detach' '{sha}' '--'")),
             "{}",
             commands[3]
         );
+    }
+
+    #[tokio::test]
+    async fn clone_rejects_a_flag_shaped_commit_before_any_command() {
+        let exec = ScriptedExec::new(vec![]);
+        let git = DerivedGit::new(&exec);
+        let options = GitCloneOptions {
+            branch:      None,
+            // Parsed as a flag by the old code: `checkout --detach -q`
+            // exited 0 at the branch tip while pinning nothing.
+            commit:      Some("-q".to_owned()),
+            depth:       None,
+            credentials: None,
+        };
+        let error = git
+            .clone_repo("https://github.com/org/repo.git", "/dst", &options)
+            .await
+            .expect_err("flag-shaped commit is rejected");
+        assert!(matches!(error, Error::InvalidSpec { .. }), "{error}");
+        assert!(exec.commands().is_empty(), "no command may run");
+    }
+
+    #[tokio::test]
+    async fn checkout_rejects_a_flag_shaped_branch() {
+        let exec = ScriptedExec::new(vec![]);
+        let git = DerivedGit::new(&exec);
+        let error = git
+            .checkout("/repo", "-q", false)
+            .await
+            .expect_err("flag-shaped branch is rejected");
+        assert!(matches!(error, Error::InvalidSpec { .. }), "{error}");
+        assert!(exec.commands().is_empty(), "no command may run");
     }
 
     #[tokio::test]

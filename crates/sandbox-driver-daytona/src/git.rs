@@ -96,6 +96,7 @@ impl Git for DaytonaGit {
         target_path: &str,
         options: &GitCloneOptions,
     ) -> Result<()> {
+        options.validate()?;
         let sandbox = self
             .client
             .get(&self.sandbox_id)
