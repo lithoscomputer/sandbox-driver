@@ -213,15 +213,19 @@ impl Filesystem for DerivedFs {
     }
 
     async fn list_dir(&self, path: &str, depth: usize) -> Result<Vec<DirEntry>> {
+        // NUL-terminated records end to end (`find -print0`, `stat
+        // --printf '…\0'`): a file name containing a newline stays one
+        // verbatim record, where newline-split parsing corrupted the
+        // entry and its neighbors.
         let command = format!(
             "cd -- {} && find . -mindepth 1 -maxdepth {depth} -print0 \
-             | xargs -0 -r stat -c '%F|%s|%n' --",
+             | xargs -0 -r stat --printf '%F|%s|%n\\0' --",
             shell_quote(path)
         );
         let result = self.run("fs list_dir", command).await?;
         let text = result.stdout_lossy();
         let mut entries = Vec::new();
-        for line in text.lines() {
+        for line in text.split('\0') {
             let mut fields = line.splitn(3, '|');
             let (Some(kind), Some(size), Some(name)) =
                 (fields.next(), fields.next(), fields.next())
@@ -297,6 +301,20 @@ mod tests {
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
         assert_eq!(base64_encode(&[0, 255, 16]), "AP8Q");
+    }
+
+    #[tokio::test]
+    async fn list_dir_keeps_special_character_names_intact() {
+        use crate::test_exec::ScriptedExec;
+        let exec = Arc::new(ScriptedExec::new(vec![ScriptedExec::ok(
+            "regular file|3|./a|b\0regular file|5|./line\nbreak.txt\0directory|0|./sub\0",
+        )]));
+        let fs = DerivedFs::new(exec);
+        let entries = fs.list_dir("/dir", 1).await.expect("list");
+        let names: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+        // NUL records keep a newline or '|' in a name verbatim instead
+        // of corrupting the entry and its neighbors.
+        assert_eq!(names, vec!["a|b", "line\nbreak.txt", "sub"]);
     }
 
     #[test]
