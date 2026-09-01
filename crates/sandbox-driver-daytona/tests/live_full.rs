@@ -69,6 +69,76 @@ fn format_error_chain(error: &(dyn StdError + 'static)) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn requested_working_directory_is_created_and_survives_attach() {
+    if env::var("DAYTONA_API_KEY").is_err() {
+        return;
+    }
+    init_diagnostics();
+    let provider = DaytonaProvider::connect().await.expect("connect");
+    let working_directory = format!("/home/daytona/{}", unique("sd-working-directory"));
+    let spec = SandboxSpec::new(SandboxSource::Snapshot {
+        id: SnapshotId::try_new(TEST_SNAPSHOT).expect("valid snapshot id"),
+    })
+    .working_directory(&working_directory)
+    .ephemeral(true);
+    let sandbox = provider.create(&spec, None).await.expect("create");
+
+    let outcome = async {
+        if sandbox.working_directory() != working_directory {
+            return Err(format!(
+                "created handle returned working directory {:?}",
+                sandbox.working_directory()
+            ));
+        }
+        let pwd = sandbox
+            .exec()
+            .run(&ExecSpec::new("pwd").timeout(Duration::from_secs(30)))
+            .await
+            .map_err(|error| format!("created handle pwd: {error}"))?;
+        if pwd.stdout_lossy().trim() != working_directory {
+            return Err(format!(
+                "created handle used working directory {:?}",
+                pwd.stdout_lossy().trim()
+            ));
+        }
+
+        // Replacing user labels must retain the provider's stored directory.
+        let mut labels = BTreeMap::new();
+        labels.insert("sd-live".to_owned(), "working-directory".to_owned());
+        sandbox
+            .set_labels(&labels)
+            .await
+            .map_err(|error| format!("set_labels: {error}"))?;
+        let attached = provider
+            .attach(sandbox.id(), None)
+            .await
+            .map_err(|error| format!("attach: {error}"))?;
+        if attached.working_directory() != working_directory {
+            return Err(format!(
+                "attached handle returned working directory {:?}",
+                attached.working_directory()
+            ));
+        }
+        let attached_pwd = attached
+            .exec()
+            .run(&ExecSpec::new("pwd").timeout(Duration::from_secs(30)))
+            .await
+            .map_err(|error| format!("attached handle pwd: {error}"))?;
+        if attached_pwd.stdout_lossy().trim() != working_directory {
+            return Err(format!(
+                "attached handle used working directory {:?}",
+                attached_pwd.stdout_lossy().trim()
+            ));
+        }
+        Ok(())
+    }
+    .await;
+
+    sandbox.delete().await.expect("delete");
+    outcome.expect("live requested working directory");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn labels_timers_access_round_trip() {
     if env::var("DAYTONA_API_KEY").is_err() {
         return;

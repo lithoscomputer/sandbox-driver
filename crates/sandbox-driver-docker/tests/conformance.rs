@@ -21,6 +21,7 @@ async fn docker_provider_passes_conformance() {
         SandboxSpec::new(SandboxSource::Image {
             reference: TEST_IMAGE.to_owned(),
         })
+        .working_directory("/workspace/sandbox-driver-conformance")
     });
     let report = Conformance::new(Arc::new(provider), specs).run().await;
     report.assert_pass();

@@ -372,6 +372,8 @@ pub struct SandboxSpec {
 
 `provider_config` is the pressure valve: Daytona's GPU type preference lists, spot instances, linked sandboxes, warm-pool hints, and future boxd golden-image options live there without polluting the common spec. It crosses the JSON-RPC boundary opaquely.
 
+`working_directory` is the final workspace directory chosen before creation. A provider creates it when needed, uses it as the default for relative file and process operations, and returns the same value from handles created by `attach`. The Host provider treats an explicit path as caller-owned and does not delete it.
+
 **The spec is an unvalidated serializable request.** Its fields are public and it can express combinations no provider accepts. The protocol adapter maps it to the stable version-1 wire DTO; in particular, the public typed snapshot `id` still crosses as `source.snapshot.name`. Validation happens at the provider boundary: every provider calls `SandboxSpec::validate()` (the cross-provider invariants — known sandbox kind, mutually exclusive idle timers, absolute mount paths, non-empty ids) and layers its own provider-specific checks, returning the typed `Error::InvalidSpec` naming the field. The builder setters are construction convenience, not an invariant guarantee.
 
 **Not in the spec:** clone URLs, branches, tags, commit SHAs, GitHub credentials. Fabro's spec carries these today, but cloning is an orchestration recipe over `Exec` + `Git`, not a provisioning concern — it stays in fabro (with its repo-layout, pinned-revision, and retry logic).

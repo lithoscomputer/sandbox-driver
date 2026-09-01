@@ -92,6 +92,7 @@ pub use crate::logs::DaytonaLogs;
 pub use crate::pty::DaytonaPty;
 
 const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
+const WORKING_DIRECTORY_LABEL: &str = "sh.sandbox-driver.working-directory";
 const FALLBACK_WORKING_DIR: &str = "/home/daytona";
 const CREATE_TIMEOUT: Duration = Duration::from_secs(600);
 /// Dockerfile sources build the image during create; real builds exceed
@@ -112,6 +113,10 @@ const SNAPSHOT_ACTIVATE_POLL: Duration = Duration::from_secs(5);
 /// paginated endpoints truncate an unpaged request to their own default
 /// page size, so listings must walk `total_pages` explicitly.
 const LIST_PAGE_SIZE: i32 = 100;
+
+fn is_internal_label(key: &str) -> bool {
+    matches!(key, MANAGED_LABEL | WORKING_DIRECTORY_LABEL)
+}
 
 /// Scopes every sandbox-driver Daytona operation may need, paired with
 /// their wire names for [`ProviderHealth::missing_permissions`].
@@ -401,7 +406,7 @@ fn status_from_sdk(
     status.labels = sdk
         .labels
         .iter()
-        .filter(|(key, _)| *key != MANAGED_LABEL)
+        .filter(|(key, _)| !is_internal_label(key))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     status.source.clone_from(&sdk.snapshot);
@@ -646,11 +651,15 @@ async fn build_handle(
     sdk: daytona_sdk::Sandbox,
     events: EventEmitter,
 ) -> Result<Arc<DaytonaSandbox>> {
-    let working_dir = match sdk.get_working_dir().await {
-        Ok(dir) => dir,
-        // A stopped sandbox has no reachable toolbox; use the
-        // conventional home until the next exec resolves it.
-        Err(_) => FALLBACK_WORKING_DIR.to_owned(),
+    let working_dir = match sdk.labels.get(WORKING_DIRECTORY_LABEL) {
+        Some(dir) => dir.clone(),
+        None => match sdk.get_working_dir().await {
+            Ok(dir) => dir,
+            // A stopped sandbox has no reachable toolbox; legacy sandboxes
+            // have no stored requested directory, so use the conventional
+            // home until the next attach while running.
+            Err(_) => FALLBACK_WORKING_DIR.to_owned(),
+        },
     };
     let id = SandboxId::try_new(&sdk.id)
         .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
@@ -833,9 +842,16 @@ fn base_params(spec: &SandboxSpec) -> Result<SandboxBaseParams> {
     let mut labels: HashMap<String, String> = spec
         .labels
         .iter()
+        .filter(|(key, _)| !is_internal_label(key))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     labels.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
+    if let Some(working_directory) = &spec.working_directory {
+        labels.insert(
+            WORKING_DIRECTORY_LABEL.to_owned(),
+            working_directory.clone(),
+        );
+    }
     Ok(SandboxBaseParams {
         name: spec.name.clone(),
         user: spec.user.clone(),
@@ -979,6 +995,22 @@ impl SandboxProvider for DaytonaProvider {
                                 ),
                             );
                             return Err(self.cleanup_failed_create(&id, error).await);
+                        }
+                    }
+                    if let Some(working_directory) = &spec.working_directory {
+                        let initialized = async {
+                            let fs = created.fs().await.map_err(|error| {
+                                daytona_error("connecting to the toolbox", error)
+                            })?;
+                            fs.create_folder(working_directory, Some("0755"))
+                                .await
+                                .map_err(|error| {
+                                    daytona_error("creating requested working directory", error)
+                                })
+                        }
+                        .await;
+                        if let Err(error) = initialized {
+                            return Err(self.cleanup_failed_create(&created.id, error).await);
                         }
                     }
                     Ok(self.handle(created, handle_emitter).await? as Arc<dyn Sandbox>)
@@ -1696,9 +1728,11 @@ impl Sandbox for DaytonaSandbox {
     async fn set_labels(&self, labels: &BTreeMap<String, String>) -> Result<()> {
         let mut all: HashMap<String, String> = labels
             .iter()
+            .filter(|(key, _)| !is_internal_label(key))
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         all.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
+        all.insert(WORKING_DIRECTORY_LABEL.to_owned(), self.working_dir.clone());
         self.events
             .run(
                 EventSubject::sandbox(Some(self.id.clone())),
@@ -2351,6 +2385,35 @@ mod tests {
         assert!(snapshots.from_image_kinds.virtual_machine);
         assert!(snapshots.from_dockerfile_kinds.container);
         assert!(!snapshots.from_dockerfile_kinds.virtual_machine);
+    }
+
+    #[test]
+    fn base_params_store_the_requested_working_directory_as_internal_metadata() {
+        let spec = SandboxSpec::new(SandboxSource::Image {
+            reference: "debian:stable-slim".to_owned(),
+        })
+        .label(WORKING_DIRECTORY_LABEL, "/caller-cannot-override")
+        .working_directory("/workspace/final");
+
+        let base = base_params(&spec).expect("valid base params");
+        let labels = base.labels.expect("managed labels");
+        assert_eq!(
+            labels.get(WORKING_DIRECTORY_LABEL).map(String::as_str),
+            Some("/workspace/final")
+        );
+        assert_eq!(labels.get(MANAGED_LABEL).map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn base_params_do_not_accept_internal_metadata_as_a_user_label() {
+        let spec = SandboxSpec::new(SandboxSource::Image {
+            reference: "debian:stable-slim".to_owned(),
+        })
+        .label(WORKING_DIRECTORY_LABEL, "/caller-injected");
+
+        let base = base_params(&spec).expect("valid base params");
+        let labels = base.labels.expect("managed labels");
+        assert!(!labels.contains_key(WORKING_DIRECTORY_LABEL));
     }
 
     #[test]

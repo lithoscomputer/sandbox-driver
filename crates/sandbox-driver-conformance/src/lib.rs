@@ -243,7 +243,16 @@ impl Conformance {
     }
 
     async fn ready(&self) -> Result<Arc<dyn Sandbox>, String> {
-        let sandbox = self.create().await?;
+        let spec = self.specs.spec();
+        self.ready_from_spec(&spec).await
+    }
+
+    async fn ready_from_spec(&self, spec: &SandboxSpec) -> Result<Arc<dyn Sandbox>, String> {
+        let sandbox = self
+            .provider
+            .create(spec, None)
+            .await
+            .map_err(|error| format!("create failed: {error}"))?;
         if let Err(error) = activate(sandbox.as_ref(), &self.wait).await {
             let _ = sandbox.delete().await;
             return Err(format!("activate failed: {error}"));
@@ -450,8 +459,18 @@ async fn activate_passes_bash_probe(ctx: &Conformance) -> CheckOutcome {
 }
 
 async fn working_directory_is_effective(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.ready().await?;
+    let spec = ctx.specs.spec();
+    let requested = spec.working_directory.clone();
+    let sandbox = ctx.ready_from_spec(&spec).await?;
     let outcome = async {
+        if let Some(requested) = &requested {
+            if sandbox.working_directory() != requested {
+                return fail(format!(
+                    "requested working_directory {requested:?}, handle returned {:?}",
+                    sandbox.working_directory()
+                ));
+            }
+        }
         let result = sandbox
             .exec()
             .run(&ExecSpec::new("pwd").timeout(Duration::from_secs(30)))
@@ -461,6 +480,28 @@ async fn working_directory_is_effective(ctx: &Conformance) -> CheckOutcome {
         let expected = sandbox.working_directory();
         if pwd != expected {
             return fail(format!("pwd is {pwd:?}, working_directory is {expected:?}"));
+        }
+        let attached = ctx
+            .provider
+            .attach(sandbox.id(), None)
+            .await
+            .map_err(|error| format!("attach failed: {error}"))?;
+        if attached.working_directory() != expected {
+            return fail(format!(
+                "attached working_directory is {:?}, expected {expected:?}",
+                attached.working_directory()
+            ));
+        }
+        let attached_result = attached
+            .exec()
+            .run(&ExecSpec::new("pwd").timeout(Duration::from_secs(30)))
+            .await
+            .map_err(|error| format!("attached exec failed: {error}"))?;
+        let attached_pwd = attached_result.stdout_lossy().trim().to_owned();
+        if attached_pwd != expected {
+            return fail(format!(
+                "attached pwd is {attached_pwd:?}, working_directory is {expected:?}"
+            ));
         }
         PASS
     }

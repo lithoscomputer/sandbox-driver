@@ -169,7 +169,9 @@ pub struct SandboxSpec {
     pub labels:            BTreeMap<String, String>,
     #[serde(default)]
     pub user:              Option<String>,
-    /// For the Host provider: `Some(path)` designates a caller-owned
+    /// The workspace directory commands use by default. Providers create
+    /// it when needed and preserve it when a sandbox is attached again.
+    /// For the Host provider, `Some(path)` designates a caller-owned
     /// directory that `delete` must never remove; `None` asks for a
     /// managed temporary workspace.
     #[serde(default)]

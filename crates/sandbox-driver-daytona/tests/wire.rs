@@ -55,6 +55,7 @@ fn default_spec() -> SandboxSpec {
         id: SnapshotId::try_new(TEST_SNAPSHOT).expect("valid snapshot id"),
     })
     .sandbox_kind(SandboxKind::Container)
+    .working_directory("/home/daytona/sandbox-driver-conformance")
     .ephemeral(true)
 }
 
