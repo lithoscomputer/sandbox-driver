@@ -87,7 +87,14 @@ impl Services for DerivedServices<'_> {
             let _ = writeln!(script, "cd -- {} || exit 8", shell_quote(dir));
         }
         for (key, value) in &spec.env {
-            let _ = writeln!(script, "export {key}={}", shell_quote(value));
+            // Quote the key as well as the value: a malformed key must
+            // corrupt nothing but its own export, never the script.
+            let _ = writeln!(
+                script,
+                "export {}={}",
+                shell_quote(key),
+                shell_quote(value)
+            );
         }
         script.push_str("export SANDBOX_DRIVER_SERVICE_DIR=\"$dir\"\n");
         // The exit record is what status trusts: a sandbox whose PID 1
@@ -192,6 +199,27 @@ impl Services for DerivedServices<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_exec::ScriptedExec;
+
+    #[tokio::test]
+    async fn spawn_quotes_env_keys_as_well_as_values() {
+        let exec = ScriptedExec::new(vec![ScriptedExec::ok("sandbox-driver-service-Ab3dEf01\n")]);
+        let services = DerivedServices::new(&exec);
+        let spec = ServiceSpec::new("run-server").env_var("BAD KEY; touch /pwned", "x");
+        services.spawn(&spec).await.expect("spawn");
+
+        let command = &exec.commands()[0];
+        // The whole assignment stays inside the export word: a hostile
+        // key corrupts only its own export, never the script.
+        assert!(
+            command.contains("export 'BAD KEY; touch /pwned'='x'"),
+            "script: {command}"
+        );
+        assert!(
+            !command.contains("export BAD KEY"),
+            "unquoted key must not reach the script: {command}"
+        );
+    }
 
     #[test]
     fn foreign_ids_are_rejected_before_reaching_a_path() {
