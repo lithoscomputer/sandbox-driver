@@ -26,13 +26,6 @@ impl Default for WaitOptions {
     }
 }
 
-/// Polls [`Sandbox::describe`] until the sandbox reaches `target`.
-///
-/// The one generic wait loop, replacing per-call hand-written loops:
-/// fails with the provider's `error_reason` when the sandbox enters
-/// [`SandboxState::Error`] (unless `Error` is the target), and with
-/// [`Error::Timeout`] when the deadline passes. `Deleted` counts as
-/// `Stopped` for ephemeral sandboxes that vanish on stop.
 /// Polls [`Sandbox::describe`] until the state settles (per
 /// [`SandboxState::is_stable`]). Unlike [`wait_for_state`], `Error` is a
 /// valid outcome — the caller decides what to do with the settled state.
@@ -63,6 +56,13 @@ pub async fn wait_for_stable_state(
     }
 }
 
+/// Polls [`Sandbox::describe`] until the sandbox reaches `target`.
+///
+/// The one generic wait loop, replacing per-call hand-written loops:
+/// fails with the provider's `error_reason` when the sandbox enters
+/// [`SandboxState::Error`] (unless `Error` is the target), and with
+/// [`Error::Timeout`] when the deadline passes. `Deleted` counts as
+/// `Stopped` for ephemeral sandboxes that vanish on stop.
 #[tracing::instrument(
     skip_all,
     fields(sandbox_id = %sandbox.id(), target = ?target),
