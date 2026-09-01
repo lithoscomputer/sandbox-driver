@@ -31,9 +31,10 @@ use std::{env, io, process};
 use async_trait::async_trait;
 use sandbox_driver::{
     Action, Capabilities, Error, EventContext, EventEmitter, EventSubject, Exec, ExecSpec,
-    Filesystem, HealthStatus, Isolation, PlatformInfo, Progress, ProgressCode, ProviderHealth,
-    ProviderKind, ResourceKind, Result, Sandbox, SandboxFilter, SandboxId, SandboxProvider,
-    SandboxSource, SandboxSpec, SandboxState, SandboxStatus, WorkspaceOwnership,
+    Filesystem, HealthStatus, Isolation, LifecycleTimers, PlatformInfo, Progress, ProgressCode,
+    ProviderHealth, ProviderKind, ResourceKind, Resources, Result, Sandbox, SandboxFilter,
+    SandboxId, SandboxProvider, SandboxSource, SandboxSpec, SandboxState, SandboxStatus,
+    WorkspaceOwnership,
 };
 use tokio::fs as tokio_fs;
 
@@ -88,6 +89,61 @@ fn host_capabilities() -> Capabilities {
     caps
 }
 
+fn validate_supported_creation_fields(spec: &SandboxSpec) -> Result<()> {
+    if spec.resources != Resources::default() {
+        return Err(Error::invalid_spec(
+            "resources",
+            "the host provider does not manage compute resources",
+        ));
+    }
+    if spec.user.is_some() {
+        return Err(Error::invalid_spec(
+            "user",
+            "the host provider always runs as the calling user",
+        ));
+    }
+    if !matches!(
+        &spec.network,
+        sandbox_driver::NetworkPolicy::ProviderDefault
+    ) {
+        return Err(Error::invalid_spec(
+            "network",
+            "the host provider does not manage host networking",
+        ));
+    }
+    if spec.timers != LifecycleTimers::default() {
+        return Err(Error::invalid_spec(
+            "timers",
+            "the host provider does not support lifecycle timers",
+        ));
+    }
+    if spec.ephemeral {
+        return Err(Error::invalid_spec(
+            "ephemeral",
+            "the host provider does not support stop-triggered deletion",
+        ));
+    }
+    if spec.public.is_some() {
+        return Err(Error::invalid_spec(
+            "public",
+            "the host provider does not manage public access",
+        ));
+    }
+    if spec.region.is_some() {
+        return Err(Error::invalid_spec(
+            "region",
+            "the host provider does not select a region",
+        ));
+    }
+    if !spec.provider_config.is_null() {
+        return Err(Error::invalid_spec(
+            "provider_config",
+            "the host provider has no provider-specific creation options",
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl SandboxProvider for HostProvider {
     fn kind(&self) -> &ProviderKind {
@@ -111,6 +167,7 @@ impl SandboxProvider for HostProvider {
         events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
         spec.validate()?;
+        validate_supported_creation_fields(spec)?;
         if spec.sandbox_kind.is_some() {
             return Err(Error::invalid_spec(
                 "sandbox_kind",

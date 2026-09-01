@@ -1754,6 +1754,7 @@ dependencies = [
  "nix",
  "sandbox-driver",
  "sandbox-driver-conformance",
+ "serde_json",
  "tokio",
  "tokio-util",
  "tracing",

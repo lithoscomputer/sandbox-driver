@@ -936,6 +936,18 @@ fn sdk_resources(resources: &Resources) -> Option<daytona_sdk::Resources> {
     })
 }
 
+fn validate_supported_creation_fields(spec: &SandboxSpec) -> Result<()> {
+    if matches!(&spec.source, SandboxSource::Snapshot { .. })
+        && spec.resources != Resources::default()
+    {
+        return Err(Error::invalid_spec(
+            "resources",
+            "a Daytona sandbox created from a snapshot inherits the snapshot resources",
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl SandboxProvider for DaytonaProvider {
     fn kind(&self) -> &ProviderKind {
@@ -953,6 +965,7 @@ impl SandboxProvider for DaytonaProvider {
         events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
         spec.validate()?;
+        validate_supported_creation_fields(spec)?;
         let base = base_params(spec)?;
         let params = match &spec.source {
             SandboxSource::Image { reference } => {
@@ -2437,6 +2450,31 @@ mod tests {
         let base = base_params(&spec).expect("valid base params");
         let labels = base.labels.expect("managed labels");
         assert!(!labels.contains_key(WORKING_DIRECTORY_LABEL));
+    }
+
+    #[test]
+    fn snapshot_sandbox_resource_overrides_return_invalid_spec() {
+        let mut spec = SandboxSpec::new(SandboxSource::Snapshot {
+            id: SnapshotId::try_new("snapshot").expect("valid snapshot id"),
+        });
+        spec.resources.cpu_cores = Some(2);
+
+        let error = validate_supported_creation_fields(&spec)
+            .expect_err("snapshot resources should be inherited");
+        assert!(matches!(error, Error::InvalidSpec { field, .. } if field == "resources"));
+    }
+
+    #[test]
+    fn image_sandbox_resource_overrides_pass_creation_field_validation() {
+        let mut spec = SandboxSpec::new(SandboxSource::Image {
+            reference: "debian:stable-slim".to_owned(),
+        });
+        spec.resources.cpu_cores = Some(2);
+        spec.resources.memory_mb = Some(4096);
+        spec.resources.disk_mb = Some(10 * 1024);
+        spec.resources.gpus = Some(1);
+
+        validate_supported_creation_fields(&spec).expect("image resources are supported");
     }
 
     #[test]

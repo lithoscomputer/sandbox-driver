@@ -10,9 +10,9 @@ use std::{env, process};
 use async_trait::async_trait;
 use sandbox_driver::{
     Action, DerivedGit, DerivedSearch, Error, Event, EventBody, EventContext, EventObserver,
-    ExecControls, ExecSpec, Git, GitCommitOptions, GrepOptions, OutputStream, SandboxFilter,
-    SandboxId, SandboxProvider, SandboxSource, SandboxSpec, Search, SpawnSpec, StdioProcessHandle,
-    Termination, WaitOptions, WalkOptions, WorkspaceOwnership, activate,
+    ExecControls, ExecSpec, Git, GitCommitOptions, GrepOptions, NetworkPolicy, OutputStream,
+    SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec, Search, SpawnSpec,
+    StdioProcessHandle, Termination, WaitOptions, WalkOptions, WorkspaceOwnership, activate,
 };
 use sandbox_driver_host::HostProvider;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -54,6 +54,54 @@ async fn managed_workspace_is_created_and_removed() {
     sandbox.delete().await.expect("delete");
     assert!(!workspace.exists());
     sandbox.delete().await.expect("delete is idempotent");
+}
+
+#[tokio::test]
+async fn unsupported_creation_fields_return_invalid_spec() {
+    let provider = HostProvider::new();
+    let mut cases = Vec::new();
+
+    let mut spec = host_spec();
+    spec.resources.cpu_cores = Some(1);
+    cases.push(("resources", spec));
+
+    let mut spec = host_spec();
+    spec.user = Some("sandbox".to_owned());
+    cases.push(("user", spec));
+
+    let mut spec = host_spec();
+    spec.network = NetworkPolicy::AllowAll;
+    cases.push(("network", spec));
+
+    let mut spec = host_spec();
+    spec.timers.auto_stop_after_idle = Some(Duration::from_secs(60));
+    cases.push(("timers", spec));
+
+    let mut spec = host_spec();
+    spec.ephemeral = true;
+    cases.push(("ephemeral", spec));
+
+    let mut spec = host_spec();
+    spec.public = Some(false);
+    cases.push(("public", spec));
+
+    let mut spec = host_spec();
+    spec.region = Some("local".to_owned());
+    cases.push(("region", spec));
+
+    let mut spec = host_spec();
+    spec.provider_config = serde_json::json!({});
+    cases.push(("provider_config", spec));
+
+    for (expected_field, spec) in cases {
+        let Err(error) = provider.create(&spec, None).await else {
+            panic!("unsupported field {expected_field} created a sandbox");
+        };
+        assert!(
+            matches!(&error, Error::InvalidSpec { field, .. } if field == expected_field),
+            "expected InvalidSpec for {expected_field}, got {error}"
+        );
+    }
 }
 
 #[tokio::test]

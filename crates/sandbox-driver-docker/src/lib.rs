@@ -42,10 +42,10 @@ use bollard::models::{ContainerInspectResponse, ContainerStateStatusEnum, HostCo
 use futures_util::StreamExt;
 use sandbox_driver::{
     Action, Capabilities, Error, EventContext, EventEmitter, EventSubject, Exec, ExecSpec,
-    Filesystem, HealthStatus, Isolation, NetworkPolicy, OperationReporter, PlatformInfo, Progress,
-    ProgressCode, ProviderError, ProviderHealth, ProviderKind, Pty, PtyCaps, ResourceKind, Result,
-    Sandbox, SandboxFilter, SandboxId, SandboxKind, SandboxProvider, SandboxSource, SandboxSpec,
-    SandboxState, SandboxStatus, ShellCommand,
+    Filesystem, HealthStatus, Isolation, LifecycleTimers, NetworkPolicy, OperationReporter,
+    PlatformInfo, Progress, ProgressCode, ProviderError, ProviderHealth, ProviderKind, Pty,
+    PtyCaps, ResourceKind, Result, Sandbox, SandboxFilter, SandboxId, SandboxKind, SandboxProvider,
+    SandboxSource, SandboxSpec, SandboxState, SandboxStatus, ShellCommand,
 };
 
 use crate::access::DockerShellCommand;
@@ -326,6 +326,52 @@ fn network_mode(policy: &NetworkPolicy) -> Result<Option<String>> {
     }
 }
 
+fn validate_supported_creation_fields(spec: &SandboxSpec) -> Result<()> {
+    if spec.resources.disk_mb.is_some() {
+        return Err(Error::invalid_spec(
+            "resources.disk_mb",
+            "the docker provider does not enforce a writable-layer disk limit",
+        ));
+    }
+    if spec.resources.gpus.is_some() {
+        return Err(Error::invalid_spec(
+            "resources.gpus",
+            "the docker provider does not configure GPU devices",
+        ));
+    }
+    if spec.user.is_some() {
+        return Err(Error::invalid_spec(
+            "user",
+            "the docker provider does not configure the container user",
+        ));
+    }
+    if spec.timers != LifecycleTimers::default() {
+        return Err(Error::invalid_spec(
+            "timers",
+            "the docker provider does not support lifecycle timers",
+        ));
+    }
+    if spec.ephemeral {
+        return Err(Error::invalid_spec(
+            "ephemeral",
+            "the docker provider does not delete a container when it stops",
+        ));
+    }
+    if spec.public.is_some() {
+        return Err(Error::invalid_spec(
+            "public",
+            "the docker provider does not manage public access",
+        ));
+    }
+    if spec.region.is_some() {
+        return Err(Error::invalid_spec(
+            "region",
+            "the docker provider does not select a region",
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl SandboxProvider for DockerProvider {
     fn kind(&self) -> &ProviderKind {
@@ -343,6 +389,7 @@ impl SandboxProvider for DockerProvider {
         events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
         spec.validate()?;
+        validate_supported_creation_fields(spec)?;
         if matches!(spec.sandbox_kind, Some(kind) if kind != SandboxKind::Container) {
             return Err(Error::invalid_spec(
                 "sandbox_kind",
@@ -788,6 +835,21 @@ impl Sandbox for DockerSandbox {
 mod tests {
     use super::*;
 
+    fn image_spec() -> SandboxSpec {
+        SandboxSpec::new(SandboxSource::Image {
+            reference: "debian:stable-slim".to_owned(),
+        })
+    }
+
+    fn assert_invalid_field(spec: &SandboxSpec, expected_field: &str) {
+        let error = validate_supported_creation_fields(spec)
+            .expect_err("unsupported field should fail validation");
+        assert!(
+            matches!(&error, Error::InvalidSpec { field, .. } if field == expected_field),
+            "expected InvalidSpec for {expected_field}, got {error}"
+        );
+    }
+
     #[test]
     fn pull_options_default_a_bare_reference_to_latest() {
         let options = pull_options("ubuntu");
@@ -814,5 +876,44 @@ mod tests {
         let options = pull_options("img@sha256:abc123");
         assert_eq!(options.from_image, "img@sha256:abc123");
         assert_eq!(options.tag, "");
+    }
+
+    #[test]
+    fn unsupported_creation_fields_return_invalid_spec() {
+        let mut spec = image_spec();
+        spec.resources.disk_mb = Some(1024);
+        assert_invalid_field(&spec, "resources.disk_mb");
+
+        let mut spec = image_spec();
+        spec.resources.gpus = Some(1);
+        assert_invalid_field(&spec, "resources.gpus");
+
+        let mut spec = image_spec();
+        spec.user = Some("sandbox".to_owned());
+        assert_invalid_field(&spec, "user");
+
+        let mut spec = image_spec();
+        spec.timers.auto_stop_after_idle = Some(Duration::from_secs(60));
+        assert_invalid_field(&spec, "timers");
+
+        let mut spec = image_spec();
+        spec.ephemeral = true;
+        assert_invalid_field(&spec, "ephemeral");
+
+        let mut spec = image_spec();
+        spec.public = Some(false);
+        assert_invalid_field(&spec, "public");
+
+        let mut spec = image_spec();
+        spec.region = Some("local".to_owned());
+        assert_invalid_field(&spec, "region");
+    }
+
+    #[test]
+    fn supported_cpu_and_memory_requests_pass_creation_field_validation() {
+        let mut spec = image_spec();
+        spec.resources.cpu_cores = Some(2);
+        spec.resources.memory_mb = Some(4096);
+        validate_supported_creation_fields(&spec).expect("CPU and memory are supported");
     }
 }
