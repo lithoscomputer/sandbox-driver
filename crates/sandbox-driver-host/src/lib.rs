@@ -335,7 +335,10 @@ pub struct HostSandbox {
     labels:            BTreeMap<String, String>,
     state:             Arc<Mutex<SandboxState>>,
     env:               BTreeMap<String, String>,
-    exec:              HostExec,
+    /// Shared across attached handles: one sandbox resolves Bash once
+    /// (`HostExec` remembers it), so two handles can never split across
+    /// two interpreters when `PATH` changes mid-process.
+    exec:              Arc<HostExec>,
     fs:                HostFs,
     events:            EventEmitter,
     working_directory: String,
@@ -358,11 +361,11 @@ impl HostSandbox {
             id,
             name,
             capabilities,
-            exec: HostExec::new(
+            exec: Arc::new(HostExec::new(
                 workspace.clone(),
                 env.clone(),
                 matches!(ownership, WorkspaceOwnership::Managed),
-            ),
+            )),
             fs: HostFs::new(workspace.clone()),
             workspace,
             ownership,
@@ -385,11 +388,7 @@ impl HostSandbox {
             labels: self.labels.clone(),
             state: Arc::clone(&self.state),
             env: self.env.clone(),
-            exec: HostExec::new(
-                self.workspace.clone(),
-                self.env.clone(),
-                matches!(self.ownership, WorkspaceOwnership::Managed),
-            ),
+            exec: Arc::clone(&self.exec),
             fs: HostFs::new(self.workspace.clone()),
             events,
             working_directory: self.working_directory.clone(),
@@ -505,7 +504,7 @@ impl Sandbox for HostSandbox {
     }
 
     fn exec(&self) -> &dyn Exec {
-        &self.exec
+        &*self.exec
     }
 
     fn fs(&self) -> &dyn Filesystem {
