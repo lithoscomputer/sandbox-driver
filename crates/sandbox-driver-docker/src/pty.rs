@@ -127,10 +127,22 @@ struct DockerPtySession {
 impl DockerPtySession {
     async fn kill_shell(&self) -> Result<()> {
         let pid_file = shell_quote(&self.pid_file);
+        // TERM the shell's process group (falling back to the pid), wait
+        // briefly, then KILL what remains — a shell that ignores TERM
+        // must still die. Children in their own job-control groups get
+        // the kernel's HUP when the shell and its TTY go away, matching
+        // a real terminal close.
         let command = format!(
             "if [ -f {pid_file} ]; then \
-             kill -TERM \"$(cat {pid_file})\" 2>/dev/null || true; \
-             rm -f {pid_file}; fi"
+             pid=$(cat {pid_file}); rm -f {pid_file}; \
+             case \"$pid\" in ''|*[!0-9]*) : ;; *) \
+             kill -TERM -- \"-$pid\" 2>/dev/null || kill -TERM -- \"$pid\" 2>/dev/null || true; \
+             for _ in 1 2 3 4 5; do \
+             kill -0 \"$pid\" 2>/dev/null || break; sleep 0.2; done; \
+             if kill -0 \"$pid\" 2>/dev/null; then \
+             kill -KILL -- \"-$pid\" 2>/dev/null || true; \
+             kill -KILL -- \"$pid\" 2>/dev/null || true; fi ;; \
+             esac; fi"
         );
         let cleanup = self
             .docker
@@ -138,7 +150,10 @@ impl DockerPtySession {
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
                 tty: Some(false),
-                cmd: Some(vec!["sh".to_owned(), "-lc".to_owned(), command]),
+                // Bash, not sh: dash's `kill` builtin rejects the `--`
+                // separator the group kills need ("Illegal number: -"),
+                // and the image contract already requires bash.
+                cmd: Some(vec!["bash".to_owned(), "-c".to_owned(), command]),
                 working_dir: Some("/".to_owned()),
                 env: Some(vec![format!("{BASH_ENV_VAR}=")]),
                 ..Default::default()
