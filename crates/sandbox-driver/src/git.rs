@@ -151,6 +151,10 @@ impl fmt::Debug for GitCredentials {
 #[non_exhaustive]
 pub struct GitCloneOptions {
     pub branch:      Option<String>,
+    /// Full commit SHA to pin the checkout to, left detached at that
+    /// commit. The pin is fetched directly, so it works with any
+    /// `depth` and never falls back to the branch head; `branch` names
+    /// no constraint on which revision is fetched.
     pub commit:      Option<String>,
     pub depth:       Option<u32>,
     pub credentials: Option<GitCredentials>,

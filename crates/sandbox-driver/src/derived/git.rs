@@ -91,6 +91,73 @@ impl<'e> DerivedGit<'e> {
     }
 }
 
+impl DerivedGit<'_> {
+    /// Pinned-commit clone: init, add the remote, fetch the commit SHA
+    /// directly, and detach at it.
+    ///
+    /// A plain clone only fetches the tip of one branch under
+    /// `--depth`/`--single-branch`, so a pinned commit outside that
+    /// window was never fetched and the checkout fails. Fetching the
+    /// SHA itself keeps the pin independent of both depth and branch;
+    /// an unavailable commit fails rather than falling back to the
+    /// branch head.
+    async fn clone_pinned(
+        &self,
+        url: &str,
+        target_path: &str,
+        options: &GitCloneOptions,
+        commit: &str,
+        rewrite: Option<&str>,
+    ) -> Result<()> {
+        self.run(
+            "git init",
+            None,
+            &["init".into(), "--".into(), target_path.to_owned()],
+            GIT_TIMEOUT,
+        )
+        .await?;
+        self.run(
+            "git remote add",
+            Some(target_path),
+            &[
+                "remote".into(),
+                "add".into(),
+                "--".into(),
+                "origin".into(),
+                url.to_owned(),
+            ],
+            GIT_TIMEOUT,
+        )
+        .await?;
+
+        let mut args: Vec<String> = Vec::new();
+        if let Some(rewrite) = rewrite {
+            args.push("-c".into());
+            args.push(rewrite.to_owned());
+        }
+        args.push("fetch".into());
+        if let Some(depth) = options.depth {
+            args.push("--depth".into());
+            args.push(depth.to_string());
+        }
+        args.push("--no-tags".into());
+        args.push("origin".into());
+        args.push("--".into());
+        args.push(commit.to_owned());
+        self.run("git fetch", Some(target_path), &args, CLONE_TIMEOUT)
+            .await?;
+
+        self.run(
+            "git checkout",
+            Some(target_path),
+            &["checkout".into(), "--detach".into(), commit.to_owned()],
+            GIT_TIMEOUT,
+        )
+        .await?;
+        Ok(())
+    }
+}
+
 /// Embeds credentials into an http(s) URL; `None` for other schemes.
 fn authed_url(url: &str, credentials: &GitCredentials) -> Option<String> {
     let (scheme, rest) = url.split_once("://")?;
@@ -134,18 +201,26 @@ impl Git for DerivedGit<'_> {
         target_path: &str,
         options: &GitCloneOptions,
     ) -> Result<()> {
-        let mut args: Vec<String> = Vec::new();
         // Credentials travel in a per-call insteadOf rewrite, exactly as
-        // push/pull do. The rewrite applies during clone's fetch, while
-        // the positional URL — which git records verbatim as
-        // `remote.origin.url` — stays plain.
-        if let Some(authed) = options
+        // push/pull do. The rewrite applies wherever the plain URL is
+        // fetched from — positional or via the configured remote — while
+        // `remote.origin.url` stays plain.
+        let rewrite = options
             .credentials
             .as_ref()
             .and_then(|credentials| authed_url(url, credentials))
-        {
+            .map(|authed| format!("url.{authed}.insteadOf={url}"));
+
+        if let Some(commit) = &options.commit {
+            return self
+                .clone_pinned(url, target_path, options, commit, rewrite.as_deref())
+                .await;
+        }
+
+        let mut args: Vec<String> = Vec::new();
+        if let Some(rewrite) = &rewrite {
             args.push("-c".into());
-            args.push(format!("url.{authed}.insteadOf={url}"));
+            args.push(rewrite.clone());
         }
         args.push("clone".into());
         if let Some(depth) = options.depth {
@@ -166,16 +241,6 @@ impl Git for DerivedGit<'_> {
         args.push(url.to_owned());
         args.push(target_path.to_owned());
         self.run("git clone", None, &args, CLONE_TIMEOUT).await?;
-
-        if let Some(commit) = &options.commit {
-            self.run(
-                "git checkout",
-                Some(target_path),
-                &["checkout".into(), "--detach".into(), commit.clone()],
-                GIT_TIMEOUT,
-            )
-            .await?;
-        }
         Ok(())
     }
 
@@ -479,6 +544,55 @@ mod tests {
         assert!(
             command.contains("'--branch' 'main' '--single-branch' '--no-tags' '--'"),
             "clone: {command}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_clone_fetches_the_commit_directly() {
+        let exec = ScriptedExec::new(vec![
+            ScriptedExec::ok(""),
+            ScriptedExec::ok(""),
+            ScriptedExec::ok(""),
+            ScriptedExec::ok(""),
+        ]);
+        let git = DerivedGit::new(&exec);
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let options = GitCloneOptions {
+            branch:      Some("main".to_owned()),
+            commit:      Some(sha.to_owned()),
+            depth:       Some(1),
+            credentials: Some(GitCredentials::new("user", "pass")),
+        };
+        git.clone_repo("https://github.com/org/repo.git", "/dst", &options)
+            .await
+            .expect("pinned clone succeeds");
+
+        let commands = exec.commands();
+        assert!(commands[0].contains("'init' '--' '/dst'"), "{}", commands[0]);
+        assert!(
+            commands[1].contains("'remote' 'add' '--' 'origin' 'https://github.com/org/repo.git'"),
+            "{}",
+            commands[1]
+        );
+        // The SHA is fetched directly — a branch or depth never
+        // constrains which revision arrives — with credentials in the
+        // per-call rewrite only.
+        assert!(
+            commands[2].contains(
+                "'-c' 'url.https://user:pass@github.com/org/repo.git.insteadOf=https://github.com/org/repo.git'"
+            ),
+            "{}",
+            commands[2]
+        );
+        assert!(
+            commands[2].contains(&format!("'fetch' '--depth' '1' '--no-tags' 'origin' '--' '{sha}'")),
+            "{}",
+            commands[2]
+        );
+        assert!(
+            commands[3].contains(&format!("'checkout' '--detach' '{sha}'")),
+            "{}",
+            commands[3]
         );
     }
 
