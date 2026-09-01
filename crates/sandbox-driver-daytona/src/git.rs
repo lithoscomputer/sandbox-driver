@@ -106,13 +106,19 @@ impl Git for DaytonaGit {
             .git()
             .await
             .map_err(|error| daytona_error("connecting to the git toolbox", error))?;
-        git.clone(
-            url,
-            &self.resolve_path(target_path),
-            clone_options(options)?,
-        )
-        .await
-        .map_err(|error| daytona_error("cloning git repository", error))
+        let repo_path = self.resolve_path(target_path);
+        git.clone(url, &repo_path, clone_options(options)?)
+            .await
+            .map_err(|error| daytona_error("cloning git repository", error))?;
+        // The toolbox leaves a pinned clone detached; attach the
+        // requested branch for cross-provider consistency (fabro ran
+        // the same step after every native pinned clone).
+        if let (Some(branch), Some(commit)) = (&options.branch, &options.commit) {
+            self.derived()
+                .attach_pinned_branch(&repo_path, branch, commit)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn status(&self, repo_path: &str) -> Result<GitStatus> {

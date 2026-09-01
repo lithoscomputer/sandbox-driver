@@ -597,6 +597,52 @@ async fn normalized_search_works_over_host_exec() {
 }
 
 #[tokio::test]
+async fn pinned_clone_attaches_the_admitted_branch() {
+    let provider = HostProvider::new();
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+    let exec = sandbox.exec();
+    let workspace = sandbox.working_directory().to_owned();
+
+    // A source repo whose main advanced past the commit being pinned.
+    let setup = ExecSpec::new(
+        "git init -q -b main src && cd src && \
+         git -c user.name=T -c user.email=t@example.com commit -q --allow-empty -m one && \
+         git rev-parse HEAD && \
+         git -c user.name=T -c user.email=t@example.com commit -q --allow-empty -m two && \
+         git config uploadpack.allowReachableSHA1InWant true",
+    )
+    .timeout(Duration::from_secs(30));
+    let result = exec.run(&setup).await.expect("source repo setup");
+    assert!(result.success(), "stderr: {}", result.stderr_lossy());
+    let pinned = result.stdout_lossy().trim().to_owned();
+    assert_eq!(pinned.len(), 40, "sha: {pinned}");
+
+    let git = sandbox.git().expect("git facet");
+    let mut options = sandbox_driver::GitCloneOptions::default();
+    options.branch = Some("main".to_owned());
+    options.commit = Some(pinned.clone());
+    options.depth = Some(1);
+    git.clone_repo(&format!("file://{workspace}/src"), "dst", &options)
+        .await
+        .expect("pinned clone");
+
+    let repo = format!("{workspace}/dst");
+    let status = git.status(&repo).await.expect("git status");
+    assert_eq!(status.current_branch.as_deref(), Some("main"));
+    assert!(!status.detached);
+    let head = exec
+        .run(
+            &ExecSpec::new(format!("git -C {repo} rev-parse HEAD"))
+                .timeout(Duration::from_secs(10)),
+        )
+        .await
+        .expect("rev-parse");
+    assert_eq!(head.stdout_lossy().trim(), pinned);
+
+    sandbox.delete().await.expect("delete");
+}
+
+#[tokio::test]
 async fn normalized_git_drives_a_real_repository() {
     let provider = HostProvider::new();
     let sandbox = provider.create(&host_spec(), None).await.expect("create");

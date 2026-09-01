@@ -122,6 +122,15 @@ impl Git for GitFacet<'_> {
 }
 
 /// Per-call git credentials (a PAT travels as the password).
+///
+/// Credentials are applied per network operation via command-line
+/// configuration, so they are visible to processes that can read the
+/// git command's arguments: inside a Docker or Daytona sandbox that
+/// means the sandboxed workload itself; on the Host provider it means
+/// **every user on the machine** (`ps`). Supply Host-provider
+/// credentials only on single-user machines, or rely on ambient
+/// authentication (an SSH agent, a configured credential helper)
+/// instead of this struct.
 #[derive(Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct GitCredentials {
@@ -151,10 +160,12 @@ impl fmt::Debug for GitCredentials {
 #[non_exhaustive]
 pub struct GitCloneOptions {
     pub branch:      Option<String>,
-    /// Full commit SHA to pin the checkout to, left detached at that
-    /// commit. The pin is fetched directly, so it works with any
-    /// `depth` and never falls back to the branch head; `branch` names
-    /// no constraint on which revision is fetched.
+    /// Full commit SHA to pin the checkout to. With `branch` set, the
+    /// checkout ends attached to that branch pointing at the pinned
+    /// commit; without one it is left detached. The pin is fetched
+    /// directly, so it works with any `depth` and never falls back to
+    /// the branch head; `branch` names no constraint on which revision
+    /// is fetched.
     pub commit:      Option<String>,
     pub depth:       Option<u32>,
     pub credentials: Option<GitCredentials>,

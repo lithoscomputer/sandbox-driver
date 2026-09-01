@@ -148,6 +148,9 @@ impl DerivedGit<'_> {
         self.run("git fetch", Some(target_path), &args, CLONE_TIMEOUT)
             .await?;
 
+        if let Some(branch) = &options.branch {
+            return self.attach_pinned_branch(target_path, branch, commit).await;
+        }
         self.run(
             "git checkout",
             Some(target_path),
@@ -157,6 +160,35 @@ impl DerivedGit<'_> {
                 commit.to_owned(),
                 // Forces revision interpretation: a bare name that also
                 // matches a path would otherwise be ambiguous.
+                "--".into(),
+            ],
+            GIT_TIMEOUT,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Points `branch` at `commit` and attaches HEAD to it
+    /// (`checkout -B`), so callers that read the current branch back out
+    /// of the workspace see the requested name instead of a detached
+    /// HEAD — and a later push of that branch carries the work done
+    /// since the clone. fabro attached pinned checkouts on every
+    /// provider for exactly this reason.
+    pub async fn attach_pinned_branch(
+        &self,
+        repo_path: &str,
+        branch: &str,
+        commit: &str,
+    ) -> Result<()> {
+        validate_branch_name(branch)?;
+        self.run(
+            "git checkout",
+            Some(repo_path),
+            &[
+                "checkout".into(),
+                "-B".into(),
+                branch.to_owned(),
+                commit.to_owned(),
                 "--".into(),
             ],
             GIT_TIMEOUT,
@@ -608,6 +640,35 @@ mod tests {
             "{}",
             commands[2]
         );
+        // With a branch given, the checkout attaches the admitted
+        // branch at the pinned commit instead of detaching.
+        assert!(
+            commands[3].contains(&format!("'checkout' '-B' 'main' '{sha}' '--'")),
+            "{}",
+            commands[3]
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_clone_without_a_branch_stays_detached() {
+        let exec = ScriptedExec::new(vec![
+            ScriptedExec::ok(""),
+            ScriptedExec::ok(""),
+            ScriptedExec::ok(""),
+            ScriptedExec::ok(""),
+        ]);
+        let git = DerivedGit::new(&exec);
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let options = GitCloneOptions {
+            branch:      None,
+            commit:      Some(sha.to_owned()),
+            depth:       None,
+            credentials: None,
+        };
+        git.clone_repo("https://github.com/org/repo.git", "/dst", &options)
+            .await
+            .expect("pinned clone succeeds");
+        let commands = exec.commands();
         assert!(
             commands[3].contains(&format!("'checkout' '--detach' '{sha}' '--'")),
             "{}",
