@@ -254,7 +254,11 @@ pub(crate) fn daytona_error(context: &str, error: DaytonaError) -> Error {
         provider.retryable = status_code >= 500;
     } else if timed_out {
         provider.code = Some("timeout".to_owned());
-        provider.retryable = true;
+        // A request timeout does not prove the remote operation stopped:
+        // retrying a clone whose first attempt is still writing the
+        // target overlaps it (fabro never retried timeouts for exactly
+        // this reason). Callers judge idempotent retries themselves.
+        provider.retryable = false;
     }
     Error::Provider(provider)
 }
@@ -2386,6 +2390,21 @@ mod tests {
             provider.source().expect("provider source").to_string(),
             "service unavailable"
         );
+    }
+
+    #[test]
+    fn a_request_timeout_is_not_marked_retryable() {
+        // A timeout does not prove the remote operation stopped; a
+        // consumer honoring `retryable` must not overlap a still-running
+        // first attempt (a clone still writing its target, say).
+        let error = daytona_error("cloning git repository", DaytonaError::Timeout {
+            message: "request timed out".to_owned(),
+        });
+        let Error::Provider(provider) = error else {
+            panic!("expected a provider error");
+        };
+        assert_eq!(provider.code.as_deref(), Some("timeout"));
+        assert!(!provider.retryable);
     }
 
     #[test]
