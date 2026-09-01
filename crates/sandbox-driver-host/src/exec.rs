@@ -206,14 +206,22 @@ fn signal_process_group(child: &Child, signal: Signal) {
 }
 
 /// Sends SIGTERM to the process group, waits [`TERM_GRACE`] for a
-/// graceful exit, then SIGKILLs the group.
+/// graceful exit, then SIGKILLs the group and the child directly.
+///
+/// The direct kill is the guarantee: a command that moved itself out of
+/// its process group makes the group signals miss entirely (killpg on
+/// an empty group is ESRCH), and the callers' subsequent `wait()` would
+/// hang forever. SIGKILL to the immediate child always lands, and
+/// `kill()` reaps it, so a completed terminate means a returned wait.
 async fn terminate_process_group(child: &mut Child) {
     #[cfg(unix)]
     {
         signal_process_group(child, Signal::SIGTERM);
-        if time::timeout(TERM_GRACE, child.wait()).await.is_err() {
-            signal_process_group(child, Signal::SIGKILL);
+        if time::timeout(TERM_GRACE, child.wait()).await.is_ok() {
+            return;
         }
+        signal_process_group(child, Signal::SIGKILL);
+        let _ = child.kill().await;
     }
     #[cfg(not(unix))]
     {

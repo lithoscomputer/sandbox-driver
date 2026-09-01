@@ -310,6 +310,27 @@ async fn exec_timeout_kills_the_process_tree() {
 }
 
 #[tokio::test]
+async fn exec_timeout_kills_a_command_that_left_its_process_group() {
+    let provider = HostProvider::new();
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+
+    // The immediate child replaces itself with a TERM-ignoring process
+    // that joins the test runner's process group, so both group signals
+    // (aimed at the child's original group, now empty) miss. Only the
+    // direct kill fallback ends it before the sleep does.
+    let spec = ExecSpec::new(
+        r#"exec perl -e '$SIG{TERM} = "IGNORE"; use POSIX (); POSIX::setpgid(0, getpgrp(getppid())); sleep 30'"#,
+    )
+    .timeout(Duration::from_millis(300));
+    let started = Instant::now();
+    let result = sandbox.exec().run(&spec).await.expect("exec resolves");
+    assert_eq!(result.termination, Termination::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(10));
+
+    sandbox.delete().await.expect("delete");
+}
+
+#[tokio::test]
 async fn exec_timeout_lets_the_process_run_its_term_trap() {
     let provider = HostProvider::new();
     let sandbox = provider.create(&host_spec(), None).await.expect("create");
