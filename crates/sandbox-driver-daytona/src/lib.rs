@@ -71,7 +71,7 @@ use daytona_api_client::models::{
 pub use daytona_sdk::DaytonaConfig;
 use daytona_sdk::{
     Client, CreateParams, CreateSandboxOptions, CreateSnapshotParams, DaytonaError, DockerImage,
-    ImageParams, ImageSource, SandboxBaseParams, SnapshotParams,
+    ImageParams, ImageSource, SandboxBaseParams, SetFilePermissionsOptions, SnapshotParams,
 };
 use sandbox_driver::{
     Action, AuthError, Capabilities, Capability, Error, EventContext, EventEmitter, EventSubject,
@@ -94,6 +94,8 @@ pub use crate::pty::DaytonaPty;
 const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
 const WORKING_DIRECTORY_LABEL: &str = "sh.sandbox-driver.working-directory";
 const FALLBACK_WORKING_DIR: &str = "/home/daytona";
+const RUNTIME_DIRECTORY_PARENT: &str = "/tmp/sandbox-driver";
+const RUNTIME_DIRECTORY: &str = "/tmp/sandbox-driver/runtime";
 const CREATE_TIMEOUT: Duration = Duration::from_secs(600);
 /// Dockerfile sources build the image during create; real builds exceed
 /// shorter budgets (fabro-sandbox landed on 30 minutes).
@@ -678,6 +680,34 @@ async fn build_handle(
     }))
 }
 
+async fn initialize_directories(
+    sdk: &daytona_sdk::Sandbox,
+    working_directory: Option<&str>,
+) -> Result<()> {
+    let fs = sdk
+        .fs()
+        .await
+        .map_err(|error| daytona_error("connecting to the toolbox", error))?;
+    if let Some(working_directory) = working_directory {
+        fs.create_folder(working_directory, Some("0755"))
+            .await
+            .map_err(|error| daytona_error("creating requested working directory", error))?;
+    }
+    for path in [RUNTIME_DIRECTORY_PARENT, RUNTIME_DIRECTORY] {
+        fs.create_folder(path, Some("0700"))
+            .await
+            .map_err(|error| daytona_error("creating runtime directory", error))?;
+        fs.set_file_permissions(path, SetFilePermissionsOptions {
+            mode:  Some("0700".to_owned()),
+            owner: None,
+            group: None,
+        })
+        .await
+        .map_err(|error| daytona_error("setting runtime directory permissions", error))?;
+    }
+    Ok(())
+}
+
 fn daytona_capabilities() -> Capabilities {
     let mut caps = Capabilities::minimal(Isolation::Vm);
     caps.lifecycle.archive = true;
@@ -997,21 +1027,10 @@ impl SandboxProvider for DaytonaProvider {
                             return Err(self.cleanup_failed_create(&id, error).await);
                         }
                     }
-                    if let Some(working_directory) = &spec.working_directory {
-                        let initialized = async {
-                            let fs = created.fs().await.map_err(|error| {
-                                daytona_error("connecting to the toolbox", error)
-                            })?;
-                            fs.create_folder(working_directory, Some("0755"))
-                                .await
-                                .map_err(|error| {
-                                    daytona_error("creating requested working directory", error)
-                                })
-                        }
-                        .await;
-                        if let Err(error) = initialized {
-                            return Err(self.cleanup_failed_create(&created.id, error).await);
-                        }
+                    if let Err(error) =
+                        initialize_directories(&created, spec.working_directory.as_deref()).await
+                    {
+                        return Err(self.cleanup_failed_create(&created.id, error).await);
                     }
                     Ok(self.handle(created, handle_emitter).await? as Arc<dyn Sandbox>)
                 },
@@ -1399,6 +1418,10 @@ impl Sandbox for DaytonaSandbox {
 
     fn working_directory(&self) -> &str {
         &self.working_dir
+    }
+
+    fn runtime_directory(&self) -> Option<&str> {
+        Some(RUNTIME_DIRECTORY)
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]

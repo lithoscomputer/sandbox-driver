@@ -101,6 +101,23 @@ async fn requested_working_directory_is_created_and_survives_attach() {
                 pwd.stdout_lossy().trim()
             ));
         }
+        let runtime_directory = sandbox
+            .runtime_directory()
+            .ok_or("created handle returned no runtime directory")?;
+        let runtime_metadata = sandbox
+            .fs()
+            .metadata(runtime_directory)
+            .await
+            .map_err(|error| format!("runtime directory metadata: {error}"))?;
+        if runtime_metadata.kind != sandbox_driver::FileKind::Directory {
+            return Err(format!("runtime path has kind {:?}", runtime_metadata.kind));
+        }
+        if runtime_metadata.mode.map(|mode| mode & 0o777) != Some(0o700) {
+            return Err(format!(
+                "runtime directory mode is {:?}",
+                runtime_metadata.mode
+            ));
+        }
 
         // Replacing user labels must retain the provider's stored directory.
         let mut labels = BTreeMap::new();
@@ -117,6 +134,12 @@ async fn requested_working_directory_is_created_and_survives_attach() {
             return Err(format!(
                 "attached handle returned working directory {:?}",
                 attached.working_directory()
+            ));
+        }
+        if attached.runtime_directory() != Some(runtime_directory) {
+            return Err(format!(
+                "attached handle returned runtime directory {:?}",
+                attached.runtime_directory()
             ));
         }
         let attached_pwd = attached

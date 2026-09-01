@@ -60,7 +60,8 @@ pub trait Sandbox: Send + Sync {
     fn working_directory(&self) -> &str;
 
     /// Run-scoped scratch directory outside any checkout, when the
-    /// provider offers one.
+    /// provider offers one. A returned directory exists, is owner-private,
+    /// and remains the same when the sandbox is attached again.
     fn runtime_directory(&self) -> Option<&str> {
         None
     }

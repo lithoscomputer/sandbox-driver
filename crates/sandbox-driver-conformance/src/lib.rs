@@ -132,6 +132,9 @@ impl Conformance {
             ("working_directory_is_effective", |ctx| {
                 Box::pin(working_directory_is_effective(ctx))
             }),
+            ("runtime_directory_is_private", |ctx| {
+                Box::pin(runtime_directory_is_private(ctx))
+            }),
             ("relative_working_dir_resolves", |ctx| {
                 Box::pin(relative_working_dir_resolves(ctx))
             }),
@@ -501,6 +504,64 @@ async fn working_directory_is_effective(ctx: &Conformance) -> CheckOutcome {
         if attached_pwd != expected {
             return fail(format!(
                 "attached pwd is {attached_pwd:?}, working_directory is {expected:?}"
+            ));
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn runtime_directory_is_private(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let Some(runtime_directory) = sandbox.runtime_directory() else {
+            return PASS;
+        };
+        if !runtime_directory.starts_with('/') {
+            return fail(format!(
+                "runtime_directory {runtime_directory:?} is not absolute"
+            ));
+        }
+        let workspace = sandbox.working_directory().trim_end_matches('/');
+        let workspace_prefix = if workspace.is_empty() {
+            "/".to_owned()
+        } else {
+            format!("{workspace}/")
+        };
+        if runtime_directory == workspace || runtime_directory.starts_with(&workspace_prefix) {
+            return fail(format!(
+                "runtime_directory {runtime_directory:?} is inside working_directory \
+                 {workspace:?}"
+            ));
+        }
+        let metadata = sandbox
+            .fs()
+            .metadata(runtime_directory)
+            .await
+            .map_err(|error| format!("runtime_directory metadata failed: {error}"))?;
+        if metadata.kind != sandbox_driver::FileKind::Directory {
+            return fail(format!(
+                "runtime_directory has kind {:?}, not Directory",
+                metadata.kind
+            ));
+        }
+        if metadata.mode.map(|mode| mode & 0o777) != Some(0o700) {
+            return fail(format!(
+                "runtime_directory mode is {:?}, expected 0700",
+                metadata.mode
+            ));
+        }
+        let attached = ctx
+            .provider
+            .attach(sandbox.id(), None)
+            .await
+            .map_err(|error| format!("attach failed: {error}"))?;
+        if attached.runtime_directory() != Some(runtime_directory) {
+            return fail(format!(
+                "attached runtime_directory is {:?}, expected {runtime_directory:?}",
+                attached.runtime_directory()
             ));
         }
         PASS

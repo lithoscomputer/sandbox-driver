@@ -59,6 +59,8 @@ use crate::pty::DockerPty;
 
 const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
 const DEFAULT_WORKING_DIRECTORY: &str = "/workspace";
+const RUNTIME_DIRECTORY_PARENT: &str = "/tmp/sandbox-driver";
+const RUNTIME_DIRECTORY: &str = "/tmp/sandbox-driver/runtime";
 
 /// Options the Docker provider reads from `SandboxSpec::provider_config`.
 ///
@@ -412,8 +414,11 @@ impl SandboxProvider for DockerProvider {
                             "/bin/bash".to_owned(),
                             "-c".to_owned(),
                             format!(
-                                "mkdir -p {} && exec sleep infinity",
-                                shell_quote(&working_dir)
+                                "mkdir -p {working_dir} {runtime_dir} && chmod 0700 \
+                                 {runtime_parent} {runtime_dir} && exec sleep infinity",
+                                working_dir = shell_quote(&working_dir),
+                                runtime_parent = shell_quote(RUNTIME_DIRECTORY_PARENT),
+                                runtime_dir = shell_quote(RUNTIME_DIRECTORY),
                             ),
                         ]),
                         working_dir: Some(working_dir.clone()),
@@ -619,6 +624,10 @@ impl Sandbox for DockerSandbox {
 
     fn working_directory(&self) -> &str {
         &self.working_dir
+    }
+
+    fn runtime_directory(&self) -> Option<&str> {
+        Some(RUNTIME_DIRECTORY)
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.id), err)]

@@ -49,6 +49,7 @@ async fn managed_workspace_is_created_and_removed() {
 
     let workspace = PathBuf::from(sandbox.working_directory());
     assert!(workspace.is_dir());
+    assert_eq!(sandbox.runtime_directory(), None);
 
     sandbox.delete().await.expect("delete");
     assert!(!workspace.exists());
