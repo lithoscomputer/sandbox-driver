@@ -656,6 +656,16 @@ impl StdioProcessHandle for DockerStdioHandle {
         if self.stop_requested.swap(true, Ordering::SeqCst) {
             return;
         }
+        // An already-exited process needs no stop request: the wrapper
+        // that would consume the stop file is gone, so the request
+        // would spawn a pointless exec and leave a permanent stray file
+        // (fabro gated on observed termination the same way). An
+        // inspect failure still sends the stop — when in doubt, kill.
+        if let Ok(inspect) = self.exec.docker.inspect_exec(&self.exec_id).await {
+            if inspect.running != Some(true) {
+                return;
+            }
+        }
         // The trait offers no error channel; awaiting at least keeps
         // the request ordered before any caller-side cleanup.
         if let Err(error) = self.exec.request_stop(&self.stop_file).await {
