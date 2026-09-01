@@ -1,7 +1,8 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::{Error, ExecFailure, Result};
-use crate::exec::{Exec, ExecSpec};
+use crate::exec::{Exec, ExecControls, ExecResult, ExecSpec, OutputSink};
 use crate::sandbox::Sandbox;
 use crate::state::SandboxState;
 use crate::wait::{WaitOptions, wait_for_stable_state, wait_for_state};
@@ -32,16 +33,36 @@ pub struct ProbeFailure {
     pub reason: String,
 }
 
-/// Runs the bash contract probe through `exec`.
+/// Runs the bash contract probe through `exec`, over both transports.
+///
+/// Buffered and streaming execution can ride different provider
+/// transports (Daytona: a one-shot endpoint vs. sessions; plugins:
+/// separate wire methods). A streaming transport that never yields an
+/// exit code otherwise surfaces as every streaming command timing out
+/// rather than as an activation failure, so both are verified — the
+/// buffered transport first, because it isolates "no usable Bash" from
+/// "Bash runs but the streaming contract is broken".
 #[tracing::instrument(skip_all, err)]
 pub async fn run_bash_probe(exec: &dyn Exec) -> Result<()> {
     let spec = ExecSpec::new(BASH_PROBE_SCRIPT).timeout(PROBE_TIMEOUT);
     let result = exec.run(&spec).await?;
+    check_probe_result("bash probe", result)?;
+
+    let sink: OutputSink = Arc::new(|_stream, _chunk| Box::pin(async { Ok(()) }));
+    let controls = ExecControls {
+        sink: Some(sink),
+        ..ExecControls::default()
+    };
+    let streaming = exec.run_streaming(&spec, controls).await?;
+    check_probe_result("bash probe (streaming transport)", streaming.result)
+}
+
+fn check_probe_result(label: &str, result: ExecResult) -> Result<()> {
     if result.success() && result.stdout_lossy().trim() == PROBE_OK_MARKER {
         return Ok(());
     }
     Err(Error::Exec(ExecFailure::new(
-        "bash probe",
+        label,
         result.termination,
         result.exit_code,
         result.stdout,
@@ -78,4 +99,36 @@ pub async fn activate(sandbox: &dyn Sandbox, wait: &WaitOptions) -> Result<()> {
         }
     }
     run_bash_probe(sandbox.exec()).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_exec::ScriptedExec;
+
+    #[tokio::test]
+    async fn probe_exercises_both_transports() {
+        let exec = ScriptedExec::new(vec![
+            ScriptedExec::ok("fabro-bash-ready"),
+            ScriptedExec::ok("fabro-bash-ready\n"),
+        ]);
+        run_bash_probe(&exec).await.expect("probe passes");
+        // One buffered run and one streaming run, same script.
+        assert_eq!(exec.commands().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn probe_names_a_broken_streaming_transport() {
+        let exec = ScriptedExec::new(vec![
+            ScriptedExec::ok("fabro-bash-ready"),
+            ScriptedExec::failed(1),
+        ]);
+        let error = run_bash_probe(&exec)
+            .await
+            .expect_err("streaming probe fails");
+        assert!(
+            format!("{error}").contains("streaming transport"),
+            "error: {error}"
+        );
+    }
 }
