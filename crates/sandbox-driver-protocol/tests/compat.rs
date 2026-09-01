@@ -12,7 +12,7 @@ use std::time::Duration;
 use sandbox_driver::{
     Action, Capabilities, Capability, Error, ErrorReport, Event, EventBody, EventSubject,
     ForkOptions, ResourceKind, SandboxKind, SandboxSnapshotOptions, SandboxSource, SandboxSpec,
-    SandboxState, SandboxStatus, ServiceCaps, SnapshotId, SnapshotMode, SnapshotSource,
+    SandboxState, SandboxStatus, SearchCaps, ServiceCaps, SnapshotId, SnapshotMode, SnapshotSource,
     SnapshotSpec, Termination,
 };
 use sandbox_driver_protocol::methods::{
@@ -51,6 +51,10 @@ fn launch_era_capabilities_still_decode() {
     assert!(caps.lifecycle.archive);
     assert!(!caps.lifecycle.undelete, "absent field defaults to false");
     assert!(
+        caps.search.supported,
+        "the old native=false shape implied exec-derived search"
+    );
+    assert!(
         caps.git.supported,
         "the old native=false shape implied exec-derived git"
     );
@@ -60,6 +64,18 @@ fn launch_era_capabilities_still_decode() {
     assert!(snapshots.from_image);
     assert!(!snapshots.from_image_kinds.container);
     assert!(!snapshots.from_image_kinds.virtual_machine);
+}
+
+#[test]
+fn pre_normalization_search_capabilities_still_decode() {
+    let legacy: SearchCaps =
+        serde_json::from_str(r#"{"native":false}"#).expect("legacy search capabilities decode");
+    assert!(legacy.supported, "native=false meant use derived search");
+    assert!(!legacy.native);
+
+    let unavailable: SearchCaps = serde_json::from_str(r#"{"supported":false,"native":false}"#)
+        .expect("normalized search capabilities decode");
+    assert!(!unavailable.supported);
 }
 
 #[test]

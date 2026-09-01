@@ -28,12 +28,12 @@ use std::{fmt, process};
 
 use async_trait::async_trait;
 use sandbox_driver::{
-    Action, Capability, DerivedSearch, Error, Event, EventBody, EventContext, EventObserver,
-    ExecControls, ExecSpec, Git, GitCloneOptions, GitCommitOptions, GitPushOptions, GrepOptions,
-    HealthStatus, LogSink, LogSource, NetworkPolicy, OutputSanitization, OutputStream, PtyOptions,
-    PtySize, Resources, Sandbox, SandboxFilter, SandboxId, SandboxProvider, SandboxSpec,
-    SandboxState, Search, ServiceSpec, Services, SnapshotMode, SpawnSpec, Termination, WaitOptions,
-    activate, wait_for_state,
+    Action, Capability, Error, Event, EventBody, EventContext, EventObserver, ExecControls,
+    ExecSpec, Git, GitCloneOptions, GitCommitOptions, GitPushOptions, GrepOptions, HealthStatus,
+    LogSink, LogSource, NetworkPolicy, OutputSanitization, OutputStream, PtyOptions, PtySize,
+    Resources, Sandbox, SandboxFilter, SandboxId, SandboxProvider, SandboxSpec, SandboxState,
+    Search, ServiceSpec, Services, SnapshotMode, SpawnSpec, Termination, WaitOptions, activate,
+    wait_for_state,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time;
@@ -1211,6 +1211,9 @@ async fn fs_round_trips(ctx: &Conformance) -> CheckOutcome {
 async fn search_greps_directories_and_single_files(ctx: &Conformance) -> CheckOutcome {
     let sandbox = ctx.ready().await?;
     let outcome = async {
+        if !sandbox.capabilities().supports(Capability::Search) {
+            return Ok(Some("capability search not declared".to_owned()));
+        }
         sandbox
             .fs()
             .write(
@@ -1219,12 +1222,8 @@ async fn search_greps_directories_and_single_files(ctx: &Conformance) -> CheckOu
             )
             .await
             .map_err(|error| format!("write failed: {error}"))?;
-        let derived;
-        let search: &dyn Search = if let Some(native) = sandbox.search() {
-            native
-        } else {
-            derived = DerivedSearch::new(sandbox.exec());
-            &derived
+        let Some(search) = sandbox.search() else {
+            return fail("search is declared but the facet is absent");
         };
         for path in ["conformance-grep", "conformance-grep/needle.txt"] {
             let matches = search
@@ -2008,6 +2007,12 @@ async fn services_match_capabilities(ctx: &Conformance) -> CheckOutcome {
     }
     if sandbox_caps.logs.is_some() != sandbox.logs().is_some() {
         wrong.push("logs facet presence disagrees with capabilities".to_owned());
+    }
+    if sandbox_caps.supports(Capability::Search) != sandbox.search().is_some() {
+        wrong.push("search facet presence disagrees with capabilities".to_owned());
+    }
+    if sandbox_caps.search.native != sandbox.provider_search().is_some() {
+        wrong.push("search provider override disagrees with search.native".to_owned());
     }
     if sandbox_caps.supports(Capability::Git) != sandbox.git().is_some() {
         wrong.push("git facet presence disagrees with capabilities".to_owned());

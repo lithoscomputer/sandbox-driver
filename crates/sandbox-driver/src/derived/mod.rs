@@ -1,14 +1,10 @@
 //! Exec-derived facet implementations.
 //!
-//! [`DerivedSearch`] and [`DerivedGit`] implement the [`crate::Search`]
-//! and [`crate::Git`] facets over any [`crate::Exec`], for providers with
-//! no native API. Both borrow the exec facet, so they work ad hoc over a
-//! sandbox handle:
-//!
-//! ```ignore
-//! let search = DerivedSearch::new(sandbox.exec());
-//! let matches = search.grep("TODO", ".", &GrepOptions::default()).await?;
-//! ```
+//! [`DerivedSearch`], [`DerivedGit`], and [`DerivedServices`] implement their
+//! facets over any [`crate::Exec`] for providers without matching native APIs.
+//! They borrow the exec facet and power the normalized accessors on
+//! [`crate::Sandbox`]. Consumers use those accessors instead of selecting a
+//! fallback themselves.
 
 mod fs;
 mod git;

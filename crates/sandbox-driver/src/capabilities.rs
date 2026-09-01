@@ -92,6 +92,8 @@ pub enum Capability {
     SnapshotsLiveProcessState,
     #[serde(rename = "snapshots.activation")]
     SnapshotsActivation,
+    #[serde(rename = "search")]
+    Search,
     #[serde(rename = "git")]
     Git,
     #[serde(rename = "services")]
@@ -231,6 +233,7 @@ impl Capabilities {
             Capability::SnapshotsActivation => {
                 self.snapshots.as_ref().is_some_and(|caps| caps.activation)
             }
+            Capability::Search => self.search.supported,
             Capability::Git => self.git.supported,
             Capability::Services => self.services.supported,
             Capability::Volumes => self.volumes.is_some(),
@@ -289,8 +292,17 @@ pub struct FsCaps {
 #[serde(default)]
 #[non_exhaustive]
 pub struct SearchCaps {
-    /// Provider overrides the exec-derived search implementation natively.
-    pub native: bool,
+    /// The complete search facet is available.
+    ///
+    /// The wire default is `true` when an older peer sends the original
+    /// `{"native": false}` shape: that shape meant callers should use the
+    /// exec-derived implementation. `SearchCaps::default()` remains
+    /// unsupported for a newly constructed minimal capability set.
+    #[serde(default = "default_true")]
+    pub supported: bool,
+    /// The provider implements search natively instead of using the shared
+    /// exec-derived implementation.
+    pub native:    bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -438,6 +450,10 @@ mod tests {
     fn capability_serializes_as_dotted_path() {
         let json = serde_json::to_string(&Capability::ExecStdioProcess).expect("serializes");
         assert_eq!(json, "\"exec.stdio_process\"");
+        assert_eq!(
+            serde_json::to_string(&Capability::Search).expect("search serializes"),
+            "\"search\""
+        );
         assert_eq!(Capability::LifecyclePause.to_string(), "lifecycle.pause");
     }
 
@@ -568,6 +584,7 @@ mod tests {
                     ..SnapshotCaps::default()
                 });
             }),
+            (Capability::Search, |caps| caps.search.supported = true),
             (Capability::Git, |caps| caps.git.supported = true),
             (Capability::Services, |caps| {
                 caps.services.supported = true;

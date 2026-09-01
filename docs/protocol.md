@@ -120,7 +120,7 @@ for the connection. Per-sandbox capability sets travel in every
   "exec": {"live_streaming":false,"streams_separated":false,"stdin":false,
             "cancel":false,"stdio_process":false},
   "fs": {"native":false,"upload":false,"download":false,"permissions":false},
-  "search": {"native":false},
+  "search": {"supported":false,"native":false},
   "git": {"supported":false,"native":false},
   "services": {"supported":false,"native":false},
   "pty": null,
@@ -149,11 +149,11 @@ Rules:
 - **The version-1 mask.** Native search/git/service passthrough and local
   shell commands do not cross the wire. A host forces `search.native`,
   `git.native`, `services.native`, and `access.shell_command` to false.
-  `git.supported` and `services.supported` remain true when the complete facets
-  can run through `exec/run`; the host then selects the exec-derived
-  implementations.
-- Older peers send `git` and `services` groups as `{"native":false}`. Hosts
-  read those groups as `supported:true` because `native:false` originally
+  `search.supported`, `git.supported`, and `services.supported` remain true when
+  the complete facets can run through `exec/run`; the host then selects the
+  exec-derived implementations.
+- Older peers send `search`, `git`, and `services` groups as `{"native":false}`.
+  Hosts read those groups as `supported:true` because `native:false` originally
   instructed the caller to use an exec-derived implementation. An explicitly
   sent `supported:false` means the complete facet is unavailable. An absent
   group also remains unsupported.

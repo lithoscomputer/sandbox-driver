@@ -13,7 +13,7 @@ use crate::git::{Git, GitFacet};
 use crate::id::{SandboxId, SnapshotId};
 use crate::logs::Logs;
 use crate::pty::Pty;
-use crate::search::Search;
+use crate::search::{Search, SearchFacet};
 use crate::service::{Services, ServicesFacet};
 use crate::spec::{LifecycleTimers, NetworkPolicy, PlatformInfo, Resources};
 use crate::state::SandboxStatus;
@@ -157,9 +157,28 @@ pub trait Sandbox: Send + Sync {
     /// File operations (required; may be exec-derived internally).
     fn fs(&self) -> &dyn Filesystem;
 
-    /// Native search, when the provider has one. `None` means use the
-    /// library's exec-derived implementation.
-    fn search(&self) -> Option<&dyn Search> {
+    /// Complete search behavior, when available.
+    ///
+    /// The provider chooses native or derived behavior. Callers do not select
+    /// the implementation. The returned facade is absent exactly when
+    /// [`Capabilities::search`](crate::Capabilities::search) reports that
+    /// search is unsupported.
+    fn search(&self) -> Option<SearchFacet<'_>> {
+        if !self.capabilities().search.supported {
+            return None;
+        }
+        Some(match self.provider_search() {
+            Some(search) => SearchFacet::provider(search),
+            None => SearchFacet::derived(self.exec()),
+        })
+    }
+
+    /// Provider implementation hook for native search.
+    ///
+    /// Consumers call [`Sandbox::search`]. Providers override this method when
+    /// search operations do not use [`crate::DerivedSearch`].
+    #[doc(hidden)]
+    fn provider_search(&self) -> Option<&dyn Search> {
         None
     }
 

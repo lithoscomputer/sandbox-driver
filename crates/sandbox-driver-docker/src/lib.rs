@@ -12,9 +12,9 @@
 //! Bash contract) and a Linux userland with `stat`, `find`, `base64`,
 //! and `setsid` (kill semantics need a separate session; an image
 //! without it fails every exec with a clear message). Because Docker advertises
-//! the normalized Git and background-services facets, the image must also
-//! provide `git` and the service commands documented by
-//! [`sandbox_driver::Services`] on `PATH`.
+//! the normalized Search, Git, and background-services facets, the image must
+//! also provide the commands documented by [`sandbox_driver::Search`] and
+//! [`sandbox_driver::Services`], plus `git`, on `PATH`.
 //!
 //! # Runtime behavior
 //!
@@ -267,6 +267,7 @@ fn docker_capabilities() -> Capabilities {
     caps.fs.upload = true;
     caps.fs.download = true;
     caps.fs.permissions = true;
+    caps.search.supported = true;
     caps.git.supported = true;
     caps.services.supported = true;
     caps.network.allow_all = true;

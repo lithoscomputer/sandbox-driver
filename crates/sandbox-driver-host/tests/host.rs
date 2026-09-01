@@ -9,10 +9,10 @@ use std::{env, process};
 
 use async_trait::async_trait;
 use sandbox_driver::{
-    Action, Capability, DerivedSearch, Error, Event, EventBody, EventContext, EventObserver,
-    ExecControls, ExecSpec, Git, GitCommitOptions, GrepOptions, NetworkPolicy, OutputStream,
-    SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec, Search, SpawnSpec,
-    StdioProcessHandle, Termination, WaitOptions, WalkOptions, WorkspaceOwnership, activate,
+    Action, Capability, Error, Event, EventBody, EventContext, EventObserver, ExecControls,
+    ExecSpec, Git, GitCommitOptions, GrepOptions, NetworkPolicy, OutputStream, SandboxFilter,
+    SandboxId, SandboxProvider, SandboxSource, SandboxSpec, Search, SpawnSpec, StdioProcessHandle,
+    Termination, WaitOptions, WalkOptions, WorkspaceOwnership, activate,
 };
 use sandbox_driver_host::HostProvider;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -489,7 +489,7 @@ async fn filesystem_round_trips() {
 }
 
 #[tokio::test]
-async fn derived_search_works_over_host_exec() {
+async fn normalized_search_works_over_host_exec() {
     let provider = HostProvider::new();
     let sandbox = provider.create(&host_spec(), None).await.expect("create");
     let fs = sandbox.fs();
@@ -503,7 +503,9 @@ async fn derived_search_works_over_host_exec() {
         .await
         .expect("write");
 
-    let search = DerivedSearch::new(sandbox.exec());
+    assert!(sandbox.capabilities().supports(Capability::Search));
+    assert!(!sandbox.capabilities().search.native);
+    let search = sandbox.search().expect("search facet");
     let matches = search
         .grep("needle", ".", &GrepOptions::default())
         .await

@@ -148,7 +148,7 @@ Legend: ✔ supported · \~ partial/approximated · — unsupported (facet retur
 Notes:
 
 - **Services hide native-versus-derived selection.** `Sandbox::services()` returns one normalized facet or `None`. Host, Docker, and Daytona use the shared exec-derived `setsid`/pidfile implementation; a provider with native service management can override it. Derived services require `bash`, `mktemp`, `basename`, `cat`, `tail`, `seq`, and `sleep`; `setsid` is optional. Service state is per-boot, and ids from before a sandbox restart report not running.
-- **Search and Git ship with exec-derived implementations.** Git selection is provider-owned: `Sandbox::git()` returns one normalized facet or `None`, never an instruction for the caller to construct a fallback. Daytona follows Fabro's battle-tested hybrid: native toolbox clone, then exec-derived status, add, commit, push, pull, branch, and checkout operations. Host and Docker use the same derived implementation for every operation.
+- **Search and Git hide implementation selection.** `Sandbox::search()` and `Sandbox::git()` return normalized facets or `None`; callers never construct a fallback. Host, Docker, and Daytona derive Search through `Exec`. Search requires `find`, `grep`, and `head`; `rg` is optional acceleration. Daytona follows Fabro's battle-tested Git hybrid: native toolbox clone, then exec-derived status, add, commit, push, pull, branch, and checkout operations. Host and Docker derive every Git operation.
 - **Git is a sandbox environment prerequisite.** When `git.supported` is true, the image, snapshot, or Host environment must provide a `git` executable on `PATH`. Providers do not probe for it. Daytona also requires it because only clone is native; the remaining operations use the executable. A missing executable is a non-conforming environment, not a reason for callers to choose another implementation.
 - **Git here is plumbing only.** Fabro's credential machinery (`refresh_push_credentials`, `push_token_source`, `git_push_ref` retry/lease engine, `setup_git` intent, clone orchestration and repo layout) stays in fabro, layered on `Exec` + `Git`. Those 6 of fabro's 34 methods do not move into this crate.
 - **Tailscale and other VPN clients are guest software.** Callers install
@@ -170,6 +170,7 @@ pub struct Capabilities {
     pub lifecycle: LifecycleCaps,     // pause, archive, fork, resize, recover, undelete, timers…
     pub exec: ExecCaps,               // live_streaming, streams_separated, stdin, cancel, stdio_process
     pub fs: FsCaps,                   // native, upload, download, permissions
+    pub search: SearchCaps,           // supported plus native diagnostic
     pub git: GitCaps,                 // supported plus native/hybrid diagnostic
     pub services: ServiceCaps,        // supported plus native diagnostic
     pub pty: Option<PtyCaps>,
@@ -262,8 +263,8 @@ pub trait Sandbox: Send + Sync {
     // (None, or the library's exec-derived implementation for search/git).
     fn exec(&self) -> &dyn Exec;
     fn fs(&self) -> &dyn Filesystem;
-    fn search(&self) -> &dyn Search;                      // default: derived over exec
-    fn git(&self) -> &dyn Git;                            // default: derived over exec
+    fn search(&self) -> Option<SearchFacet<'_>>;          // provider selects native or derived
+    fn git(&self) -> Option<GitFacet<'_>>;                // provider selects native, hybrid, or derived
     fn services(&self) -> Option<ServicesFacet<'_>>;      // provider selects native or derived
     fn pty(&self) -> Option<&dyn Pty>;                    // default: None
     fn logs(&self) -> Option<&dyn Logs>;                  // default: None
@@ -507,3 +508,4 @@ Each of these is implementable over `Exec`/`Git`/core — the fabro survey confi
 13. **Provider health is a report, not an error**: `health()` always answers; non-`ok` statuses (`unreachable`, `unauthorized` with `missing_permissions`) are successful responses, and `Err` is reserved for the check itself failing.
 14. **Git is an environment prerequisite when advertised.** Images and snapshots used by Docker or Daytona, and the Host process environment, provide `git` on `PATH`. Providers do not probe for it or change immutable capabilities based on guest package discovery.
 15. **Services are normalized when advertised.** `services.supported` reports complete availability; `services.native` is diagnostic only. The sandbox chooses the provider implementation or `DerivedServices`, so consumers never construct the fallback.
+16. **Search is normalized when advertised.** `search.supported` reports complete availability; `search.native` is diagnostic only. The sandbox chooses the provider implementation or `DerivedSearch`. Derived Search requires `find`, `grep`, and `head`; `rg` remains optional.
