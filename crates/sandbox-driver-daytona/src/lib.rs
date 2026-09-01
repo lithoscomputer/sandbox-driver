@@ -308,7 +308,7 @@ async fn create_sandbox_snapshot(
     sandbox_id: &str,
     name: &str,
     mode: SnapshotMode,
-) -> Result<()> {
+) -> Result<SnapshotId> {
     let sdk = client
         .get(sandbox_id)
         .await
@@ -344,25 +344,44 @@ async fn create_sandbox_snapshot(
     .await
     .map_err(|error| generated_error("snapshotting sandbox", error))?;
 
+    // Wait on the snapshot record itself, not the sandbox state: right
+    // after the POST the sandbox may not have entered Snapshotting yet,
+    // so watching it can declare completion while the snapshot is still
+    // being written — and a caller could delete the sandbox under it.
     let started = Instant::now();
     loop {
-        let sdk = client
-            .get(sandbox_id)
-            .await
-            .map_err(|error| daytona_error("waiting for sandbox snapshot", error))?;
-        // The raw state, not map_state: the mapped view reports a
-        // snapshotting sandbox as Running (it stays usable), while this
-        // loop specifically waits out the snapshot itself.
-        if sdk.state == Some(daytona_sdk::SandboxState::Snapshotting) {
-            // Still snapshotting; keep waiting.
-        } else if map_state(sdk.state) == SandboxState::Error {
-            return Err(Error::Provider(ProviderError::new(
-                ProviderKind::try_new("daytona").expect("static kind is valid"),
-                sdk.error_reason
-                    .unwrap_or_else(|| "sandbox snapshot failed".to_owned()),
-            )));
-        } else {
-            return Ok(());
+        match client.snapshot.get(name).await {
+            // The record can appear a beat after the POST.
+            Err(error) if is_not_found(&error) => {}
+            Err(error) => {
+                return Err(daytona_error("waiting for sandbox snapshot", error));
+            }
+            Ok(dto) => match map_snapshot_state(dto.state) {
+                SnapshotState::Building => {}
+                // Inactive counts as written: the org's active-snapshot
+                // budget can deactivate a snapshot on arrival, but the
+                // data exists and activate() can bring it back.
+                SnapshotState::Active | SnapshotState::Inactive => {
+                    return SnapshotId::try_new(dto.id)
+                        .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()));
+                }
+                SnapshotState::Error => {
+                    return Err(Error::Provider(ProviderError::new(
+                        ProviderKind::try_new("daytona").expect("static kind is valid"),
+                        dto.error_reason
+                            .unwrap_or_else(|| "sandbox snapshot failed".to_owned()),
+                    )));
+                }
+                SnapshotState::Deleting => {
+                    return Err(Error::Provider(ProviderError::new(
+                        ProviderKind::try_new("daytona").expect("static kind is valid"),
+                        "snapshot was removed while being created".to_owned(),
+                    )));
+                }
+                // A state this crate does not know yet: keep polling;
+                // the budget below bounds the wait.
+                _ => {}
+            },
         }
         let elapsed = started.elapsed();
         if elapsed >= CREATE_TIMEOUT {
@@ -1655,9 +1674,7 @@ impl Sandbox for DaytonaSandbox {
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Snapshot,
                 |_| async {
-                    create_sandbox_snapshot(&self.client, &self.sdk_id, &name, options.mode)
-                        .await?;
-                    created_snapshot_id(&self.client, &name).await
+                    create_sandbox_snapshot(&self.client, &self.sdk_id, &name, options.mode).await
                 },
             )
             .await
