@@ -357,7 +357,6 @@ async fn create_sandbox_snapshot(
                 return Err(daytona_error("waiting for sandbox snapshot", error));
             }
             Ok(dto) => match map_snapshot_state(dto.state) {
-                SnapshotState::Building => {}
                 // Inactive counts as written: the org's active-snapshot
                 // budget can deactivate a snapshot on arrival, but the
                 // data exists and activate() can bring it back.
@@ -378,8 +377,8 @@ async fn create_sandbox_snapshot(
                         "snapshot was removed while being created".to_owned(),
                     )));
                 }
-                // A state this crate does not know yet: keep polling;
-                // the budget below bounds the wait.
+                // Building — or a state this crate does not know yet:
+                // keep polling; the budget below bounds the wait.
                 _ => {}
             },
         }
