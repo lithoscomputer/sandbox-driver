@@ -54,6 +54,7 @@ pub enum SandboxState {
 
 pub struct SandboxStatus {
     pub id: SandboxId,
+    pub name: Option<String>,             // provider display name, distinct from id
     pub state: SandboxState,
     pub provider_state: String,          // raw, e.g. Daytona's "pulling_snapshot"
     pub error_reason: Option<String>,

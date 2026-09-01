@@ -248,7 +248,7 @@ to operate a sandbox without further negotiation:
 
 ```json
 {
-  "status": {"id":"sb-1","state":"running","provider_state":"started",
+  "status": {"id":"sb-1","name":"demo","state":"running","provider_state":"started",
               "error_reason":null,"resources":{"...":"…"},
               "sandbox_kind":"container","region":"eu","labels":{},
               "source":null,"workspace_ownership":null,

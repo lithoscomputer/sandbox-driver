@@ -401,6 +401,7 @@ fn status_from_sdk(
     let id = SandboxId::try_new(&sdk.id)
         .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
     let mut status = SandboxStatus::new(id, map_state(sdk.state));
+    status.name = (!sdk.name.is_empty()).then(|| sdk.name.clone());
     status.provider_state = sdk.state.map(|state| state.to_string()).unwrap_or_default();
     status.error_reason.clone_from(&sdk.error_reason);
     status.sandbox_kind = sdk.sandbox_class.map(sandbox_kind_from_sandbox_class);
@@ -672,6 +673,7 @@ async fn build_handle(
         logs: DaytonaLogs::new(Arc::clone(client), sdk.id.clone()),
         pty: DaytonaPty::new(Arc::clone(client), sdk.id.clone(), working_dir.clone()),
         id,
+        name: (!sdk.name.is_empty()).then(|| sdk.name.clone()),
         capabilities: narrowed_capabilities(base_capabilities, sdk.sandbox_class),
         client: Arc::clone(client),
         sdk_id: sdk.id,
@@ -1231,6 +1233,7 @@ impl SandboxProvider for DaytonaProvider {
 /// A Daytona-backed sandbox handle.
 pub struct DaytonaSandbox {
     id:           SandboxId,
+    name:         Option<String>,
     capabilities: Capabilities,
     client:       DaytonaClient,
     sdk_id:       String,
@@ -1423,7 +1426,9 @@ impl Sandbox for DaytonaSandbox {
         match self.client.get(&self.sdk_id).await {
             Ok(sdk) => status_from_sdk(&self.client, &sdk),
             Err(error) if is_not_found(&error) => {
-                Ok(SandboxStatus::new(self.id.clone(), SandboxState::Deleted))
+                let mut status = SandboxStatus::new(self.id.clone(), SandboxState::Deleted);
+                status.name.clone_from(&self.name);
+                Ok(status)
             }
             Err(error) => Err(daytona_error("fetching sandbox", error)),
         }

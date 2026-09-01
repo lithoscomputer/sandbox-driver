@@ -185,6 +185,7 @@ impl DockerProvider {
     fn handle(
         &self,
         container_id: String,
+        name: Option<String>,
         working_dir: String,
         labels: BTreeMap<String, String>,
         env: BTreeMap<String, String>,
@@ -210,6 +211,7 @@ impl DockerProvider {
         );
         Arc::new(DockerSandbox {
             id: SandboxId::try_new(container_id).expect("container id is a valid sandbox id"),
+            name,
             capabilities: self.capabilities.clone(),
             docker: self.docker.clone(),
             working_dir,
@@ -289,6 +291,7 @@ fn map_state(inspect: &ContainerInspectResponse) -> SandboxState {
 
 fn status_from_inspect(id: SandboxId, inspect: &ContainerInspectResponse) -> SandboxStatus {
     let mut status = SandboxStatus::new(id, map_state(inspect));
+    status.name = normalized_container_name(inspect.name.as_deref());
     status.sandbox_kind = Some(SandboxKind::Container);
     status.provider_state = inspect
         .state
@@ -307,6 +310,12 @@ fn status_from_inspect(id: SandboxId, inspect: &ContainerInspectResponse) -> San
         status.source.clone_from(&config.image);
     }
     status
+}
+
+fn normalized_container_name(name: Option<&str>) -> Option<String> {
+    name.map(|name| name.trim_start_matches('/'))
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
 }
 
 fn network_mode(policy: &NetworkPolicy) -> Result<Option<String>> {
@@ -503,6 +512,7 @@ impl SandboxProvider for DockerProvider {
                         .map_err(|error| docker_error("starting container", error))?;
                     Ok(self.handle(
                         created.id,
+                        spec.name.clone(),
                         working_dir,
                         spec.labels.clone(),
                         spec.env.clone(),
@@ -557,6 +567,7 @@ impl SandboxProvider for DockerProvider {
                         .unwrap_or_default();
                     Ok(self.handle(
                         inspect.id.clone().unwrap_or_else(|| id.as_str().to_owned()),
+                        normalized_container_name(inspect.name.as_deref()),
                         working_dir,
                         user_labels,
                         BTreeMap::new(),
@@ -625,6 +636,7 @@ impl SandboxProvider for DockerProvider {
 /// A container-backed sandbox.
 pub struct DockerSandbox {
     id:            SandboxId,
+    name:          Option<String>,
     capabilities:  Capabilities,
     docker:        Docker,
     working_dir:   String,
@@ -662,6 +674,7 @@ impl Sandbox for DockerSandbox {
             }
             Err(error) if is_not_found(&error) => {
                 let mut status = SandboxStatus::new(self.id.clone(), SandboxState::Deleted);
+                status.name.clone_from(&self.name);
                 status.sandbox_kind = Some(SandboxKind::Container);
                 Ok(status)
             }

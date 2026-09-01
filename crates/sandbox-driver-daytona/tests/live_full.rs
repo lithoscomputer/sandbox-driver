@@ -76,14 +76,26 @@ async fn requested_working_directory_is_created_and_survives_attach() {
     init_diagnostics();
     let provider = DaytonaProvider::connect().await.expect("connect");
     let working_directory = format!("/home/daytona/{}", unique("sd-working-directory"));
+    let display_name = unique("sd-display-name");
     let spec = SandboxSpec::new(SandboxSource::Snapshot {
         id: SnapshotId::try_new(TEST_SNAPSHOT).expect("valid snapshot id"),
     })
+    .name(&display_name)
     .working_directory(&working_directory)
     .ephemeral(true);
     let sandbox = provider.create(&spec, None).await.expect("create");
 
     let outcome = async {
+        let status = sandbox
+            .describe()
+            .await
+            .map_err(|error| format!("describe created sandbox: {error}"))?;
+        if status.name.as_deref() != Some(display_name.as_str()) {
+            return Err(format!(
+                "created sandbox display name was {:?}",
+                status.name
+            ));
+        }
         if sandbox.working_directory() != working_directory {
             return Err(format!(
                 "created handle returned working directory {:?}",
@@ -130,6 +142,16 @@ async fn requested_working_directory_is_created_and_survives_attach() {
             .attach(sandbox.id(), None)
             .await
             .map_err(|error| format!("attach: {error}"))?;
+        let attached_status = attached
+            .describe()
+            .await
+            .map_err(|error| format!("describe attached sandbox: {error}"))?;
+        if attached_status.name.as_deref() != Some(display_name.as_str()) {
+            return Err(format!(
+                "attached sandbox display name was {:?}",
+                attached_status.name
+            ));
+        }
         if attached.working_directory() != working_directory {
             return Err(format!(
                 "attached handle returned working directory {:?}",

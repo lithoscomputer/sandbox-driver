@@ -58,6 +58,9 @@ impl SandboxState {
 #[non_exhaustive]
 pub struct SandboxStatus {
     pub id:                  SandboxId,
+    /// Provider display name. This is not the stable provider identifier.
+    #[serde(default)]
+    pub name:                Option<String>,
     pub state:               SandboxState,
     /// Provider's raw state string, e.g. Daytona's `"pulling_snapshot"`.
     #[serde(default)]
@@ -94,6 +97,7 @@ impl SandboxStatus {
     pub fn new(id: SandboxId, state: SandboxState) -> Self {
         Self {
             id,
+            name: None,
             state,
             provider_state: String::new(),
             error_reason: None,

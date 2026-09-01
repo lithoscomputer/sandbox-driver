@@ -361,7 +361,10 @@ async fn provider_identity_and_list(ctx: &Conformance) -> CheckOutcome {
 }
 
 async fn create_describe_delete(ctx: &Conformance) -> CheckOutcome {
-    let spec = ctx.specs.spec();
+    let mut spec = ctx.specs.spec();
+    if spec.name.is_none() {
+        spec.name = Some(format!("sandbox-driver-conformance-{}", process::id()));
+    }
     let sandbox = ctx
         .provider
         .create(&spec, None)
@@ -374,6 +377,12 @@ async fn create_describe_delete(ctx: &Conformance) -> CheckOutcome {
             .map_err(|error| format!("describe failed: {error}"))?;
         if status.id != *sandbox.id() {
             return fail("describe returned a different sandbox id");
+        }
+        if status.name != spec.name {
+            return fail(format!(
+                "requested display name {:?}, observed {:?}",
+                spec.name, status.name
+            ));
         }
         if let Some(requested) = spec.sandbox_kind {
             if status.sandbox_kind != Some(requested) {

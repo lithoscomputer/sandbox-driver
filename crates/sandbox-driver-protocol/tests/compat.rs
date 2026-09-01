@@ -102,6 +102,7 @@ fn launch_era_status_still_decodes() {
     let status: SandboxStatus = serde_json::from_str(json).expect("launch-era status decodes");
     assert_eq!(status.state, SandboxState::Running);
     assert!(status.web_url.is_none(), "absent newer field defaults");
+    assert!(status.name.is_none(), "absent display name defaults");
     assert!(status.sandbox_kind.is_none());
     assert!(status.region.is_none());
     assert_eq!(status.labels.get("team").map(String::as_str), Some("a"));

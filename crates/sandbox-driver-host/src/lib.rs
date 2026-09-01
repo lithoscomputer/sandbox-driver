@@ -240,6 +240,7 @@ impl SandboxProvider for HostProvider {
                 };
                 let sandbox = Arc::new(HostSandbox::new(
                     id.clone(),
+                    spec.name.clone(),
                     self.capabilities.clone(),
                     workspace,
                     ownership,
@@ -319,6 +320,7 @@ impl SandboxProvider for HostProvider {
 /// A directory-backed sandbox on the local machine.
 pub struct HostSandbox {
     id:                SandboxId,
+    name:              Option<String>,
     capabilities:      Capabilities,
     workspace:         PathBuf,
     ownership:         WorkspaceOwnership,
@@ -335,6 +337,7 @@ pub struct HostSandbox {
 impl HostSandbox {
     fn new(
         id: SandboxId,
+        name: Option<String>,
         capabilities: Capabilities,
         workspace: PathBuf,
         ownership: WorkspaceOwnership,
@@ -345,6 +348,7 @@ impl HostSandbox {
         let working_directory = workspace.to_string_lossy().into_owned();
         Self {
             id,
+            name,
             capabilities,
             exec: HostExec::new(workspace.clone(), env.clone()),
             fs: HostFs::new(workspace.clone()),
@@ -362,6 +366,7 @@ impl HostSandbox {
     fn with_emitter(&self, events: EventEmitter) -> Self {
         Self {
             id: self.id.clone(),
+            name: self.name.clone(),
             capabilities: self.capabilities.clone(),
             workspace: self.workspace.clone(),
             ownership: self.ownership,
@@ -384,6 +389,7 @@ impl HostSandbox {
     fn status(&self) -> SandboxStatus {
         let state = *self.state.lock().expect("state lock");
         let mut status = SandboxStatus::new(self.id.clone(), state);
+        status.name.clone_from(&self.name);
         status.provider_state = format!("{state:?}").to_lowercase();
         status.labels = self.labels.clone();
         status.workspace_ownership = Some(self.ownership);
