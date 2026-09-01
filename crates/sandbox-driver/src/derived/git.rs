@@ -54,13 +54,16 @@ impl<'e> DerivedGit<'e> {
         if result.success() {
             return Ok(result);
         }
-        Err(Error::Exec(ExecFailure::new(
-            label,
-            result.termination,
-            result.exit_code,
-            result.stdout,
-            result.stderr,
-        )))
+        Err(Error::Exec(
+            ExecFailure::new(
+                label,
+                result.termination,
+                result.exit_code,
+                result.stdout,
+                result.stderr,
+            )
+            .with_duration(result.duration),
+        ))
     }
 
     /// A per-call config value (`url.<authed>.insteadOf=<plain>`) that

@@ -45,13 +45,16 @@ impl<'e> DerivedServices<'e> {
         if result.success() {
             return Ok(result);
         }
-        Err(Error::Exec(ExecFailure::new(
-            label,
-            result.termination,
-            result.exit_code,
-            result.stdout,
-            result.stderr,
-        )))
+        Err(Error::Exec(
+            ExecFailure::new(
+                label,
+                result.termination,
+                result.exit_code,
+                result.stdout,
+                result.stderr,
+            )
+            .with_duration(result.duration),
+        ))
     }
 }
 

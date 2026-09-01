@@ -67,13 +67,16 @@ async fn run_match_command(
     if result.exit_code == Some(1) {
         return Ok(None);
     }
-    Err(Error::Exec(ExecFailure::new(
-        label,
-        result.termination,
-        result.exit_code,
-        result.stdout,
-        result.stderr,
-    )))
+    Err(Error::Exec(
+        ExecFailure::new(
+            label,
+            result.termination,
+            result.exit_code,
+            result.stdout,
+            result.stderr,
+        )
+        .with_duration(result.duration),
+    ))
 }
 
 #[async_trait]
@@ -150,13 +153,16 @@ impl Search for DerivedSearch<'_> {
             // An unparseable line means wrong results, not skippable
             // noise — surface it instead of silently dropping matches.
             let Some((file, line_number, content)) = parsed else {
-                return Err(Error::Exec(ExecFailure::new(
-                    "grep output parse",
-                    result.termination,
-                    result.exit_code,
-                    result.stdout.clone(),
-                    result.stderr.clone(),
-                )));
+                return Err(Error::Exec(
+                    ExecFailure::new(
+                        "grep output parse",
+                        result.termination,
+                        result.exit_code,
+                        result.stdout.clone(),
+                        result.stderr.clone(),
+                    )
+                    .with_duration(result.duration),
+                ));
             };
             matches.push(GrepMatch {
                 path: file.to_owned(),
@@ -243,13 +249,16 @@ impl Search for DerivedSearch<'_> {
         let spec = ExecSpec::new(posix).timeout(WALK_TIMEOUT);
         let result = self.exec.run(&spec).await?;
         if !result.success() {
-            return Err(Error::Exec(ExecFailure::new(
-                "walk",
-                result.termination,
-                result.exit_code,
-                result.stdout,
-                result.stderr,
-            )));
+            return Err(Error::Exec(
+                ExecFailure::new(
+                    "walk",
+                    result.termination,
+                    result.exit_code,
+                    result.stdout,
+                    result.stderr,
+                )
+                .with_duration(result.duration),
+            ));
         }
         Ok(parse_posix_walk(&result.stdout))
     }

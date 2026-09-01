@@ -177,6 +177,7 @@ pub struct ExecFailure {
     exit_code:   Option<i32>,
     stdout:      Vec<u8>,
     stderr:      Vec<u8>,
+    duration:    Option<Duration>,
 }
 
 impl fmt::Display for ExecFailure {
@@ -186,6 +187,9 @@ impl fmt::Display for ExecFailure {
             "command {:?} failed ({:?}, exit code {:?})",
             self.label, self.termination, self.exit_code
         )?;
+        if let Some(duration) = self.duration {
+            write!(f, " after {} ms", duration.as_millis())?;
+        }
         if let Some(hint) = self.hint() {
             write!(f, " — hint: {hint}")?;
         }
@@ -226,7 +230,20 @@ impl ExecFailure {
             exit_code,
             stdout,
             stderr,
+            duration: None,
         }
+    }
+
+    /// How long the command ran before failing, when the reporter
+    /// observed it (fabro's exec errors carried this).
+    #[must_use]
+    pub fn with_duration(mut self, duration: Duration) -> Self {
+        self.duration = Some(duration);
+        self
+    }
+
+    pub fn duration(&self) -> Option<Duration> {
+        self.duration
     }
 
     /// The label the failure was reported under (e.g. `"bash probe"`).

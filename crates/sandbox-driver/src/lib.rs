@@ -89,7 +89,7 @@ pub use git::{
 };
 pub use id::{InvalidIdError, ProviderKind, SandboxId, ServiceId, SnapshotId, VolumeId};
 pub use logs::{LogSink, LogSource, Logs};
-pub use probe::{BASH_PROBE_SCRIPT, ProbeFailure, activate, run_bash_probe};
+pub use probe::{BASH_PROBE_SCRIPT, activate, run_bash_probe};
 pub use provider::{
     HealthStatus, ProviderHealth, SandboxFilter, SandboxProvider, SnapshotFilter, SnapshotProvider,
     SnapshotSource, SnapshotSpec, SnapshotState, SnapshotStatus, VolumeProvider, VolumeSpec,

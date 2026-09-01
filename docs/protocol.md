@@ -235,7 +235,7 @@ kind-specific fields for faithful reconstruction:
 | `auth` | `auth` object: `{provider, reason}` |
 | `rate_limited` | `retry_after` (optional) |
 | `provider` | `provider` object: `{provider, code, message, retryable, detail}` |
-| `exec` | `exec` object: `{label, termination, exit_code, stdout_b64, stderr_b64}` |
+| `exec` | `exec` object: `{label, termination, exit_code, stdout_b64, stderr_b64, duration_ms?}` (`duration_ms` is additive: senders may omit it, receivers must tolerate its absence) |
 | `transport` | `transport_context` |
 | `io` | `io_context` |
 

@@ -163,6 +163,9 @@ struct ExecDetail {
     exit_code:   Option<i32>,
     stdout_b64:  String,
     stderr_b64:  String,
+    /// Additive since v1: absent from older peers, tolerated by them.
+    #[serde(default)]
+    duration_ms: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -240,6 +243,9 @@ impl WireError {
                     exit_code:   failure.exit_code(),
                     stdout_b64:  encode_bytes(failure.stdout()),
                     stderr_b64:  encode_bytes(failure.stderr()),
+                    duration_ms: failure
+                        .duration()
+                        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
                 });
             }
             Error::Io { context, .. } => detail.io_context = Some(context.clone()),
@@ -330,13 +336,17 @@ impl WireError {
                         decode_bytes(&exec.stdout_b64),
                         decode_bytes(&exec.stderr_b64),
                     ) {
-                        return Error::Exec(ExecFailure::new(
+                        let mut failure = ExecFailure::new(
                             exec.label,
                             exec.termination,
                             exec.exit_code,
                             stdout,
                             stderr,
-                        ));
+                        );
+                        if let Some(duration_ms) = exec.duration_ms {
+                            failure = failure.with_duration(Duration::from_millis(duration_ms));
+                        }
+                        return Error::Exec(failure);
                     }
                 }
             }
@@ -460,19 +470,32 @@ mod tests {
             "daemon disconnected"
         );
 
-        let error = Error::Exec(ExecFailure::new(
-            "probe",
-            Termination::Exited,
-            Some(3),
-            b"out".to_vec(),
-            b"err".to_vec(),
-        ));
+        let error = Error::Exec(
+            ExecFailure::new(
+                "probe",
+                Termination::Exited,
+                Some(3),
+                b"out".to_vec(),
+                b"err".to_vec(),
+            )
+            .with_duration(Duration::from_millis(1500)),
+        );
         let Error::Exec(failure) = WireError::from_error(&error).into_error() else {
             panic!("expected exec failure");
         };
         assert_eq!(failure.label(), "probe");
         assert_eq!(failure.exit_code(), Some(3));
         assert_eq!(failure.stdout(), b"out");
+        assert_eq!(failure.duration(), Some(Duration::from_millis(1500)));
+
+        // duration_ms is additive: a v1 peer that omits it must decode
+        // to a duration-less failure, not an error.
+        let old_shape: ExecDetail = serde_json::from_str(
+            r#"{"label":"probe","termination":"exited","exit_code":3,
+                "stdout_b64":"","stderr_b64":""}"#,
+        )
+        .expect("old exec detail decodes");
+        assert_eq!(old_shape.duration_ms, None);
 
         let error = Error::io(
             "reading plugin executable",

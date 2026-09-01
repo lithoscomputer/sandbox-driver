@@ -24,15 +24,6 @@ printf 'fabro-bash-ready'
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_OK_MARKER: &str = "fabro-bash-ready";
 
-/// A failed bash probe. The raw output stays behind [`ExecFailure`]'s
-/// accessors.
-#[derive(Debug, thiserror::Error)]
-#[error("bash probe failed: {reason}")]
-#[non_exhaustive]
-pub struct ProbeFailure {
-    pub reason: String,
-}
-
 /// Runs the bash contract probe through `exec`, over both transports.
 ///
 /// Buffered and streaming execution can ride different provider
@@ -61,13 +52,16 @@ fn check_probe_result(label: &str, result: ExecResult) -> Result<()> {
     if result.success() && result.stdout_lossy().trim() == PROBE_OK_MARKER {
         return Ok(());
     }
-    Err(Error::Exec(ExecFailure::new(
-        label,
-        result.termination,
-        result.exit_code,
-        result.stdout,
-        result.stderr,
-    )))
+    Err(Error::Exec(
+        ExecFailure::new(
+            label,
+            result.termination,
+            result.exit_code,
+            result.stdout,
+            result.stderr,
+        )
+        .with_duration(result.duration),
+    ))
 }
 
 /// Ensures a sandbox is running and healthy: describe, then start (or
