@@ -33,10 +33,19 @@ const TIMEOUT_GRACE: Duration = Duration::from_secs(10);
 /// year fits comfortably in the API's `i32` seconds.
 const UNBOUNDED_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
-/// The server-side timeout for a spec: its own, or the unbounded
-/// stand-in — never an omitted field.
+/// The server-side timeout for a spec: its own, rounded up to a whole
+/// second, or the unbounded stand-in — never an omitted field. The API
+/// field is integer seconds; without the ceiling, a sub-second timeout
+/// would truncate to `0` on the wire instead of bounding the command.
 fn wire_timeout(spec_timeout: Option<Duration>) -> Duration {
-    spec_timeout.unwrap_or(UNBOUNDED_TIMEOUT)
+    let Some(timeout) = spec_timeout else {
+        return UNBOUNDED_TIMEOUT;
+    };
+    if timeout.subsec_nanos() > 0 {
+        Duration::from_secs(timeout.as_secs() + 1)
+    } else {
+        timeout
+    }
 }
 
 /// Bound on deleting a stdin temp file, so cleanup can never stall a
@@ -659,6 +668,19 @@ pub(crate) fn wrap_session_script(script: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wire_timeout_rounds_sub_second_up() {
+        assert_eq!(
+            wire_timeout(Some(Duration::from_millis(300))),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            wire_timeout(Some(Duration::from_secs(10))),
+            Duration::from_secs(10)
+        );
+        assert_eq!(wire_timeout(None), UNBOUNDED_TIMEOUT);
+    }
 
     #[test]
     fn compose_strips_a_spec_provided_bash_env() {
