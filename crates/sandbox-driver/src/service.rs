@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -100,7 +101,9 @@ impl Services for ServicesFacet<'_> {
 }
 
 /// Spawn request for [`Services::spawn`].
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// `Debug` redacts the command and env values, as on
+/// [`crate::ExecSpec`].
+#[derive(Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ServiceSpec {
     /// Bash source, under the [`crate::Exec`] command contract.
@@ -109,6 +112,16 @@ pub struct ServiceSpec {
     pub working_dir: Option<String>,
     #[serde(default)]
     pub env:         BTreeMap<String, String>,
+}
+
+impl fmt::Debug for ServiceSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServiceSpec")
+            .field("command", &"<redacted>")
+            .field("working_dir", &self.working_dir)
+            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 impl ServiceSpec {

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -169,7 +170,7 @@ impl PlatformInfo {
 /// Deliberately absent: clone URLs, branches, credentials. Repository
 /// cloning is an orchestration recipe over `Exec`/`Git`, not a
 /// provisioning concern.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct SandboxSpec {
     #[serde(default)]
@@ -212,6 +213,31 @@ pub struct SandboxSpec {
     /// Provider-specific options, documented by each provider's schema.
     #[serde(default)]
     pub provider_config:   serde_json::Value,
+}
+
+// The env map is the designated secret channel and provider_config can
+// carry credentials (proxy URLs); `Debug` redacts both so tracing a
+// spec can never leak them.
+impl fmt::Debug for SandboxSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SandboxSpec")
+            .field("name", &self.name)
+            .field("source", &self.source)
+            .field("resources", &self.resources)
+            .field("sandbox_kind", &self.sandbox_kind)
+            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .field("labels", &self.labels)
+            .field("user", &self.user)
+            .field("working_directory", &self.working_directory)
+            .field("network", &self.network)
+            .field("volumes", &self.volumes)
+            .field("timers", &self.timers)
+            .field("ephemeral", &self.ephemeral)
+            .field("public", &self.public)
+            .field("region", &self.region)
+            .field("provider_config", &"<redacted>")
+            .finish()
+    }
 }
 
 impl SandboxSpec {
@@ -404,6 +430,17 @@ mod tests {
             empty_region.validate(),
             Err(crate::Error::InvalidSpec { .. })
         ));
+    }
+
+    #[test]
+    fn spec_debug_redacts_env_values_and_provider_config() {
+        let spec = SandboxSpec::new(SandboxSource::HostDirectory)
+            .env_var("API_TOKEN", "hunter2")
+            .provider_config(serde_json::json!({"proxy": "https://u:hunter2@proxy"}));
+        let debug = format!("{spec:?}");
+        assert!(!debug.contains("hunter2"), "debug: {debug}");
+        // Keys stay visible for diagnostics.
+        assert!(debug.contains("API_TOKEN"), "debug: {debug}");
     }
 
     #[test]

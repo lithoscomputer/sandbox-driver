@@ -66,7 +66,12 @@ pub trait Exec: Send + Sync {
 
 /// Serializable execution request — exactly what crosses the JSON-RPC
 /// boundary. Process-local control objects travel in [`ExecControls`].
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// `Debug` redacts the command (it can embed credentialed URLs — the
+/// git credential rewrite does), env values, and stdin, so tracing a
+/// spec can never leak them; fabro enforced the same rule by omitting
+/// `Debug` entirely.
+#[derive(Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ExecSpec {
     /// Bash source; see the trait-level contract.
@@ -123,6 +128,19 @@ impl ExecSpec {
     pub fn output_sanitization(mut self, policy: OutputSanitization) -> Self {
         self.output_sanitization = policy;
         self
+    }
+}
+
+impl fmt::Debug for ExecSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExecSpec")
+            .field("command", &"<redacted>")
+            .field("timeout", &self.timeout)
+            .field("working_dir", &self.working_dir)
+            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .field("stdin_bytes", &self.stdin.as_ref().map(Vec::len))
+            .field("output_sanitization", &self.output_sanitization)
+            .finish()
     }
 }
 
@@ -285,12 +303,23 @@ impl ExecStreamingResult {
 
 /// Serializable spawn request for [`Exec::spawn_stdio`]. The command is
 /// Bash source under the same contract as [`ExecSpec::command`].
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// `Debug` redacts the command and env values, as on [`ExecSpec`].
+#[derive(Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct SpawnSpec {
     pub command:     String,
     pub working_dir: Option<String>,
     pub env:         BTreeMap<String, String>,
+}
+
+impl fmt::Debug for SpawnSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SpawnSpec")
+            .field("command", &"<redacted>")
+            .field("working_dir", &self.working_dir)
+            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 impl SpawnSpec {
@@ -405,6 +434,25 @@ impl Default for StderrTail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_and_spawn_spec_debug_redact_secrets() {
+        let spec = ExecSpec::new("curl https://user:hunter2@host/")
+            .env_var("API_TOKEN", "hunter2")
+            .stdin(b"hunter2".to_vec());
+        let debug = format!("{spec:?}");
+        assert!(!debug.contains("hunter2"), "debug: {debug}");
+        assert!(debug.contains("API_TOKEN"), "keys stay visible: {debug}");
+
+        let spawn = SpawnSpec {
+            command:     "run --token hunter2".to_owned(),
+            working_dir: None,
+            env:         BTreeMap::from([("API_TOKEN".to_owned(), "hunter2".to_owned())]),
+        };
+        let debug = format!("{spawn:?}");
+        assert!(!debug.contains("hunter2"), "debug: {debug}");
+        assert!(debug.contains("API_TOKEN"), "keys stay visible: {debug}");
+    }
 
     #[test]
     fn stderr_tail_keeps_only_newest_bytes() {
