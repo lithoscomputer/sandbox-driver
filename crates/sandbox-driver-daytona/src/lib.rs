@@ -1648,6 +1648,9 @@ impl Sandbox for DaytonaSandbox {
 
     #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
     async fn update_network(&self, policy: &NetworkPolicy) -> Result<()> {
+        // Runtime updates bypass spec validation, so the allow-list
+        // emptiness invariant is re-checked at this boundary.
+        policy.validate()?;
         let mut settings = UpdateSandboxNetworkSettings::new();
         match policy {
             NetworkPolicy::AllowAll => settings.network_block_all = Some(false),

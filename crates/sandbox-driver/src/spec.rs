@@ -69,6 +69,25 @@ pub enum NetworkPolicy {
     },
 }
 
+impl NetworkPolicy {
+    /// Checks the policy's own invariants. An empty allow-list is
+    /// rejected rather than passed through: providers treat a present
+    /// but empty allow-list as no restriction at all (Daytona: open
+    /// egress), the opposite of what an emptied-out filter intends.
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        match self {
+            Self::CidrAllowList { cidrs } if cidrs.is_empty() => Err(crate::Error::invalid_spec(
+                "network",
+                "cidr allow-list must not be empty",
+            )),
+            Self::DomainAllowList { domains } if domains.is_empty() => Err(
+                crate::Error::invalid_spec("network", "domain allow-list must not be empty"),
+            ),
+            _ => Ok(()),
+        }
+    }
+}
+
 /// A volume attached at sandbox create time, the portable attach point.
 /// Provider-specific runtime attachment remains outside this interface.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -300,6 +319,7 @@ impl SandboxSpec {
         if self.region.as_deref() == Some("") {
             return Err(crate::Error::invalid_spec("region", "must not be empty"));
         }
+        self.network.validate()?;
         if self.timers.auto_stop_after_idle.is_some() && self.timers.auto_pause_after_idle.is_some()
         {
             return Err(crate::Error::invalid_spec(
@@ -384,5 +404,30 @@ mod tests {
             empty_region.validate(),
             Err(crate::Error::InvalidSpec { .. })
         ));
+    }
+
+    #[test]
+    fn spec_rejects_empty_network_allow_lists() {
+        // An empty allow-list reaching a provider means "no
+        // restriction", not "block everything" — it must fail closed.
+        let empty_cidrs = SandboxSpec::new(SandboxSource::HostDirectory)
+            .network(NetworkPolicy::CidrAllowList { cidrs: vec![] });
+        assert!(matches!(
+            empty_cidrs.validate(),
+            Err(crate::Error::InvalidSpec { .. })
+        ));
+
+        let empty_domains = SandboxSpec::new(SandboxSource::HostDirectory)
+            .network(NetworkPolicy::DomainAllowList { domains: vec![] });
+        assert!(matches!(
+            empty_domains.validate(),
+            Err(crate::Error::InvalidSpec { .. })
+        ));
+
+        let populated = SandboxSpec::new(SandboxSource::HostDirectory)
+            .network(NetworkPolicy::CidrAllowList {
+                cidrs: vec!["10.0.0.0/8".into()],
+            });
+        assert!(populated.validate().is_ok());
     }
 }
