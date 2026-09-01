@@ -134,7 +134,20 @@ impl Git for DerivedGit<'_> {
         target_path: &str,
         options: &GitCloneOptions,
     ) -> Result<()> {
-        let mut args: Vec<String> = vec!["clone".into()];
+        let mut args: Vec<String> = Vec::new();
+        // Credentials travel in a per-call insteadOf rewrite, exactly as
+        // push/pull do. The rewrite applies during clone's fetch, while
+        // the positional URL — which git records verbatim as
+        // `remote.origin.url` — stays plain.
+        if let Some(authed) = options
+            .credentials
+            .as_ref()
+            .and_then(|credentials| authed_url(url, credentials))
+        {
+            args.push("-c".into());
+            args.push(format!("url.{authed}.insteadOf={url}"));
+        }
+        args.push("clone".into());
         if let Some(depth) = options.depth {
             args.push("--depth".into());
             args.push(depth.to_string());
@@ -150,12 +163,7 @@ impl Git for DerivedGit<'_> {
         // End option parsing so a URL or path starting with `-` cannot
         // be read as a flag.
         args.push("--".into());
-        let url = options
-            .credentials
-            .as_ref()
-            .and_then(|credentials| authed_url(url, credentials))
-            .unwrap_or_else(|| url.to_owned());
-        args.push(url);
+        args.push(url.to_owned());
         args.push(target_path.to_owned());
         self.run("git clone", None, &args, CLONE_TIMEOUT).await?;
 
@@ -470,6 +478,35 @@ mod tests {
         // pinned shape.
         assert!(
             command.contains("'--branch' 'main' '--single-branch' '--no-tags' '--'"),
+            "clone: {command}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clone_credentials_travel_in_the_rewrite_not_the_url() {
+        let exec = ScriptedExec::new(vec![ScriptedExec::ok("")]);
+        let git = DerivedGit::new(&exec);
+        let options = GitCloneOptions {
+            branch:      None,
+            commit:      None,
+            depth:       None,
+            credentials: Some(GitCredentials::new("user", "pass")),
+        };
+        git.clone_repo("https://github.com/org/repo.git", "/dst", &options)
+            .await
+            .expect("clone succeeds");
+        let command = &exec.commands()[0];
+        assert!(
+            command.contains(
+                "'-c' 'url.https://user:pass@github.com/org/repo.git.insteadOf=https://github.com/org/repo.git'"
+            ),
+            "clone: {command}"
+        );
+        // The positional URL stays plain, so git records a plain
+        // `remote.origin.url` and the credentials never reach
+        // .git/config.
+        assert!(
+            command.contains("'--' 'https://github.com/org/repo.git' '/dst'"),
             "clone: {command}"
         );
     }
