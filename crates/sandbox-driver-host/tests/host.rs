@@ -57,6 +57,29 @@ async fn managed_workspace_is_created_and_removed() {
 }
 
 #[tokio::test]
+async fn exec_recreates_a_managed_workspace_the_os_cleaned_up() {
+    let provider = HostProvider::new();
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+    let workspace = PathBuf::from(sandbox.working_directory());
+
+    // The OS periodically cleans temp directories out from under
+    // long-lived workers (macOS /var/folders, systemd-tmpfiles).
+    tokio_fs::remove_dir_all(&workspace)
+        .await
+        .expect("simulate temp cleanup");
+
+    let result = sandbox
+        .exec()
+        .run(&ExecSpec::new("pwd").timeout(Duration::from_secs(10)))
+        .await
+        .expect("exec self-heals the workspace");
+    assert!(result.success(), "exec failed: {result:?}");
+    assert!(workspace.is_dir(), "workspace was recreated");
+
+    sandbox.delete().await.expect("delete");
+}
+
+#[tokio::test]
 async fn unsupported_creation_fields_return_invalid_spec() {
     let provider = HostProvider::new();
     let mut cases = Vec::new();

@@ -73,14 +73,24 @@ fn inherited_var_is_sensitive(key: &str) -> bool {
 pub struct HostExec {
     working_dir: PathBuf,
     base_env:    BTreeMap<String, String>,
+    /// Managed workspaces live under the OS temp directory, which the
+    /// OS cleans periodically; recreate rather than failing every exec
+    /// forever. Designated directories stay caller-owned and are never
+    /// created here.
+    recreate_missing_workspace: bool,
     bash_path:   OnceLock<PathBuf>,
 }
 
 impl HostExec {
-    pub fn new(working_dir: PathBuf, base_env: BTreeMap<String, String>) -> Self {
+    pub fn new(
+        working_dir: PathBuf,
+        base_env: BTreeMap<String, String>,
+        recreate_missing_workspace: bool,
+    ) -> Self {
         Self {
             working_dir,
             base_env,
+            recreate_missing_workspace,
             bash_path: OnceLock::new(),
         }
     }
@@ -122,6 +132,10 @@ impl HostExec {
         working_dir: Option<&str>,
         env: &BTreeMap<String, String>,
     ) -> Result<Command> {
+        if self.recreate_missing_workspace && !self.working_dir.exists() {
+            std::fs::create_dir_all(&self.working_dir)
+                .map_err(|error| Error::io("recreating managed workspace", error))?;
+        }
         let mut command = Command::new(self.bash()?);
         command.arg("-c").arg(program);
         command.current_dir(self.resolve_dir(working_dir));
