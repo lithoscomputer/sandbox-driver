@@ -1,0 +1,87 @@
+bin.name = "lithos-sandbox"
+args = [
+  "--provider",
+  "host",
+  "--output",
+  "json",
+  "--events",
+  "off",
+  "provider",
+  "capabilities",
+]
+status = "success"
+stdout = """
+{
+  "isolation": "none",
+  "lifecycle": {
+    "pause": false,
+    "archive": false,
+    "fork": false,
+    "resize": false,
+    "recover": false,
+    "undelete": false,
+    "refresh_activity": false,
+    "timers": false,
+    "labels": false,
+    "update_network": false,
+    "snapshot_sandbox": false
+  },
+  "exec": {
+    "live_streaming": true,
+    "streams_separated": true,
+    "stdin": true,
+    "cancel": true,
+    "stdio_process": true
+  },
+  "fs": {
+    "native": true,
+    "upload": true,
+    "download": true,
+    "permissions": true
+  },
+  "search": {
+    "supported": true,
+    "native": false
+  },
+  "git": {
+    "supported": true,
+    "native": false
+  },
+  "services": {
+    "supported": true,
+    "native": false
+  },
+  "pty": null,
+  "logs": null,
+  "access": {
+    "preview_urls": false,
+    "signed_preview_urls": false,
+    "ssh": false,
+    "ssh_ttl": false,
+    "ssh_revoke": false,
+    "shell_command": false,
+    "web_terminal": false,
+    "vnc": false,
+    "vpn": false
+  },
+  "network": {
+    "allow_all": false,
+    "block_all": false,
+    "cidr_allow_list": false,
+    "domain_allow_list": false,
+    "outbound_proxy": false
+  },
+  "snapshots": null,
+  "volumes": null
+}
+"""
+stderr = ""
+
+[env]
+inherit = false
+
+[env.add]
+NO_COLOR = "1"
+PATH = "/usr/bin:/bin"
+RUST_LOG = "off"
+XDG_CONFIG_HOME = "tests/cmd/no-config"

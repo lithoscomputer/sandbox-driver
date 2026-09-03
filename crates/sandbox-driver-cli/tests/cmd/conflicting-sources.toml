@@ -1,0 +1,26 @@
+bin.name = "lithos-sandbox"
+args = [
+  "sandbox",
+  "create",
+  "--image",
+  "ubuntu:24.04",
+  "--host-directory",
+]
+status.code = 2
+stdout = ""
+stderr = """
+error: the argument '--image <IMAGE>' cannot be used with '--host-directory'
+
+Usage: lithos-sandbox sandbox create --image <IMAGE>
+
+For more information, try '--help'.
+"""
+
+[env]
+inherit = false
+
+[env.add]
+NO_COLOR = "1"
+PATH = "/usr/bin:/bin"
+RUST_LOG = "off"
+XDG_CONFIG_HOME = "tests/cmd/no-config"

@@ -1,0 +1,17 @@
+bin.name = "lithos-sandbox"
+args = ["--provider", "unknown", "provider", "health"]
+status.code = 1
+stdout = ""
+stderr = """
+error: connecting provider profile "unknown"
+  caused by: unknown provider "unknown"; use host, docker, daytona, or a configured profile
+"""
+
+[env]
+inherit = false
+
+[env.add]
+NO_COLOR = "1"
+PATH = "/usr/bin:/bin"
+RUST_LOG = "off"
+XDG_CONFIG_HOME = "tests/cmd/no-config"
