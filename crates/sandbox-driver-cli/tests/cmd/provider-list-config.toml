@@ -1,0 +1,47 @@
+bin.name = "lithos-sandbox"
+args = ["--config", "config.toml", "--output", "json", "provider", "list"]
+status = "success"
+stdout = """
+[
+  {
+    "name": "daytona",
+    "provider_type": "daytona",
+    "kind": "daytona",
+    "selected": false
+  },
+  {
+    "name": "docker",
+    "provider_type": "docker",
+    "kind": "docker",
+    "selected": false
+  },
+  {
+    "name": "host",
+    "provider_type": "host",
+    "kind": "host",
+    "selected": false
+  },
+  {
+    "name": "local",
+    "provider_type": "host",
+    "kind": "host",
+    "selected": true
+  },
+  {
+    "name": "remote",
+    "provider_type": "plugin",
+    "kind": "example",
+    "selected": false
+  }
+]
+"""
+stderr = ""
+
+[env]
+inherit = false
+
+[env.add]
+NO_COLOR = "1"
+PATH = "/usr/bin:/bin"
+RUST_LOG = "off"
+XDG_CONFIG_HOME = "tests/cmd/no-config"

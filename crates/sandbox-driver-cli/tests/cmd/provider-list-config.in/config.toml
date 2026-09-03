@@ -1,0 +1,10 @@
+default-provider = "local"
+
+[providers.local]
+type = "host"
+
+[providers.remote]
+type = "plugin"
+kind = "example"
+path = "/opt/lithos-sandbox-example"
+dev = true

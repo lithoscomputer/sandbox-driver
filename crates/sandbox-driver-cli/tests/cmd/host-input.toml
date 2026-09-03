@@ -1,0 +1,37 @@
+bin.name = "lithos-sandbox"
+args = [
+  "--provider",
+  "host",
+  "--events",
+  "off",
+  "sandbox",
+  "run",
+  "--workspace",
+  ".",
+  "--env",
+  "CREATED_ENV=created",
+  "--exec-env",
+  "EXEC_ENV=exec",
+  "--stdin",
+  "--",
+  "/bin/sh",
+  "-c",
+  "read input; printf '%s:%s:%s\\n' \"$CREATED_ENV\" \"$EXEC_ENV\" \"$input\"; printf 'stderr-value\\n' >&2",
+]
+stdin = "payload\n"
+status = "success"
+stdout = """
+created:exec:payload
+"""
+stderr = """
+stderr-value
+"""
+
+[env]
+inherit = false
+
+[env.add]
+NO_COLOR = "1"
+PATH = "/usr/bin:/bin"
+RUST_LOG = "off"
+XDG_CONFIG_HOME = "tests/cmd/no-config"

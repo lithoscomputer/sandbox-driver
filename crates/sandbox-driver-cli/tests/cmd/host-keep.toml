@@ -1,0 +1,16 @@
+bin.name = "lithos-sandbox"
+args = ["--provider", "host", "sandbox", "run", "--keep", "--", "/bin/true"]
+status.code = 1
+stdout = ""
+stderr = """
+error: Host sandboxes cannot be reattached after this command exits; remove --keep or use a persistent provider
+"""
+
+[env]
+inherit = false
+
+[env.add]
+NO_COLOR = "1"
+PATH = "/usr/bin:/bin"
+RUST_LOG = "off"
+XDG_CONFIG_HOME = "tests/cmd/no-config"

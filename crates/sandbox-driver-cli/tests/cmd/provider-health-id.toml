@@ -1,0 +1,16 @@
+bin.name = "lithos-sandbox"
+args = ["--provider", "host", "--output", "id", "provider", "health"]
+status.code = 1
+stdout = ""
+stderr = """
+error: --output id is not valid for provider health
+"""
+
+[env]
+inherit = false
+
+[env.add]
+NO_COLOR = "1"
+PATH = "/usr/bin:/bin"
+RUST_LOG = "off"
+XDG_CONFIG_HOME = "tests/cmd/no-config"

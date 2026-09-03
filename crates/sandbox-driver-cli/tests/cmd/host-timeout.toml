@@ -1,0 +1,29 @@
+bin.name = "lithos-sandbox"
+args = [
+  "--provider",
+  "host",
+  "--events",
+  "off",
+  "sandbox",
+  "run",
+  "--timeout-seconds",
+  "1",
+  "--",
+  "/bin/sh",
+  "-c",
+  "sleep 10",
+]
+status.code = 124
+stdout = ""
+stderr = """
+sandbox command timed out
+"""
+
+[env]
+inherit = false
+
+[env.add]
+NO_COLOR = "1"
+PATH = "/usr/bin:/bin"
+RUST_LOG = "off"
+XDG_CONFIG_HOME = "tests/cmd/no-config"

@@ -1,0 +1,27 @@
+bin.name = "lithos-sandbox"
+args = [
+  "--provider",
+  "host",
+  "--events",
+  "off",
+  "sandbox",
+  "run",
+  "--dockerfile",
+  "Dockerfile",
+  "--",
+  "/bin/true",
+]
+status.code = 1
+stdout = ""
+stderr = """
+error: invalid spec: source: the host provider only supports SandboxSource::HostDirectory
+"""
+
+[env]
+inherit = false
+
+[env.add]
+NO_COLOR = "1"
+PATH = "/usr/bin:/bin"
+RUST_LOG = "off"
+XDG_CONFIG_HOME = "tests/cmd/no-config"

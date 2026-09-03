@@ -1,0 +1,25 @@
+bin.name = "lithos-sandbox"
+args = [
+  "--provider",
+  "host",
+  "--output",
+  "json",
+  "sandbox",
+  "run",
+  "--",
+  "/bin/true",
+]
+status.code = 1
+stdout = ""
+stderr = """
+error: sandbox run streams raw output and requires --output table
+"""
+
+[env]
+inherit = false
+
+[env.add]
+NO_COLOR = "1"
+PATH = "/usr/bin:/bin"
+RUST_LOG = "off"
+XDG_CONFIG_HOME = "tests/cmd/no-config"
