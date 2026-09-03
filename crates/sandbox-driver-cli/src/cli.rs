@@ -134,7 +134,6 @@ pub(crate) struct CreateArgs {
 }
 
 #[derive(Debug, Args)]
-#[group(id = "source", multiple = false)]
 pub(crate) struct CreateSpecArgs {
     /// Read the complete SandboxSpec from a JSON file. Use `-` for stdin.
     #[arg(long)]
@@ -335,5 +334,31 @@ mod tests {
         .expect_err("sources conflict");
 
         assert!(error.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn creation_source_can_be_combined_with_other_options() {
+        let cli = Cli::try_parse_from([
+            "lithos-sandbox",
+            "sandbox",
+            "create",
+            "--snapshot",
+            "daytona-medium",
+            "--name",
+            "example",
+            "--cpu",
+            "2",
+        ])
+        .expect("source and creation options parse together");
+
+        let Command::Sandbox { command } = cli.command else {
+            panic!("expected sandbox command");
+        };
+        let SandboxCommand::Create(args) = *command else {
+            panic!("expected sandbox create");
+        };
+        assert_eq!(args.spec.snapshot.as_deref(), Some("daytona-medium"));
+        assert_eq!(args.spec.name.as_deref(), Some("example"));
+        assert_eq!(args.spec.cpu, Some(2));
     }
 }
