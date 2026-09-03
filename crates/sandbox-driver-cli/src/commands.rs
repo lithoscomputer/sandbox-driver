@@ -607,11 +607,17 @@ fn command_output_sink() -> OutputSink {
             let result = match stream {
                 OutputStream::Stdout => {
                     let mut output = async_stdout();
-                    output.write_all(&bytes).await
+                    match output.write_all(&bytes).await {
+                        Ok(()) => output.flush().await,
+                        Err(error) => Err(error),
+                    }
                 }
                 OutputStream::Stderr => {
                     let mut output = async_stderr();
-                    output.write_all(&bytes).await
+                    match output.write_all(&bytes).await {
+                        Ok(()) => output.flush().await,
+                        Err(error) => Err(error),
+                    }
                 }
             };
             result.map_err(|error| Error::io("writing command output", error))
