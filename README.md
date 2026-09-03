@@ -11,6 +11,7 @@ snapshots, and volumes behind one capability-discoverable interface.
 | `sandbox-driver-daytona` | Daytona provider — cloud VMs, snapshots, volumes |
 | `sandbox-driver-protocol` | JSON-RPC plugin protocol: serve any provider, adapt any plugin |
 | `sandbox-driver-conformance` | Black-box conformance suite every provider must pass |
+| `sandbox-driver-cli` | `lithos-sandbox` command for provider diagnostics and sandbox operations |
 
 Host and Docker pass conformance locally (Docker needs a daemon); the
 Daytona suite runs live with `DAYTONA_API_KEY` set. The protocol crate
@@ -18,6 +19,34 @@ re-runs the same suite through the wire.
 
 See `docs/design.md` for the interface design
 and `docs/protocol.md` for the normative plugin wire protocol.
+
+## CLI
+
+Build the `lithos-sandbox` command and inspect the available operations:
+
+```sh
+cargo build --locked -p sandbox-driver-cli
+target/debug/lithos-sandbox --help
+```
+
+Run a command in a temporary Host sandbox:
+
+```sh
+lithos-sandbox --provider host sandbox run --workspace "$PWD" -- \
+  bash -lc 'cargo test'
+```
+
+Use Docker for persistent sandbox operations:
+
+```sh
+id=$(lithos-sandbox --provider docker --output id sandbox create \
+  --image ubuntu:24.04)
+lithos-sandbox --provider docker sandbox exec "$id" -- uname -a
+lithos-sandbox --provider docker sandbox delete "$id"
+```
+
+See [docs/cli.md](docs/cli.md) for provider profiles, plugin configuration,
+creation specifications, output formats, and exit behavior.
 
 ## Diagnostics
 
