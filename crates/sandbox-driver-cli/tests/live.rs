@@ -579,12 +579,21 @@ fn docker_is_available(cli: &CliRunner) -> bool {
         "health",
     ]);
     let output = run(&mut command);
-    let health: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
-        panic!(
-            "Docker health was not JSON: {error}; {}",
-            diagnostic(&output)
-        )
-    });
+    let health: Value = match serde_json::from_slice(&output.stdout) {
+        Ok(health) => health,
+        Err(_)
+            if !output.status.success()
+                && stderr_text(&output).contains("connecting to the docker daemon") =>
+        {
+            return false;
+        }
+        Err(error) => {
+            panic!(
+                "Docker health was not JSON: {error}; {}",
+                diagnostic(&output)
+            );
+        }
+    };
     match health["status"].as_str() {
         Some("ok") => {
             assert_success(&output, "Docker health");
