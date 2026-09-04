@@ -47,6 +47,8 @@ each night. Both workflows test these native platforms:
 
 ## Releases
 
-Pushing a `v*` tag builds native archives and SHA-256 checksums for all three
-platforms. The workflow creates a draft GitHub release. Review the draft before
-publishing it.
+Pushing a `v*` tag builds the three plugin executables (`sandbox-driver-host`,
+`sandbox-driver-docker`, `sandbox-driver-daytona`) for all three platforms,
+one archive and SHA-256 checksum each, plus a checksum of each bare executable
+for hosts that pin plugins. The workflow creates a draft GitHub release.
+Review the draft before publishing it.

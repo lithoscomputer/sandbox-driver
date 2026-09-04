@@ -62,6 +62,10 @@ pub enum Capability {
     Pty,
     #[serde(rename = "logs")]
     Logs,
+    #[serde(rename = "one_shot")]
+    OneShot,
+    #[serde(rename = "one_shot.build")]
+    OneShotBuild,
     #[serde(rename = "sessions")]
     Sessions,
     #[serde(rename = "access.preview_urls")]
@@ -146,6 +150,9 @@ pub struct Capabilities {
     pub pty:       Option<PtyCaps>,
     #[serde(default)]
     pub logs:      Option<LogsCaps>,
+    /// Ephemeral containers run in the sandbox's world ([`crate::OneShot`]).
+    #[serde(default)]
+    pub one_shot:  Option<OneShotCaps>,
     #[serde(default)]
     pub access:    AccessCaps,
     #[serde(default)]
@@ -171,6 +178,7 @@ impl Capabilities {
             services: ServiceCaps::default(),
             pty: None,
             logs: None,
+            one_shot: None,
             access: AccessCaps::default(),
             network: NetworkCaps::default(),
             snapshots: None,
@@ -203,6 +211,8 @@ impl Capabilities {
             Capability::FsPermissions => self.fs.permissions,
             Capability::Pty => self.pty.is_some(),
             Capability::Logs => self.logs.is_some(),
+            Capability::OneShot => self.one_shot.is_some(),
+            Capability::OneShotBuild => self.one_shot.as_ref().is_some_and(|caps| caps.build),
             Capability::PreviewUrls => self.access.preview_urls,
             Capability::SignedPreviewUrls => self.access.signed_preview_urls,
             Capability::Ssh => self.access.ssh,
@@ -371,6 +381,16 @@ pub struct LogsCaps {
     pub entrypoint: bool,
 }
 
+/// What a provider's [`crate::OneShot`] facet offers.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
+pub struct OneShotCaps {
+    /// [`crate::OneShotImage::Build`]: images built from a Dockerfile in
+    /// the sandbox workspace.
+    pub build: bool,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 #[non_exhaustive]
@@ -523,6 +543,12 @@ mod tests {
             (Capability::Pty, |caps| caps.pty = Some(PtyCaps::default())),
             (Capability::Logs, |caps| {
                 caps.logs = Some(LogsCaps::default());
+            }),
+            (Capability::OneShot, |caps| {
+                caps.one_shot = Some(OneShotCaps::default());
+            }),
+            (Capability::OneShotBuild, |caps| {
+                caps.one_shot = Some(OneShotCaps { build: true });
             }),
             (Capability::PreviewUrls, |caps| {
                 caps.access.preview_urls = true;

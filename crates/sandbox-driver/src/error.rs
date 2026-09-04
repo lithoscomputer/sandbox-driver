@@ -23,6 +23,9 @@ pub enum ResourceKind {
     Volume,
     /// A plugin binary, in discovery errors.
     Plugin,
+    /// A file inside a sandbox, from the filesystem facet. `id` is the
+    /// path as the caller gave it.
+    File,
     /// A resource kind sent by a protocol peer that this version does not
     /// model.
     #[serde(other)]

@@ -31,10 +31,10 @@ use async_trait::async_trait;
 use sandbox_driver::{
     Action, Capability, Error, Event, EventBody, EventContext, EventObserver, ExecControls,
     ExecSpec, Git, GitCloneOptions, GitCommitOptions, GitPushOptions, GrepOptions, HealthStatus,
-    LogSink, LogSource, NetworkPolicy, OutputSanitization, OutputStream, PtyOptions, PtySize,
-    Resources, Sandbox, SandboxFilter, SandboxId, SandboxProvider, SandboxSpec, SandboxState,
-    Search, ServiceSpec, Services, SnapshotMode, SpawnSpec, StdinSource, Termination, WaitOptions,
-    activate, wait_for_state,
+    LogSink, LogSource, NetworkPolicy, OneShotSpec, OutputSanitization, OutputStream, PtyOptions,
+    PtySize, Resources, Sandbox, SandboxFilter, SandboxId, SandboxProvider, SandboxSpec,
+    SandboxState, Search, ServiceSpec, Services, SnapshotMode, SpawnSpec, StdinSource, Termination,
+    WaitOptions, activate, wait_for_state,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time;
@@ -59,6 +59,7 @@ pub struct SpecFactory {
     make:                 Box<dyn Fn() -> SandboxSpec + Send + Sync>,
     make_entrypoint_logs: Option<Box<dyn Fn() -> SandboxSpec + Send + Sync>>,
     git_clone_url:        Option<String>,
+    one_shot_image:       Option<String>,
 }
 
 impl SpecFactory {
@@ -67,7 +68,17 @@ impl SpecFactory {
             make:                 Box::new(make),
             make_entrypoint_logs: None,
             git_clone_url:        None,
+            one_shot_image:       None,
         }
+    }
+
+    /// A registry image with `sh`, `cat`, `printf`, and `sleep`, for the
+    /// one-shot container check. Providers that declare
+    /// [`sandbox_driver::OneShot`] must configure one.
+    #[must_use]
+    pub fn with_one_shot_image(mut self, reference: impl Into<String>) -> Self {
+        self.one_shot_image = Some(reference.into());
+        self
     }
 
     /// Adds a spec whose entrypoint emits output and remains running.
@@ -103,6 +114,10 @@ impl SpecFactory {
 
     fn git_clone_url(&self) -> Option<&str> {
         self.git_clone_url.as_deref()
+    }
+
+    fn one_shot_image(&self) -> Option<&str> {
+        self.one_shot_image.as_deref()
     }
 }
 
@@ -262,6 +277,12 @@ impl Conformance {
                 Box::pin(provider_health_answers(ctx))
             }),
             ("volume_round_trip", |ctx| Box::pin(volume_round_trip(ctx))),
+            ("one_shot_shares_the_sandbox_world", |ctx| {
+                Box::pin(one_shot_shares_the_sandbox_world(ctx))
+            }),
+            ("fs_missing_file_is_not_found", |ctx| {
+                Box::pin(fs_missing_file_is_not_found(ctx))
+            }),
         ];
 
         let mut results = Vec::new();
@@ -2839,4 +2860,140 @@ async fn create_emits_terminal_events(ctx: &Conformance) -> CheckOutcome {
         return fail("event source or sequence changed across create and delete");
     }
     PASS
+}
+
+/// A one-shot container runs in the sandbox's world: it reads a file the
+/// sandbox wrote, its output and exit code come back, the file it writes
+/// is visible to the sandbox, and a `term` ends a long one.
+async fn one_shot_shares_the_sandbox_world(ctx: &Conformance) -> CheckOutcome {
+    if ctx.caps().one_shot.is_none() {
+        return Ok(Some("capability one_shot not declared".to_owned()));
+    }
+    let Some(image) = ctx.specs.one_shot_image() else {
+        return fail("one_shot is declared but no one-shot image was configured");
+    };
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let Some(one_shot) = sandbox.one_shot() else {
+            return fail("one_shot is declared but the facet is absent");
+        };
+        sandbox
+            .fs()
+            .write("one-shot/in.txt", b"shared-in")
+            .await
+            .map_err(|error| format!("write failed: {error}"))?;
+        let chunks: SeenChunks = Arc::new(Mutex::new(Vec::new()));
+        let sink_chunks = Arc::clone(&chunks);
+        let controls = ExecControls {
+            sink: Some(Arc::new(move |stream, chunk| {
+                let chunks = Arc::clone(&sink_chunks);
+                Box::pin(async move {
+                    chunks.lock().expect("chunks lock").push((stream, chunk));
+                    Ok(())
+                })
+            })),
+            ..ExecControls::default()
+        };
+        let spec = OneShotSpec::registry(image)
+            .entrypoint("sh")
+            .args([
+                "-c",
+                "cat one-shot/in.txt; printf shared-out > one-shot/out.txt; exit 4",
+            ])
+            .timeout(Duration::from_secs(120));
+        let streaming = one_shot
+            .run(&spec, controls)
+            .await
+            .map_err(|error| format!("one-shot run failed: {error}"))?;
+        if streaming.result.termination != Termination::Exited
+            || streaming.result.exit_code != Some(4)
+        {
+            return fail(format!(
+                "expected exit 4, got {:?} with code {:?}: {}",
+                streaming.result.termination,
+                streaming.result.exit_code,
+                streaming.result.stderr_lossy()
+            ));
+        }
+        let seen: Vec<u8> = chunks
+            .lock()
+            .expect("chunks lock")
+            .iter()
+            .flat_map(|(_, chunk)| chunk.clone())
+            .collect();
+        if !String::from_utf8_lossy(&seen).contains("shared-in") {
+            return fail(format!(
+                "the one-shot did not see the sandbox's file: {:?}",
+                String::from_utf8_lossy(&seen)
+            ));
+        }
+        let written = sandbox
+            .fs()
+            .read("one-shot/out.txt")
+            .await
+            .map_err(|error| format!("reading the one-shot's file failed: {error}"))?;
+        if written != b"shared-out" {
+            return fail(format!(
+                "the sandbox did not see the one-shot's file: {written:?}"
+            ));
+        }
+
+        let token = CancellationToken::new();
+        let stop_after = token.clone();
+        tokio::spawn(async move {
+            time::sleep(Duration::from_millis(500)).await;
+            stop_after.cancel();
+        });
+        let controls = ExecControls {
+            term: Some(token),
+            ..ExecControls::default()
+        };
+        let spec = OneShotSpec::registry(image)
+            .entrypoint("sleep")
+            .args(["300"])
+            .timeout(Duration::from_secs(120));
+        let started = Instant::now();
+        let streaming = one_shot
+            .run(&spec, controls)
+            .await
+            .map_err(|error| format!("one-shot term run failed: {error}"))?;
+        if streaming.result.termination != Termination::Cancelled {
+            return fail(format!(
+                "expected Cancelled after term, got {:?}",
+                streaming.result.termination
+            ));
+        }
+        if started.elapsed() > Duration::from_secs(60) {
+            return fail("the term took over a minute to end the one-shot");
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+/// Reading a file that does not exist is `NotFound`, so a caller can
+/// treat absence as a value instead of parsing provider errors.
+async fn fs_missing_file_is_not_found(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        match sandbox.fs().read("conformance-missing/nope.txt").await {
+            Err(Error::NotFound { .. }) => {}
+            Err(other) => return fail(format!("expected NotFound, got: {other}")),
+            Ok(bytes) => return fail(format!("a missing file read {} bytes", bytes.len())),
+        }
+        match sandbox
+            .fs()
+            .read_range("conformance-missing/nope.txt", 0, Some(4))
+            .await
+        {
+            Err(Error::NotFound { .. }) => PASS,
+            Err(other) => fail(format!("expected NotFound from read_range, got: {other}")),
+            Ok(bytes) => fail(format!("a missing file read_range {} bytes", bytes.len())),
+        }
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
 }

@@ -24,6 +24,7 @@ reqwest = { version = "0.13", default-features = false }
 reqwest-middleware = "0.5"
 sandbox-driver = { path = "crates/sandbox-driver" }
 sandbox-driver-conformance = { path = "crates/sandbox-driver-conformance" }
+sandbox-driver-docker-config = { path = "crates/sandbox-driver-docker-config" }
 sandbox-driver-host = { path = "crates/sandbox-driver-host" }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"

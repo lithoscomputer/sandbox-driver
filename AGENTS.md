@@ -13,7 +13,7 @@ Authoritative documents:
 - `docs/design.md` — the Rust interface design: resource model,
   lifecycle actions, facets, capability discovery, and what stays out of
   this library.
-- `docs/protocol.md` — the normative plugin wire protocol (version 1),
+- `docs/protocol.md` — the normative plugin wire protocol (version 2),
   written for implementers in any language. The compatibility tests in
   `crates/sandbox-driver-protocol` verify its encodings and tolerance
   rules behaviorally (era-JSON decoding, unknown-value handling) — not
@@ -23,7 +23,8 @@ Authoritative documents:
   it.
 
 The workspace is `crates/sandbox-driver` (core traits and types) plus
-`sandbox-driver-{conformance,host,docker,daytona,protocol,host-plugin}`.
+`sandbox-driver-{conformance,host,docker,docker-config,daytona,protocol,cli}`
+and the plugin executables `sandbox-driver-{host,docker,daytona}-plugin`.
 
 ## Rust style
 

@@ -136,6 +136,7 @@ Per-sandbox functionality is grouped into small **facet traits** (per the style 
 | `Services` (derived) | Background processes that outlive their exec (MCP servers, dev servers): spawn / status / logs / stop — default impl derived from `Exec` (`setsid` + pidfile, fabro's proven pattern); state is per-boot | derived | derived | derived | derived |
 | `Pty` | create/resize/kill + bidirectional byte stream (fabro's `TerminalSession`) | ✔ | ✔ (exec+tty) | ✔ (websocket) | ✔ (console) |
 | `Logs` | Provider-side logs: build/provision logs, entrypoint output, sandbox event log; streaming follow | — | ✔ (container logs) | ✔ | ? |
+| `OneShot` | Ephemeral containers in the sandbox's world: same workspace, same network namespace, own image (registry or built from the workspace); stream, term/kill, timeout; ended by the sandbox's `stop`/`delete` | — | ✔ (workspace volume, `container:` network) | future (inside the VM) | — |
 | `PreviewUrls` | port → `{ url, headers }`; signed expiring URLs; revocation | \~ (localhost) | future (port map) | ✔ | ✔ (HTTPS proxies) |
 | `SshAccess` | Return a ready-to-run SSH command; optional exact TTL and token revocation are separate capabilities | — | — | ✔ | ✔ |
 | `ShellCommand` | A local command string that opens a shell (Docker's `docker exec -it …`) — distinct from real SSH | trivial | ✔ | — | — |
@@ -154,6 +155,7 @@ Notes:
 - **Tailscale and other VPN clients are guest software.** Callers install
   and configure them through `Exec`; they are not sandbox-driver
   resources or facets.
+- **The sandbox owns its workspace.** A Docker sandbox's working directory is a volume created with the container and removed with it; nothing is bind-mounted from the host unless the caller asks. One-shot containers mount the same volume, so a host that reaches the sandbox over the plugin wire — possibly a remote daemon — never needs a filesystem in common with it. File I/O goes through the `Filesystem` facet, which Docker serves from the archive API without a shell in the image.
 - Daytona's **LSP, code interpreter, and computer-use input automation** are out of scope for v1 — real surfaces, but no consumer yet. The capability schema reserves names for them. Command sessions were originally deferred with them, but the Daytona provider now uses them internally as the transport for streaming, cancellation, and partial-output-on-timeout execs (plain buffered runs keep the cheaper one-shot endpoint); sessions remain unexposed as an API surface.
 
 ## Capability discovery
@@ -175,6 +177,7 @@ pub struct Capabilities {
     pub services: ServiceCaps,        // supported plus native diagnostic
     pub pty: Option<PtyCaps>,
     pub logs: Option<LogsCaps>,
+    pub one_shot: Option<OneShotCaps>, // build
     pub access: AccessCaps,           // preview_urls { signed }, ssh { ttl, revoke }, shell_command, web_terminal, vnc
     pub network: NetworkCaps,         // modes: block_all, allow_all, cidr_allow_list, domain_allow_list, proxy
     pub snapshots: Option<SnapshotCaps>,  // image/dockerfile × container/VM, sandbox capture modes; activation
@@ -190,7 +193,7 @@ Capabilities are **negotiated metadata, not live state**. They are captured once
 
 ### Wire compatibility
 
-The protocol crate owns wire compatibility; domain types never absorb a wire break. The `initialize` handshake negotiates a protocol version and capability set. Readers ignore unknown optional object fields and return a structured protocol error for unknown required semantics. Enums define stable string values and an unknown-value policy. Durations, timestamps, paths, and byte payloads use explicit wire formats. Provider configuration carries a provider kind and schema version and is validated at the provider boundary. In v1 the wire DTOs may share their serde shape with core domain types, verified by behavioral compatibility tests in the protocol crate (era-JSON decoding, per-field encoding checks, `#[serde(default)]` field tolerance) and by `#[serde(other)]` unknown-variant fallbacks on state enums; when a shape needs to diverge, the protocol crate grows a dedicated DTO and conversion — core types are never broken for wire reasons.
+The protocol crate owns wire compatibility; domain types never absorb a wire break. The `initialize` handshake negotiates a protocol version, a data transport, and a capability set. Control messages are JSON on the plugin's stdio; every byte stream — exec output and stdin, stdio and PTY traffic, logs, file contents — rides a per-operation Unix-socket data channel the plugin opens back to the host, so no base64 crosses the control connection and a slow consumer of one stream stalls only that stream (see `docs/protocol.md` §2.1). Readers ignore unknown optional object fields and return a structured protocol error for unknown required semantics. Enums define stable string values and an unknown-value policy. Durations, timestamps, paths, and byte payloads use explicit wire formats. Provider configuration carries a provider kind and schema version and is validated at the provider boundary. In v1 the wire DTOs may share their serde shape with core domain types, verified by behavioral compatibility tests in the protocol crate (era-JSON decoding, per-field encoding checks, `#[serde(default)]` field tolerance) and by `#[serde(other)]` unknown-variant fallbacks on state enums; when a shape needs to diverge, the protocol crate grows a dedicated DTO and conversion — core types are never broken for wire reasons.
 
 ## The traits
 

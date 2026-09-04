@@ -7,15 +7,17 @@ snapshots, and volumes behind one capability-discoverable interface.
 | --- | --- |
 | `sandbox-driver` | Core traits, types, exec-derived facets, wait/probe helpers |
 | `sandbox-driver-host` | Host (local) provider — directories, no isolation |
-| `sandbox-driver-docker` | Docker provider — containers, pause/resume, image pulls |
+| `sandbox-driver-docker` | Docker provider — containers with a workspace volume, one-shot containers, sidecars, image pulls |
+| `sandbox-driver-docker-config` | The Docker provider's `provider_config` as plain Serde types, for hosts on the wire |
 | `sandbox-driver-daytona` | Daytona provider — cloud VMs, snapshots, volumes |
-| `sandbox-driver-protocol` | JSON-RPC plugin protocol: serve any provider, adapt any plugin |
+| `sandbox-driver-protocol` | JSON-RPC plugin protocol (version 2, with per-operation data channels): serve any provider, adapt any plugin |
 | `sandbox-driver-conformance` | Black-box conformance suite every provider must pass |
+| `sandbox-driver-{host,docker,daytona}-plugin` | The three providers as plugin executables: `sandbox-driver-host`, `sandbox-driver-docker`, `sandbox-driver-daytona` |
 | `sandbox-driver-cli` | `lithos-sandbox` command for provider diagnostics and sandbox operations |
 
-Host and Docker pass conformance locally (Docker needs a daemon); the
-Daytona suite runs live with `DAYTONA_API_KEY` set. The protocol crate
-re-runs the same suite through the wire.
+Host and Docker pass conformance locally (Docker needs a daemon), in
+process and served over the plugin wire; the Daytona suite runs live with
+`DAYTONA_API_KEY` set.
 
 See `docs/design.md` for the interface design
 and `docs/protocol.md` for the normative plugin wire protocol.
@@ -56,8 +58,8 @@ kinds, resource IDs, states, attempts, counts, and durations. They do not
 include commands, environment values, tokens, URLs, file paths, request
 bodies, or command output.
 
-The host plugin configures a stderr subscriber. It uses `RUST_LOG` when
-set and defaults to `info`. Protocol messages remain on stdout.
+The plugin executables configure a stderr subscriber. They use `RUST_LOG`
+when set and default to `info`. Protocol messages remain on stdout.
 
 ## Setup
 
@@ -80,5 +82,6 @@ mise run check
 See [DEVELOPING.md](DEVELOPING.md) for the complete development workflow.
 
 Routine and nightly checks run on macOS arm64, Linux x86_64, and Linux arm64.
-A pushed `v*` tag builds archives for the same three platforms and creates a
-draft GitHub release.
+A pushed `v*` tag builds one archive per plugin executable for the same three
+platforms, with a checksum of each archive and of each executable, and
+creates a draft GitHub release.

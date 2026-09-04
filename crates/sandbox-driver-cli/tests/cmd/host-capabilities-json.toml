@@ -55,6 +55,7 @@ stdout = """
   },
   "pty": null,
   "logs": null,
+  "one_shot": null,
   "access": {
     "preview_urls": false,
     "signed_preview_urls": false,

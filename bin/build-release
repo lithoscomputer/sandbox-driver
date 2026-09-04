@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Builds every plugin executable for the native target and packages each
+# one as its own archive with a SHA-256 checksum, so a host bundling the
+# plugins can pin each binary independently.
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
@@ -8,12 +11,26 @@ fi
 
 target=$1
 version=$2
-binary_name=${RUST_TEMPLATE_BINARY_NAME:?RUST_TEMPLATE_BINARY_NAME is required}
+plugins=(sandbox-driver-host sandbox-driver-docker sandbox-driver-daytona)
 
 case "$target" in
   aarch64-apple-darwin | x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu) ;;
   *)
     echo "Unsupported release target: $target" >&2
+    exit 2
+    ;;
+esac
+
+case "$version" in
+  v[0-9]*) ;;
+  *)
+    echo "Release version must start with v and a digit: $version" >&2
+    exit 2
+    ;;
+esac
+case "$version" in
+  *[!0-9A-Za-z.+-]*)
+    echo "Release version contains unsupported characters: $version" >&2
     exit 2
     ;;
 esac
@@ -24,10 +41,12 @@ if [[ "$host_target" != "$target" ]]; then
   exit 1
 fi
 
-cargo build --locked --release --target "$target"
+cargo build --locked --release --target "$target" \
+  --package sandbox-driver-host-plugin \
+  --package sandbox-driver-docker-plugin \
+  --package sandbox-driver-daytona-plugin
 
-archive_name="${binary_name}-${version}-${target}.tar.gz"
-output_dir="dist-release"
+output_dir=dist-release
 staging_dir=$(mktemp -d)
 
 cleanup() {
@@ -36,17 +55,31 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 mkdir -p "$output_dir"
-cp "target/$target/release/$binary_name" "$staging_dir/$binary_name"
-tar -C "$staging_dir" -czf "$output_dir/$archive_name" "$binary_name"
 
-(
-  cd "$output_dir"
+checksum() {
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$archive_name" > "$archive_name.sha256"
+    sha256sum "$1"
   else
-    shasum -a 256 "$archive_name" > "$archive_name.sha256"
+    shasum -a 256 "$1"
   fi
-)
+}
 
-echo "$output_dir/$archive_name"
-echo "$output_dir/$archive_name.sha256"
+for binary_name in "${plugins[@]}"; do
+  archive_name="${binary_name}-${version}-${target}.tar.gz"
+  cp "target/$target/release/$binary_name" "$staging_dir/$binary_name"
+  tar -C "$staging_dir" -czf "$output_dir/$archive_name" "$binary_name"
+  (
+    cd "$output_dir"
+    checksum "$archive_name" > "$archive_name.sha256"
+  )
+  # The checksum of the executable itself, which is what a host pins.
+  (
+    cd "$staging_dir"
+    checksum "$binary_name" > "../$output_dir/${binary_name}-${version}-${target}.bin.sha256"
+  ) 2>/dev/null || checksum "$staging_dir/$binary_name" | sed "s| .*| $binary_name|" > "$output_dir/${binary_name}-${version}-${target}.bin.sha256"
+  # The staging copy may be reused by name; keep one binary per iteration.
+  rm -f -- "$staging_dir/$binary_name"
+  echo "$output_dir/$archive_name"
+  echo "$output_dir/$archive_name.sha256"
+  echo "$output_dir/${binary_name}-${version}-${target}.bin.sha256"
+done

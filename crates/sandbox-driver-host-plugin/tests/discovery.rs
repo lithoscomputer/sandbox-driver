@@ -9,7 +9,7 @@ use sandbox_driver::{Error, ExecSpec, ProviderKind, SandboxProvider, SandboxSour
 use sandbox_driver_protocol::{PluginConfig, file_sha256, launch_plugin};
 
 fn binary() -> &'static str {
-    env!("CARGO_BIN_EXE_sandbox-driver-host-plugin")
+    env!("CARGO_BIN_EXE_sandbox-driver-host")
 }
 
 #[tokio::test(flavor = "multi_thread")]

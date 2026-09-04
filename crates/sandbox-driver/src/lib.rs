@@ -3,11 +3,11 @@
 //! A [`SandboxProvider`] manages three resource types: sandboxes, snapshots,
 //! and volumes. A [`Sandbox`] is a stateless handle — an ID plus a provider
 //! connection — whose functionality is grouped into facet traits ([`Exec`],
-//! [`Filesystem`], [`Search`], [`Git`], [`Services`], [`Pty`], [`Logs`], and
-//! the access facets). Optional functionality is capability-gated: absence is
-//! visible both in the type system (`Option` accessors) and in the serializable
-//! [`Capabilities`] structure used for preflight checks and the JSON-RPC
-//! plugin handshake.
+//! [`Filesystem`], [`Search`], [`Git`], [`Services`], [`Pty`], [`Logs`],
+//! [`OneShot`], and the access facets). Optional functionality is
+//! capability-gated: absence is visible both in the type system (`Option`
+//! accessors) and in the serializable [`Capabilities`] structure used for
+//! preflight checks and the JSON-RPC plugin handshake.
 //!
 //! # Runtime contract
 //!
@@ -46,6 +46,7 @@ mod fs;
 mod git;
 mod id;
 mod logs;
+mod one_shot;
 mod probe;
 mod provider;
 mod pty;
@@ -65,8 +66,8 @@ pub use access::{
 };
 pub use capabilities::{
     AccessCaps, Capabilities, Capability, ExecCaps, FsCaps, GitCaps, Isolation, LifecycleCaps,
-    LogsCaps, NetworkCaps, PtyCaps, SandboxKindSupport, SearchCaps, ServiceCaps, SnapshotCaps,
-    VolumeCaps,
+    LogsCaps, NetworkCaps, OneShotCaps, PtyCaps, SandboxKindSupport, SearchCaps, ServiceCaps,
+    SnapshotCaps, VolumeCaps,
 };
 pub use capture::OutputCaptureBuffer;
 pub use derived::{DerivedFs, DerivedGit, DerivedSearch, DerivedServices};
@@ -90,6 +91,7 @@ pub use git::{
 };
 pub use id::{InvalidIdError, ProviderKind, SandboxId, ServiceId, SnapshotId, VolumeId};
 pub use logs::{LogSink, LogSource, Logs};
+pub use one_shot::{OneShot, OneShotImage, OneShotSpec};
 pub use probe::{BASH_PROBE_SCRIPT, activate, run_bash_probe};
 pub use provider::{
     HealthStatus, ProviderHealth, SandboxFilter, SandboxProvider, SnapshotFilter, SnapshotProvider,

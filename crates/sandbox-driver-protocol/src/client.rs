@@ -1,5 +1,12 @@
 //! Host-side client: adapts a JSON-RPC plugin back into the
 //! [`SandboxProvider`] / [`Sandbox`] traits.
+//!
+//! Control requests and responses cross the plugin's stdio; every byte
+//! stream rides a data channel the plugin opens back to this host
+//! ([`crate::channel`]). Each operation that moves bytes registers the
+//! channel it expects before it sends the request, pumps it concurrently
+//! with awaiting the response, and returns only after the channel ends —
+//! so a result never arrives ahead of the output it describes.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -12,11 +19,12 @@ use async_trait::async_trait;
 use sandbox_driver::{
     Capabilities, Capability, DirEntry, Error, EventContext, EventSubject, Exec, ExecControls,
     ExecResult, ExecSpec, ExecStreamingResult, FileMetadata, Filesystem, ForkOptions, HealthStatus,
-    LifecycleTimers, LogSink, LogSource, Logs, NetworkPolicy, OutputStream, PlatformInfo,
-    PreviewUrl, PreviewUrls, ProviderHealth, ProviderKind, Pty, PtyOptions, PtySession, PtySize,
-    Resources, Result, Sandbox, SandboxFilter, SandboxId, SandboxSnapshotOptions, SandboxSpec,
-    SandboxStatus, SnapshotFilter, SnapshotId, SnapshotProvider, SnapshotSpec, SnapshotStatus,
-    SpawnSpec, SshAccess, SshAccessInfo, StderrTail, StdioProcess, StdioProcessHandle, StopLevel,
+    LifecycleTimers, LogSink, LogSource, Logs, NetworkPolicy, OneShot, OneShotSpec,
+    OutputCaptureBuffer, OutputSink, OutputStream, PlatformInfo, PreviewUrl, PreviewUrls,
+    ProviderHealth, ProviderKind, Pty, PtyOptions, PtySession, PtySize, Resources, Result, Sandbox,
+    SandboxFilter, SandboxId, SandboxSnapshotOptions, SandboxSpec, SandboxStatus, SnapshotFilter,
+    SnapshotId, SnapshotProvider, SnapshotSpec, SnapshotStatus, SpawnSpec, SshAccess,
+    SshAccessInfo, StderrTail, StdinReader, StdioProcess, StdioProcessHandle, StopLevel,
     Termination, TransportError, Vnc, VncConnection, VolumeId, VolumeProvider, VolumeSpec,
     VolumeStatus, WebTerminal,
 };
@@ -26,6 +34,7 @@ use serde_json::Value;
 use tokio::io::{
     AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, duplex,
 };
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::process::{Child, Command};
 use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::{Mutex as AsyncMutex, OnceCell, mpsc, oneshot};
@@ -33,15 +42,22 @@ use tokio::task::JoinHandle;
 use tokio::{fs as tokio_fs, time};
 use tracing::field;
 
+use crate::channel::{
+    Channel, ChannelListener, ChannelReceiver, FrameKind, FrameReader, FrameWriter,
+};
 use crate::methods as m;
-use crate::wire::{Message, decode_bytes, encode_bytes};
+use crate::wire::Message;
+
+/// How long the host waits, after a plugin has answered an operation,
+/// for the data channel that operation must already have opened.
+const LATE_CHANNEL_GRACE: Duration = Duration::from_secs(10);
 
 /// A provider served by a JSON-RPC plugin over a byte stream.
 ///
-/// `connect` performs the `initialize` handshake and returns a provider
-/// whose capabilities are the plugin's declared set. The background read
-/// and write tasks end when the transport closes or the provider is
-/// dropped.
+/// `connect` binds the data transport, performs the `initialize`
+/// handshake, and returns a provider whose capabilities are the plugin's
+/// declared set. The background read and write tasks end when the
+/// transport closes or the provider is dropped.
 pub struct PluginProvider {
     client:       Arc<Client>,
     kind:         ProviderKind,
@@ -58,10 +74,13 @@ impl PluginProvider {
         reader: impl AsyncRead + Unpin + Send + 'static,
         writer: impl AsyncWrite + Unpin + Send + 'static,
     ) -> Result<Self> {
-        let client = Client::start(reader, writer);
+        let listener = ChannelListener::bind()?;
+        let transport = listener.transport();
+        let client = Client::start(reader, writer, listener);
         let result: m::InitializeResult = client
             .call(m::INITIALIZE, &m::InitializeParams {
                 protocol_version: m::PROTOCOL_VERSION,
+                data_transport:   transport,
             })
             .await?;
         if result.protocol_version != m::PROTOCOL_VERSION {
@@ -116,6 +135,12 @@ impl PluginProvider {
         Ok(provider)
     }
 
+    /// Whether the control transport is still open. `false` once the
+    /// plugin exited or its stdio broke; every later call fails at once.
+    pub fn is_closed(&self) -> bool {
+        self.client.closed.load(Ordering::SeqCst)
+    }
+
     /// Asks the plugin to shut down cleanly and, for a spawned plugin,
     /// reaps the child — killing it after a grace period if it lingers.
     #[tracing::instrument(skip_all, fields(provider_kind = %self.kind), err)]
@@ -161,34 +186,14 @@ impl PluginProvider {
                 .expect("event contexts lock")
                 .insert(id.as_str().to_owned(), context.clone());
         }
-        Arc::new(SandboxHandle {
-            client: Arc::clone(&self.client),
-            id: id.clone(),
-            capabilities: info.capabilities,
-            working_directory: info.working_directory,
-            runtime_directory: info.runtime_directory,
-            exec: SandboxExec {
-                client:     Arc::clone(&self.client),
-                sandbox_id: id.clone(),
-            },
-            access: SandboxAccess {
-                client:     Arc::clone(&self.client),
-                sandbox_id: id.clone(),
-            },
-            pty: SandboxPty {
-                client:     Arc::clone(&self.client),
-                sandbox_id: id.clone(),
-            },
-            logs: SandboxLogs {
-                client:     Arc::clone(&self.client),
-                sandbox_id: id.clone(),
-            },
-            fs: SandboxFs {
-                client:     Arc::clone(&self.client),
-                sandbox_id: id,
-            },
+        Arc::new(SandboxHandle::new(
+            Arc::clone(&self.client),
+            id,
+            info.capabilities,
+            info.working_directory,
+            info.runtime_directory,
             events,
-        })
+        ))
     }
 }
 
@@ -283,8 +288,8 @@ impl sandbox_driver::SandboxProvider for PluginProvider {
             .await
         {
             Ok(result) => Ok(result.health),
-            // An older plugin without provider/health answers -32601;
-            // that is "no health check", not a failed one.
+            // A plugin without provider/health answers -32601; that is
+            // "no health check", not a failed one.
             Err(Error::Provider(provider)) if provider.code.as_deref() == Some("-32601") => {
                 Ok(ProviderHealth::new(HealthStatus::Unknown))
             }
@@ -368,15 +373,18 @@ impl SnapshotProvider for ProviderSnapshots {
 
     async fn build_logs(&self, id: &SnapshotId, follow: bool, sink: LogSink) -> Result<()> {
         let stream_id = self.client.next_stream_id("snapshot");
+        let (channel, receiver) = self.client.listener.expect();
         follow_log_stream(
             &self.client,
             m::SNAPSHOT_BUILD_LOGS,
             &m::SnapshotBuildLogsParams {
                 snapshot_id: id.as_str().to_owned(),
                 stream_id: stream_id.clone(),
+                channel,
                 follow,
             },
             &stream_id,
+            receiver,
             sink,
         )
         .await
@@ -549,40 +557,23 @@ impl Vnc for SandboxAccess {
 
 /// Removes capabilities the protocol cannot deliver through the wire.
 /// Native search/git/service passthrough and local shell commands remain
-/// process-local. The normalized stdio, PTY, logs, browser access,
-/// snapshots, volumes, preview URLs, and SSH facets cross the wire.
-/// Streamed stdin has no channel and `Sandbox::environment` no method in
-/// protocol version 1, so those are masked too, whatever the plugin
-/// declares.
+/// process-local; everything else, streamed stdin and the effective
+/// environment included, crosses in version 2.
 fn mask_wire_capabilities(capabilities: &mut Capabilities) {
     capabilities.search.native = false;
     capabilities.git.native = false;
     capabilities.services.native = false;
     capabilities.access.shell_command = false;
-    capabilities.exec.stdin_stream = false;
-    capabilities.exec.environment = false;
 }
-
-/// One in-flight chunk of streamed exec output.
-type ExecChunk = (OutputStream, Vec<u8>);
-
-/// Raw bytes per fs/read / fs/write message during composed uploads and
-/// downloads (the base64 payload is 4/3 of this on the wire).
-const TRANSFER_CHUNK_BYTES: usize = 4 * 1024 * 1024;
-
-/// Chunks buffered per exec before the reader backpressures. Deep enough
-/// that a slow consumer of one stream cannot stall unrelated responses in
-/// any realistic run; full-queue blocking is the documented residual
-/// coupling of a single shared pipe (the side-channel transport lifts it).
-const EXEC_STREAM_QUEUE: usize = 1024;
 
 /// Request/response correlation plus notification routing.
 ///
-/// The reader task never awaits consumer code: exec output is handed to a
-/// per-exec ordered queue drained by a pump task that owns the caller's
-/// sink, so one slow consumer delays only its own stream.
+/// The reader task never awaits consumer code: it only resolves pending
+/// calls and forwards events. Every byte stream has a connection of its
+/// own, pumped by the operation that asked for it.
 struct Client {
     outbound:       mpsc::Sender<Message>,
+    listener:       ChannelListener,
     next_id:        AtomicU64,
     next_exec:      AtomicU64,
     next_stream:    AtomicU64,
@@ -592,8 +583,6 @@ struct Client {
     closed:         AtomicBool,
     closed_error:   Mutex<Option<TransportError>>,
     pending:        Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>,
-    exec_streams:   Mutex<HashMap<String, mpsc::Sender<ExecChunk>>>,
-    log_streams:    Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>,
     event_contexts: Mutex<HashMap<String, EventContext>>,
     /// Contexts for in-flight resource operations, keyed by a wire-only
     /// route id so events can arrive before a resource id exists.
@@ -604,10 +593,12 @@ impl Client {
     fn start(
         reader: impl AsyncRead + Unpin + Send + 'static,
         writer: impl AsyncWrite + Unpin + Send + 'static,
+        listener: ChannelListener,
     ) -> Arc<Self> {
         let (outbound, mut outbound_rx) = mpsc::channel::<Message>(256);
         let client = Arc::new(Self {
             outbound,
+            listener,
             next_id: AtomicU64::new(1),
             next_exec: AtomicU64::new(1),
             next_stream: AtomicU64::new(1),
@@ -615,8 +606,6 @@ impl Client {
             closed: AtomicBool::new(false),
             closed_error: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
-            exec_streams: Mutex::new(HashMap::new()),
-            log_streams: Mutex::new(HashMap::new()),
             event_contexts: Mutex::new(HashMap::new()),
             event_routes: Mutex::new(HashMap::new()),
         });
@@ -697,8 +686,6 @@ impl Client {
         for (_, sender) in pending {
             let _ = sender.send(Err(Error::Transport(error.clone())));
         }
-        self.exec_streams.lock().expect("exec streams lock").clear();
-        self.log_streams.lock().expect("log streams lock").clear();
         self.event_contexts
             .lock()
             .expect("event contexts lock")
@@ -720,6 +707,14 @@ impl Client {
         format!(
             "{prefix}-{}",
             self.next_stream.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn next_exec_id(&self, sandbox_id: &SandboxId) -> String {
+        format!(
+            "x{}-{}",
+            sandbox_id.as_str(),
+            self.next_exec.fetch_add(1, Ordering::Relaxed)
         )
     }
 
@@ -766,87 +761,40 @@ impl Client {
             return Ok(());
         };
         let params = message.params.unwrap_or(Value::Null);
-        match method {
-            m::EXEC_OUTPUT => {
-                let notification = serde_json::from_value::<m::ExecOutputNotification>(params)
-                    .map_err(|error| {
-                        TransportError::with_source(
-                            "decoding plugin exec output notification",
-                            error,
-                        )
-                    })?;
-                let queue = self
-                    .exec_streams
-                    .lock()
-                    .expect("exec streams lock")
-                    .get(&notification.exec_id)
-                    .cloned();
-                if let Some(queue) = queue {
-                    let chunk = decode_bytes(&notification.data_b64).map_err(|error| {
-                        TransportError::with_source("decoding plugin exec output", error)
-                    })?;
-                    // A send failure means the exec already resolved and
-                    // unregistered; dropping the late chunk is correct.
-                    let _ = queue.send((notification.stream, chunk)).await;
-                }
-            }
-            m::LOG_OUTPUT => {
-                let notification = serde_json::from_value::<m::LogOutputNotification>(params)
-                    .map_err(|error| {
-                        TransportError::with_source(
-                            "decoding plugin log output notification",
-                            error,
-                        )
-                    })?;
-                let queue = self
-                    .log_streams
-                    .lock()
-                    .expect("log streams lock")
-                    .get(&notification.stream_id)
-                    .cloned();
-                if let Some(queue) = queue {
-                    let chunk = decode_bytes(&notification.data_b64).map_err(|error| {
-                        TransportError::with_source("decoding plugin log output", error)
-                    })?;
-                    let _ = queue.send(chunk).await;
-                }
-            }
-            m::HOST_EVENT => {
-                let notification = serde_json::from_value::<m::HostEventNotification>(params)
-                    .map_err(|error| {
-                        TransportError::with_source("decoding plugin host event", error)
-                    })?;
-                // Route id first: a create event can arrive before a
-                // resource id exists. Established sandbox handles fall
-                // back to the resource id in the event subject.
-                let resource_id = match &notification.event.subject {
-                    EventSubject::Sandbox { id: Some(id), .. } => Some(id.as_str()),
-                    _ => None,
-                };
-                let context = notification
-                    .route_id
-                    .as_ref()
-                    .and_then(|route_id| {
-                        self.event_routes
+        if method == m::HOST_EVENT {
+            let notification =
+                serde_json::from_value::<m::HostEventNotification>(params).map_err(|error| {
+                    TransportError::with_source("decoding plugin host event", error)
+                })?;
+            // Route id first: a create event can arrive before a resource
+            // id exists. Established sandbox handles fall back to the
+            // resource id in the event subject.
+            let resource_id = match &notification.event.subject {
+                EventSubject::Sandbox { id: Some(id), .. } => Some(id.as_str()),
+                _ => None,
+            };
+            let context = notification
+                .route_id
+                .as_ref()
+                .and_then(|route_id| {
+                    self.event_routes
+                        .lock()
+                        .expect("event routes lock")
+                        .get(route_id)
+                        .cloned()
+                })
+                .or_else(|| {
+                    resource_id.and_then(|resource_id| {
+                        self.event_contexts
                             .lock()
-                            .expect("event routes lock")
-                            .get(route_id)
+                            .expect("event contexts lock")
+                            .get(resource_id)
                             .cloned()
                     })
-                    .or_else(|| {
-                        resource_id.and_then(|resource_id| {
-                            self.event_contexts
-                                .lock()
-                                .expect("event contexts lock")
-                                .get(resource_id)
-                                .cloned()
-                        })
-                    });
-                if let Some(context) = context {
-                    context.forward(notification.event).await;
-                }
+                });
+            if let Some(context) = context {
+                context.forward(notification.event).await;
             }
-            _ => {}
         }
         Ok(())
     }
@@ -900,6 +848,227 @@ impl Client {
             ))
         })
     }
+
+    /// Fires an `exec/stop` for each stop token as it fires: a term then
+    /// a kill are two requests, in that order.
+    fn forward_stops(
+        self: &Arc<Self>,
+        exec_id: &str,
+        controls: &ExecControls,
+    ) -> Option<JoinHandle<()>> {
+        (controls.term.is_some() || controls.kill.is_some()).then(|| {
+            let client = Arc::clone(self);
+            let exec_id = exec_id.to_owned();
+            let term = controls.term.clone();
+            let kill = controls.kill.clone();
+            tokio::spawn(async move {
+                let mut termed = std::pin::pin!(sandbox_driver::stop_signal(term.as_ref()));
+                let mut killed = std::pin::pin!(sandbox_driver::stop_signal(kill.as_ref()));
+                let mut term_sent = false;
+                loop {
+                    let level = tokio::select! {
+                        () = &mut termed, if !term_sent => StopLevel::Term,
+                        () = &mut killed => StopLevel::Kill,
+                    };
+                    client.send_stop(&exec_id, level).await;
+                    if level == StopLevel::Kill {
+                        break;
+                    }
+                    term_sent = true;
+                }
+            })
+        })
+    }
+
+    async fn send_stop(&self, exec_id: &str, level: StopLevel) {
+        let outcome: Result<m::Empty> = self
+            .call(m::EXEC_STOP, &m::ExecStopParams {
+                exec_id: exec_id.to_owned(),
+                level,
+            })
+            .await;
+        if let Err(error) = outcome {
+            tracing::warn!(error = %error, ?level, "plugin exec stop failed");
+        }
+    }
+}
+
+/// Waits for a task that was pumping a data channel, after the operation
+/// it belongs to has answered. The plugin ends the channel before it
+/// answers, so a channel that never even opened is a broken plugin, not
+/// slow output.
+async fn join_pump<T>(pump: JoinHandle<Result<T>>, accepted: &AtomicBool, what: &str) -> Result<T> {
+    let joined = if accepted.load(Ordering::SeqCst) {
+        pump.await
+    } else {
+        match time::timeout(LATE_CHANNEL_GRACE, pump).await {
+            Ok(joined) => joined,
+            Err(_) => {
+                return Err(Error::Transport(TransportError::new(format!(
+                    "the plugin answered {what} without opening its data channel"
+                ))));
+            }
+        }
+    };
+    joined.map_err(|error| {
+        Error::Transport(TransportError::with_source(
+            "joining a data channel pump",
+            error,
+        ))
+    })?
+}
+
+/// What an exec pump collected while the command ran.
+struct PumpedOutput {
+    stdout:     OutputCaptureBuffer,
+    stderr:     OutputCaptureBuffer,
+    /// The caller's sink failed on this chunk: the command was killed and
+    /// the result reports a cancellation.
+    sink_error: Option<Error>,
+}
+
+/// Pumps one exec's channel: output frames go to the capture buffers and
+/// the caller's sink, stdin bytes go out as frames. Ends when the plugin
+/// sends its `Eof`.
+async fn pump_exec_channel(
+    client: Arc<Client>,
+    exec_id: String,
+    receiver: ChannelReceiver,
+    accepted: Arc<AtomicBool>,
+    stdin: Option<StdinReader>,
+    sink: Option<OutputSink>,
+    retained_output_limit: Option<usize>,
+) -> Result<PumpedOutput> {
+    let Channel { mut reader, writer } = receiver.accept().await?;
+    accepted.store(true, Ordering::SeqCst);
+    let mut writer = Some(writer);
+    let stdin_task = stdin.map(|reader| {
+        let writer = writer.take().expect("the writer is handed to stdin once");
+        tokio::spawn(feed_stdin_frames(reader, writer))
+    });
+    let mut output = PumpedOutput {
+        stdout:     OutputCaptureBuffer::new(retained_output_limit),
+        stderr:     OutputCaptureBuffer::new(retained_output_limit),
+        sink_error: None,
+    };
+    loop {
+        let frame = match reader.read().await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(error) => {
+                if let Some(task) = stdin_task {
+                    task.abort();
+                }
+                return Err(error);
+            }
+        };
+        let (stream, payload) = match frame {
+            (FrameKind::Stdout, payload) => (OutputStream::Stdout, payload),
+            (FrameKind::Stderr, payload) => (OutputStream::Stderr, payload),
+            (FrameKind::Eof, _) => break,
+            (kind, _) => {
+                tracing::warn!(?kind, "unexpected frame on an exec channel");
+                continue;
+            }
+        };
+        match stream {
+            OutputStream::Stdout => output.stdout.push(&payload),
+            OutputStream::Stderr => output.stderr.push(&payload),
+        }
+        if output.sink_error.is_some() || payload.is_empty() {
+            continue;
+        }
+        if let Some(sink) = &sink {
+            if let Err(error) = sink(stream, payload).await {
+                // A failing sink is a hard stop on every provider; the
+                // rest of the stream is drained and dropped.
+                client.send_stop(&exec_id, StopLevel::Kill).await;
+                output.sink_error = Some(error);
+            }
+        }
+    }
+    if let Some(task) = stdin_task {
+        // The command is done; unwritten stdin bytes are unwanted.
+        task.abort();
+    }
+    Ok(output)
+}
+
+/// Copies `reader` into the channel as `Stdin` frames, then sends the
+/// host's `Eof`. A channel the plugin closed is the command declining
+/// its input, which is not an error.
+async fn feed_stdin_frames(mut reader: StdinReader, mut writer: FrameWriter<OwnedWriteHalf>) {
+    let mut buffer = vec![0; 32 * 1024];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => break,
+            Err(error) => {
+                tracing::debug!(error = %error, "exec stdin source failed");
+                break;
+            }
+            Ok(read) => {
+                if writer
+                    .write(FrameKind::Stdin, &buffer[..read])
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    }
+    let _ = writer.finish().await;
+}
+
+/// Runs a channel-backed command to its result: sends the request, pumps
+/// the channel, forwards stops, and assembles the result from the host's
+/// retained copy plus the plugin's metadata.
+async fn run_channel_exec<P: Serialize>(
+    client: &Arc<Client>,
+    method: &str,
+    params: &P,
+    exec_id: &str,
+    receiver: ChannelReceiver,
+    stdin: Option<StdinReader>,
+    controls: &ExecControls,
+) -> Result<ExecStreamingResult> {
+    let accepted = Arc::new(AtomicBool::new(false));
+    let pump = tokio::spawn(pump_exec_channel(
+        Arc::clone(client),
+        exec_id.to_owned(),
+        receiver,
+        Arc::clone(&accepted),
+        stdin,
+        controls.sink.clone(),
+        controls.retained_output_limit,
+    ));
+    let stop_task = client.forward_stops(exec_id, controls);
+    let outcome: Result<m::ExecStreamResult> = client.call(method, params).await;
+    if let Some(task) = stop_task {
+        task.abort();
+    }
+    let result = match outcome {
+        Ok(result) => result,
+        Err(error) => {
+            pump.abort();
+            return Err(error);
+        }
+    };
+    let pumped = join_pump(pump, &accepted, method).await?;
+    let (stdout, mut stdout_stats) = pumped.stdout.into_parts();
+    let (stderr, mut stderr_stats) = pumped.stderr.into_parts();
+    stdout_stats.truncated = result.stdout_capture.truncated;
+    stderr_stats.truncated = result.stderr_capture.truncated;
+    let mut exec_result = result.result.into_result(stdout, stderr);
+    if pumped.sink_error.is_some() {
+        exec_result.termination = Termination::Cancelled;
+    }
+    let mut streaming = ExecStreamingResult::new(exec_result);
+    streaming.streams_separated = result.streams_separated;
+    streaming.live_streaming = result.live_streaming;
+    streaming.stdout_capture = stdout_stats;
+    streaming.stderr_capture = stderr_stats;
+    Ok(streaming)
 }
 
 struct StreamCancelGuard {
@@ -933,55 +1102,69 @@ impl Drop for StreamCancelGuard {
     }
 }
 
+/// Feeds a log channel to `sink` until the plugin's `Eof`. A sink error
+/// ends the pump and is the caller's result.
+async fn pump_log_channel(
+    receiver: ChannelReceiver,
+    accepted: Arc<AtomicBool>,
+    sink: LogSink,
+) -> Result<()> {
+    let Channel { mut reader, .. } = receiver.accept().await?;
+    accepted.store(true, Ordering::SeqCst);
+    loop {
+        match reader.read().await? {
+            Some((FrameKind::Stdout | FrameKind::Stderr, payload)) => sink(payload).await?,
+            Some((FrameKind::Eof, _)) | None => return Ok(()),
+            Some((kind, _)) => tracing::warn!(?kind, "unexpected frame on a log channel"),
+        }
+    }
+}
+
 async fn follow_log_stream<P: Serialize>(
     client: &Arc<Client>,
     method: &str,
     params: &P,
     stream_id: &str,
+    receiver: ChannelReceiver,
     sink: LogSink,
 ) -> Result<()> {
-    let (queue, mut receiver) = mpsc::channel::<Vec<u8>>(EXEC_STREAM_QUEUE);
-    client
-        .log_streams
-        .lock()
-        .expect("log streams lock")
-        .insert(stream_id.to_owned(), queue);
     let mut guard = StreamCancelGuard {
         client:    Arc::clone(client),
         stream_id: stream_id.to_owned(),
         armed:     true,
     };
+    let accepted = Arc::new(AtomicBool::new(false));
+    let mut pump = tokio::spawn(pump_log_channel(receiver, Arc::clone(&accepted), sink));
     let mut call = Box::pin(client.call::<_, m::Empty>(method, params));
-    let mut queue_open = true;
-    loop {
+    let mut pumped: Option<Result<()>> = None;
+    let outcome = loop {
         tokio::select! {
-            outcome = &mut call => {
-                client
-                    .log_streams
-                    .lock()
-                    .expect("log streams lock")
-                    .remove(stream_id);
-                while let Ok(chunk) = receiver.try_recv() {
-                    sink(chunk).await?;
-                }
-                guard.armed = false;
-                return outcome.map(|_| ());
+            outcome = &mut call => break outcome.map(|_| ()),
+            joined = &mut pump, if pumped.is_none() => {
+                let result = joined.map_err(|error| {
+                    Error::Transport(TransportError::with_source(
+                        "joining the log channel pump",
+                        error,
+                    ))
+                });
+                // A sink that refused a chunk ends the follow: the guard
+                // cancels the stream and the error is the outcome.
+                result.and_then(|result| result)?;
+                pumped = Some(Ok(()));
             }
-            chunk = receiver.recv(), if queue_open => {
-                match chunk {
-                    Some(chunk) => {
-                        if let Err(error) = sink(chunk).await {
-                            client
-                                .log_streams
-                                .lock()
-                                .expect("log streams lock")
-                                .remove(stream_id);
-                            return Err(error);
-                        }
-                    }
-                    None => queue_open = false,
-                }
+        }
+    };
+    guard.armed = false;
+    match outcome {
+        Ok(()) => {
+            if pumped.is_none() {
+                join_pump(pump, &accepted, method).await?;
             }
+            Ok(())
+        }
+        Err(error) => {
+            pump.abort();
+            Err(error)
         }
     }
 }
@@ -994,6 +1177,7 @@ struct SandboxHandle {
     working_directory: String,
     runtime_directory: Option<String>,
     exec:              SandboxExec,
+    one_shot:          SandboxOneShot,
     access:            SandboxAccess,
     pty:               SandboxPty,
     logs:              SandboxLogs,
@@ -1002,6 +1186,48 @@ struct SandboxHandle {
 }
 
 impl SandboxHandle {
+    fn new(
+        client: Arc<Client>,
+        id: SandboxId,
+        capabilities: Capabilities,
+        working_directory: String,
+        runtime_directory: Option<String>,
+        events: Option<EventContext>,
+    ) -> Self {
+        Self {
+            exec: SandboxExec {
+                client:     Arc::clone(&client),
+                sandbox_id: id.clone(),
+            },
+            one_shot: SandboxOneShot {
+                client:     Arc::clone(&client),
+                sandbox_id: id.clone(),
+            },
+            access: SandboxAccess {
+                client:     Arc::clone(&client),
+                sandbox_id: id.clone(),
+            },
+            pty: SandboxPty {
+                client:     Arc::clone(&client),
+                sandbox_id: id.clone(),
+            },
+            logs: SandboxLogs {
+                client:     Arc::clone(&client),
+                sandbox_id: id.clone(),
+            },
+            fs: SandboxFs {
+                client:     Arc::clone(&client),
+                sandbox_id: id.clone(),
+            },
+            client,
+            id,
+            capabilities,
+            working_directory,
+            runtime_directory,
+            events,
+        }
+    }
+
     fn id_params(&self) -> m::SandboxIdParams {
         m::SandboxIdParams {
             sandbox_id: self.id.as_str().to_owned(),
@@ -1034,6 +1260,17 @@ impl Sandbox for SandboxHandle {
 
     fn working_directory(&self) -> &str {
         &self.working_directory
+    }
+
+    async fn environment(&self) -> Result<BTreeMap<String, String>> {
+        if !self.capabilities.exec.environment {
+            return Err(Error::unsupported(Capability::ExecEnvironment));
+        }
+        let result: m::EnvironmentResult = self
+            .client
+            .call(m::SANDBOX_ENVIRONMENT, &self.id_params())
+            .await?;
+        Ok(result.environment)
     }
 
     fn runtime_directory(&self) -> Option<&str> {
@@ -1096,34 +1333,14 @@ impl Sandbox for SandboxHandle {
                 .expect("event contexts lock")
                 .insert(id.as_str().to_owned(), context.clone());
         }
-        Ok(Arc::new(Self {
-            client:            Arc::clone(&self.client),
-            id:                id.clone(),
-            capabilities:      info.capabilities,
-            working_directory: info.working_directory,
-            runtime_directory: info.runtime_directory,
-            exec:              SandboxExec {
-                client:     Arc::clone(&self.client),
-                sandbox_id: id.clone(),
-            },
-            access:            SandboxAccess {
-                client:     Arc::clone(&self.client),
-                sandbox_id: id.clone(),
-            },
-            pty:               SandboxPty {
-                client:     Arc::clone(&self.client),
-                sandbox_id: id.clone(),
-            },
-            logs:              SandboxLogs {
-                client:     Arc::clone(&self.client),
-                sandbox_id: id.clone(),
-            },
-            fs:                SandboxFs {
-                client:     Arc::clone(&self.client),
-                sandbox_id: id,
-            },
-            events:            self.events.clone(),
-        }))
+        Ok(Arc::new(Self::new(
+            Arc::clone(&self.client),
+            id,
+            info.capabilities,
+            info.working_directory,
+            info.runtime_directory,
+            self.events.clone(),
+        )))
     }
 
     async fn resize(&self, resources: &Resources) -> Result<()> {
@@ -1190,6 +1407,13 @@ impl Sandbox for SandboxHandle {
         &self.fs
     }
 
+    fn one_shot(&self) -> Option<&dyn OneShot> {
+        self.capabilities
+            .one_shot
+            .as_ref()
+            .map(|_| &self.one_shot as &dyn OneShot)
+    }
+
     fn preview_urls(&self) -> Option<&dyn PreviewUrls> {
         self.capabilities
             .access
@@ -1242,17 +1466,22 @@ struct SandboxPty {
 impl Pty for SandboxPty {
     async fn open(&self, options: &PtyOptions) -> Result<Box<dyn PtySession>> {
         let pty_id = self.client.next_stream_id("pty");
+        let (channel, receiver) = self.client.listener.expect();
         let _: m::Empty = self
             .client
             .call(m::PTY_OPEN, &m::PtyOpenParams {
                 sandbox_id: self.sandbox_id.as_str().to_owned(),
-                pty_id:     pty_id.clone(),
-                options:    options.clone(),
+                pty_id: pty_id.clone(),
+                channel,
+                options: options.clone(),
             })
             .await?;
+        let Channel { reader, writer } = receiver.accept_soon().await?;
         Ok(Box::new(RemotePtySession {
             client: Arc::clone(&self.client),
             pty_id,
+            reader: AsyncMutex::new(reader),
+            writer: AsyncMutex::new(writer),
         }))
     }
 }
@@ -1260,29 +1489,30 @@ impl Pty for SandboxPty {
 struct RemotePtySession {
     client: Arc<Client>,
     pty_id: String,
+    reader: AsyncMutex<FrameReader<OwnedReadHalf>>,
+    writer: AsyncMutex<FrameWriter<OwnedWriteHalf>>,
 }
 
 #[async_trait]
 impl PtySession for RemotePtySession {
     async fn write_input(&self, bytes: &[u8]) -> Result<()> {
-        let _: m::Empty = self
-            .client
-            .call(m::PTY_INPUT, &m::PtyInputParams {
-                pty_id:   self.pty_id.clone(),
-                data_b64: encode_bytes(bytes),
-            })
-            .await?;
-        Ok(())
+        self.writer
+            .lock()
+            .await
+            .write(FrameKind::Stdin, bytes)
+            .await
     }
 
     async fn read_output(&self) -> Result<Option<Vec<u8>>> {
-        let result: m::PtyOutputResult = self
-            .client
-            .call(m::PTY_OUTPUT, &m::PtyIdParams {
-                pty_id: self.pty_id.clone(),
-            })
-            .await?;
-        result.data_b64.map(|data| decode_bytes(&data)).transpose()
+        loop {
+            match self.reader.lock().await.read().await? {
+                Some((FrameKind::Stdout | FrameKind::Stderr, payload)) => {
+                    return Ok(Some(payload));
+                }
+                Some((FrameKind::Eof, _)) | None => return Ok(None),
+                Some(_) => {}
+            }
+        }
     }
 
     async fn resize(&self, size: PtySize) -> Result<()> {
@@ -1303,6 +1533,7 @@ impl PtySession for RemotePtySession {
                 pty_id: self.pty_id.clone(),
             })
             .await?;
+        let _ = self.writer.lock().await.finish().await;
         Ok(())
     }
 }
@@ -1316,15 +1547,18 @@ struct SandboxLogs {
 impl Logs for SandboxLogs {
     async fn follow(&self, source: LogSource, sink: LogSink) -> Result<()> {
         let stream_id = self.client.next_stream_id("logs");
+        let (channel, receiver) = self.client.listener.expect();
         follow_log_stream(
             &self.client,
             m::LOGS_FOLLOW,
             &m::LogsFollowParams {
                 sandbox_id: self.sandbox_id.as_str().to_owned(),
                 stream_id: stream_id.clone(),
+                channel,
                 source,
             },
             &stream_id,
+            receiver,
             sink,
         )
         .await
@@ -1339,14 +1573,8 @@ struct SandboxExec {
 #[async_trait]
 impl Exec for SandboxExec {
     async fn run(&self, spec: &ExecSpec) -> Result<ExecResult> {
-        let result: m::ExecResultDto = self
-            .client
-            .call(m::EXEC_RUN, &m::ExecRunParams {
-                sandbox_id: self.sandbox_id.as_str().to_owned(),
-                spec:       m::ExecSpecDto::from_spec(spec),
-            })
-            .await?;
-        result.into_result()
+        let streaming = self.run_streaming(spec, ExecControls::default()).await?;
+        Ok(streaming.result)
     }
 
     async fn run_streaming(
@@ -1354,231 +1582,78 @@ impl Exec for SandboxExec {
         spec: &ExecSpec,
         controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
-        if controls.stdin.is_some() {
-            return Err(Error::unsupported(Capability::ExecStdinStream));
-        }
-        let exec_id = format!(
-            "x{}-{}",
-            self.sandbox_id.as_str(),
-            self.client.next_exec.fetch_add(1, Ordering::Relaxed)
-        );
-        // The caller's sink runs in a pump task fed by a per-exec ordered
-        // queue, never in the shared reader task.
-        let pump = controls.sink.clone().map(|sink| {
-            let (queue, mut receiver) = mpsc::channel::<ExecChunk>(EXEC_STREAM_QUEUE);
-            self.client
-                .exec_streams
-                .lock()
-                .expect("exec streams lock")
-                .insert(exec_id.clone(), queue);
-            let client = Arc::clone(&self.client);
-            let stop_exec_id = exec_id.clone();
-            tokio::spawn(async move {
-                while let Some((stream, chunk)) = receiver.recv().await {
-                    if let Err(error) = sink(stream, chunk).await {
-                        // A failing sink is a hard stop on every provider.
-                        let stop: Result<m::Empty> = client
-                            .call(m::EXEC_STOP, &m::ExecStopParams {
-                                exec_id: stop_exec_id.clone(),
-                                level:   StopLevel::Kill,
-                            })
-                            .await;
-                        if let Err(stop_error) = stop {
-                            tracing::warn!(
-                                error = %stop_error,
-                                "plugin exec kill after sink failure failed"
-                            );
-                        }
-                        return Err(error);
-                    }
-                }
-                Ok(())
-            })
-        });
-        // Forward each stop token as an exec/stop request with its level.
-        // A term then a kill are two requests, in that order.
-        let stop_task = (controls.term.is_some() || controls.kill.is_some()).then(|| {
-            let client = Arc::clone(&self.client);
-            let exec_id = exec_id.clone();
-            let term = controls.term.clone();
-            let kill = controls.kill.clone();
-            tokio::spawn(async move {
-                let mut termed = std::pin::pin!(sandbox_driver::stop_signal(term.as_ref()));
-                let mut killed = std::pin::pin!(sandbox_driver::stop_signal(kill.as_ref()));
-                let mut term_sent = false;
-                loop {
-                    let level = tokio::select! {
-                        () = &mut termed, if !term_sent => StopLevel::Term,
-                        () = &mut killed => StopLevel::Kill,
-                    };
-                    let outcome: Result<m::Empty> = client
-                        .call(m::EXEC_STOP, &m::ExecStopParams {
-                            exec_id: exec_id.clone(),
-                            level,
-                        })
-                        .await;
-                    if let Err(error) = outcome {
-                        tracing::warn!(error = %error, ?level, "plugin exec stop failed");
-                    }
-                    if level == StopLevel::Kill {
-                        break;
-                    }
-                    term_sent = true;
-                }
-            })
-        });
-
-        let outcome: Result<m::ExecStreamResult> = self
-            .client
-            .call(m::EXEC_STREAM, &m::ExecStreamParams {
-                sandbox_id:            self.sandbox_id.as_str().to_owned(),
-                exec_id:               exec_id.clone(),
-                spec:                  m::ExecSpecDto::from_spec(spec),
-                retained_output_limit: controls.retained_output_limit,
-            })
-            .await;
-
-        self.client
-            .exec_streams
-            .lock()
-            .expect("exec streams lock")
-            .remove(&exec_id);
-        let pump_outcome = if let Some(pump) = pump {
-            // The queue sender is gone; the pump drains what remains and
-            // ends, so every chunk is delivered before the result is.
-            match pump.await {
-                Ok(result) => result,
-                Err(error) => Err(Error::Transport(TransportError::with_source(
-                    "joining plugin exec output pump",
-                    error,
-                ))),
-            }
-        } else {
-            Ok(())
+        let exec_id = self.client.next_exec_id(&self.sandbox_id);
+        let stdin = controls.stdin_reader(spec);
+        let (channel, receiver) = self.client.listener.expect();
+        let params = m::ExecStreamParams {
+            sandbox_id: self.sandbox_id.as_str().to_owned(),
+            exec_id: exec_id.clone(),
+            channel,
+            spec: m::ExecSpecDto::from_spec(spec),
+            stdin: stdin.is_some(),
+            retained_output_limit: controls.retained_output_limit,
         };
-        if let Some(task) = stop_task {
-            task.abort();
-        }
-        pump_outcome?;
-        let result = outcome?;
-        let mut streaming = ExecStreamingResult::new(result.result.into_result()?);
-        streaming.streams_separated = result.streams_separated;
-        streaming.live_streaming = result.live_streaming;
-        streaming.stdout_capture = result.stdout_capture;
-        streaming.stderr_capture = result.stderr_capture;
-        Ok(streaming)
+        run_channel_exec(
+            &self.client,
+            m::EXEC_STREAM,
+            &params,
+            &exec_id,
+            receiver,
+            stdin,
+            &controls,
+        )
+        .await
     }
 
     async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
         let process_id = self.client.next_stream_id("stdio");
+        let (channel, receiver) = self.client.listener.expect();
         let _: m::Empty = self
             .client
             .call(m::EXEC_STDIO_OPEN, &m::StdioOpenParams {
                 sandbox_id: self.sandbox_id.as_str().to_owned(),
                 process_id: process_id.clone(),
-                spec:       spec.clone(),
+                channel,
+                spec: spec.clone(),
             })
             .await?;
+        let Channel { mut reader, writer } = receiver.accept_soon().await?;
 
-        let (stdin_writer, mut stdin_reader) = duplex(64 * 1024);
-        let input_client = Arc::clone(&self.client);
-        let input_id = process_id.clone();
-        let input_task = tokio::spawn(async move {
-            let mut buffer = vec![0; 32 * 1024];
-            loop {
-                let read = match stdin_reader.read(&mut buffer).await {
-                    Ok(0) => break,
-                    Err(error) => {
-                        tracing::warn!(
-                            process_id = %input_id,
-                            error = %error,
-                            "plugin stdio input pipe failed"
-                        );
-                        return;
-                    }
-                    Ok(read) => read,
-                };
-                let outcome: Result<m::Empty> = input_client
-                    .call(m::EXEC_STDIO_INPUT, &m::StdioInputParams {
-                        process_id: input_id.clone(),
-                        data_b64:   encode_bytes(&buffer[..read]),
-                    })
-                    .await;
-                if let Err(error) = outcome {
-                    tracing::warn!(
-                        process_id = %input_id,
-                        error = %error,
-                        "plugin stdio input forwarding failed"
-                    );
-                    return;
-                }
-            }
-            let outcome: Result<m::Empty> = input_client
-                .call(m::EXEC_STDIO_CLOSE_INPUT, &m::StdioIdParams {
-                    process_id: input_id.clone(),
-                })
-                .await;
-            if let Err(error) = outcome {
-                tracing::warn!(
-                    process_id = %input_id,
-                    error = %error,
-                    "plugin stdio input close failed"
-                );
-            }
-        });
+        let (stdin_writer, stdin_reader) = duplex(64 * 1024);
+        let input_task = tokio::spawn(feed_stdin_frames(Box::pin(stdin_reader), writer));
 
         let (mut stdout_writer, stdout_reader) = duplex(64 * 1024);
-        let output_client = Arc::clone(&self.client);
+        let stderr_tail = StderrTail::default();
+        let output_tail = stderr_tail.clone();
         let output_id = process_id.clone();
         let output_task = tokio::spawn(async move {
             loop {
-                let result: Result<m::StdioOutputResult> = output_client
-                    .call(m::EXEC_STDIO_OUTPUT, &m::StdioIdParams {
-                        process_id: output_id.clone(),
-                    })
-                    .await;
-                let result = match result {
-                    Ok(result) => result,
+                match reader.read().await {
+                    Ok(Some((FrameKind::Stdout, payload))) => {
+                        if stdout_writer.write_all(&payload).await.is_err() {
+                            tracing::debug!(
+                                process_id = %output_id,
+                                "plugin stdio output reader closed"
+                            );
+                            break;
+                        }
+                    }
+                    Ok(Some((FrameKind::Stderr, payload))) => output_tail.push(&payload),
+                    Ok(Some((FrameKind::Eof, _)) | None) => break,
+                    Ok(Some(_)) => {}
                     Err(error) => {
                         tracing::warn!(
                             process_id = %output_id,
                             error = %error,
-                            "plugin stdio output polling failed"
+                            "plugin stdio output channel failed"
                         );
                         break;
                     }
-                };
-                let Some(chunk) = result.data_b64 else { break };
-                let chunk = match decode_bytes(&chunk) {
-                    Ok(chunk) => chunk,
-                    Err(error) => {
-                        tracing::warn!(
-                            process_id = %output_id,
-                            error = %error,
-                            "plugin stdio output decoding failed"
-                        );
-                        break;
-                    }
-                };
-                if let Err(error) = stdout_writer.write_all(&chunk).await {
-                    tracing::debug!(
-                        process_id = %output_id,
-                        error = ?error,
-                        "plugin stdio output reader closed"
-                    );
-                    break;
                 }
             }
-            if let Err(error) = stdout_writer.shutdown().await {
-                tracing::debug!(
-                    process_id = %output_id,
-                    error = ?error,
-                    "plugin stdio output pipe close failed"
-                );
-            }
+            let _ = stdout_writer.shutdown().await;
         });
 
-        let stderr_tail = StderrTail::default();
         let handle = RemoteStdioHandle {
             client: Arc::clone(&self.client),
             process_id,
@@ -1593,6 +1668,36 @@ impl Exec for SandboxExec {
             stderr_tail,
             handle: Box::new(handle),
         })
+    }
+}
+
+struct SandboxOneShot {
+    client:     Arc<Client>,
+    sandbox_id: SandboxId,
+}
+
+#[async_trait]
+impl OneShot for SandboxOneShot {
+    async fn run(&self, spec: &OneShotSpec, controls: ExecControls) -> Result<ExecStreamingResult> {
+        let exec_id = self.client.next_exec_id(&self.sandbox_id);
+        let (channel, receiver) = self.client.listener.expect();
+        let params = m::OneShotRunParams {
+            sandbox_id: self.sandbox_id.as_str().to_owned(),
+            exec_id: exec_id.clone(),
+            channel,
+            spec: spec.clone(),
+            retained_output_limit: controls.retained_output_limit,
+        };
+        run_channel_exec(
+            &self.client,
+            m::ONE_SHOT_RUN,
+            &params,
+            &exec_id,
+            receiver,
+            None,
+            &controls,
+        )
+        .await
     }
 }
 
@@ -1638,11 +1743,13 @@ impl StdioProcessHandle for RemoteStdioHandle {
                         return (Termination::Unknown, None);
                     }
                 };
-                self.stderr_tail.push(result.stderr_tail.as_bytes());
                 if let Some(task) = self.output_task.lock().await.take() {
                     if let Err(error) = task.await {
                         tracing::error!(error = ?error, "plugin stdio output task failed");
                     }
+                }
+                if !result.stderr_tail.is_empty() {
+                    self.stderr_tail.push(result.stderr_tail.as_bytes());
                 }
                 if let Some(task) = self.input_task.lock().await.take() {
                     task.abort();
@@ -1665,60 +1772,89 @@ impl SandboxFs {
             path:       path.to_owned(),
         }
     }
+
+    async fn read_through_channel(
+        &self,
+        path: &str,
+        offset: Option<u64>,
+        length: Option<u64>,
+    ) -> Result<Vec<u8>> {
+        let (channel, receiver) = self.client.listener.expect();
+        let accepted = Arc::new(AtomicBool::new(false));
+        let collect_accepted = Arc::clone(&accepted);
+        let collect = tokio::spawn(async move {
+            let Channel { mut reader, .. } = receiver.accept().await?;
+            collect_accepted.store(true, Ordering::SeqCst);
+            let mut content = Vec::new();
+            loop {
+                match reader.read().await? {
+                    Some((FrameKind::Stdout, payload)) => content.extend(payload),
+                    Some((FrameKind::Eof, _)) | None => return Ok(content),
+                    Some(_) => {}
+                }
+            }
+        });
+        let outcome: Result<m::Empty> = self
+            .client
+            .call(m::FS_READ, &m::FsReadParams {
+                sandbox_id: self.sandbox_id.as_str().to_owned(),
+                path: path.to_owned(),
+                channel,
+                offset,
+                length,
+            })
+            .await;
+        if let Err(error) = outcome {
+            collect.abort();
+            return Err(error);
+        }
+        join_pump(collect, &accepted, m::FS_READ).await
+    }
+
+    async fn write_through_channel(&self, path: &str, content: &[u8], append: bool) -> Result<()> {
+        let (channel, receiver) = self.client.listener.expect();
+        let accepted = Arc::new(AtomicBool::new(false));
+        let send_accepted = Arc::clone(&accepted);
+        let content = content.to_vec();
+        let send = tokio::spawn(async move {
+            let Channel { mut writer, .. } = receiver.accept().await?;
+            send_accepted.store(true, Ordering::SeqCst);
+            writer.write(FrameKind::Stdin, &content).await?;
+            writer.finish().await
+        });
+        let outcome: Result<m::Empty> = self
+            .client
+            .call(m::FS_WRITE, &m::FsWriteParams {
+                sandbox_id: self.sandbox_id.as_str().to_owned(),
+                path: path.to_owned(),
+                channel,
+                append,
+            })
+            .await;
+        if let Err(error) = outcome {
+            send.abort();
+            return Err(error);
+        }
+        join_pump(send, &accepted, m::FS_WRITE).await
+    }
 }
 
 #[async_trait]
 impl Filesystem for SandboxFs {
     async fn read(&self, path: &str) -> Result<Vec<u8>> {
-        let result: m::FsReadResult = self
-            .client
-            .call(m::FS_READ, &m::FsReadParams {
-                sandbox_id: self.sandbox_id.as_str().to_owned(),
-                path:       path.to_owned(),
-                offset:     None,
-                length:     None,
-            })
-            .await?;
-        decode_bytes(&result.content_b64)
+        self.read_through_channel(path, None, None).await
     }
 
     async fn read_range(&self, path: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
-        let result: m::FsReadResult = self
-            .client
-            .call(m::FS_READ, &m::FsReadParams {
-                sandbox_id: self.sandbox_id.as_str().to_owned(),
-                path: path.to_owned(),
-                offset: Some(offset),
-                length,
-            })
-            .await?;
-        decode_bytes(&result.content_b64)
+        self.read_through_channel(path, Some(offset), length).await
     }
 
     async fn write(&self, path: &str, content: &[u8]) -> Result<()> {
-        let _: m::Empty = self
-            .client
-            .call(m::FS_WRITE, &m::FsWriteParams {
-                sandbox_id:  self.sandbox_id.as_str().to_owned(),
-                path:        path.to_owned(),
-                content_b64: encode_bytes(content),
-                append:      false,
-            })
-            .await?;
-        Ok(())
+        self.write_through_channel(path, content, false).await
     }
 
     async fn write_append(&self, path: &str, content: &[u8]) -> Result<()> {
-        let _: m::Empty = self
-            .client
-            .call(m::FS_WRITE, &m::FsWriteParams {
-                sandbox_id:  self.sandbox_id.as_str().to_owned(),
-                path:        path.to_owned(),
-                content_b64: encode_bytes(content),
-                append:      true,
-            })
-            .await?;
-        Ok(())
+        self.write_through_channel(path, content, true).await
     }
 
     async fn delete(&self, path: &str, recursive: bool) -> Result<()> {
@@ -1794,56 +1930,22 @@ impl Filesystem for SandboxFs {
     }
 
     async fn upload(&self, local: &Path, remote: &str) -> Result<()> {
-        // Bounded chunks: a large file must never become one NDJSON line
-        // buffered whole on both sides of the pipe.
-        let mut file = tokio_fs::File::open(local)
+        // The channel carries any size in bounded frames; the file is read
+        // once and written once.
+        let content = tokio_fs::read(local)
             .await
             .map_err(|error| Error::io(format!("reading {}", local.display()), error))?;
-        let mut first = true;
-        loop {
-            let mut chunk = Vec::with_capacity(TRANSFER_CHUNK_BYTES);
-            let read = (&mut file)
-                .take(TRANSFER_CHUNK_BYTES as u64)
-                .read_to_end(&mut chunk)
-                .await
-                .map_err(|error| Error::io(format!("reading {}", local.display()), error))?;
-            if first {
-                // The first chunk truncates and creates parents; an
-                // empty file is one empty write.
-                self.write(remote, &chunk).await?;
-                first = false;
-            } else if read > 0 {
-                self.write_append(remote, &chunk).await?;
-            }
-            if read < TRANSFER_CHUNK_BYTES {
-                return Ok(());
-            }
-        }
+        self.write(remote, &content).await
     }
 
     async fn download(&self, remote: &str, local: &Path) -> Result<()> {
+        let content = self.read(remote).await?;
         if let Some(parent) = local.parent() {
             tokio_fs::create_dir_all(parent).await.map_err(|error| {
                 Error::io(format!("creating parent of {}", local.display()), error)
             })?;
         }
-        let mut file = tokio_fs::File::create(local)
-            .await
-            .map_err(|error| Error::io(format!("writing {}", local.display()), error))?;
-        let mut offset: u64 = 0;
-        loop {
-            let chunk = self
-                .read_range(remote, offset, Some(TRANSFER_CHUNK_BYTES as u64))
-                .await?;
-            file.write_all(&chunk)
-                .await
-                .map_err(|error| Error::io(format!("writing {}", local.display()), error))?;
-            offset += chunk.len() as u64;
-            if chunk.len() < TRANSFER_CHUNK_BYTES {
-                break;
-            }
-        }
-        file.flush()
+        tokio_fs::write(local, content)
             .await
             .map_err(|error| Error::io(format!("writing {}", local.display()), error))
     }

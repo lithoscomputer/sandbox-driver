@@ -3,7 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use sandbox_driver::{DirEntry, Error, FileKind, FileMetadata, Filesystem, Result};
+use sandbox_driver::{DirEntry, Error, FileKind, FileMetadata, Filesystem, ResourceKind, Result};
 use tokio::fs;
 
 /// Native filesystem access rooted at the sandbox workspace.
@@ -47,21 +47,36 @@ fn io_error(context: impl Into<String>) -> impl FnOnce(io::Error) -> Error {
     move |error| Error::io(context, error)
 }
 
+/// A read of a path that is not there is `NotFound`, which callers branch
+/// on; any other failure keeps its I/O cause.
+fn read_error(path: &str, full: &Path) -> impl FnOnce(io::Error) -> Error {
+    let path = path.to_owned();
+    let context = format!("reading {}", full.display());
+    move |error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            Error::NotFound {
+                resource: ResourceKind::File,
+                id:       path,
+            }
+        } else {
+            Error::io(context, error)
+        }
+    }
+}
+
 #[async_trait]
 impl Filesystem for HostFs {
     #[tracing::instrument(skip_all, fields(provider_kind = "host"), err)]
     async fn read(&self, path: &str) -> Result<Vec<u8>> {
         let full = self.resolve(path);
-        fs::read(&full)
-            .await
-            .map_err(io_error(format!("reading {}", full.display())))
+        fs::read(&full).await.map_err(read_error(path, &full))
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "host", offset), err)]
     async fn read_range(&self, path: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         let full = self.resolve(path);
-        let context = io_error(format!("reading {}", full.display()));
+        let context = read_error(path, &full);
         let outcome = async {
             let mut file = fs::File::open(&full).await?;
             file.seek(io::SeekFrom::Start(offset)).await?;

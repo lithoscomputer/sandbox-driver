@@ -12,6 +12,7 @@ use crate::fs::Filesystem;
 use crate::git::{Git, GitFacet};
 use crate::id::{SandboxId, SnapshotId};
 use crate::logs::Logs;
+use crate::one_shot::OneShot;
 use crate::pty::Pty;
 use crate::search::{Search, SearchFacet};
 use crate::service::{Services, ServicesFacet};
@@ -247,6 +248,12 @@ pub trait Sandbox: Send + Sync {
     }
 
     fn logs(&self) -> Option<&dyn Logs> {
+        None
+    }
+
+    /// Ephemeral containers run in this sandbox's world, when the provider
+    /// offers them. Capability-gated on `one_shot`.
+    fn one_shot(&self) -> Option<&dyn OneShot> {
         None
     }
 

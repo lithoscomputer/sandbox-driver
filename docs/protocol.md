@@ -1,20 +1,27 @@
-# sandbox-driver plugin protocol, version 1
+# sandbox-driver plugin protocol, version 2
 
 This is the normative specification of the wire protocol between a
-**host** (an application embedding `sandbox-driver`, such as fabro) and a
-**plugin** (an executable serving one sandbox provider). It is written so
-a plugin can be implemented in any language without reading the Rust
-source. The Rust implementation lives in the `sandbox-driver-protocol`
-crate: `serve_stdio()` is the plugin side, `PluginProvider` the host
-side, and the compatibility tests in
+**host** (an application embedding `sandbox-driver`, such as Petri or
+fabro) and a **plugin** (an executable serving one sandbox provider). It
+is written so a plugin can be implemented in any language without reading
+the Rust source. The Rust implementation lives in the
+`sandbox-driver-protocol` crate: `serve_stdio()` is the plugin side,
+`PluginProvider` the host side, and the compatibility tests in
 `crates/sandbox-driver-protocol/tests/` verify the encodings and
 tolerance rules shown here — behaviorally, not as full-shape pins.
+
+Version 2 replaces version 1. It moves every byte stream off the control
+connection onto a per-operation **data channel** (§2.1), removes the
+base64 payload methods and notifications that carried them, adds
+`sandbox/environment` and `one_shot/run`, and lifts the version-1 masks
+on streamed stdin and the effective environment. A version-1 peer fails
+the handshake by version number (§4).
 
 Normative words: **must**, **must not**, **may**.
 
 ## 1. Model
 
-A plugin serves exactly one provider **kind** (e.g. `e2b`) and
+A plugin serves exactly one provider **kind** (e.g. `docker`) and
 multiplexes every sandbox of that kind over one connection. The host
 speaks first and drives the conversation; the plugin answers requests
 and emits notifications. One plugin process per provider kind, not per
@@ -26,17 +33,66 @@ versa, minus the capability mask in §5.
 
 ## 2. Transport and framing
 
-- The transport is the plugin's **stdin/stdout**. Stdout belongs
-  exclusively to the protocol; a plugin must log to stderr only. The
-  host may leave the plugin's stderr inherited or capture it.
-- Messages are **newline-delimited JSON** (NDJSON): one complete JSON
-  object per line, UTF-8, terminated by `\n`. A message must not contain
-  a raw newline. Blank lines are ignored.
+- The **control transport** is the plugin's **stdin/stdout**. Stdout
+  belongs exclusively to the protocol; a plugin must log to stderr only.
+  The host may leave the plugin's stderr inherited or capture it.
+- Control messages are **newline-delimited JSON** (NDJSON): one complete
+  JSON object per line, UTF-8, terminated by `\n`. A message must not
+  contain a raw newline. Blank lines are ignored.
 - Either side may have any number of requests outstanding.
   **Responses may arrive in any order**; the `id` correlates them. A
   plugin must not serialize request handling: a slow call must not
   block an unrelated fast call (see §9 and the conformance suite's
   interleaving checks).
+- **No bytes cross the control transport.** Command output and input,
+  stdio and PTY traffic, logs, and file contents ride data channels. The
+  only exception is the bounded output sample inside an `exec` error
+  report (§7), which is base64.
+
+### 2.1 Data channels
+
+The host owns a **Unix domain socket** in a private directory (mode
+`0700`) and announces its path at `initialize` (§4). Every request that
+moves bytes carries a `channel` object:
+
+```json
+{"channel_id": 7, "token": "3f9a…"}
+```
+
+`channel_id` is host-generated and unique for the connection; `token` is
+a one-use secret of at least 128 bits. The plugin handles such a request
+by **connecting to the socket** and sending one `open` frame carrying the
+JSON `{"channel_id": 7, "token": "3f9a…"}`. The host binds the
+connection to the waiting operation when both values match, and closes
+any connection whose open frame does not match, arrives late, or is not
+the first frame. A plugin must open the channel **before** it starts the
+operation's work, and must close its side (an `eof` frame) **before** it
+sends the operation's response, so a result never arrives ahead of the
+bytes it describes.
+
+Frames are binary: one byte of kind, four bytes of big-endian payload
+length, then the payload.
+
+| kind | byte | direction | carries |
+| --- | --- | --- | --- |
+| `open` | 0 | plugin → host | the JSON open payload, once, first |
+| `stdout` | 1 | plugin → host | command stdout, PTY output, log and file bytes |
+| `stderr` | 2 | plugin → host | command stderr |
+| `stdin` | 3 | host → plugin | command or PTY input, file content to write |
+| `eof` | 4 | either | the sender has no more data |
+
+`initialize` negotiates `max_frame_bytes`; this implementation offers and
+accepts 65536. A receiver must reject a frame whose length exceeds the
+limit before it allocates the payload, and a sender must split larger
+chunks. An `eof` frame has an empty payload. Each side sends at most one
+`eof` and nothing after it; a closed connection is read as an `eof`. A
+frame kind the receiver does not expect on a given channel must be
+ignored or must end the channel; it must not be misread as data.
+
+Backpressure is the socket's: a plugin that cannot write because the
+host is slow to read must stall the producing process, never drop or
+buffer output without bound, and the stall affects that one operation.
+Control responses, `exec/stop`, and every other channel keep flowing.
 
 ## 3. Message envelope
 
@@ -67,17 +123,21 @@ Notification (has `method`, no `id`; never answered):
 {"jsonrpc":"2.0","method":"exec/output","params":{"...":"..."}}
 ```
 
-In version 1 the host sends only requests; the plugin sends responses
-and the notifications `exec/output`, `host/event`, and `host/log`.
-Unknown notifications must be ignored. A request with an unknown method
-must be answered with error code `-32601`.
+The host sends only requests; the plugin sends responses and the
+notifications `host/event` and `host/log`. Unknown notifications must be
+ignored. A request with an unknown method must be answered with error
+code `-32601`.
 
 ## 4. Handshake
 
-The host's first request must be `initialize`:
+The host's first request must be `initialize`, naming the data transport
+(§2.1):
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol_version":1}}
+{"jsonrpc":"2.0","id":1,"method":"initialize",
+ "params":{"protocol_version":2,
+           "data_transport":{"socket_path":"/tmp/sandbox-driver-…/data.sock",
+                             "max_frame_bytes":65536}}}
 ```
 
 The plugin answers with its protocol version, identity, and capability
@@ -87,7 +147,7 @@ set:
 {
   "jsonrpc":"2.0","id":1,
   "result":{
-    "protocol_version":1,
+    "protocol_version":2,
     "provider":{"kind":"host","version":"0.1.0"},
     "capabilities":{"...":"see §5"}
   }
@@ -96,7 +156,9 @@ set:
 
 Versioning is a single integer. If the versions differ, each side must
 fail with a human-readable message naming both versions — never a decode
-error. `provider.kind` is the plugin's declared kind: lowercase ASCII
+error. `data_transport` is required: a plugin that receives none must
+refuse the handshake, and every channel the host names later opens
+against the announced socket. `provider.kind` is the plugin's declared kind: lowercase ASCII
 letters, digits, and interior hyphens, at most 64 bytes. A host that
 launched the plugin from configuration must refuse a plugin whose
 declared kind differs from the configured kind (§12).
@@ -126,6 +188,7 @@ for the connection. Per-sandbox capability sets travel in every
   "services": {"supported":false,"native":false},
   "pty": null,
   "logs": null,
+  "one_shot": null,
   "access": {"preview_urls":false,"signed_preview_urls":false,"ssh":false,
               "ssh_ttl":false,"ssh_revoke":false,
               "shell_command":false,"web_terminal":false,"vnc":false,"vpn":false},
@@ -147,14 +210,15 @@ Rules:
   work; an undeclared operation must fail with the `unsupported` error
   kind (§7). Capabilities optimize failure timing; the error is still
   the enforcement.
-- **The version-1 mask.** Native search/git/service passthrough, local
-  shell commands, streamed stdin, and the effective-environment query do
-  not cross the wire. A host forces `search.native`, `git.native`,
-  `services.native`, `access.shell_command`, `exec.stdin_stream`, and
-  `exec.environment` to false.
+- **The wire mask.** Native search/git/service passthrough and local
+  shell commands do not cross the wire. A host forces `search.native`,
+  `git.native`, `services.native`, and `access.shell_command` to false.
   `search.supported`, `git.supported`, and `services.supported` remain true when
-  the complete facets can run through `exec/run`; the host then selects the
-  exec-derived implementations.
+  the complete facets can run through `exec/stream`; the host then selects the
+  exec-derived implementations. Streamed stdin (`exec.stdin_stream`) and
+  the effective environment (`exec.environment`) cross as declared.
+- `one_shot` is a nullable object `{"build": false}`: non-null authorizes
+  `one_shot/run`, and `build` authorizes the `build` image source.
 - Older peers send `search`, `git`, and `services` groups as `{"native":false}`.
   Hosts read those groups as `supported:true` because `native:false` originally
   instructed the caller to use an exec-derived implementation. An explicitly
@@ -179,8 +243,9 @@ Rules:
 
 - **Field names** are `snake_case`. Readers must ignore unknown object
   fields; new optional fields are the compatible evolution path.
-- **Binary data** (file contents, command output, stdin) crosses as
-  standard base64 with padding, in fields suffixed `_b64`.
+- **Binary data** (file contents, command output, stdin) crosses on
+  data channels (§2.1), never in JSON. The one base64 field that remains
+  is the output sample inside an `exec` error report, suffixed `_b64`.
 - **Durations** appear in two forms, fixed per field: integer
   milliseconds in fields suffixed `_ms`, and the structural form
   `{"secs":90,"nanos":0}` where a spec object embeds one (e.g.
@@ -275,6 +340,7 @@ to operate a sandbox without further negotiation:
 | `sandbox/list` | `{filter:{labels:{…}}}` | `{sandboxes:[status…]}` |
 | `sandbox/describe` | `{sandbox_id}` | `{status}` |
 | `sandbox/platform_info` | `{sandbox_id}` | `{platform:{os,arch,version}}` |
+| `sandbox/environment` | `{sandbox_id}` | `{environment:{…}}` (gated on `exec.environment`) |
 
 ### 8.2 The creation spec
 
@@ -393,10 +459,13 @@ on `PATH` to serve them.
 The exec spec DTO:
 
 ```json
-{"program":"echo","args":["hi"],"timeout_ms":30000,"working_dir":null,"env":{},"stdin_b64":null,"output_sanitization":"strip_ansi"}
+{"program":"echo","args":["hi"],"timeout_ms":30000,"working_dir":null,"env":{},"output_sanitization":"strip_ansi"}
 ```
 
-`args` may be omitted and means `[]`.
+`args` may be omitted and means `[]`. Standard input is not in the spec:
+a request whose `stdin` is true feeds the command from the channel's
+`stdin` frames (§9), and a plugin whose provider takes only fixed stdin
+collects those frames to their `eof` first.
 
 `output_sanitization` is optional. Its values are `raw`, `strip_ansi`,
 and `strip_all`; omission means `raw`. A plugin applies this policy to
@@ -405,48 +474,46 @@ PTY and bidirectional stdio traffic always remains raw.
 
 | method | params | result |
 | --- | --- | --- |
-| `exec/run` | `{sandbox_id, spec}` | ExecResult (below) |
-| `exec/stream` | `{sandbox_id, exec_id, spec, retained_output_limit}` | ExecStreamResult (§9) |
+| `exec/stream` | `{sandbox_id, exec_id, channel, spec, stdin, retained_output_limit}` | ExecStreamResult (§9) |
 | `exec/stop` | `{exec_id, level}` | `{}` |
-| `exec/stdio_open` | `{sandbox_id, process_id, spec}` | `{}` |
-| `exec/stdio_input` | `{process_id, data_b64}` | `{}` |
-| `exec/stdio_close_input` | `{process_id}` | `{}` |
-| `exec/stdio_output` | `{process_id}` | `{data_b64:null | "…"}` |
+| `one_shot/run` | `{sandbox_id, exec_id, channel, spec, retained_output_limit}` | ExecStreamResult (§9.1) |
+| `exec/stdio_open` | `{sandbox_id, process_id, channel, spec}` | `{}` |
 | `exec/stdio_terminate` | `{process_id}` | `{}` |
 | `exec/stdio_wait` | `{process_id}` | `{termination,exit_code,stderr_tail}` |
-| `pty/open` | `{sandbox_id, pty_id, options}` | `{}` |
-| `pty/input` | `{pty_id, data_b64}` | `{}` |
-| `pty/output` | `{pty_id}` | `{data_b64:null | "…"}` |
+| `pty/open` | `{sandbox_id, pty_id, channel, options}` | `{}` |
 | `pty/resize` | `{pty_id, size}` | `{}` |
 | `pty/close` | `{pty_id}` | `{}` |
-| `logs/follow` | `{sandbox_id, stream_id, source}` | `{}` after the stream ends |
+| `logs/follow` | `{sandbox_id, stream_id, channel, source}` | `{}` after the stream ends |
 | `stream/cancel` | `{stream_id}` | `{}` |
 
-ExecResult:
+There is no buffered exec method: a host that wants a buffered result
+runs `exec/stream` and keeps the bytes itself.
+
+ExecResult, the metadata half of a finished command:
 
 ```json
-{"stdout_b64":"…","stderr_b64":"…","exit_code":0,"signal":null,
- "termination":"exited","duration_ms":12}
+{"exit_code":0,"signal":null,"termination":"exited","duration_ms":12}
 ```
 
-`signal` is additive: the signal number that ended the process when the
-plugin observed one — on any termination, a foreign `kill` or the
-plugin's own stop ladder alike — else absent or `null`; receivers
-tolerate its absence. `termination` ∈ `exited timed_out cancelled killed unknown`. A timeout
-or a stop resolves the call **normally** with the corresponding
-termination — it is not an error. `cancelled` means the host's `term`
-(or a failing sink) ended the command; `killed` means its `kill` did. `stdin_b64`, when present, is written
-to the process then closed for EOF; a broken pipe while writing is not
-an error.
+`signal` is the signal number that ended the process when the plugin
+observed one — on any termination, a foreign `kill` or the plugin's own
+stop ladder alike — else absent or `null`. `termination` ∈ `exited
+timed_out cancelled killed unknown`. A timeout or a stop resolves the
+call **normally** with the corresponding termination — it is not an
+error. `cancelled` means the host's `term` (or a failing sink) ended the
+command; `killed` means its `kill` did. Stdin arrives as `stdin` frames
+and the host's `eof` closes it; a broken pipe while writing is not an
+error.
 
 `process_id`, `pty_id`, and `stream_id` are host-generated and unique
-for the connection. Stdio and PTY reads are long-poll requests. The
-server handles requests concurrently, so an output read never blocks
-input, resize, terminate, or unrelated work — but a host must keep **at
-most one outstanding output read per process or PTY id**: concurrent
-reads on one id race their response ordering. `logs/follow` emits
-`logs/output` notifications with `{stream_id,data_b64}` before its final
-response. Dropping the host-side follow future sends `stream/cancel`.
+for the connection. A stdio process and a PTY each live on one channel
+for their whole life: the host sends input as `stdin` frames (its `eof`
+closes the process's stdin), the plugin sends output as `stdout` frames
+(and a stdio process's stderr as `stderr` frames, which the host keeps as
+the diagnostic tail) and its `eof` when the output ends. `pty/close` and
+`exec/stdio_wait` end the channel. `logs/follow` writes `stdout` frames
+on its channel and sends `eof` before its final response. Dropping the
+host-side follow future sends `stream/cancel`.
 
 ### 8.5 Filesystem
 
@@ -455,8 +522,8 @@ sandbox working directory.
 
 | method | params | result |
 | --- | --- | --- |
-| `fs/read` | `{sandbox_id, path, offset?, length?}` | `{content_b64}` |
-| `fs/write` | `{sandbox_id, path, content_b64, append?}` | `{}` (creates parents) |
+| `fs/read` | `{sandbox_id, path, channel, offset?, length?}` | `{}` after the bytes |
+| `fs/write` | `{sandbox_id, path, channel, append?}` | `{}` (creates parents) |
 | `fs/delete` | `{sandbox_id, path, recursive}` | `{}` |
 | `fs/exists` | `{sandbox_id, path}` | `{exists}` |
 | `fs/metadata` | `{sandbox_id, path}` | `{metadata:{kind,size,mode,modified_at}}` |
@@ -465,18 +532,20 @@ sandbox working directory.
 | `fs/rename` | `{sandbox_id, from, to}` | `{}` |
 | `fs/set_permissions` | `{sandbox_id, path, mode}` | `{}` (mode is numeric POSIX) |
 
-`kind` ∈ `file directory symlink other`. `fs/read` takes an optional
-byte `offset` (default `0`) and `length` (default: to end of file);
-reading at or past the end returns empty content. `fs/write` takes an
-optional `append` (default `false`) that appends instead of truncating,
-creating the file when missing. Both fields were added within version 1;
-readers ignore them when absent.
+`kind` ∈ `file directory symlink other`. `fs/read` sends the file's
+bytes as `stdout` frames on its channel, then `eof`, then the response;
+it takes an optional byte `offset` (default `0`) and `length` (default:
+to end of file), and reading at or past the end sends no bytes. A
+missing file is the `not_found` error kind with resource `file`.
+`fs/write` reads the content from the channel's `stdin` frames to the
+host's `eof`, then writes it; `append` (default `false`) appends instead
+of truncating, creating the file when missing. A plugin must create
+missing parent directories, and must not need a shell in the sandbox to
+do it.
 
 Upload/download have no wire methods: the host composes them from local
-I/O plus `fs/read`/`fs/write` — in **bounded chunks** (the reference
-implementation uses 4 MiB), using `offset`/`length` to page reads and
-`append` to page writes, so a large file never crosses as a single
-message buffered whole on both sides.
+I/O plus `fs/read`/`fs/write`. Frames bound every message, so a large
+file crosses in pieces without paging by the host.
 
 ### 8.6 Snapshots and volumes
 
@@ -553,18 +622,20 @@ kill it after a grace period.
 
 ## 9. Streaming exec
 
-`exec/stream` is the one method with mid-flight traffic:
+`exec/stream` runs one command with its bytes on a data channel:
 
 ```
 host → {"id":7,"method":"exec/stream","params":{"sandbox_id":"sb-1","exec_id":"x1",
+         "channel":{"channel_id":3,"token":"…"},"stdin":false,
          "spec":{"program":"cargo","args":["build"],"timeout_ms":null,…},"retained_output_limit":65536}}
-plugin → {"method":"exec/output","params":{"exec_id":"x1","stream":"stdout","data_b64":"…"}}
-plugin → {"method":"exec/output","params":{"exec_id":"x1","stream":"stderr","data_b64":"…"}}
+plugin ⇢ connects to the data socket, frame open {"channel_id":3,"token":"…"}
+plugin ⇢ frame stdout …    frame stderr …    (as the command produces them)
 host → {"id":8,"method":"exec/stop","params":{"exec_id":"x1","level":"term"}}  (optional)
 plugin → {"id":8,"result":{}}
 host → {"id":9,"method":"exec/stop","params":{"exec_id":"x1","level":"kill"}}  (optional)
 plugin → {"id":9,"result":{}}
-plugin → {"id":7,"result":{"result":{…,"termination":"killed"},
+plugin ⇢ frame eof
+plugin → {"id":7,"result":{"result":{"exit_code":null,"termination":"killed",…},
            "streams_separated":true,"live_streaming":true,
            "stdout_capture":{"observed_bytes":…,"retained_bytes":…,"omitted_bytes":…,
                              "truncated":false},
@@ -573,9 +644,13 @@ plugin → {"id":7,"result":{"result":{…,"termination":"killed"},
 
 Rules:
 
-- `exec_id` is **host-generated** and unique per connection, so output
-  can be routed and a stop addressed before the `exec/stream` response
-  exists.
+- `exec_id` is **host-generated** and unique per connection, so a stop
+  can be addressed before the `exec/stream` response exists.
+- When `stdin` is true the host writes the command's input as `stdin`
+  frames and its `eof` closes the input; a plugin whose provider offers
+  fixed stdin only (`exec.stdin` without `exec.stdin_stream`) reads the
+  frames to `eof` before it starts the command. A plugin whose provider
+  offers neither must fail the request with `unsupported`.
 - **Stops are signals, not a policy.** `level: "term"` sends SIGTERM to
   the command's process group once; the command keeps running until it
   exits or a `level: "kill"` sends SIGKILL. The host owns any escalation
@@ -583,39 +658,65 @@ Rules:
   the command on either level and reports the termination for the level
   it received. The plugin's own stops — `timeout_ms` elapsing, a failing
   output notification — have no host present to escalate, so they kill.
-- Every `exec/output` for an exec must be sent **before** its
-  `exec/stream` response, in the order the output was observed.
-  `stream` ∈ `stdout stderr`.
+- Every output frame for an exec must be sent **before** its `eof`, and
+  the `eof` before the `exec/stream` response, in the order the output
+  was observed.
 - **Honesty flags.** `live_streaming` is true only if output was
   delivered while the command ran (a plugin that buffers and replays
   must say false). `streams_separated` is true only if stdout and
   stderr are genuinely distinct (combined-output backends must say
   false and use `stdout`). Results must never claim a flag the
   `initialize` capabilities did not declare.
-- **Retention.** `retained_output_limit` bounds only the buffered copy
-  returned in the result (a stable head plus rolling tail); the full
-  stream must still be drained and emitted as notifications, with
-  accounting such that `retained + omitted = observed` per stream.
-  `truncated` (optional, default `false`; added within v1) means bytes
-  were lost *beyond* that accounting — the provider abandoned an
-  unfinished drain — so the counts undercount the real output.
-- **Backpressure and isolation.** A plugin must not buffer output
-  unboundedly: when the transport cannot keep up, it must stall the
-  producing process (pipe backpressure), never drop output. Both sides
-  must keep one slow stream from starving unrelated traffic: a slow
-  consumer of one exec's output must not delay another exec's output or
-  any response beyond transient, bounded queuing. The conformance
-  suite's `concurrent_streams_do_not_starve_each_other` check is the
-  acceptance test.
+- **Retention.** The host keeps its own retained copy of the output
+  (a stable head plus rolling tail, bounded by `retained_output_limit`)
+  from the frames it reads; the result's bytes are the host's. The
+  plugin's `stdout_capture`/`stderr_capture` report its own accounting
+  such that `retained + omitted = observed` per stream, and `truncated`
+  (default `false`) means bytes were lost *beyond* that accounting — the
+  provider abandoned an unfinished drain — so the counts undercount the
+  real output.
+- **Backpressure and isolation.** The channel's socket is the
+  backpressure: a plugin that cannot write must stall the producing
+  process, never drop output. Because every exec has its own channel, a
+  slow consumer of one exec's output delays nothing else. The
+  conformance suite's `concurrent_streams_do_not_starve_each_other`
+  check is the acceptance test.
 - `exec/stop` for an unknown or finished `exec_id` succeeds and does
   nothing.
+
+### 9.1 One-shot containers
+
+`one_shot/run` (gated on a non-null `one_shot` capability) runs an
+ephemeral container beside a sandbox, in the sandbox's world: it shares
+the sandbox's workspace at the sandbox's working directory and the
+sandbox's network namespace, runs one command from its own image, and is
+removed when the command ends. The request shape, channel use, stops,
+retention, and result are those of `exec/stream`, without stdin. The spec:
+
+```json
+{"image":{"registry":{"reference":"alpine:3.20"}},
+ "entrypoint":"sh","args":["-c","echo hi"],"env":{},
+ "working_dir":null,"timeout":{"secs":60,"nanos":0},"output_sanitization":"raw"}
+```
+
+`image` is `{"registry":{"reference":…}}` or, gated on `one_shot.build`,
+`{"build":{"context":…,"dockerfile":…,"tag":…,"reuse":…}}`: a Dockerfile
+under `context` inside the sandbox, built to `tag`, reused without
+building when `reuse` is true and an image carrying `tag` exists.
+`working_dir` defaults to the sandbox's working directory. `timeout` is
+the structural duration form, `null` for none.
+
+A one-shot container belongs to its sandbox: the sandbox's `stop` and
+`delete` end any of its one-shot containers still running, so a host
+that went away mid-run leaves nothing the sandbox's own lifecycle does
+not reach. The exit code is the container's own; a `term` is one SIGTERM
+to the container's entrypoint, `kill` and the timeout SIGKILL it.
 
 ## 10. Events
 
 The plugin emits `host/event` notifications for sandbox, snapshot, and
 volume control-plane operations. Exec output, PTY bytes, file-transfer
-chunks, and logs use their dedicated streams and never use this event
-feed.
+chunks, and logs use their data channels and never use this event feed.
 
 ```json
 {"method":"host/event","params":{
@@ -686,7 +787,7 @@ event types and subject kinds must be ignored without closing the
 connection.
 
 `host/log` (`{level, message}`) is reserved: plugins should prefer
-stderr for logs in version 1, and hosts may ignore `host/log`.
+stderr for logs, and hosts may ignore `host/log`.
 
 ## 11. Discovery and trust (host-side conventions)
 
@@ -695,9 +796,11 @@ implementation is `sandbox_driver_protocol::discovery`.
 
 - **Naming convention.** A plugin binary is found either at an
   explicitly configured path or as `<prefix>-<kind>` on `PATH`, where
-  `<prefix>` is chosen by the embedder (fabro uses `fabro-sandbox`,
-  giving `fabro-sandbox-e2b`). There is no other fallback; unknown kinds
-  are never launched (deny by default).
+  `<prefix>` is chosen by the embedder. The reference plugins ship under
+  the `sandbox-driver` prefix: `sandbox-driver-host`,
+  `sandbox-driver-docker`, and `sandbox-driver-daytona`, one archive and
+  one checksum each per target. There is no other fallback; unknown
+  kinds are never launched (deny by default).
 - **Checksum or dev, never neither.** Configuration pins the binary's
   SHA-256, verified before exec; a mismatch is a hard failure naming
   both hashes. Launching without a pin requires an explicit dev flag,
@@ -717,26 +820,36 @@ implementation is `sandbox_driver_protocol::discovery`.
 A plugin is conformant when the `sandbox-driver-conformance` suite
 passes against it through `PluginProvider` — the same battery every
 in-process provider must pass, covering lifecycle, the bash probe,
-exec semantics (literal argv, exit codes, env, binary safety, stdin,
-timeout, term and kill), streaming honesty and isolation, retention accounting,
-filesystem round trips, capability honesty in both directions, label
-listing, event delivery, and service/facet-capability consistency.
+exec semantics (literal argv, exit codes, env, binary safety, fixed and
+streamed stdin, the effective environment, timeout, term and kill),
+streaming honesty and isolation, retention accounting, filesystem round
+trips including bounded reads and missing files, one-shot containers,
+capability honesty in both directions, label listing, event delivery,
+and service/facet-capability consistency. The Host and Docker providers
+run it over the wire in this repository's own tests.
 
 ## 13. Compatibility policy
 
-Within version 1: changes must be additive (new methods, new optional
+Within version 2: changes must be additive (new methods, new optional
 fields, new enum values that readers already tolerate). Anything else —
 renaming fields, changing a pinned encoding, making an optional field
-required — requires incrementing `protocol_version`, and the handshake's
-version check is the only compatibility gate. Compatibility is verified
-behaviorally: readers must decode era JSON written before any later
-additive field existed (every wire struct's growable fields carry serde
-defaults), tolerate unknown fields and enum values, and keep the pinned
-per-field encodings. Full-shape golden pins are deliberately not used —
-they fail on additive changes this section declares compatible.
+required, changing the frame format — requires incrementing
+`protocol_version`, and the handshake's version check is the only
+compatibility gate. Compatibility is verified behaviorally: readers must
+decode era JSON written before any later additive field existed (every
+wire struct's growable fields carry serde defaults), tolerate unknown
+fields and enum values, and keep the pinned per-field encodings.
+Full-shape golden pins are deliberately not used — they fail on additive
+changes this section declares compatible.
 
-## 14. Deferred beyond version 1
+Version 1 is not served or spoken by this implementation. Its
+base64 methods (`exec/run`, `exec/stdio_input`, `exec/stdio_output`,
+`exec/stdio_close_input`, `pty/input`, `pty/output`) and notifications
+(`exec/output`, `logs/output`) do not exist in version 2, and a
+version-1 `fs/read` or `fs/write` shape is a `-32600` here.
+
+## 14. Deferred beyond version 2
 
 Native search/git/service passthrough, local `shell_command`, and
 `host/credentials` (per-call secret fetches from the host) remain
-deferred. They are masked or absent in version 1 per §5.
+deferred. They are masked or absent per §5.

@@ -2,36 +2,40 @@
 //!
 //! Every request is handled in its own task, so a slow call never blocks
 //! its siblings (the interleaving requirement from the design). One
-//! writer task owns the output stream; events and exec output cross as
-//! notifications.
+//! writer task owns the control stream; events cross as notifications and
+//! every byte stream rides a data channel the plugin opens back to the
+//! host ([`crate::channel`]).
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::future::Future;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use sandbox_driver::{
-    Capability, Error, Event, EventContext, EventObserver, ExecControls, LogSink, OutputSink,
-    Result, Sandbox, SandboxId, SandboxProvider, SandboxSpec, SandboxStatus, SnapshotId,
-    StderrTail, StdioProcessHandle, StopLevel, TransportError, VolumeId,
+    Capability, Error, Event, EventContext, EventObserver, ExecControls, ExecStreamingResult,
+    LogSink, OutputSink, OutputStream, Result, Sandbox, SandboxId, SandboxProvider, SandboxSpec,
+    SandboxStatus, SnapshotId, StderrTail, StdinSource, StdioProcessHandle, StopLevel,
+    TransportError, VolumeId,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, stdin, stdout,
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, duplex, stdin,
+    stdout,
 };
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::methods as m;
-use crate::wire::{
-    CODE_INVALID_REQUEST, CODE_METHOD_NOT_FOUND, Message, WireError, decode_bytes, encode_bytes,
+use crate::channel::{
+    self, Channel, ChannelRequest, DataTransport, FrameKind, FrameReader, FrameWriter,
 };
+use crate::methods as m;
+use crate::wire::{CODE_INVALID_REQUEST, CODE_METHOD_NOT_FOUND, Message, WireError};
 
 /// Serves `provider` over this process's stdin and stdout until EOF or
 /// `shutdown` — the main loop of a plugin binary:
@@ -52,7 +56,8 @@ pub async fn serve_stdio(provider: Arc<dyn SandboxProvider>) -> Result<()> {
 ///
 /// This is the plugin-side main loop: a provider binary calls it with
 /// stdin/stdout. It also runs over any in-process duplex, which is how
-/// the conformance tests drive it.
+/// the conformance tests drive it; the data channels are real Unix
+/// sockets either way.
 #[tracing::instrument(skip_all, fields(provider_kind = %provider.kind()), err)]
 pub async fn serve(
     provider: Arc<dyn SandboxProvider>,
@@ -87,6 +92,7 @@ pub async fn serve(
 
     let state = Arc::new(ServerState {
         provider,
+        transport: OnceLock::new(),
         handles: Mutex::new(HashMap::new()),
         execs: Mutex::new(HashMap::new()),
         stdios: Mutex::new(HashMap::new()),
@@ -140,7 +146,7 @@ pub async fn serve(
             }
         };
         let (Some(id), Some(method)) = (message.id, message.method.clone()) else {
-            // v1 has no host→plugin notifications; ignore.
+            // There are no host→plugin notifications; ignore.
             continue;
         };
         if method == m::SHUTDOWN {
@@ -196,23 +202,16 @@ pub async fn serve(
 }
 
 struct ServerState {
-    provider: Arc<dyn SandboxProvider>,
-    handles:  Mutex<HashMap<String, Arc<dyn Sandbox>>>,
+    provider:  Arc<dyn SandboxProvider>,
+    /// Set by `initialize`; every data channel opens against it.
+    transport: OnceLock<DataTransport>,
+    handles:   Mutex<HashMap<String, Arc<dyn Sandbox>>>,
     /// Per in-flight exec: its `term` and `kill` tokens, in that order.
-    execs:    Mutex<HashMap<String, (CancellationToken, CancellationToken)>>,
-    stdios:   Mutex<HashMap<String, Arc<ServerStdio>>>,
-    ptys:     Mutex<HashMap<String, Arc<dyn sandbox_driver::PtySession>>>,
-    streams:  Mutex<HashMap<String, CancellationToken>>,
-    outbound: mpsc::Sender<Message>,
-}
-
-struct ServerStdio {
-    stdin:       AsyncMutex<Pin<Box<dyn AsyncWrite + Send>>>,
-    stdout:      AsyncMutex<Pin<Box<dyn AsyncRead + Send>>>,
-    stderr_tail: StderrTail,
-    handle:      Arc<dyn StdioProcessHandle>,
-    stdout_done: AtomicBool,
-    waited:      AtomicBool,
+    execs:     Mutex<HashMap<String, (CancellationToken, CancellationToken)>>,
+    stdios:    Mutex<HashMap<String, Arc<ServerStdio>>>,
+    ptys:      Mutex<HashMap<String, Arc<dyn sandbox_driver::PtySession>>>,
+    streams:   Mutex<HashMap<String, CancellationToken>>,
+    outbound:  mpsc::Sender<Message>,
 }
 
 impl ServerState {
@@ -242,7 +241,7 @@ impl ServerState {
             .lock()
             .expect("stdios lock")
             .drain()
-            .map(|(_, process)| process)
+            .map(|(_, handle)| handle)
             .collect::<Vec<_>>();
         for process in stdios {
             process.handle.terminate().await;
@@ -295,6 +294,24 @@ impl ServerState {
             context
         })
     }
+
+    /// Opens the data channel a request named. Before `initialize` there
+    /// is no transport to open it against, which is a protocol violation.
+    async fn open_channel(&self, request: &ChannelRequest) -> Result<Channel> {
+        let transport = self.transport.get().ok_or_else(|| {
+            Error::Transport(TransportError::new(
+                "a data channel was requested before initialize",
+            ))
+        })?;
+        channel::open(transport, request).await
+    }
+}
+
+/// A spawned stdio process the plugin holds for the host: its control
+/// handle and the stderr tail the host reads back at `wait`.
+struct ServerStdio {
+    handle:      Arc<dyn StdioProcessHandle>,
+    stderr_tail: StderrTail,
 }
 
 struct ProtocolEventObserver {
@@ -350,12 +367,6 @@ fn stdio(state: &ServerState, id: &str) -> Result<Arc<ServerStdio>> {
         .ok_or_else(|| Error::invalid_spec("process_id", "unknown stdio process id"))
 }
 
-fn forget_stdio_if_finished(state: &ServerState, id: &str, process: &ServerStdio) {
-    if process.stdout_done.load(Ordering::SeqCst) && process.waited.load(Ordering::SeqCst) {
-        state.stdios.lock().expect("stdios lock").remove(id);
-    }
-}
-
 fn pty(state: &ServerState, id: &str) -> Result<Arc<dyn sandbox_driver::PtySession>> {
     state
         .ptys
@@ -366,29 +377,141 @@ fn pty(state: &ServerState, id: &str) -> Result<Arc<dyn sandbox_driver::PtySessi
         .ok_or_else(|| Error::invalid_spec("pty_id", "unknown PTY id"))
 }
 
-fn log_sink(state: &ServerState, stream_id: &str) -> LogSink {
-    let outbound = state.outbound.clone();
-    let stream_id = stream_id.to_owned();
-    Arc::new(move |chunk| {
-        let outbound = outbound.clone();
-        let stream_id = stream_id.clone();
+type SharedWriter = Arc<AsyncMutex<FrameWriter<OwnedWriteHalf>>>;
+
+/// A sink that writes every chunk as one frame of its stream, awaiting
+/// the connection: a slow host consumer backpressures exactly this
+/// operation.
+fn frame_sink(writer: &SharedWriter) -> OutputSink {
+    let writer = Arc::clone(writer);
+    Arc::new(move |stream, chunk| {
+        let writer = Arc::clone(&writer);
         Box::pin(async move {
-            let notification = Message::notification(
-                m::LOG_OUTPUT,
-                serde_json::to_value(m::LogOutputNotification {
-                    stream_id,
-                    data_b64: encode_bytes(&chunk),
-                })
-                .expect("log output notification contains serializable values"),
-            );
-            outbound.send(notification).await.map_err(|error| {
-                Error::Transport(TransportError::with_source(
-                    "sending plugin log notification",
-                    error,
-                ))
-            })
+            let kind = match stream {
+                OutputStream::Stdout => FrameKind::Stdout,
+                OutputStream::Stderr => FrameKind::Stderr,
+            };
+            writer.lock().await.write(kind, &chunk).await
         })
     })
+}
+
+fn log_frame_sink(writer: &SharedWriter) -> LogSink {
+    let writer = Arc::clone(writer);
+    Arc::new(move |chunk| {
+        let writer = Arc::clone(&writer);
+        Box::pin(async move { writer.lock().await.write(FrameKind::Stdout, &chunk).await })
+    })
+}
+
+/// Ends the plugin's side of a channel; a failure here means the host is
+/// gone, which the response will report too.
+async fn finish_channel(writer: &SharedWriter) {
+    if let Err(error) = writer.lock().await.finish().await {
+        tracing::debug!(error = %error, "data channel eof was not delivered");
+    }
+}
+
+/// Pumps the host's `Stdin` frames into `sink` until its `Eof`. The
+/// duplex's writer half closing is the command's end-of-file.
+fn pump_stdin_frames(mut reader: FrameReader<OwnedReadHalf>) -> (StdinSource, JoinHandle<()>) {
+    let (mut writer, pipe) = duplex(64 * 1024);
+    let task = tokio::spawn(async move {
+        loop {
+            match reader.read().await {
+                Ok(Some((FrameKind::Stdin, payload))) => {
+                    if writer.write_all(&payload).await.is_err() {
+                        // The command stopped reading its input; that is
+                        // not an error, and the rest is unwanted.
+                        break;
+                    }
+                }
+                Ok(Some((FrameKind::Eof, _)) | None) => break,
+                Ok(Some((kind, _))) => {
+                    tracing::warn!(?kind, "unexpected frame on an input channel");
+                    break;
+                }
+                Err(error) => {
+                    tracing::debug!(error = %error, "input channel read failed");
+                    break;
+                }
+            }
+        }
+        let _ = writer.shutdown().await;
+    });
+    (StdinSource::new(pipe), task)
+}
+
+/// Reads the host's `Stdin` frames to `Eof` and returns the bytes.
+async fn collect_stdin_frames(reader: &mut FrameReader<OwnedReadHalf>) -> Result<Vec<u8>> {
+    let mut content = Vec::new();
+    loop {
+        match reader.read().await? {
+            Some((FrameKind::Stdin, payload)) => content.extend(payload),
+            Some((FrameKind::Eof, _)) | None => return Ok(content),
+            Some((kind, _)) => {
+                return Err(Error::invalid_spec(
+                    "frame",
+                    format!("unexpected {kind:?} frame on a write channel"),
+                ));
+            }
+        }
+    }
+}
+
+/// Runs a streaming command whose output goes to the channel and whose
+/// stop tokens are addressable by `exec_id`, then closes the channel
+/// before the result is returned.
+async fn stream_through_channel<F, Fut>(
+    state: &ServerState,
+    exec_id: &str,
+    channel: Channel,
+    stdin: bool,
+    run: F,
+) -> Result<ExecStreamingResult>
+where
+    F: FnOnce(ExecControls) -> Fut,
+    Fut: Future<Output = Result<ExecStreamingResult>>,
+{
+    let Channel { reader, writer } = channel;
+    let writer: SharedWriter = Arc::new(AsyncMutex::new(writer));
+    let term = CancellationToken::new();
+    let kill = CancellationToken::new();
+    state
+        .execs
+        .lock()
+        .expect("execs lock")
+        .insert(exec_id.to_owned(), (term.clone(), kill.clone()));
+    let (stdin_source, stdin_task) = if stdin {
+        let (source, task) = pump_stdin_frames(reader);
+        (Some(source), Some(task))
+    } else {
+        (None, None)
+    };
+    let controls = ExecControls {
+        term:                  Some(term),
+        kill:                  Some(kill),
+        stdin:                 stdin_source,
+        sink:                  Some(frame_sink(&writer)),
+        retained_output_limit: None,
+    };
+    let outcome = run(controls).await;
+    state.execs.lock().expect("execs lock").remove(exec_id);
+    if let Some(task) = stdin_task {
+        task.abort();
+    }
+    finish_channel(&writer).await;
+    outcome
+}
+
+fn stream_result(streaming: &ExecStreamingResult) -> m::ExecStreamResult {
+    m::ExecStreamResult {
+        result:            m::ExecResultDto::from_result(&streaming.result),
+        streams_separated: streaming.streams_separated,
+        live_streaming:    streaming.live_streaming,
+        stdout_capture:    streaming.stdout_capture,
+        stderr_capture:    streaming.stderr_capture,
+    }
 }
 
 async fn follow_logs<F>(state: &ServerState, stream_id: &str, follow: F) -> Result<()>
@@ -448,6 +571,15 @@ async fn dispatch(
                     ),
                 )));
             }
+            if request.data_transport.max_frame_bytes == 0 {
+                return Err(DispatchError::App(Error::invalid_spec(
+                    "data_transport.max_frame_bytes",
+                    "must be positive",
+                )));
+            }
+            // A second initialize keeps the first transport: channels the
+            // host is already waiting on were named against it.
+            let _ = state.transport.set(request.data_transport);
             to_value(&m::InitializeResult {
                 protocol_version: m::PROTOCOL_VERSION,
                 provider:         m::ProviderInfo {
@@ -494,6 +626,15 @@ async fn dispatch(
                 .platform_info()
                 .await?;
             to_value(&m::PlatformInfoResult { platform })
+        }
+        m::SANDBOX_ENVIRONMENT => {
+            let request: m::SandboxIdParams = parse(params)?;
+            let environment = state
+                .sandbox(&request.sandbox_id)
+                .await?
+                .environment()
+                .await?;
+            to_value(&m::EnvironmentResult { environment })
         }
         m::SANDBOX_DELETE => {
             // Delete is a provider-level operation by id: no prior attach is
@@ -605,71 +746,54 @@ async fn dispatch(
                 .await?;
             to_value(&m::Empty)
         }
-        m::EXEC_RUN => {
-            let request: m::ExecRunParams = parse(params)?;
-            let handle = state.sandbox(&request.sandbox_id).await?;
-            let spec = request.spec.into_spec()?;
-            let result = handle.exec().run(&spec).await?;
-            to_value(&m::ExecResultDto::from_result(&result))
-        }
         m::EXEC_STREAM => {
             let request: m::ExecStreamParams = parse(params)?;
             let handle = state.sandbox(&request.sandbox_id).await?;
-            let spec = request.spec.into_spec()?;
-            let term = CancellationToken::new();
-            let kill = CancellationToken::new();
-            state
-                .execs
-                .lock()
-                .expect("execs lock")
-                .insert(request.exec_id.clone(), (term.clone(), kill.clone()));
-
-            let outbound = state.outbound.clone();
-            let exec_id = request.exec_id.clone();
-            let sink: OutputSink = Arc::new(move |stream, chunk| {
-                let outbound = outbound.clone();
-                let exec_id = exec_id.clone();
-                Box::pin(async move {
-                    let notification = Message::notification(
-                        m::EXEC_OUTPUT,
-                        serde_json::to_value(m::ExecOutputNotification {
-                            exec_id,
-                            stream,
-                            data_b64: encode_bytes(&chunk),
-                        })
-                        .expect("exec output notification contains serializable values"),
-                    );
-                    outbound.send(notification).await.map_err(|error| {
-                        Error::Transport(TransportError::with_source(
-                            "sending plugin exec output notification",
-                            error,
-                        ))
-                    })?;
-                    Ok(())
+            let mut spec = request.spec.into_spec();
+            let mut channel = state.open_channel(&request.channel).await?;
+            // A provider without streamed stdin takes the input as the
+            // spec's fixed bytes, so the host's stream still reaches the
+            // command; one without any stdin then rejects it honestly.
+            let stream_stdin = request.stdin && handle.capabilities().exec.stdin_stream;
+            if request.stdin && !stream_stdin {
+                spec.stdin = Some(collect_stdin_frames(&mut channel.reader).await?);
+            }
+            let retained = request.retained_output_limit;
+            let streaming = stream_through_channel(
+                state,
+                &request.exec_id,
+                channel,
+                stream_stdin,
+                |controls| {
+                    let controls = ExecControls {
+                        retained_output_limit: retained,
+                        ..controls
+                    };
+                    async move { handle.exec().run_streaming(&spec, controls).await }
+                },
+            )
+            .await?;
+            to_value(&stream_result(&streaming))
+        }
+        m::ONE_SHOT_RUN => {
+            let request: m::OneShotRunParams = parse(params)?;
+            let handle = state.sandbox(&request.sandbox_id).await?;
+            let one_shot = handle
+                .one_shot()
+                .ok_or_else(|| Error::unsupported(Capability::OneShot))?;
+            let channel = state.open_channel(&request.channel).await?;
+            let retained = request.retained_output_limit;
+            let spec = request.spec;
+            let streaming =
+                stream_through_channel(state, &request.exec_id, channel, false, |controls| {
+                    let controls = ExecControls {
+                        retained_output_limit: retained,
+                        ..controls
+                    };
+                    async move { one_shot.run(&spec, controls).await }
                 })
-            });
-
-            let controls = ExecControls {
-                term: Some(term),
-                kill: Some(kill),
-                sink: Some(sink),
-                retained_output_limit: request.retained_output_limit,
-                ..ExecControls::default()
-            };
-            let outcome = handle.exec().run_streaming(&spec, controls).await;
-            state
-                .execs
-                .lock()
-                .expect("execs lock")
-                .remove(&request.exec_id);
-            let streaming = outcome?;
-            to_value(&m::ExecStreamResult {
-                result:            m::ExecResultDto::from_result(&streaming.result),
-                streams_separated: streaming.streams_separated,
-                live_streaming:    streaming.live_streaming,
-                stdout_capture:    streaming.stdout_capture,
-                stderr_capture:    streaming.stderr_capture,
-            })
+                .await?;
+            to_value(&stream_result(&streaming))
         }
         m::EXEC_STOP => {
             let request: m::ExecStopParams = parse(params)?;
@@ -695,74 +819,70 @@ async fn dispatch(
                 .exec()
                 .spawn_stdio(&request.spec)
                 .await?;
-            let process = Arc::new(ServerStdio {
-                stdin:       AsyncMutex::new(process.stdin),
-                stdout:      AsyncMutex::new(process.stdout),
+            let handle: Arc<dyn StdioProcessHandle> = Arc::from(process.handle);
+            let entry_value = Arc::new(ServerStdio {
+                handle:      Arc::clone(&handle),
                 stderr_tail: process.stderr_tail,
-                handle:      Arc::from(process.handle),
-                stdout_done: AtomicBool::new(false),
-                waited:      AtomicBool::new(false),
             });
             let inserted = {
                 let mut stdios = state.stdios.lock().expect("stdios lock");
                 match stdios.entry(request.process_id.clone()) {
                     Entry::Vacant(entry) => {
-                        entry.insert(Arc::clone(&process));
+                        entry.insert(entry_value);
                         true
                     }
                     Entry::Occupied(_) => false,
                 }
             };
             if !inserted {
-                process.handle.terminate().await;
+                handle.terminate().await;
                 return Err(Error::invalid_spec("process_id", "duplicate stdio process id").into());
             }
+            let channel = match state.open_channel(&request.channel).await {
+                Ok(channel) => channel,
+                Err(error) => {
+                    state
+                        .stdios
+                        .lock()
+                        .expect("stdios lock")
+                        .remove(&request.process_id);
+                    handle.terminate().await;
+                    return Err(error.into());
+                }
+            };
+            let Channel { mut reader, writer } = channel;
+            let mut stdin = process.stdin;
+            tokio::spawn(async move {
+                // Anything but an input frame — the host's eof, a closed
+                // connection, a stray kind — ends the process's stdin.
+                while let Ok(Some((FrameKind::Stdin, payload))) = reader.read().await {
+                    if stdin.write_all(&payload).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = stdin.shutdown().await;
+            });
+            let mut stdout = process.stdout;
+            tokio::spawn(async move {
+                let mut writer = writer;
+                let mut buffer = vec![0; 32 * 1024];
+                loop {
+                    match stdout.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => {
+                            if writer
+                                .write(FrameKind::Stdout, &buffer[..read])
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                }
+                let _ = writer.finish().await;
+            });
             to_value(&m::Empty)
-        }
-        m::EXEC_STDIO_INPUT => {
-            let request: m::StdioInputParams = parse(params)?;
-            let process = stdio(state, &request.process_id)?;
-            let data = decode_bytes(&request.data_b64)?;
-            process
-                .stdin
-                .lock()
-                .await
-                .write_all(&data)
-                .await
-                .map_err(|error| Error::io("writing remote process stdin", error))?;
-            to_value(&m::Empty)
-        }
-        m::EXEC_STDIO_CLOSE_INPUT => {
-            let request: m::StdioIdParams = parse(params)?;
-            let process = stdio(state, &request.process_id)?;
-            process
-                .stdin
-                .lock()
-                .await
-                .shutdown()
-                .await
-                .map_err(|error| Error::io("closing remote process stdin", error))?;
-            to_value(&m::Empty)
-        }
-        m::EXEC_STDIO_OUTPUT => {
-            let request: m::StdioIdParams = parse(params)?;
-            let process = stdio(state, &request.process_id)?;
-            let mut chunk = vec![0; 32 * 1024];
-            let read = process
-                .stdout
-                .lock()
-                .await
-                .read(&mut chunk)
-                .await
-                .map_err(|error| Error::io("reading remote process stdout", error))?;
-            chunk.truncate(read);
-            if read == 0 {
-                process.stdout_done.store(true, Ordering::SeqCst);
-                forget_stdio_if_finished(state, &request.process_id, &process);
-            }
-            to_value(&m::StdioOutputResult {
-                data_b64: (read != 0).then(|| encode_bytes(&chunk)),
-            })
         }
         m::EXEC_STDIO_TERMINATE => {
             let request: m::StdioIdParams = parse(params)?;
@@ -773,8 +893,11 @@ async fn dispatch(
             let request: m::StdioIdParams = parse(params)?;
             let process = stdio(state, &request.process_id)?;
             let (termination, exit_code) = process.handle.wait().await;
-            process.waited.store(true, Ordering::SeqCst);
-            forget_stdio_if_finished(state, &request.process_id, &process);
+            state
+                .stdios
+                .lock()
+                .expect("stdios lock")
+                .remove(&request.process_id);
             to_value(&m::StdioWaitResult {
                 termination,
                 exit_code,
@@ -792,7 +915,7 @@ async fn dispatch(
             let pty: Arc<dyn sandbox_driver::PtySession> = Arc::from(pty);
             let inserted = {
                 let mut ptys = state.ptys.lock().expect("ptys lock");
-                match ptys.entry(request.pty_id) {
+                match ptys.entry(request.pty_id.clone()) {
                     Entry::Vacant(entry) => {
                         entry.insert(Arc::clone(&pty));
                         true
@@ -806,21 +929,38 @@ async fn dispatch(
                 }
                 return Err(Error::invalid_spec("pty_id", "duplicate PTY id").into());
             }
+            let channel = match state.open_channel(&request.channel).await {
+                Ok(channel) => channel,
+                Err(error) => {
+                    state
+                        .ptys
+                        .lock()
+                        .expect("ptys lock")
+                        .remove(&request.pty_id);
+                    let _ = pty.close().await;
+                    return Err(error.into());
+                }
+            };
+            let Channel { mut reader, writer } = channel;
+            let input_pty = Arc::clone(&pty);
+            tokio::spawn(async move {
+                while let Ok(Some((FrameKind::Stdin, payload))) = reader.read().await {
+                    if input_pty.write_input(&payload).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let output_pty = Arc::clone(&pty);
+            tokio::spawn(async move {
+                let mut writer = writer;
+                while let Ok(Some(chunk)) = output_pty.read_output().await {
+                    if writer.write(FrameKind::Stdout, &chunk).await.is_err() {
+                        return;
+                    }
+                }
+                let _ = writer.finish().await;
+            });
             to_value(&m::Empty)
-        }
-        m::PTY_INPUT => {
-            let request: m::PtyInputParams = parse(params)?;
-            pty(state, &request.pty_id)?
-                .write_input(&decode_bytes(&request.data_b64)?)
-                .await?;
-            to_value(&m::Empty)
-        }
-        m::PTY_OUTPUT => {
-            let request: m::PtyIdParams = parse(params)?;
-            let chunk = pty(state, &request.pty_id)?.read_output().await?;
-            to_value(&m::PtyOutputResult {
-                data_b64: chunk.as_deref().map(encode_bytes),
-            })
         }
         m::PTY_RESIZE => {
             let request: m::PtyResizeParams = parse(params)?;
@@ -845,12 +985,16 @@ async fn dispatch(
             let logs = handle
                 .logs()
                 .ok_or_else(|| Error::unsupported(Capability::Logs))?;
-            follow_logs(
+            let channel = state.open_channel(&request.channel).await?;
+            let writer: SharedWriter = Arc::new(AsyncMutex::new(channel.writer));
+            let outcome = follow_logs(
                 state,
                 &request.stream_id,
-                logs.follow(request.source, log_sink(state, &request.stream_id)),
+                logs.follow(request.source, log_frame_sink(&writer)),
             )
-            .await?;
+            .await;
+            finish_channel(&writer).await;
+            outcome?;
             to_value(&m::Empty)
         }
         m::STREAM_CANCEL => {
@@ -872,27 +1016,40 @@ async fn dispatch(
         m::FS_READ => {
             let request: m::FsReadParams = parse(params)?;
             let handle = state.sandbox(&request.sandbox_id).await?;
+            let mut channel = state.open_channel(&request.channel).await?;
             let content = if request.offset.is_some() || request.length.is_some() {
                 handle
                     .fs()
                     .read_range(&request.path, request.offset.unwrap_or(0), request.length)
-                    .await?
+                    .await
             } else {
-                handle.fs().read(&request.path).await?
+                handle.fs().read(&request.path).await
             };
-            to_value(&m::FsReadResult {
-                content_b64: encode_bytes(&content),
-            })
+            let content = match content {
+                Ok(content) => content,
+                Err(error) => {
+                    // The host learns of the failure from the response; the
+                    // channel just ends.
+                    let _ = channel.writer.finish().await;
+                    return Err(error.into());
+                }
+            };
+            channel.writer.write(FrameKind::Stdout, &content).await?;
+            channel.writer.finish().await?;
+            to_value(&m::Empty)
         }
         m::FS_WRITE => {
             let request: m::FsWriteParams = parse(params)?;
-            let content = decode_bytes(&request.content_b64)?;
             let handle = state.sandbox(&request.sandbox_id).await?;
-            if request.append {
-                handle.fs().write_append(&request.path, &content).await?;
+            let mut channel = state.open_channel(&request.channel).await?;
+            let content = collect_stdin_frames(&mut channel.reader).await?;
+            let outcome = if request.append {
+                handle.fs().write_append(&request.path, &content).await
             } else {
-                handle.fs().write(&request.path, &content).await?;
-            }
+                handle.fs().write(&request.path, &content).await
+            };
+            let _ = channel.writer.finish().await;
+            outcome?;
             to_value(&m::Empty)
         }
         m::FS_DELETE => {
@@ -1015,12 +1172,16 @@ async fn dispatch(
                 .ok_or_else(|| Error::unsupported(Capability::Snapshots))?;
             let id = SnapshotId::try_new(&request.snapshot_id)
                 .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))?;
-            follow_logs(
+            let channel = state.open_channel(&request.channel).await?;
+            let writer: SharedWriter = Arc::new(AsyncMutex::new(channel.writer));
+            let outcome = follow_logs(
                 state,
                 &request.stream_id,
-                service.build_logs(&id, request.follow, log_sink(state, &request.stream_id)),
+                service.build_logs(&id, request.follow, log_frame_sink(&writer)),
             )
-            .await?;
+            .await;
+            finish_channel(&writer).await;
+            outcome?;
             to_value(&m::Empty)
         }
         m::SNAPSHOT_DELETE | m::SNAPSHOT_ACTIVATE | m::SNAPSHOT_DEACTIVATE => {

@@ -3,7 +3,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use daytona_sdk::{FileSystemService, SetFilePermissionsOptions};
-use sandbox_driver::{DirEntry, Error, FileKind, FileMetadata, Filesystem, Result};
+use sandbox_driver::{DirEntry, Error, FileKind, FileMetadata, Filesystem, ResourceKind, Result};
 use tokio::fs as tokio_fs;
 use tokio::sync::OnceCell;
 
@@ -84,7 +84,16 @@ impl Filesystem for DaytonaFs {
             .await?
             .download_file(&self.resolve(path))
             .await
-            .map_err(|error| daytona_error("reading file", error))
+            .map_err(|error| {
+                if is_not_found(&error) {
+                    Error::NotFound {
+                        resource: ResourceKind::File,
+                        id:       path.to_owned(),
+                    }
+                } else {
+                    daytona_error("reading file", error)
+                }
+            })
     }
 
     #[tracing::instrument(
