@@ -9,10 +9,12 @@
 //! so a result never arrives ahead of the output it describes.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::path::Path;
+use std::pin::pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -40,6 +42,7 @@ use tokio::runtime::Handle as RuntimeHandle;
 use tokio::sync::{Mutex as AsyncMutex, OnceCell, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::{fs as tokio_fs, time};
+use tokio_util::task::AbortOnDropHandle;
 use tracing::field;
 
 use crate::channel::{
@@ -587,6 +590,18 @@ struct Client {
     /// Contexts for in-flight resource operations, keyed by a wire-only
     /// route id so events can arrive before a resource id exists.
     event_routes:   Mutex<HashMap<String, EventContext>>,
+    tasks:          OnceLock<[AbortOnDropHandle<()>; 2]>,
+}
+
+struct PendingCall<'a> {
+    pending: &'a Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>,
+    id:      u64,
+}
+
+impl Drop for PendingCall<'_> {
+    fn drop(&mut self) {
+        self.pending.lock().expect("pending lock").remove(&self.id);
+    }
 }
 
 impl Client {
@@ -608,10 +623,11 @@ impl Client {
             pending: Mutex::new(HashMap::new()),
             event_contexts: Mutex::new(HashMap::new()),
             event_routes: Mutex::new(HashMap::new()),
+            tasks: OnceLock::new(),
         });
 
-        let writer_client = Arc::clone(&client);
-        tokio::spawn(async move {
+        let writer_client = Arc::downgrade(&client);
+        let writer_task = tokio::spawn(async move {
             let mut writer = writer;
             let outcome: Result<(), TransportError> = async {
                 while let Some(message) = outbound_rx.recv().await {
@@ -629,40 +645,50 @@ impl Client {
                 Ok(())
             }
             .await;
-            writer_client.mark_closed(
-                outcome
-                    .err()
-                    .unwrap_or_else(|| TransportError::new("plugin request transport closed")),
-            );
+            if let Some(client) = writer_client.upgrade() {
+                client.mark_closed(
+                    outcome
+                        .err()
+                        .unwrap_or_else(|| TransportError::new("plugin request transport closed")),
+                );
+            }
         });
 
-        let reader_client = Arc::clone(&client);
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(reader).lines();
-            let outcome: Result<(), TransportError> = async {
-                loop {
-                    let Some(line) = lines.next_line().await.map_err(|error| {
-                        TransportError::with_source("reading plugin response", error)
-                    })?
-                    else {
-                        return Ok(());
-                    };
-                    if line.trim().is_empty() {
-                        continue;
+        let reader_client = Arc::downgrade(&client);
+        let reader_task =
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(reader).lines();
+                let outcome: Result<(), TransportError> = async {
+                    loop {
+                        let Some(line) = lines.next_line().await.map_err(|error| {
+                            TransportError::with_source("reading plugin response", error)
+                        })?
+                        else {
+                            return Ok(());
+                        };
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        let message = serde_json::from_str::<Message>(&line).map_err(|error| {
+                            TransportError::with_source("decoding plugin response", error)
+                        })?;
+                        let Some(client) = reader_client.upgrade() else {
+                            return Ok(());
+                        };
+                        client.route(message).await?;
                     }
-                    let message = serde_json::from_str::<Message>(&line).map_err(|error| {
-                        TransportError::with_source("decoding plugin response", error)
-                    })?;
-                    reader_client.route(message).await?;
                 }
-            }
-            .await;
-            reader_client.mark_closed(
-                outcome
-                    .err()
-                    .unwrap_or_else(|| TransportError::new("plugin response transport closed")),
-            );
-        });
+                .await;
+                if let Some(client) = reader_client.upgrade() {
+                    client.mark_closed(outcome.err().unwrap_or_else(|| {
+                        TransportError::new("plugin response transport closed")
+                    }));
+                }
+            });
+        let _ = client.tasks.set([
+            AbortOnDropHandle::new(writer_task),
+            AbortOnDropHandle::new(reader_task),
+        ]);
 
         client
     }
@@ -818,10 +844,13 @@ impl Client {
             .lock()
             .expect("pending lock")
             .insert(id, sender);
+        let _pending = PendingCall {
+            pending: &self.pending,
+            id,
+        };
         if self.closed.load(Ordering::SeqCst) {
             // The transport may have died between the drain and our
-            // registration; drain again so this call cannot hang.
-            self.pending.lock().expect("pending lock").remove(&id);
+            // registration. The guard removes this call on return.
             return Err(self.closed_error());
         }
         if let Err(send_error) = self
@@ -829,7 +858,6 @@ impl Client {
             .send(Message::request(id, method, params))
             .await
         {
-            self.pending.lock().expect("pending lock").remove(&id);
             return Err(Error::Transport(TransportError::with_source(
                 "sending plugin request",
                 send_error,
@@ -893,29 +921,35 @@ impl Client {
     }
 }
 
-/// Waits for a task that was pumping a data channel, after the operation
-/// it belongs to has answered. The plugin ends the channel before it
-/// answers, so a channel that never even opened is a broken plugin, not
-/// slow output.
-async fn join_pump<T>(pump: JoinHandle<Result<T>>, accepted: &AtomicBool, what: &str) -> Result<T> {
-    let joined = if accepted.load(Ordering::SeqCst) {
-        pump.await
-    } else {
-        match time::timeout(LATE_CHANNEL_GRACE, pump).await {
-            Ok(joined) => joined,
-            Err(_) => {
-                return Err(Error::Transport(TransportError::new(format!(
-                    "the plugin answered {what} without opening its data channel"
-                ))));
-            }
+/// Polls the control call and data pump together. Both futures belong to
+/// this operation, so cancellation drops the channel and its expectation.
+async fn call_with_pump<R, T>(
+    call: impl Future<Output = Result<R>>,
+    pump: impl Future<Output = Result<T>>,
+    accepted: &AtomicBool,
+    method: &str,
+) -> Result<(R, T)> {
+    let mut call = pin!(call);
+    let mut pump = pin!(pump);
+    tokio::select! {
+        pumped = &mut pump => {
+            let pumped = pumped?;
+            Ok((call.await?, pumped))
+        },
+        result = &mut call => {
+            let result = result?;
+            let pumped = if accepted.load(Ordering::SeqCst) {
+                pump.await?
+            } else {
+                time::timeout(LATE_CHANNEL_GRACE, pump).await.map_err(|_| {
+                    Error::Transport(TransportError::new(format!(
+                        "the plugin answered {method} without opening its data channel"
+                    )))
+                })??
+            };
+            Ok((result, pumped))
         }
-    };
-    joined.map_err(|error| {
-        Error::Transport(TransportError::with_source(
-            "joining a data channel pump",
-            error,
-        ))
-    })?
+    }
 }
 
 /// What an exec pump collected while the command ran.
@@ -941,26 +975,16 @@ async fn pump_exec_channel(
 ) -> Result<PumpedOutput> {
     let Channel { mut reader, writer } = receiver.accept().await?;
     accepted.store(true, Ordering::SeqCst);
-    let mut writer = Some(writer);
-    let stdin_task = stdin.map(|reader| {
-        let writer = writer.take().expect("the writer is handed to stdin once");
-        tokio::spawn(feed_stdin_frames(reader, writer))
-    });
+    let _stdin_task =
+        stdin.map(|reader| AbortOnDropHandle::new(tokio::spawn(feed_stdin_frames(reader, writer))));
     let mut output = PumpedOutput {
         stdout:     OutputCaptureBuffer::new(retained_output_limit),
         stderr:     OutputCaptureBuffer::new(retained_output_limit),
         sink_error: None,
     };
     loop {
-        let frame = match reader.read().await {
-            Ok(Some(frame)) => frame,
-            Ok(None) => break,
-            Err(error) => {
-                if let Some(task) = stdin_task {
-                    task.abort();
-                }
-                return Err(error);
-            }
+        let Some(frame) = reader.read().await? else {
+            break;
         };
         let (stream, payload) = match frame {
             (FrameKind::Stdout, payload) => (OutputStream::Stdout, payload),
@@ -986,10 +1010,6 @@ async fn pump_exec_channel(
                 output.sink_error = Some(error);
             }
         }
-    }
-    if let Some(task) = stdin_task {
-        // The command is done; unwritten stdin bytes are unwanted.
-        task.abort();
     }
     Ok(output)
 }
@@ -1033,7 +1053,7 @@ async fn run_channel_exec<P: Serialize>(
     controls: &ExecControls,
 ) -> Result<ExecStreamingResult> {
     let accepted = Arc::new(AtomicBool::new(false));
-    let pump = tokio::spawn(pump_exec_channel(
+    let pump = pump_exec_channel(
         Arc::clone(client),
         exec_id.to_owned(),
         receiver,
@@ -1041,20 +1061,17 @@ async fn run_channel_exec<P: Serialize>(
         stdin,
         controls.sink.clone(),
         controls.retained_output_limit,
-    ));
-    let stop_task = client.forward_stops(exec_id, controls);
-    let outcome: Result<m::ExecStreamResult> = client.call(method, params).await;
-    if let Some(task) = stop_task {
-        task.abort();
-    }
-    let result = match outcome {
-        Ok(result) => result,
-        Err(error) => {
-            pump.abort();
-            return Err(error);
-        }
-    };
-    let pumped = join_pump(pump, &accepted, method).await?;
+    );
+    let _stop_task = client
+        .forward_stops(exec_id, controls)
+        .map(AbortOnDropHandle::new);
+    let (result, pumped) = call_with_pump(
+        client.call::<_, m::ExecStreamResult>(method, params),
+        pump,
+        &accepted,
+        method,
+    )
+    .await?;
     let (stdout, mut stdout_stats) = pumped.stdout.into_parts();
     let (stderr, mut stderr_stats) = pumped.stderr.into_parts();
     stdout_stats.truncated = result.stdout_capture.truncated;
@@ -1134,39 +1151,19 @@ async fn follow_log_stream<P: Serialize>(
         armed:     true,
     };
     let accepted = Arc::new(AtomicBool::new(false));
-    let mut pump = tokio::spawn(pump_log_channel(receiver, Arc::clone(&accepted), sink));
-    let mut call = Box::pin(client.call::<_, m::Empty>(method, params));
-    let mut pumped: Option<Result<()>> = None;
-    let outcome = loop {
-        tokio::select! {
-            outcome = &mut call => break outcome.map(|_| ()),
-            joined = &mut pump, if pumped.is_none() => {
-                let result = joined.map_err(|error| {
-                    Error::Transport(TransportError::with_source(
-                        "joining the log channel pump",
-                        error,
-                    ))
-                });
-                // A sink that refused a chunk ends the follow: the guard
-                // cancels the stream and the error is the outcome.
-                result.and_then(|result| result)?;
-                pumped = Some(Ok(()));
-            }
-        }
+    let call = async {
+        let outcome = client.call::<_, m::Empty>(method, params).await;
+        guard.armed = false;
+        outcome
     };
-    guard.armed = false;
-    match outcome {
-        Ok(()) => {
-            if pumped.is_none() {
-                join_pump(pump, &accepted, method).await?;
-            }
-            Ok(())
-        }
-        Err(error) => {
-            pump.abort();
-            Err(error)
-        }
-    }
+    call_with_pump(
+        call,
+        pump_log_channel(receiver, Arc::clone(&accepted), sink),
+        &accepted,
+        method,
+    )
+    .await?;
+    Ok(())
 }
 
 /// A sandbox handle backed by the plugin.
@@ -1782,7 +1779,7 @@ impl SandboxFs {
         let (channel, receiver) = self.client.listener.expect();
         let accepted = Arc::new(AtomicBool::new(false));
         let collect_accepted = Arc::clone(&accepted);
-        let collect = tokio::spawn(async move {
+        let collect = async move {
             let Channel { mut reader, .. } = receiver.accept().await?;
             collect_accepted.store(true, Ordering::SeqCst);
             let mut content = Vec::new();
@@ -1793,49 +1790,48 @@ impl SandboxFs {
                     Some(_) => {}
                 }
             }
-        });
-        let outcome: Result<m::Empty> = self
-            .client
-            .call(m::FS_READ, &m::FsReadParams {
-                sandbox_id: self.sandbox_id.as_str().to_owned(),
-                path: path.to_owned(),
-                channel,
-                offset,
-                length,
-            })
-            .await;
-        if let Err(error) = outcome {
-            collect.abort();
-            return Err(error);
-        }
-        join_pump(collect, &accepted, m::FS_READ).await
+        };
+        let params = m::FsReadParams {
+            sandbox_id: self.sandbox_id.as_str().to_owned(),
+            path: path.to_owned(),
+            channel,
+            offset,
+            length,
+        };
+        let (_, content) = call_with_pump(
+            self.client.call::<_, m::Empty>(m::FS_READ, &params),
+            collect,
+            &accepted,
+            m::FS_READ,
+        )
+        .await?;
+        Ok(content)
     }
 
     async fn write_through_channel(&self, path: &str, content: &[u8], append: bool) -> Result<()> {
         let (channel, receiver) = self.client.listener.expect();
         let accepted = Arc::new(AtomicBool::new(false));
         let send_accepted = Arc::clone(&accepted);
-        let content = content.to_vec();
-        let send = tokio::spawn(async move {
+        let send = async move {
             let Channel { mut writer, .. } = receiver.accept().await?;
             send_accepted.store(true, Ordering::SeqCst);
-            writer.write(FrameKind::Stdin, &content).await?;
+            writer.write(FrameKind::Stdin, content).await?;
             writer.finish().await
-        });
-        let outcome: Result<m::Empty> = self
-            .client
-            .call(m::FS_WRITE, &m::FsWriteParams {
-                sandbox_id: self.sandbox_id.as_str().to_owned(),
-                path: path.to_owned(),
-                channel,
-                append,
-            })
-            .await;
-        if let Err(error) = outcome {
-            send.abort();
-            return Err(error);
-        }
-        join_pump(send, &accepted, m::FS_WRITE).await
+        };
+        let params = m::FsWriteParams {
+            sandbox_id: self.sandbox_id.as_str().to_owned(),
+            path: path.to_owned(),
+            channel,
+            append,
+        };
+        call_with_pump(
+            self.client.call::<_, m::Empty>(m::FS_WRITE, &params),
+            send,
+            &accepted,
+            m::FS_WRITE,
+        )
+        .await?;
+        Ok(())
     }
 }
 
@@ -1948,5 +1944,100 @@ impl Filesystem for SandboxFs {
         tokio_fs::write(local, content)
             .await
             .map_err(|error| Error::io(format!("writing {}", local.display()), error))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future;
+
+    use tokio::task::yield_now;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_failed_pump_does_not_wait_for_the_control_response() {
+        let accepted = AtomicBool::new(true);
+        let outcome = time::timeout(
+            Duration::from_secs(1),
+            call_with_pump(
+                future::pending::<Result<()>>(),
+                async { Err::<(), _>(Error::invalid_spec("sink", "closed")) },
+                &accepted,
+                "test",
+            ),
+        )
+        .await
+        .expect("pump failure resolves promptly");
+        assert!(matches!(outcome, Err(Error::InvalidSpec { .. })));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_call_removes_its_pending_response() {
+        let (reader, _plugin_writer) = duplex(1024);
+        let (writer, _plugin_reader) = duplex(1024);
+        let client = Client::start(reader, writer, ChannelListener::bind().expect("bind"));
+        let mut call = Box::pin(client.call::<_, m::Empty>("test", &m::Empty));
+        tokio::select! {
+            biased;
+            result = &mut call => panic!("call must await a response: {result:?}"),
+            () = yield_now() => {}
+        }
+        assert_eq!(client.pending.lock().expect("pending lock").len(), 1);
+        drop(call);
+        assert!(client.pending.lock().expect("pending lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropping_the_client_releases_its_transport() {
+        let (reader, _plugin_writer) = duplex(1024);
+        let (writer, mut plugin_reader) = duplex(1024);
+        let client = Client::start(reader, writer, ChannelListener::bind().expect("bind"));
+        let socket = client.listener.transport().socket_path;
+        let weak = Arc::downgrade(&client);
+        drop(client);
+        assert!(
+            weak.upgrade().is_none(),
+            "transport tasks must not retain the client"
+        );
+        assert!(!tokio_fs::try_exists(socket).await.expect("socket lookup"));
+        let mut byte = [0];
+        assert_eq!(
+            time::timeout(Duration::from_secs(1), plugin_reader.read(&mut byte))
+                .await
+                .expect("writer task closes")
+                .expect("read"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoning_an_operation_drops_its_pump() {
+        let (sender, mut receiver) = oneshot::channel::<()>();
+        let accepted = AtomicBool::new(false);
+        let pump = async move {
+            let _sender = sender;
+            future::pending::<Result<()>>().await
+        };
+        let mut operation = Box::pin(call_with_pump(
+            future::pending::<Result<()>>(),
+            pump,
+            &accepted,
+            "test",
+        ));
+        tokio::select! {
+            biased;
+            _ = &mut operation => panic!("operation must wait"),
+            () = yield_now() => {}
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        drop(operation);
+        assert!(
+            receiver.await.is_err(),
+            "the pump releases its owned resources"
+        );
     }
 }

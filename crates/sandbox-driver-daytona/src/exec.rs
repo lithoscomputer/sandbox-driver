@@ -16,7 +16,7 @@ use tokio::sync::{Mutex, OnceCell};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
-use crate::session::{Session, missing_suffix, wait_for_completion};
+use crate::session::{Session, dedup_capture, missing_suffix, wait_for_completion};
 use crate::{DaytonaClient, daytona_error, exec_line, is_server_timeout, shell_quote, stdio};
 
 /// Bound on waiting for the log stream to close after the command has
@@ -402,13 +402,10 @@ impl DaytonaExec {
             controls.retained_output_limit,
         )));
         // Deduplication must compare the provider's raw live and final
-        // output. The public captures below contain sanitized bytes.
-        let stdout_raw_seen = Arc::new(Mutex::new(OutputCaptureBuffer::new(
-            controls.retained_output_limit,
-        )));
-        let stderr_raw_seen = Arc::new(Mutex::new(OutputCaptureBuffer::new(
-            controls.retained_output_limit,
-        )));
+        // output, with its own minimum overlap window. The public
+        // captures contain sanitized bytes and keep the caller's limit.
+        let stdout_raw_seen = Arc::new(Mutex::new(dedup_capture(controls.retained_output_limit)));
+        let stderr_raw_seen = Arc::new(Mutex::new(dedup_capture(controls.retained_output_limit)));
         let stdout_sanitizer = Arc::new(Mutex::new(OutputSanitizer::new(spec.output_sanitization)));
         let stderr_sanitizer = Arc::new(Mutex::new(OutputSanitizer::new(spec.output_sanitization)));
         let saw_live = Arc::new(AtomicBool::new(false));

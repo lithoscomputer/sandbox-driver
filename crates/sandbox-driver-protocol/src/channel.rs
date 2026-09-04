@@ -14,6 +14,7 @@
 //! to the waiting operation; anything else is closed unanswered.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,7 +27,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time;
 
 /// The largest payload one frame may carry. Negotiated at `initialize`;
@@ -44,7 +45,7 @@ const HEADER_LEN: usize = 5;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum FrameKind {
-    /// The plugin's first frame: a JSON [`OpenFrame`].
+    /// The plugin's first frame: a JSON [`ChannelRequest`].
     Open   = 0,
     /// Bytes from the plugin: a command's stdout, PTY output, a log or file
     /// chunk.
@@ -71,13 +72,6 @@ impl FrameKind {
     }
 }
 
-/// The `Open` frame's payload.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct OpenFrame {
-    pub channel_id: u64,
-    pub token:      String,
-}
-
 /// What a request carries to name its channel: the id the host will look
 /// the connection up by, and the one-use token that proves the plugin
 /// read the request.
@@ -95,7 +89,7 @@ pub struct DataTransport {
     pub max_frame_bytes: u32,
 }
 
-fn transport(context: &'static str, error: io::Error) -> Error {
+fn transport_error(context: &'static str, error: io::Error) -> Error {
     Error::Transport(TransportError::with_source(context, error))
 }
 
@@ -134,11 +128,11 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         self.writer
             .write_all(&header)
             .await
-            .map_err(|error| transport("writing data frame header", error))?;
+            .map_err(|error| transport_error("writing data frame header", error))?;
         self.writer
             .write_all(payload)
             .await
-            .map_err(|error| transport("writing data frame", error))?;
+            .map_err(|error| transport_error("writing data frame", error))?;
         Ok(())
     }
 
@@ -148,7 +142,7 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         self.writer
             .flush()
             .await
-            .map_err(|error| transport("flushing data channel", error))
+            .map_err(|error| transport_error("flushing data channel", error))
     }
 }
 
@@ -169,11 +163,19 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     /// The next frame, or `None` when the connection closed cleanly.
     pub async fn read(&mut self) -> Result<Option<(FrameKind, Vec<u8>)>> {
         let mut header = [0u8; HEADER_LEN];
-        match self.reader.read_exact(&mut header).await {
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(error) => return Err(transport("reading data frame header", error)),
+        if self
+            .reader
+            .read(&mut header[..1])
+            .await
+            .map_err(|error| transport_error("reading data frame header", error))?
+            == 0
+        {
+            return Ok(None);
         }
+        self.reader
+            .read_exact(&mut header[1..])
+            .await
+            .map_err(|error| transport_error("reading data frame header", error))?;
         let kind = FrameKind::from_byte(header[0])
             .ok_or_else(|| Error::invalid_spec("frame", format!("unknown kind {}", header[0])))?;
         let length = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
@@ -190,7 +192,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         self.reader
             .read_exact(&mut payload)
             .await
-            .map_err(|error| transport("reading data frame", error))?;
+            .map_err(|error| transport_error("reading data frame", error))?;
         Ok(Some((kind, payload)))
     }
 }
@@ -249,29 +251,34 @@ impl ChannelListener {
         let directory = env::temp_dir().join(format!(
             "sandbox-driver-{}-{:016x}",
             process::id(),
-            random_u64()
+            rand::random::<u64>()
         ));
         fs::create_dir_all(&directory)
-            .map_err(|error| transport("creating data transport directory", error))?;
+            .map_err(|error| transport_error("creating data transport directory", error))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
-                .map_err(|error| transport("securing data transport directory", error))?;
+                .map_err(|error| transport_error("securing data transport directory", error))?;
         }
         let socket_path = directory.join("data.sock");
         let listener = UnixListener::bind(&socket_path)
-            .map_err(|error| transport("binding data transport socket", error))?;
+            .map_err(|error| transport_error("binding data transport socket", error))?;
         let pending: Arc<Mutex<HashMap<u64, Pending>>> = Arc::new(Mutex::new(HashMap::new()));
         let accept_pending = Arc::clone(&pending);
         let max_frame = MAX_FRAME_BYTES;
         let accept_task = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
             loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    return;
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => accepted,
+                    _ = connections.join_next(), if !connections.is_empty() => continue,
+                };
+                let Ok((stream, _)) = accepted else {
+                    break;
                 };
                 let pending = Arc::clone(&accept_pending);
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     if let Err(error) = admit(stream, &pending, max_frame).await {
                         tracing::warn!(error = %error, "data channel connection refused");
                     }
@@ -323,6 +330,7 @@ impl ChannelListener {
 impl Drop for ChannelListener {
     fn drop(&mut self) {
         self.accept_task.abort();
+        self.pending.lock().expect("pending channels lock").clear();
         let _ = fs::remove_dir_all(&self.directory);
     }
 }
@@ -382,21 +390,24 @@ async fn admit(
             "the first frame on a data channel must be open",
         ));
     };
-    let open: OpenFrame = serde_json::from_slice(&payload)
+    let open: ChannelRequest = serde_json::from_slice(&payload)
         .map_err(|error| Error::invalid_spec("frame", format!("bad open frame: {error}")))?;
-    let expected = pending
+    let expected = match pending
         .lock()
         .expect("pending channels lock")
-        .remove(&open.channel_id);
-    let Some(expected) = expected else {
-        return Err(Error::invalid_spec(
-            "channel_id",
-            format!("no operation is waiting on channel {}", open.channel_id),
-        ));
+        .entry(open.channel_id)
+    {
+        Entry::Occupied(entry) if entry.get().token == open.token => entry.remove(),
+        Entry::Occupied(_) => {
+            return Err(Error::invalid_spec("token", "data channel token mismatch"));
+        }
+        Entry::Vacant(_) => {
+            return Err(Error::invalid_spec(
+                "channel_id",
+                format!("no operation is waiting on channel {}", open.channel_id),
+            ));
+        }
     };
-    if expected.token != open.token {
-        return Err(Error::invalid_spec("token", "data channel token mismatch"));
-    }
     if expected.sender.send(channel).is_err() {
         return Err(Error::Transport(TransportError::new(
             "the operation stopped waiting for its data channel",
@@ -411,21 +422,10 @@ pub async fn open(transport: &DataTransport, request: &ChannelRequest) -> Result
         .await
         .map_err(|error| transport_error("connecting to the host data socket", error))?;
     let mut channel = Channel::from_stream(stream, transport.max_frame_bytes);
-    let payload = serde_json::to_vec(&OpenFrame {
-        channel_id: request.channel_id,
-        token:      request.token.clone(),
-    })
-    .expect("open frame contains only serializable values");
+    let payload =
+        serde_json::to_vec(request).expect("open frame contains only serializable values");
     channel.writer.write(FrameKind::Open, &payload).await?;
     Ok(channel)
-}
-
-fn transport_error(context: &'static str, error: io::Error) -> Error {
-    transport(context, error)
-}
-
-fn random_u64() -> u64 {
-    rand::random::<u64>()
 }
 
 fn random_token() -> String {
@@ -516,8 +516,40 @@ mod tests {
         // The host closes the connection without binding it.
         let closed = channel.reader.read().await;
         assert!(matches!(closed, Ok(None) | Err(_)));
-        // The waiting operation is still waiting: its expectation is gone
-        // (consumed by the refused attempt), so a later accept fails.
+        // A refused connection must not consume another operation's token.
+        let _legitimate = open(&transport, &request)
+            .await
+            .expect("legitimate connect");
+        receiver
+            .accept_soon()
+            .await
+            .expect("legitimate channel accepted");
+    }
+
+    #[tokio::test]
+    async fn partial_frame_headers_are_transport_errors() {
+        let header = [FrameKind::Stdout as u8, 0, 0, 0, 0];
+        for length in 0..header.len() {
+            let (mut writer, reader) = duplex(16);
+            writer
+                .write_all(&header[..length])
+                .await
+                .expect("header prefix");
+            writer.shutdown().await.expect("close");
+            let mut reader = FrameReader::new(reader, MAX_FRAME_BYTES);
+            let result = reader.read().await;
+            if length == 0 {
+                assert!(matches!(result, Ok(None)));
+            } else {
+                assert!(matches!(result, Err(Error::Transport(_))), "{result:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_the_listener_releases_waiting_operations() {
+        let listener = ChannelListener::bind().expect("bind");
+        let (_, receiver) = listener.expect();
         drop(listener);
         assert!(receiver.accept().await.is_err());
     }

@@ -30,6 +30,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::channel::{
     self, Channel, ChannelRequest, DataTransport, FrameKind, FrameReader, FrameWriter,
@@ -484,7 +485,7 @@ where
         .insert(exec_id.to_owned(), (term.clone(), kill.clone()));
     let (stdin_source, stdin_task) = if stdin {
         let (source, task) = pump_stdin_frames(reader);
-        (Some(source), Some(task))
+        (Some(source), Some(AbortOnDropHandle::new(task)))
     } else {
         (None, None)
     };
@@ -493,7 +494,9 @@ where
         kill:                  Some(kill),
         stdin:                 stdin_source,
         sink:                  Some(frame_sink(&writer)),
-        retained_output_limit: None,
+        // The host captures the frames. Retaining another copy here
+        // would grow memory with output the response never contains.
+        retained_output_limit: Some(0),
     };
     let outcome = run(controls).await;
     state.execs.lock().expect("execs lock").remove(exec_id);
@@ -560,17 +563,23 @@ async fn dispatch(
 ) -> Result<Value, DispatchError> {
     match method {
         m::INITIALIZE => {
-            let request: m::InitializeParams = parse(params)?;
-            if request.protocol_version != m::PROTOCOL_VERSION {
+            let version: u32 = parse(
+                params
+                    .get("protocol_version")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            )?;
+            if version != m::PROTOCOL_VERSION {
                 return Err(DispatchError::App(Error::invalid_spec(
                     "protocol_version",
                     format!(
                         "plugin speaks protocol version {} but the host asked for {}",
                         m::PROTOCOL_VERSION,
-                        request.protocol_version
+                        version
                     ),
                 )));
             }
+            let request: m::InitializeParams = parse(params)?;
             if request.data_transport.max_frame_bytes == 0 {
                 return Err(DispatchError::App(Error::invalid_spec(
                     "data_transport.max_frame_bytes",
@@ -758,19 +767,12 @@ async fn dispatch(
             if request.stdin && !stream_stdin {
                 spec.stdin = Some(collect_stdin_frames(&mut channel.reader).await?);
             }
-            let retained = request.retained_output_limit;
             let streaming = stream_through_channel(
                 state,
                 &request.exec_id,
                 channel,
                 stream_stdin,
-                |controls| {
-                    let controls = ExecControls {
-                        retained_output_limit: retained,
-                        ..controls
-                    };
-                    async move { handle.exec().run_streaming(&spec, controls).await }
-                },
+                |controls| async move { handle.exec().run_streaming(&spec, controls).await },
             )
             .await?;
             to_value(&stream_result(&streaming))
@@ -782,17 +784,15 @@ async fn dispatch(
                 .one_shot()
                 .ok_or_else(|| Error::unsupported(Capability::OneShot))?;
             let channel = state.open_channel(&request.channel).await?;
-            let retained = request.retained_output_limit;
             let spec = request.spec;
-            let streaming =
-                stream_through_channel(state, &request.exec_id, channel, false, |controls| {
-                    let controls = ExecControls {
-                        retained_output_limit: retained,
-                        ..controls
-                    };
-                    async move { one_shot.run(&spec, controls).await }
-                })
-                .await?;
+            let streaming = stream_through_channel(
+                state,
+                &request.exec_id,
+                channel,
+                false,
+                |controls| async move { one_shot.run(&spec, controls).await },
+            )
+            .await?;
             to_value(&stream_result(&streaming))
         }
         m::EXEC_STOP => {

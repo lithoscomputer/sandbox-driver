@@ -75,8 +75,8 @@ for binary_name in "${plugins[@]}"; do
   # The checksum of the executable itself, which is what a host pins.
   (
     cd "$staging_dir"
-    checksum "$binary_name" > "../$output_dir/${binary_name}-${version}-${target}.bin.sha256"
-  ) 2>/dev/null || checksum "$staging_dir/$binary_name" | sed "s| .*| $binary_name|" > "$output_dir/${binary_name}-${version}-${target}.bin.sha256"
+    checksum "$binary_name"
+  ) > "$output_dir/${binary_name}-${version}-${target}.bin.sha256"
   # The staging copy may be reused by name; keep one binary per iteration.
   rm -f -- "$staging_dir/$binary_name"
   echo "$output_dir/$archive_name"

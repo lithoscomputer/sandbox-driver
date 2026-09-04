@@ -7,9 +7,9 @@
 //! as the conformance run does.
 
 use std::collections::HashMap;
-use std::process;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::{env, future, process};
 
 use bollard::Docker;
 use bollard::container::ListContainersOptions;
@@ -17,10 +17,10 @@ use sandbox_driver::{
     Error, ExecControls, ExecSpec, OneShotSpec, OutputStream, SandboxFilter, SandboxProvider,
     SandboxSource, SandboxSpec, Termination,
 };
-use sandbox_driver_docker::DockerProvider;
+use sandbox_driver_docker::{BindMount, DockerProvider, DockerProviderConfig};
 use sandbox_driver_protocol::{PluginProvider, serve};
 use tokio::io::{duplex, split};
-use tokio::time;
+use tokio::{fs, time};
 use tokio_util::sync::CancellationToken;
 
 const ALPINE: &str = "alpine:3.20";
@@ -389,4 +389,110 @@ async fn workspace_volume(sandbox_id: &str) -> Option<String> {
             .then_some(mount.name)
             .flatten()
     })
+}
+
+/// A caller's read-only bind has the same access mode in both containers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_shot_preserves_a_read_only_workspace_bind() {
+    let Ok(provider) = DockerProvider::connect().await else {
+        return;
+    };
+    let directory = env::temp_dir().join(marker("sandbox-driver-read-only"));
+    fs::create_dir_all(&directory)
+        .await
+        .expect("workspace directory");
+    let config = DockerProviderConfig {
+        binds: vec![BindMount {
+            host:      directory.to_string_lossy().into_owned(),
+            container: WORKSPACE.to_owned(),
+            mode:      Some("ro".to_owned()),
+        }],
+        ..DockerProviderConfig::default()
+    };
+    let sandbox = provider
+        .create(
+            &alpine_spec("read-only").provider_config(config.into_value()),
+            None,
+        )
+        .await
+        .expect("sandbox");
+    let spec = OneShotSpec::registry(ALPINE)
+        .entrypoint("sh")
+        .args(["-c", "printf forbidden > forbidden.txt"])
+        .timeout(Duration::from_secs(30));
+    let outcome = sandbox
+        .one_shot()
+        .expect("facet")
+        .run(&spec, ExecControls::default())
+        .await;
+    sandbox.delete().await.expect("delete");
+    let written = fs::read(directory.join("forbidden.txt")).await;
+    fs::remove_dir_all(directory)
+        .await
+        .expect("remove workspace");
+    let result = outcome.expect("one-shot");
+    assert!(
+        !result.result.success(),
+        "a read-only workspace must reject writes"
+    );
+    assert!(written.is_err(), "the host workspace was modified");
+}
+
+/// Signal handling remains active when a consumer never finishes a chunk.
+#[tokio::test(flavor = "multi_thread")]
+async fn blocked_output_sinks_do_not_block_kill() {
+    let Ok(provider) = DockerProvider::connect().await else {
+        return;
+    };
+    let sandbox = provider
+        .create(&alpine_spec("blocked-sink"), None)
+        .await
+        .expect("sandbox");
+    for one_shot in [false, true] {
+        let kill = CancellationToken::new();
+        let sink_kill = kill.clone();
+        let controls = ExecControls {
+            kill: Some(kill),
+            sink: Some(Arc::new(move |_, _| {
+                sink_kill.cancel();
+                Box::pin(future::pending())
+            })),
+            ..ExecControls::default()
+        };
+        let outcome = time::timeout(Duration::from_secs(25), async {
+            if one_shot {
+                sandbox
+                    .one_shot()
+                    .expect("facet")
+                    .run(
+                        &OneShotSpec::registry(ALPINE)
+                            .entrypoint("sh")
+                            .args(["-c", "printf ready; sleep 300"]),
+                        controls,
+                    )
+                    .await
+            } else {
+                sandbox
+                    .exec()
+                    .run_streaming(
+                        &ExecSpec::new("sh").args(["-c", "printf ready; sleep 300"]),
+                        controls,
+                    )
+                    .await
+            }
+        })
+        .await;
+        if outcome.is_err() {
+            sandbox.delete().await.expect("cleanup stalled sandbox");
+        }
+        let result = outcome
+            .expect("kill resolves despite a blocked sink")
+            .expect("run");
+        assert_eq!(result.result.termination, Termination::Killed);
+        assert!(
+            result.stdout_capture.truncated,
+            "abandoned output is reported"
+        );
+    }
+    sandbox.delete().await.expect("delete");
 }

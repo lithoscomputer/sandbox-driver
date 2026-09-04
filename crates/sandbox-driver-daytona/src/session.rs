@@ -29,6 +29,10 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Poll interval for session command status.
 const STATUS_POLL: Duration = Duration::from_millis(250);
 
+/// Minimum raw output kept for matching overlapping live and final logs.
+/// Public output retention can be zero without losing this overlap window.
+const MIN_DEDUP_BYTES: usize = 64 * 1024;
+
 /// One command session, deleted (best-effort, bounded) when closed.
 ///
 /// Deleting the session is also the kill mechanism: Daytona terminates
@@ -224,6 +228,13 @@ pub(crate) async fn wait_for_completion(
     }
 }
 
+/// Keeps enough raw output to compare live and final logs even when the
+/// caller retains little or no output. Larger limits and unbounded
+/// retention keep their existing behavior.
+pub(crate) fn dedup_capture(retained_output_limit: Option<usize>) -> OutputCaptureBuffer {
+    OutputCaptureBuffer::new(retained_output_limit.map(|limit| limit.max(MIN_DEDUP_BYTES)))
+}
+
 /// Bytes of `final_bytes` the buffer has not yet seen. The live stream
 /// and the final log fetch overlap arbitrarily (either can be ahead or
 /// truncated), so the append point is found from the retained head/tail
@@ -332,5 +343,25 @@ mod tests {
         assert_eq!(missing_suffix(&mut seen, b"hello world"), b"world");
         assert!(missing_suffix(&mut seen, b"hello ").is_empty());
         assert!(missing_suffix(&mut seen, b"").is_empty());
+    }
+
+    #[test]
+    fn zero_public_retention_preserves_final_log_overlap() {
+        let mut raw_seen = dedup_capture(Some(0));
+        let mut public_capture = OutputCaptureBuffer::new(Some(0));
+        let mut live = vec![b'x'; 128 * 1024];
+        live.extend_from_slice(b"abcdef");
+        raw_seen.push(&live);
+        public_capture.push(&live);
+
+        let missing = missing_suffix(&mut raw_seen, b"cdefgh");
+        assert_eq!(missing, b"gh", "the final suffix must still reach the sink");
+        public_capture.push(&missing);
+
+        let (retained, stats) = public_capture.into_parts();
+        assert!(retained.is_empty());
+        assert_eq!(stats.observed_bytes, live.len() + 2);
+        assert_eq!(stats.omitted_bytes, stats.observed_bytes);
+        assert_eq!(raw_seen.stats().retained_bytes, MIN_DEDUP_BYTES);
     }
 }

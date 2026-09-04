@@ -367,3 +367,29 @@ impl AsyncWrite for FailingWriter {
         Poll::Ready(Ok(()))
     }
 }
+
+#[tokio::test]
+async fn version_one_handshakes_report_the_version_mismatch() {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let (host, plugin) = duplex(4096);
+    let (plugin_read, plugin_write) = split(plugin);
+    let server = tokio::spawn(serve(
+        Arc::new(HostProvider::new()),
+        plugin_read,
+        plugin_write,
+    ));
+    let (host_read, mut host_write) = split(host);
+    host_write.write_all(
+        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocol_version\":1}}\n"
+    ).await.expect("version one initialize");
+    let mut lines = BufReader::new(host_read).lines();
+    let response = lines.next_line().await.expect("response").expect("line");
+    let message: sandbox_driver_protocol::Message =
+        serde_json::from_str(&response).expect("JSON response");
+    let error = message.error.expect("incompatible version refused");
+    assert!(error.message.contains("protocol_version"), "{error:?}");
+    assert!(error.message.contains("host asked for 1"), "{error:?}");
+    host_write.shutdown().await.expect("close requests");
+    server.await.expect("join server").expect("server shutdown");
+}

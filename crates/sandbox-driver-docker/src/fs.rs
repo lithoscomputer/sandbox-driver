@@ -39,7 +39,7 @@ pub(crate) struct DockerFs {
     exec:         Arc<dyn Exec>,
     derived:      DerivedFs,
     /// The container user's numeric identity, for what the archive
-    /// uploads create. Looked up once, on the first write.
+    /// uploads create. Cached after a successful lookup.
     owner:        OnceCell<Owner>,
 }
 
@@ -88,22 +88,27 @@ impl DockerFs {
 
     /// Who the container runs as. A stopped container answers nothing,
     /// and root is then the honest default: the daemon extracts as root.
+    /// Failed lookups are retried on the next write.
     async fn owner(&self) -> Owner {
-        *self
-            .owner
-            .get_or_init(|| async {
-                let mut owner = Owner::default();
-                for (flag, field) in [("-u", &mut owner.uid), ("-g", &mut owner.gid)] {
+        self.owner
+            .get_or_try_init(|| async {
+                let lookup = |flag| async move {
                     let spec = ExecSpec::new("id").arg(flag).timeout(PROBE_TIMEOUT);
-                    if let Ok(result) = self.exec.run(&spec).await {
-                        if let Ok(value) = result.stdout_lossy().trim().parse() {
-                            *field = value;
-                        }
+                    let result = self.exec.run(&spec).await.map_err(|_| ())?;
+                    if !result.success() {
+                        return Err(());
                     }
-                }
-                owner
+                    result.stdout_lossy().trim().parse::<u64>().map_err(|_| ())
+                };
+                let (uid, gid) = tokio::join!(lookup("-u"), lookup("-g"));
+                Ok::<_, ()>(Owner {
+                    uid: uid?,
+                    gid: gid?,
+                })
             })
             .await
+            .copied()
+            .unwrap_or_default()
     }
 
     /// The path a symlink at `container_path` finally points at, through
@@ -157,19 +162,20 @@ impl DockerFs {
                 break;
             }
         }
-        Ok(scanner.finish())
+        scanner.finish()
     }
 }
 
 /// An incremental reader over a tar stream that finds the first regular
 /// file and keeps only the requested range of its content.
 struct TarScanner {
-    offset:    u64,
-    length:    Option<u64>,
-    pending:   Vec<u8>,
-    state:     ScanState,
-    collected: Vec<u8>,
-    found:     bool,
+    offset:     u64,
+    length:     Option<u64>,
+    header:     [u8; TAR_BLOCK],
+    header_len: usize,
+    state:      ScanState,
+    collected:  Vec<u8>,
+    found:      bool,
 }
 
 enum ScanState {
@@ -193,7 +199,8 @@ impl TarScanner {
         Self {
             offset,
             length,
-            pending: Vec::new(),
+            header: [0; TAR_BLOCK],
+            header_len: 0,
             state: ScanState::Header,
             collected: Vec::new(),
             found: false,
@@ -206,27 +213,37 @@ impl TarScanner {
             .map_or(u64::MAX, |length| self.offset.saturating_add(length))
     }
 
-    fn padded(size: u64) -> u64 {
-        size.div_ceil(TAR_BLOCK as u64) * TAR_BLOCK as u64
+    fn padded(size: u64) -> Result<u64> {
+        let padding = (TAR_BLOCK as u64 - size % TAR_BLOCK as u64) % TAR_BLOCK as u64;
+        size.checked_add(padding).ok_or_else(|| {
+            Error::io(
+                "reading download archive",
+                io::Error::new(io::ErrorKind::InvalidData, "archive entry size overflows"),
+            )
+        })
     }
 
     /// Consumes `chunk`; `true` once nothing further is wanted.
-    fn feed(&mut self, chunk: &[u8]) -> Result<bool> {
-        self.pending.extend_from_slice(chunk);
+    fn feed(&mut self, mut chunk: &[u8]) -> Result<bool> {
         loop {
             match self.state {
                 ScanState::Done => return Ok(true),
                 ScanState::Header => {
-                    if self.pending.len() < TAR_BLOCK {
+                    let take = (TAR_BLOCK - self.header_len).min(chunk.len());
+                    self.header[self.header_len..self.header_len + take]
+                        .copy_from_slice(&chunk[..take]);
+                    self.header_len += take;
+                    chunk = &chunk[take..];
+                    if self.header_len < TAR_BLOCK {
                         return Ok(false);
                     }
-                    let block: Vec<u8> = self.pending.drain(..TAR_BLOCK).collect();
-                    if block.iter().all(|byte| *byte == 0) {
+                    self.header_len = 0;
+                    if self.header.iter().all(|byte| *byte == 0) {
                         // End-of-archive marker: no regular file came.
                         self.state = ScanState::Done;
                         return Ok(true);
                     }
-                    let header = tar::Header::from_byte_slice(&block);
+                    let header = tar::Header::from_byte_slice(&self.header);
                     let size = header
                         .entry_size()
                         .map_err(|error| Error::io("reading download archive", error))?;
@@ -243,15 +260,15 @@ impl TarScanner {
                         // A pax or long-name header, or something
                         // exotic: skip its data and read on.
                         self.state = ScanState::Skip {
-                            remaining: Self::padded(size),
+                            remaining: Self::padded(size)?,
                         };
                     }
                 }
                 ScanState::Skip { remaining } => {
                     let take = usize::try_from(remaining)
                         .unwrap_or(usize::MAX)
-                        .min(self.pending.len());
-                    self.pending.drain(..take);
+                        .min(chunk.len());
+                    chunk = &chunk[take..];
                     let remaining = remaining - take as u64;
                     if remaining > 0 {
                         self.state = ScanState::Skip { remaining };
@@ -260,7 +277,7 @@ impl TarScanner {
                     self.state = ScanState::Header;
                 }
                 ScanState::Content { position, size } => {
-                    let available = self.pending.len() as u64;
+                    let available = chunk.len() as u64;
                     let file_left = size.saturating_sub(position);
                     let take = available.min(file_left);
                     let end = self.end();
@@ -270,10 +287,8 @@ impl TarScanner {
                     if keep_to > keep_from {
                         let from = usize::try_from(keep_from).unwrap_or(usize::MAX);
                         let to = usize::try_from(keep_to).unwrap_or(usize::MAX);
-                        self.collected.extend_from_slice(&self.pending[from..to]);
+                        self.collected.extend_from_slice(&chunk[from..to]);
                     }
-                    let taken = usize::try_from(take).unwrap_or(usize::MAX);
-                    self.pending.drain(..taken);
                     let position = position + take;
                     if position >= size || position >= end {
                         self.state = ScanState::Done;
@@ -286,8 +301,17 @@ impl TarScanner {
         }
     }
 
-    fn finish(self) -> Option<Vec<u8>> {
-        self.found.then_some(self.collected)
+    fn finish(self) -> Result<Option<Vec<u8>>> {
+        if !matches!(self.state, ScanState::Done) {
+            return Err(Error::io(
+                "reading download archive",
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "archive ended before the requested file data was complete",
+                ),
+            ));
+        }
+        Ok(self.found.then_some(self.collected))
     }
 }
 
@@ -348,20 +372,6 @@ fn upload_archive(
     builder.into_inner().map_err(tar_io)
 }
 
-/// The ancestors of `parent` from itself upwards, ending at `/`.
-fn ancestors(parent: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = Path::new(parent);
-    loop {
-        out.push(current.to_string_lossy().into_owned());
-        match current.parent() {
-            Some(next) => current = next,
-            None => break,
-        }
-    }
-    out
-}
-
 #[async_trait]
 impl Filesystem for DockerFs {
     #[tracing::instrument(
@@ -419,9 +429,10 @@ impl Filesystem for DockerFs {
         // Upload at the deepest existing ancestor, carrying only the
         // directories below it, so an existing directory is never
         // re-written with the archive's mode and ownership.
-        for root in ancestors(&parent) {
+        for root in Path::new(&parent).ancestors() {
+            let root = root.to_string_lossy();
             let below = parent
-                .strip_prefix(root.as_str())
+                .strip_prefix(root.as_ref())
                 .unwrap_or_default()
                 .trim_matches('/');
             let mut dirs: Vec<String> = Vec::new();
@@ -533,6 +544,10 @@ impl Filesystem for DockerFs {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use sandbox_driver::{ExecControls, ExecResult, ExecStreamingResult, Termination};
+
     use super::*;
 
     fn single_file_tar(name: &str, bytes: &[u8]) -> Vec<u8> {
@@ -612,7 +627,10 @@ mod tests {
                     "chunk {chunk_size} never finished"
                 );
                 assert_eq!(
-                    scanner.finish().expect("a file was found"),
+                    scanner
+                        .finish()
+                        .expect("the requested data is complete")
+                        .expect("a file was found"),
                     expected,
                     "offset {offset} length {length:?} chunk {chunk_size}"
                 );
@@ -633,16 +651,122 @@ mod tests {
         let archive = builder.into_inner().expect("tar");
         let mut scanner = TarScanner::new(0, None);
         scanner.feed(&archive).expect("feed");
-        assert!(scanner.finish().is_none());
+        assert!(scanner.finish().expect("complete symlink header").is_none());
     }
 
     #[test]
-    fn ancestors_walk_to_the_root() {
-        assert_eq!(ancestors("/workspace/a/b"), [
-            "/workspace/a/b",
-            "/workspace/a",
-            "/workspace",
-            "/"
-        ]);
+    fn the_scanner_rejects_incomplete_headers_and_requested_content() {
+        let archive = single_file_tar("file.bin", b"0123456789");
+        for end in [0, 1, TAR_BLOCK - 1, TAR_BLOCK, TAR_BLOCK + 6] {
+            let mut scanner = TarScanner::new(2, Some(5));
+            assert!(!scanner.feed(&archive[..end]).expect("valid prefix"));
+            assert!(
+                scanner.finish().is_err(),
+                "accepted a prefix of {end} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scanner_finishes_as_soon_as_the_requested_content_arrives() {
+        let archive = single_file_tar("file.bin", b"0123456789");
+        for (offset, length, end, expected) in [
+            (2, Some(5), TAR_BLOCK + 7, b"23456".as_slice()),
+            (0, None, TAR_BLOCK + 10, b"0123456789".as_slice()),
+            (0, Some(0), TAR_BLOCK, b"".as_slice()),
+        ] {
+            let mut scanner = TarScanner::new(offset, length);
+            assert!(scanner.feed(&archive[..end]).expect("valid archive prefix"));
+            assert_eq!(
+                scanner.finish().expect("complete range").expect("file"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn the_scanner_rejects_an_incomplete_extended_header() {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::GNULongName);
+        header.set_size(4);
+        header.set_mode(0o644);
+        builder
+            .append_data(&mut header, "././@LongLink", b"abc\0".as_slice())
+            .expect("extended header");
+        let archive = builder.into_inner().expect("archive");
+        for end in [TAR_BLOCK + 2, TAR_BLOCK * 2] {
+            let mut scanner = TarScanner::new(0, None);
+            assert!(!scanner.feed(&archive[..end]).expect("valid prefix"));
+            assert!(scanner.finish().is_err());
+        }
+        let mut scanner = TarScanner::new(0, None);
+        assert!(scanner.feed(&archive).expect("complete archive"));
+        assert!(scanner.finish().expect("archive with no file").is_none());
+    }
+
+    struct UserLookup {
+        ready:             AtomicBool,
+        calls:             AtomicUsize,
+        transport_failure: bool,
+    }
+
+    #[async_trait]
+    impl Exec for UserLookup {
+        async fn run(&self, spec: &ExecSpec) -> Result<ExecResult> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(spec.program, "id");
+            let ready = self.ready.load(Ordering::Relaxed);
+            if !ready && self.transport_failure {
+                return Err(Error::io(
+                    "looking up user",
+                    io::Error::other("container stopped"),
+                ));
+            }
+            let mut result =
+                ExecResult::new(Termination::Exited, Some(i32::from(!ready)), Duration::ZERO);
+            result.stdout = match spec.args[0].as_str() {
+                "-u" => b"1000\n".to_vec(),
+                "-g" => b"1001\n".to_vec(),
+                other => panic!("unexpected id argument {other}"),
+            };
+            Ok(result)
+        }
+
+        async fn run_streaming(
+            &self,
+            _spec: &ExecSpec,
+            _controls: ExecControls,
+        ) -> Result<ExecStreamingResult> {
+            panic!("user lookups use buffered exec")
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_user_lookups_are_retried_and_successful_ones_are_cached() {
+        for transport_failure in [false, true] {
+            let exec = Arc::new(UserLookup {
+                ready: AtomicBool::new(false),
+                calls: AtomicUsize::new(0),
+                transport_failure,
+            });
+            let fs = DockerFs::new(
+                Docker::connect_with_local_defaults().expect("docker client"),
+                "test-container".to_owned(),
+                "/workspace".to_owned(),
+                exec.clone(),
+            );
+            let fallback = fs.owner().await;
+            assert_eq!((fallback.uid, fallback.gid), (0, 0));
+
+            exec.ready.store(true, Ordering::Relaxed);
+            let owner = fs.owner().await;
+            assert_eq!((owner.uid, owner.gid), (1000, 1001));
+
+            exec.ready.store(false, Ordering::Relaxed);
+            let cached = fs.owner().await;
+            assert_eq!((cached.uid, cached.gid), (1000, 1001));
+            assert_eq!(exec.calls.load(Ordering::Relaxed), 4);
+        }
     }
 }
