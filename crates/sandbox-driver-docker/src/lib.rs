@@ -30,6 +30,7 @@
 //! restarts.
 
 mod access;
+mod config;
 mod exec;
 mod fs;
 mod pty;
@@ -41,7 +42,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bollard::Docker;
-use bollard::auth::DockerCredentials;
 use bollard::container::{
     Config, CreateContainerOptions, InspectContainerOptions, ListContainersOptions,
     RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
@@ -60,6 +60,7 @@ use sandbox_driver::{
 use serde::Deserialize;
 
 use crate::access::DockerShellCommand;
+pub use crate::config::{BindMount, DockerProviderConfig, Health, RegistryAuth, Sidecar};
 pub use crate::exec::DockerExec;
 use crate::exec::{
     POSIX_SH, docker_error, docker_kind, is_conflict, is_not_found, is_not_modified, shell_quote,
@@ -80,80 +81,9 @@ pub(crate) fn non_empty<T>(items: Vec<T>) -> Option<Vec<T>> {
     (!items.is_empty()).then_some(items)
 }
 
-/// A single host-to-container bind mount.
-#[derive(Clone, Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct BindMount {
-    pub host:      String,
-    pub container: String,
-    /// `rw` (default) or `ro`.
-    pub mode:      Option<String>,
-}
-
-/// Registry credentials for pulling a private image.
-#[derive(Clone, Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RegistryAuth {
-    pub username: String,
-    pub password: String,
-    pub server:   Option<String>,
-}
-
-impl RegistryAuth {
-    fn to_credentials(&self) -> DockerCredentials {
-        DockerCredentials {
-            username: Some(self.username.clone()),
-            password: Some(self.password.clone()),
-            serveraddress: self.server.clone(),
-            ..Default::default()
-        }
-    }
-}
-
-/// Options the Docker provider reads from `SandboxSpec::provider_config`.
-///
-/// Schema (all fields optional, unknown fields rejected):
-/// `auto_pull` (default `true`), `init`, `privileged`, `platform`, `binds`,
-/// `extra_hosts`, `dns`, `cap_add`, `registry_auth`, and `sidecars`.
-/// The typed fields are the Docker-only escape hatch for what the portable
-/// spec does not carry: bind mounts, an init process, privilege, a pull and
-/// create platform, extra host entries, DNS servers, added capabilities, and
-/// sidecar service containers. A container-level `user` rides on the
-/// portable `SandboxSpec::user`; an `entrypoint` override is a sidecar-only
-/// field, because the scope container runs a fixed init and steps go through
-/// `docker exec`.
-#[derive(Debug, serde::Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct DockerProviderConfig {
-    auto_pull:     bool,
-    init:          bool,
-    privileged:    bool,
-    platform:      Option<String>,
-    binds:         Vec<BindMount>,
-    extra_hosts:   Vec<String>,
-    dns:           Vec<String>,
-    cap_add:       Vec<String>,
-    registry_auth: Option<RegistryAuth>,
-    sidecars:      Vec<sidecars::Sidecar>,
-}
-
-impl Default for DockerProviderConfig {
-    fn default() -> Self {
-        Self {
-            auto_pull:     true,
-            init:          false,
-            privileged:    false,
-            platform:      None,
-            binds:         Vec::new(),
-            extra_hosts:   Vec::new(),
-            dns:           Vec::new(),
-            cap_add:       Vec::new(),
-            registry_auth: None,
-            sidecars:      Vec::new(),
-        }
-    }
-}
-
+/// Parses `SandboxSpec::provider_config` as [`DockerProviderConfig`]:
+/// `null` is the default, an object is validated, anything else is
+/// rejected.
 fn provider_config(value: &serde_json::Value) -> Result<DockerProviderConfig> {
     match value {
         serde_json::Value::Null => Ok(DockerProviderConfig::default()),

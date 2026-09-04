@@ -380,7 +380,7 @@ pub struct SandboxSpec {
 }
 ```
 
-`provider_config` is the pressure valve: Daytona's GPU type preference lists, spot instances, linked sandboxes, warm-pool hints, and future boxd golden-image options live there without polluting the common spec. It crosses the JSON-RPC boundary opaquely.
+`provider_config` is the pressure valve: Daytona's GPU type preference lists, spot instances, linked sandboxes, warm-pool hints, and future boxd golden-image options live there without polluting the common spec. It crosses the JSON-RPC boundary opaquely. Each provider crate exports its shape as a type — the Docker provider's `DockerProviderConfig` with `into_value()` — so an in-process consumer builds it type-checked and the provider parses it back through the same type; only the wire sees untyped JSON.
 
 `working_directory` is the final workspace directory chosen before creation. A provider creates it when needed, uses it as the default for relative file and process operations, and returns the same value from handles created by `attach`. The Host provider treats an explicit path as caller-owned and does not delete it.
 

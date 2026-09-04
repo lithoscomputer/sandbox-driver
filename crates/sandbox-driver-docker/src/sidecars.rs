@@ -28,16 +28,15 @@ use bollard::container::{
     Config, CreateContainerOptions, ListContainersOptions, LogsOptions, NetworkingConfig,
     RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
-use bollard::models::{
-    ContainerStateStatusEnum, EndpointSettings, HealthConfig, HealthStatusEnum, HostConfig,
-};
+use bollard::models::{ContainerStateStatusEnum, EndpointSettings, HealthStatusEnum, HostConfig};
 use bollard::network::CreateNetworkOptions;
 use futures_util::StreamExt;
 use sandbox_driver::{Error, ProviderError, Result};
 use tokio::time;
 
+use crate::config::{Health, Sidecar};
 use crate::exec::{docker_error, docker_kind, is_not_found, tolerate_not_modified};
-use crate::{MANAGED_LABEL, RegistryAuth, image_present, non_empty, pull_image};
+use crate::{MANAGED_LABEL, image_present, non_empty, pull_image};
 
 /// The label every sidecar carries, naming its network.
 pub(crate) const NETWORK_LABEL: &str = "sh.sandbox-driver.network";
@@ -51,56 +50,6 @@ const FAILURE_LOG_LINES: usize = 10;
 /// Bound on fetching that tail: the failure is what matters, and a slow
 /// daemon must not turn it into a hang.
 const FAILURE_LOG_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// One sidecar service, parsed from `provider_config.sidecars`.
-#[derive(Clone, Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Sidecar {
-    pub name:          String,
-    pub image:         String,
-    #[serde(default)]
-    pub env:           HashMap<String, String>,
-    #[serde(default)]
-    pub dns:           Vec<String>,
-    #[serde(default)]
-    pub cap_add:       Vec<String>,
-    pub user:          Option<String>,
-    pub entrypoint:    Option<Vec<String>>,
-    /// When set, `create` waits for the sidecar to report healthy and
-    /// fails if it exits or turns unhealthy first. When unset, the sidecar
-    /// is started and not watched, so it may exit (see the module docs).
-    pub health:        Option<Health>,
-    pub registry_auth: Option<RegistryAuth>,
-}
-
-/// A sidecar health check, mapped onto Docker's own.
-#[derive(Clone, Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Health {
-    /// The `CMD-SHELL` command, run by the container's default shell.
-    pub cmd:             String,
-    pub interval_ms:     Option<u64>,
-    pub timeout_ms:      Option<u64>,
-    pub retries:         Option<u64>,
-    pub start_period_ms: Option<u64>,
-}
-
-fn ms_to_ns(ms: u64) -> i64 {
-    i64::try_from(ms.saturating_mul(1_000_000)).unwrap_or(i64::MAX)
-}
-
-impl Health {
-    fn to_config(&self) -> HealthConfig {
-        HealthConfig {
-            test:           Some(vec!["CMD-SHELL".to_owned(), self.cmd.clone()]),
-            interval:       self.interval_ms.map(ms_to_ns),
-            timeout:        self.timeout_ms.map(ms_to_ns),
-            retries:        self.retries.and_then(|r| i64::try_from(r).ok()),
-            start_period:   self.start_period_ms.map(ms_to_ns),
-            start_interval: None,
-        }
-    }
-}
 
 /// The container name of `sidecar` on `network`.
 fn container_name(network: &str, sidecar: &Sidecar) -> String {
