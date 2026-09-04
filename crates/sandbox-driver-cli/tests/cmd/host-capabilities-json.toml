@@ -31,7 +31,9 @@ stdout = """
     "streams_separated": true,
     "stdin": true,
     "cancel": true,
-    "stdio_process": true
+    "stdio_process": true,
+    "stdin_stream": true,
+    "environment": true
   },
   "fs": {
     "native": true,

@@ -1998,6 +1998,7 @@ dependencies = [
  "futures-util",
  "sandbox-driver",
  "sandbox-driver-conformance",
+ "serde",
  "serde_json",
  "tar",
  "tokio",

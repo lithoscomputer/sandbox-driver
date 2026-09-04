@@ -579,9 +579,10 @@ async fn execute_command(
         .cancel
         .then(CancellationToken::new);
     let controls = ExecControls {
-        cancel:                cancel.clone(),
-        sink:                  Some(command_output_sink()),
+        cancel: cancel.clone(),
+        sink: Some(command_output_sink()),
         retained_output_limit: Some(0),
+        ..ExecControls::default()
     };
     let execution = sandbox.exec().run_streaming(&spec, controls);
     tokio::pin!(execution);

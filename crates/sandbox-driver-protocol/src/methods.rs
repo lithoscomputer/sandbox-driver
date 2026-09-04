@@ -460,6 +460,9 @@ pub struct ExecResultDto {
     pub stdout_b64:  String,
     pub stderr_b64:  String,
     pub exit_code:   Option<i32>,
+    /// Additive: senders may omit it, receivers tolerate its absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal:      Option<i32>,
     pub termination: Termination,
     pub duration_ms: u64,
 }
@@ -470,6 +473,7 @@ impl ExecResultDto {
             stdout_b64:  encode_bytes(&result.stdout),
             stderr_b64:  encode_bytes(&result.stderr),
             exit_code:   result.exit_code,
+            signal:      result.signal,
             termination: result.termination,
             duration_ms: u64::try_from(result.duration.as_millis()).unwrap_or(u64::MAX),
         }
@@ -481,6 +485,7 @@ impl ExecResultDto {
             self.exit_code,
             Duration::from_millis(self.duration_ms),
         );
+        result.signal = self.signal;
         result.stdout = decode_bytes(&self.stdout_b64)?;
         result.stderr = decode_bytes(&self.stderr_b64)?;
         Ok(result)

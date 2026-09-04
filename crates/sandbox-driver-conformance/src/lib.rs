@@ -21,6 +21,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -32,8 +33,8 @@ use sandbox_driver::{
     ExecSpec, Git, GitCloneOptions, GitCommitOptions, GitPushOptions, GrepOptions, HealthStatus,
     LogSink, LogSource, NetworkPolicy, OutputSanitization, OutputStream, PtyOptions, PtySize,
     Resources, Sandbox, SandboxFilter, SandboxId, SandboxProvider, SandboxSpec, SandboxState,
-    Search, ServiceSpec, Services, SnapshotMode, SpawnSpec, Termination, WaitOptions, activate,
-    wait_for_state,
+    Search, ServiceSpec, Services, SnapshotMode, SpawnSpec, StdinSource, Termination, WaitOptions,
+    activate, wait_for_state,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time;
@@ -176,6 +177,18 @@ impl Conformance {
             }),
             ("exec_cancel_terminates", |ctx| {
                 Box::pin(exec_cancel_terminates(ctx))
+            }),
+            ("exec_kill_terminates", |ctx| {
+                Box::pin(exec_kill_terminates(ctx))
+            }),
+            ("exec_reports_a_foreign_signal", |ctx| {
+                Box::pin(exec_reports_a_foreign_signal(ctx))
+            }),
+            ("exec_reports_environment", |ctx| {
+                Box::pin(exec_reports_environment(ctx))
+            }),
+            ("exec_streams_stdin", |ctx| {
+                Box::pin(exec_streams_stdin(ctx))
             }),
             ("exec_streaming_is_honest", |ctx| {
                 Box::pin(exec_streaming_is_honest(ctx))
@@ -853,6 +866,130 @@ async fn exec_cancel_terminates(ctx: &Conformance) -> CheckOutcome {
             return fail(format!(
                 "expected Cancelled, got {:?}",
                 streaming.result.termination
+            ));
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn exec_kill_terminates(ctx: &Conformance) -> CheckOutcome {
+    if !ctx.caps().exec.cancel {
+        return Ok(Some("capability exec.cancel not declared".to_owned()));
+    }
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let token = CancellationToken::new();
+        let kill_after = token.clone();
+        tokio::spawn(async move {
+            time::sleep(Duration::from_millis(500)).await;
+            kill_after.cancel();
+        });
+        let controls = ExecControls {
+            kill: Some(token),
+            ..ExecControls::default()
+        };
+        let started = Instant::now();
+        let streaming = sandbox
+            .exec()
+            .run_streaming(&ExecSpec::new("sleep 300"), controls)
+            .await
+            .map_err(|error| format!("exec failed: {error}"))?;
+        // A provider that cannot separate the two levels reports Cancelled;
+        // either is a correct end for a kill.
+        if !matches!(
+            streaming.result.termination,
+            Termination::Killed | Termination::Cancelled
+        ) {
+            return fail(format!(
+                "expected Killed or Cancelled, got {:?}",
+                streaming.result.termination
+            ));
+        }
+        if started.elapsed() > Duration::from_secs(60) {
+            return fail("kill enforcement took over a minute");
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn exec_reports_a_foreign_signal(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        // The command signals its own process; the provider reports the
+        // signal number even though the shell only sees `128 + N`.
+        let spec = ExecSpec::new("kill -TERM $$; sleep 5").timeout(Duration::from_secs(30));
+        let result = sandbox
+            .exec()
+            .run(&spec)
+            .await
+            .map_err(|error| format!("exec failed: {error}"))?;
+        if result.signal != Some(15) {
+            return fail(format!(
+                "expected signal 15, got signal {:?} (code {:?}, {:?})",
+                result.signal, result.exit_code, result.termination
+            ));
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn exec_reports_environment(ctx: &Conformance) -> CheckOutcome {
+    if !ctx.caps().exec.environment {
+        return Ok(Some("capability exec.environment not declared".to_owned()));
+    }
+    let mut spec = ctx.specs.spec();
+    spec.env
+        .insert("CONFORMANCE_ENV".to_owned(), "present".to_owned());
+    let sandbox = ctx
+        .provider
+        .create(&spec, None)
+        .await
+        .map_err(|error| format!("create failed: {error}"))?;
+    let outcome = async {
+        let env = sandbox
+            .environment()
+            .await
+            .map_err(|error| format!("environment failed: {error}"))?;
+        if env.get("CONFORMANCE_ENV").map(String::as_str) != Some("present") {
+            return fail("spec env not reflected in the effective environment");
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+async fn exec_streams_stdin(ctx: &Conformance) -> CheckOutcome {
+    if !ctx.caps().exec.stdin_stream {
+        return Ok(Some("capability exec.stdin_stream not declared".to_owned()));
+    }
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let source = StdinSource::new(Cursor::new(b"streamed".to_vec()));
+        let controls = ExecControls {
+            stdin: Some(source),
+            ..ExecControls::default()
+        };
+        let spec = ExecSpec::new("cat").timeout(Duration::from_secs(30));
+        let streaming = sandbox
+            .exec()
+            .run_streaming(&spec, controls)
+            .await
+            .map_err(|error| format!("exec failed: {error}"))?;
+        if streaming.result.stdout != b"streamed" {
+            return fail(format!(
+                "streamed stdin not delivered: {:?}",
+                streaming.result.stdout_lossy()
             ));
         }
         PASS

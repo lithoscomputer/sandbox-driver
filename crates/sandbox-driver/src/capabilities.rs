@@ -48,6 +48,10 @@ pub enum Capability {
     ExecCancel,
     #[serde(rename = "exec.stdio_process")]
     ExecStdioProcess,
+    #[serde(rename = "exec.stdin_stream")]
+    ExecStdinStream,
+    #[serde(rename = "exec.environment")]
+    ExecEnvironment,
     #[serde(rename = "fs.upload")]
     FsUpload,
     #[serde(rename = "fs.download")]
@@ -192,6 +196,8 @@ impl Capabilities {
             Capability::ExecStdin => self.exec.stdin,
             Capability::ExecCancel => self.exec.cancel,
             Capability::ExecStdioProcess => self.exec.stdio_process,
+            Capability::ExecStdinStream => self.exec.stdin_stream,
+            Capability::ExecEnvironment => self.exec.environment,
             Capability::FsUpload => self.fs.upload,
             Capability::FsDownload => self.fs.download,
             Capability::FsPermissions => self.fs.permissions,
@@ -275,6 +281,10 @@ pub struct ExecCaps {
     pub cancel:            bool,
     /// Long-lived bidirectional stdio processes ([`crate::Exec::spawn_stdio`]).
     pub stdio_process:     bool,
+    /// Streamed standard input on [`crate::ExecControls::stdin`].
+    pub stdin_stream:      bool,
+    /// [`crate::Sandbox::environment`] reports the effective environment.
+    pub environment:       bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

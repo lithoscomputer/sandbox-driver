@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::process::Stdio;
@@ -12,9 +14,9 @@ use nix::sys::signal::Signal;
 use sandbox_driver::{
     Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputCaptureBuffer,
     OutputSanitization, OutputSanitizer, OutputSink, OutputStream, Result, SpawnSpec, StderrTail,
-    StdioProcess, StdioProcessHandle, Termination,
+    StdinSource, StdioProcess, StdioProcessHandle, Termination,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, copy};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::watch;
 use tokio::time;
@@ -59,6 +61,28 @@ fn inherited_var_is_sensitive(key: &str) -> bool {
         || lower.ends_with("_token")
         || lower.ends_with("_password")
         || lower.ends_with("_credential")
+}
+
+/// The environment a host command starts from: the inherited process env
+/// through the fail-closed secret filter, with `base_env` overlaid.
+/// [`crate::HostSandbox::environment`] reports exactly this, so a caller
+/// reads the same variables a command would see before its own spec env.
+pub(crate) fn effective_env(base_env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    for (key, value) in env::vars_os() {
+        let (Some(key), Some(value)) = (key.to_str(), value.to_str()) else {
+            continue;
+        };
+        if key != BASH_ENV_VAR && !inherited_var_is_sensitive(key) {
+            env.insert(key.to_owned(), value.to_owned());
+        }
+    }
+    for (key, value) in base_env {
+        if key != BASH_ENV_VAR {
+            env.insert(key.clone(), value.clone());
+        }
+    }
+    env
 }
 
 /// Command execution on the local machine.
@@ -205,19 +229,19 @@ fn signal_process_group(child: &Child, signal: Signal) {
     }
 }
 
-/// Sends SIGTERM to the process group, waits [`TERM_GRACE`] for a
-/// graceful exit, then SIGKILLs the group and the child directly.
+/// Sends SIGTERM to the process group, waits `grace` for a graceful exit,
+/// then SIGKILLs the group and the child directly.
 ///
 /// The direct kill is the guarantee: a command that moved itself out of
 /// its process group makes the group signals miss entirely (killpg on
 /// an empty group is ESRCH), and the callers' subsequent `wait()` would
 /// hang forever. SIGKILL to the immediate child always lands, and
 /// `kill()` reaps it, so a completed terminate means a returned wait.
-async fn terminate_process_group(child: &mut Child) {
+async fn terminate_process_group(child: &mut Child, grace: Duration) {
     #[cfg(unix)]
     {
         signal_process_group(child, Signal::SIGTERM);
-        if time::timeout(TERM_GRACE, child.wait()).await.is_ok() {
+        if time::timeout(grace, child.wait()).await.is_ok() {
             return;
         }
         signal_process_group(child, Signal::SIGKILL);
@@ -225,27 +249,63 @@ async fn terminate_process_group(child: &mut Child) {
     }
     #[cfg(not(unix))]
     {
+        let _ = grace;
         let _ = child.kill().await;
     }
+}
+
+/// SIGKILLs the process group and the child directly, with no grace: the
+/// [`ExecControls::kill`] path.
+async fn kill_process_group(child: &mut Child) {
+    #[cfg(unix)]
+    signal_process_group(child, Signal::SIGKILL);
+    let _ = child.kill().await;
 }
 
 /// Writes stdin then closes it for EOF. A command that stops reading its
 /// input (`head -1`) disconnecting the pipe is normal; any other failure
 /// means the command saw truncated input and must not pass silently.
+/// Whether a stdin write failed because the reader disconnected — normal
+/// for a command like `head -1` that stops reading.
+fn is_disconnect(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+    )
+}
+
 async fn write_stdin(mut stdin: ChildStdin, bytes: Vec<u8>) -> Result<()> {
-    fn is_disconnect(error: &io::Error) -> bool {
-        matches!(
-            error.kind(),
-            io::ErrorKind::BrokenPipe
-                | io::ErrorKind::ConnectionReset
-                | io::ErrorKind::ConnectionAborted
-        )
-    }
     if let Err(error) = stdin.write_all(&bytes).await {
         if is_disconnect(&error) {
             return Ok(());
         }
         return Err(Error::io("writing exec stdin", error));
+    }
+    if let Err(error) = stdin.shutdown().await {
+        if is_disconnect(&error) {
+            return Ok(());
+        }
+        return Err(Error::io("closing exec stdin", error));
+    }
+    Ok(())
+}
+
+/// Copies a streamed source into the process stdin, then closes it for
+/// EOF. A command that stops reading disconnecting the pipe is normal;
+/// any other failure means the command saw truncated input.
+async fn stream_stdin_into(mut stdin: ChildStdin, source: StdinSource) -> Result<()> {
+    let Some(mut reader) = source.take() else {
+        // Another consumer already took the reader; nothing to write.
+        let _ = stdin.shutdown().await;
+        return Ok(());
+    };
+    if let Err(error) = copy(&mut reader, &mut stdin).await {
+        if is_disconnect(&error) {
+            return Ok(());
+        }
+        return Err(Error::io("streaming exec stdin", error));
     }
     if let Err(error) = stdin.shutdown().await {
         if is_disconnect(&error) {
@@ -327,8 +387,11 @@ impl Exec for HostExec {
         controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
         let started = Instant::now();
+        let grace = controls.grace.unwrap_or(TERM_GRACE);
+        let stream_stdin = controls.stdin.clone();
+        let wants_stdin = spec.stdin.is_some() || stream_stdin.is_some();
         let mut command = self.command(&spec.command, spec.working_dir.as_deref(), &spec.env)?;
-        command.stdin(if spec.stdin.is_some() {
+        command.stdin(if wants_stdin {
             Stdio::piped()
         } else {
             Stdio::null()
@@ -341,12 +404,16 @@ impl Exec for HostExec {
             .map_err(|error| Error::io("spawning bash for exec", error))?;
 
         // Write-then-EOF, concurrently with output pumping so a large
-        // write cannot deadlock against a full output pipe.
-        let stdin_task = child
-            .stdin
-            .take()
-            .zip(spec.stdin.clone())
-            .map(|(stdin, bytes)| tokio::spawn(write_stdin(stdin, bytes)));
+        // write cannot deadlock against a full output pipe. A streamed
+        // source is copied for the life of the command; a fixed
+        // `spec.stdin` is written once. The two never coexist (the
+        // control-plane contract), so a stream wins if both are set.
+        let child_stdin = child.stdin.take();
+        let stdin_task = match (child_stdin, stream_stdin, spec.stdin.clone()) {
+            (Some(stdin), Some(source), _) => Some(tokio::spawn(stream_stdin_into(stdin, source))),
+            (Some(stdin), None, Some(bytes)) => Some(tokio::spawn(write_stdin(stdin, bytes))),
+            _ => None,
+        };
 
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
@@ -390,6 +457,13 @@ impl Exec for HostExec {
                     None => future::pending().await,
                 }
             });
+            let kill = controls.kill.clone();
+            let mut killed = pin!(async {
+                match &kill {
+                    Some(token) => token.cancelled().await,
+                    None => future::pending().await,
+                }
+            });
             let mut timeout = pin!(async {
                 match spec.timeout {
                     Some(timeout) => time::sleep(timeout).await,
@@ -409,7 +483,7 @@ impl Exec for HostExec {
                             }
                         }
                         if sink_error || read_error.is_some() {
-                            terminate_process_group(&mut child).await;
+                            terminate_process_group(&mut child, grace).await;
                             break (Termination::Cancelled, None);
                         }
                     }
@@ -420,11 +494,15 @@ impl Exec for HostExec {
                         break (Termination::Exited, Some(status));
                     }
                     () = &mut cancelled => {
-                        terminate_process_group(&mut child).await;
+                        terminate_process_group(&mut child, grace).await;
                         break (Termination::Cancelled, None);
                     }
+                    () = &mut killed => {
+                        kill_process_group(&mut child).await;
+                        break (Termination::Killed, None);
+                    }
                     () = &mut timeout => {
-                        terminate_process_group(&mut child).await;
+                        terminate_process_group(&mut child, grace).await;
                         break (Termination::TimedOut, None);
                     }
                 }
@@ -474,6 +552,10 @@ impl Exec for HostExec {
             return Err(Error::io("reading exec output", error));
         }
         let exit_code = status.code();
+        #[cfg(unix)]
+        let exit_signal = ExitStatusExt::signal(&status);
+        #[cfg(not(unix))]
+        let exit_signal: Option<i32> = None;
 
         let (stdout_bytes, mut stdout_stats) = stdout_capture.into_parts();
         let (stderr_bytes, mut stderr_stats) = stderr_capture.into_parts();
@@ -482,6 +564,7 @@ impl Exec for HostExec {
             stderr_stats.truncated = true;
         }
         let mut result = ExecResult::new(termination, exit_code, started.elapsed());
+        result.signal = exit_signal;
         result.stdout = stdout_bytes;
         result.stderr = stderr_bytes;
 
@@ -572,7 +655,7 @@ impl HostStdioHandle {
                         future::pending::<()>().await;
                     }
                 } => {
-                    terminate_process_group(&mut child).await;
+                    terminate_process_group(&mut child, TERM_GRACE).await;
                     let code = match child.wait().await {
                         Ok(status) => status.code(),
                         Err(error) => {

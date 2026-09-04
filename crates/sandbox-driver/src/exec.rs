@@ -43,6 +43,14 @@ pub trait Exec: Send + Sync {
     /// drained (and counted in [`CaptureStats::omitted_bytes`]), never left
     /// to block the process. A sink error cancels the execution.
     ///
+    /// `controls.kill` ends the command with [`Termination::Killed`] and no
+    /// grace; `controls.grace` sets the cancel ladder's SIGTERM-to-SIGKILL
+    /// wait. A provider that cannot separate the two treats `kill` as
+    /// `cancel` and ignores `grace`. `controls.stdin` streams standard
+    /// input for the life of the command; it is capability-gated on
+    /// `exec.stdin_stream` and rejected with [`Error::Unsupported`] where
+    /// undeclared.
+    ///
     /// A provider that does not support stdin or cancellation must reject
     /// a call that supplies them with [`Error::Unsupported`]
     /// (`exec.stdin` / `exec.cancel`) — never run the command with the
@@ -176,9 +184,25 @@ pub type OutputSink = Arc<
 
 /// Process-local controls for [`Exec::run_streaming`]. Never serialized;
 /// on the wire these map to negotiated execution IDs.
+///
+/// Two stop levels: `cancel` is the polite ladder (SIGTERM to the process
+/// group, `grace`, then SIGKILL) and resolves with
+/// [`Termination::Cancelled`]; `kill` skips the grace and SIGKILLs the
+/// group at once, resolving with [`Termination::Killed`]. A provider that
+/// cannot distinguish the two treats `kill` as `cancel`. `grace` overrides
+/// the provider's default (two seconds); a provider that cannot honor a
+/// grace ignores it.
 #[derive(Clone, Default)]
 pub struct ExecControls {
     pub cancel:                Option<CancellationToken>,
+    /// Immediate SIGKILL of the process group, no grace.
+    pub kill:                  Option<CancellationToken>,
+    /// How long the cancel ladder waits between SIGTERM and SIGKILL.
+    pub grace:                 Option<Duration>,
+    /// Streamed standard input, written to the process as it becomes
+    /// readable and closed at its EOF. Mutually exclusive with
+    /// [`ExecSpec::stdin`]; capability-gated on `exec.stdin_stream`.
+    pub stdin:                 Option<StdinSource>,
     pub sink:                  Option<OutputSink>,
     /// Retention cap for the buffered copy in the result (head + tail);
     /// output beyond it is drained and counted, not kept.
@@ -189,9 +213,48 @@ impl fmt::Debug for ExecControls {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExecControls")
             .field("cancel", &self.cancel.is_some())
+            .field("kill", &self.kill.is_some())
+            .field("grace", &self.grace)
+            .field("stdin", &self.stdin.is_some())
             .field("sink", &self.sink.is_some())
             .field("retained_output_limit", &self.retained_output_limit)
             .finish()
+    }
+}
+
+/// A streamed standard input for [`ExecControls::stdin`].
+///
+/// The reader is handed over exactly once: the provider that runs the
+/// command takes it, so a cloned `ExecControls` shares one source. The
+/// source is closed for EOF when the reader ends; a process that stops
+/// reading its input disconnecting the pipe is not an error.
+/// The boxed reader a [`StdinSource`] hands to the running provider.
+type BoxedReader = Pin<Box<dyn AsyncRead + Send>>;
+
+#[derive(Clone)]
+pub struct StdinSource {
+    reader: Arc<Mutex<Option<BoxedReader>>>,
+}
+
+impl StdinSource {
+    pub fn new(reader: impl AsyncRead + Send + 'static) -> Self {
+        Self {
+            reader: Arc::new(Mutex::new(Some(Box::pin(reader)))),
+        }
+    }
+
+    /// Takes the reader; `None` once a provider has already taken it.
+    pub fn take(&self) -> Option<BoxedReader> {
+        self.reader
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+}
+
+impl fmt::Debug for StdinSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StdinSource").finish_non_exhaustive()
     }
 }
 
@@ -202,7 +265,9 @@ impl fmt::Debug for ExecControls {
 pub enum Termination {
     Exited,
     TimedOut,
+    /// Ended by [`ExecControls::cancel`] (or a failing sink).
     Cancelled,
+    /// Ended by [`ExecControls::kill`].
     Killed,
     #[serde(other)]
     Unknown,
@@ -221,6 +286,13 @@ pub struct ExecResult {
     /// wrapper's 143) — never treat `Some(0)` alone as success; use
     /// [`ExecResult::success`], which checks the termination.
     pub exit_code:   Option<i32>,
+    /// The signal that ended the command's process, when the provider
+    /// observed one — a foreign `kill`, or the provider's own cancel
+    /// ladder. `None` when the process exited on its own or the provider
+    /// cannot tell; a provider that only sees a shell's `128 + N`
+    /// convention may decode it here.
+    #[serde(default)]
+    pub signal:      Option<i32>,
     pub termination: Termination,
     pub duration:    Duration,
 }
@@ -231,9 +303,22 @@ impl ExecResult {
             stdout: Vec::new(),
             stderr: Vec::new(),
             exit_code,
+            signal: None,
             termination,
             duration,
         }
+    }
+
+    /// Reads a shell-reported status: `128 + N` means the child died of
+    /// signal `N`, anything else is an ordinary exit code. A process that
+    /// deliberately exits with such a code is indistinguishable — the
+    /// convention is the best a wrapper shell can report.
+    pub fn from_shell_status(termination: Termination, status: i32, duration: Duration) -> Self {
+        let mut result = Self::new(termination, Some(status), duration);
+        if (129..=192).contains(&status) {
+            result.signal = Some(status - 128);
+        }
+        result
     }
 
     /// Stdout decoded lossily for display.

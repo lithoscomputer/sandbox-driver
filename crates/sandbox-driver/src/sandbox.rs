@@ -59,6 +59,16 @@ pub trait Sandbox: Send + Sync {
     /// The workspace directory commands run in by default.
     fn working_directory(&self) -> &str;
 
+    /// The environment a command starts from before [`crate::ExecSpec::env`]
+    /// lands on top: the image's or host's variables plus the spec env
+    /// given at create. A fact about the sandbox, not a policy.
+    ///
+    /// Capability-gated on `exec.environment`; the default returns
+    /// [`Error::Unsupported`].
+    async fn environment(&self) -> Result<BTreeMap<String, String>> {
+        Err(Error::unsupported(Capability::ExecEnvironment))
+    }
+
     /// Run-scoped scratch directory outside any checkout, when the
     /// provider offers one. A returned directory exists, is owner-private,
     /// and remains the same when the sandbox is attached again.

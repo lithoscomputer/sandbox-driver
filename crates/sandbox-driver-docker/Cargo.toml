@@ -14,6 +14,7 @@ async-trait.workspace = true
 bollard.workspace = true
 futures-util.workspace = true
 sandbox-driver.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tar.workspace = true
 tokio = { workspace = true, features = ["fs", "rt"] }

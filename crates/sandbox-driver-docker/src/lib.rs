@@ -29,6 +29,7 @@ mod access;
 mod exec;
 mod fs;
 mod pty;
+mod sidecars;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -36,6 +37,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bollard::Docker;
+use bollard::auth::DockerCredentials;
 use bollard::container::{
     Config, CreateContainerOptions, InspectContainerOptions, ListContainersOptions,
     RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
@@ -65,41 +67,110 @@ const DEFAULT_WORKING_DIRECTORY: &str = "/workspace";
 const RUNTIME_DIRECTORY_PARENT: &str = "/tmp/sandbox-driver";
 pub(crate) const RUNTIME_DIRECTORY: &str = "/tmp/sandbox-driver/runtime";
 
+/// A single host-to-container bind mount.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BindMount {
+    pub host:      String,
+    pub container: String,
+    /// `rw` (default) or `ro`.
+    #[serde(default)]
+    pub mode:      Option<String>,
+}
+
+/// Registry credentials for pulling a private image.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RegistryAuth {
+    pub username: String,
+    pub password: String,
+    #[serde(default)]
+    pub server:   Option<String>,
+}
+
+impl RegistryAuth {
+    fn to_credentials(&self) -> DockerCredentials {
+        DockerCredentials {
+            username: Some(self.username.clone()),
+            password: Some(self.password.clone()),
+            serveraddress: self.server.clone(),
+            ..Default::default()
+        }
+    }
+}
+
 /// Options the Docker provider reads from `SandboxSpec::provider_config`.
 ///
-/// Schema: `{"auto_pull": bool}` — whether a missing image may be pulled
-/// during create (default `true`). Unknown fields are rejected so typos
-/// fail loudly instead of silently using defaults.
+/// Schema (all fields optional, unknown fields rejected):
+/// `auto_pull` (default `true`), `init`, `binds`, `extra_hosts`, `dns`,
+/// `cap_add`, `registry_auth`, and `sidecars`. The typed fields are the
+/// Docker-only escape hatch for what the portable spec does not carry:
+/// bind mounts, an init process, extra host entries, DNS servers, added
+/// capabilities, and sidecar service containers. A container-level
+/// `user` rides on the portable `SandboxSpec::user`; an `entrypoint`
+/// override is a sidecar-only field, because the scope container runs a
+/// fixed init and steps go through `docker exec`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DockerProviderConfig {
-    auto_pull: bool,
+    #[serde(default = "default_true")]
+    auto_pull:     bool,
+    #[serde(default)]
+    init:          bool,
+    #[serde(default)]
+    binds:         Vec<BindMount>,
+    #[serde(default)]
+    extra_hosts:   Vec<String>,
+    #[serde(default)]
+    dns:           Vec<String>,
+    #[serde(default)]
+    cap_add:       Vec<String>,
+    #[serde(default)]
+    registry_auth: Option<RegistryAuth>,
+    #[serde(default)]
+    sidecars:      Vec<sidecars::Sidecar>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn provider_config(value: &serde_json::Value) -> Result<DockerProviderConfig> {
-    let mut config = DockerProviderConfig { auto_pull: true };
     match value {
-        serde_json::Value::Null => {}
-        serde_json::Value::Object(fields) => {
-            for (key, field) in fields {
-                match key.as_str() {
-                    "auto_pull" => {
-                        config.auto_pull = field.as_bool().ok_or_else(|| {
-                            Error::invalid_spec("provider_config.auto_pull", "expected a boolean")
-                        })?;
-                    }
-                    other => {
-                        return Err(Error::invalid_spec(
-                            "provider_config",
-                            format!("unknown field {other:?}"),
-                        ));
-                    }
-                }
-            }
-        }
-        _ => {
-            return Err(Error::invalid_spec("provider_config", "expected an object"));
-        }
+        serde_json::Value::Null => Ok(DockerProviderConfig {
+            auto_pull:     true,
+            init:          false,
+            binds:         Vec::new(),
+            extra_hosts:   Vec::new(),
+            dns:           Vec::new(),
+            cap_add:       Vec::new(),
+            registry_auth: None,
+            sidecars:      Vec::new(),
+        }),
+        serde_json::Value::Object(_) => serde_json::from_value(value.clone())
+            .map_err(|error| Error::invalid_spec("provider_config", error.to_string())),
+        _ => Err(Error::invalid_spec("provider_config", "expected an object")),
     }
-    Ok(config)
+}
+
+/// Pulls an image if it is not present, using registry credentials when
+/// given. Shared by the main-image path and sidecars.
+pub(crate) async fn pull_image(
+    docker: &Docker,
+    reference: &str,
+    auth: Option<&RegistryAuth>,
+) -> Result<()> {
+    match docker.inspect_image(reference).await {
+        Ok(_) => return Ok(()),
+        Err(error) if is_not_found(&error) => {}
+        Err(error) => return Err(docker_error("inspecting image", error)),
+    }
+    let credentials = auth.map(RegistryAuth::to_credentials);
+    let mut stream = docker.create_image(Some(pull_options(reference)), None, credentials);
+    while let Some(progress) = stream.next().await {
+        progress.map_err(|error| docker_error("pulling image", error))?;
+    }
+    Ok(())
 }
 
 /// The Docker provider. One per process, sharing one daemon connection.
@@ -131,6 +202,7 @@ impl DockerProvider {
         &self,
         reference: &str,
         auto_pull: bool,
+        auth: Option<&RegistryAuth>,
         reporter: &OperationReporter,
     ) -> Result<()> {
         match self.docker.inspect_image(reference).await {
@@ -155,9 +227,10 @@ impl DockerProvider {
                     .message(format!("pulling image {reference}")),
             )
             .await;
+        let credentials = auth.map(RegistryAuth::to_credentials);
         let mut stream = self
             .docker
-            .create_image(Some(pull_options(reference)), None, None);
+            .create_image(Some(pull_options(reference)), None, credentials);
         while let Some(progress) = stream.next().await {
             progress.map_err(|error| docker_error("pulling image", error))?;
         }
@@ -192,6 +265,7 @@ impl DockerProvider {
         working_dir: String,
         labels: BTreeMap<String, String>,
         env: BTreeMap<String, String>,
+        network: Option<String>,
         events: EventEmitter,
     ) -> Arc<DockerSandbox> {
         let pty = DockerPty::new(
@@ -223,6 +297,7 @@ impl DockerProvider {
             fs,
             pty,
             shell_command,
+            network,
             events,
         })
     }
@@ -257,8 +332,10 @@ fn docker_capabilities() -> Capabilities {
     caps.exec.live_streaming = true;
     caps.exec.streams_separated = true;
     caps.exec.stdin = true;
+    caps.exec.stdin_stream = true;
     caps.exec.cancel = true;
     caps.exec.stdio_process = true;
+    caps.exec.environment = true;
     let mut pty = PtyCaps::default();
     pty.resize = true;
     caps.pty = Some(pty);
@@ -318,6 +395,14 @@ fn status_from_inspect(id: SandboxId, inspect: &ContainerInspectResponse) -> San
     status
 }
 
+/// Whether a container's network mode names a managed sidecar network
+/// (`<sandbox>-net`) rather than a standard Docker mode.
+fn is_sidecar_network(mode: &str) -> bool {
+    mode.ends_with("-net")
+        && !matches!(mode, "bridge" | "host" | "none" | "default")
+        && !mode.starts_with("container:")
+}
+
 fn normalized_container_name(name: Option<&str>) -> Option<String> {
     name.map(|name| name.trim_start_matches('/'))
         .filter(|name| !name.is_empty())
@@ -352,12 +437,6 @@ fn validate_supported_creation_fields(spec: &SandboxSpec) -> Result<()> {
         return Err(Error::invalid_spec(
             "resources.gpus",
             "the docker provider does not configure GPU devices",
-        ));
-    }
-    if spec.user.is_some() {
-        return Err(Error::invalid_spec(
-            "user",
-            "the docker provider does not configure the container user",
         ));
     }
     if spec.timers != LifecycleTimers::default() {
@@ -424,7 +503,17 @@ impl SandboxProvider for DockerProvider {
             ));
         }
         let config_options = provider_config(&spec.provider_config)?;
-        let network = network_mode(&spec.network)?;
+        let base_network = network_mode(&spec.network)?;
+        // Sidecars live on one user-defined network the main container
+        // joins, named after the sandbox. They need a named sandbox.
+        let sidecar_network = if config_options.sidecars.is_empty() {
+            None
+        } else {
+            let name = spec.name.clone().ok_or_else(|| {
+                Error::invalid_spec("name", "a sandbox with sidecars must be named")
+            })?;
+            Some(format!("{name}-net"))
+        };
 
         let emitter = EventEmitter::new(self.kind.clone(), events);
         let handle_emitter = emitter.clone();
@@ -433,8 +522,19 @@ impl SandboxProvider for DockerProvider {
                 EventSubject::pending_sandbox(spec.name.clone()),
                 Action::Create,
                 |reporter| async move {
-                    self.ensure_image(reference, config_options.auto_pull, &reporter)
-                        .await?;
+                    self.ensure_image(
+                        reference,
+                        config_options.auto_pull,
+                        config_options.registry_auth.as_ref(),
+                        &reporter,
+                    )
+                    .await?;
+
+                    // Sidecars come up healthy before the main container, so
+                    // a workload never races a service that is not ready.
+                    if let Some(network) = &sidecar_network {
+                        sidecars::realize(&self.docker, network, &config_options.sidecars).await?;
+                    }
 
                     let working_dir = spec
                         .working_directory
@@ -447,8 +547,24 @@ impl SandboxProvider for DockerProvider {
                         .collect();
                     labels.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
 
+                    let network_mode = sidecar_network.clone().or(base_network);
+                    let binds: Vec<String> = config_options
+                        .binds
+                        .iter()
+                        .map(|bind| {
+                            let mode = bind.mode.as_deref().unwrap_or("rw");
+                            format!("{}:{}:{mode}", bind.host, bind.container)
+                        })
+                        .collect();
                     let host_config = HostConfig {
-                        network_mode: network,
+                        network_mode,
+                        binds: (!binds.is_empty()).then_some(binds),
+                        init: config_options.init.then_some(true),
+                        extra_hosts: (!config_options.extra_hosts.is_empty())
+                            .then(|| config_options.extra_hosts.clone()),
+                        dns: (!config_options.dns.is_empty()).then(|| config_options.dns.clone()),
+                        cap_add: (!config_options.cap_add.is_empty())
+                            .then(|| config_options.cap_add.clone()),
                         memory: spec
                             .resources
                             .memory_mb
@@ -472,6 +588,7 @@ impl SandboxProvider for DockerProvider {
                     env_entries.push(format!("{BASH_ENV_VAR}="));
                     let config = Config {
                         image: Some(reference.clone()),
+                        user: spec.user.clone(),
                         cmd: Some(vec![
                             "/bin/bash".to_owned(),
                             "-c".to_owned(),
@@ -493,35 +610,44 @@ impl SandboxProvider for DockerProvider {
                         name,
                         platform: None,
                     });
-                    let created = self
-                        .docker
-                        .create_container(options, config)
-                        .await
-                        .map_err(|error| {
-                            // A name collision is a caller-actionable branch, not
-                            // an opaque daemon failure.
-                            if is_conflict(&error) && spec.name.is_some() {
+                    // From here a failure must sweep the sidecars it started.
+                    let sweep_on_error = |error: Error| async {
+                        if let Some(network) = &sidecar_network {
+                            sidecars::sweep(&self.docker, network).await;
+                        }
+                        error
+                    };
+                    let created = match self.docker.create_container(options, config).await {
+                        Ok(created) => created,
+                        Err(error) => {
+                            let error = if is_conflict(&error) && spec.name.is_some() {
                                 Error::invalid_spec(
                                     "name",
                                     "a container with this name already exists",
                                 )
                             } else {
                                 docker_error("creating container", error)
-                            }
-                        })?;
+                            };
+                            return Err(sweep_on_error(error).await);
+                        }
+                    };
                     let event_id = SandboxId::try_new(created.id.clone())
                         .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
                     reporter.set_subject(EventSubject::sandbox(Some(event_id)));
-                    self.docker
+                    if let Err(error) = self
+                        .docker
                         .start_container(&created.id, None::<StartContainerOptions<String>>)
                         .await
-                        .map_err(|error| docker_error("starting container", error))?;
+                    {
+                        return Err(sweep_on_error(docker_error("starting container", error)).await);
+                    }
                     Ok(self.handle(
                         created.id,
                         spec.name.clone(),
                         working_dir,
                         spec.labels.clone(),
                         spec.env.clone(),
+                        sidecar_network.clone(),
                         handle_emitter,
                     ) as Arc<dyn Sandbox>)
                 },
@@ -571,12 +697,20 @@ impl SandboxProvider for DockerProvider {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    // A sidecar network is a user-defined one named after the
+                    // sandbox; recover it so this handle sweeps sidecars too.
+                    let network = inspect
+                        .host_config
+                        .as_ref()
+                        .and_then(|host| host.network_mode.clone())
+                        .filter(|mode| is_sidecar_network(mode));
                     Ok(self.handle(
                         inspect.id.clone().unwrap_or_else(|| id.as_str().to_owned()),
                         normalized_container_name(inspect.name.as_deref()),
                         working_dir,
                         user_labels,
                         BTreeMap::new(),
+                        network,
                         handle_emitter,
                     ) as Arc<dyn Sandbox>)
                 },
@@ -651,6 +785,8 @@ pub struct DockerSandbox {
     fs:            DockerFs,
     pty:           DockerPty,
     shell_command: DockerShellCommand,
+    /// The sidecar network to sweep on delete, when the sandbox has one.
+    network:       Option<String>,
     events:        EventEmitter,
 }
 
@@ -697,6 +833,31 @@ impl Sandbox for DockerSandbox {
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.id), err)]
+    async fn environment(&self) -> Result<BTreeMap<String, String>> {
+        // The container's effective env is the image's plus what create
+        // set, which the daemon records on `.Config.Env`. `BASH_ENV` is
+        // an internal blank and never part of the reported environment.
+        let inspect = self
+            .docker
+            .inspect_container(self.id.as_str(), None::<InspectContainerOptions>)
+            .await
+            .map_err(|error| docker_error("inspecting container", error))?;
+        let entries = inspect
+            .config
+            .and_then(|config| config.env)
+            .unwrap_or_default();
+        let mut env = BTreeMap::new();
+        for entry in entries {
+            if let Some((key, value)) = entry.split_once('=') {
+                if key != BASH_ENV_VAR {
+                    env.insert(key.to_owned(), value.to_owned());
+                }
+            }
+        }
+        Ok(env)
+    }
+
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.id), err)]
     async fn platform_info(&self) -> Result<PlatformInfo> {
         // uname prints its fields in canonical order — sysname, release,
         // machine — regardless of flag order.
@@ -719,6 +880,9 @@ impl Sandbox for DockerSandbox {
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Start,
                 |_| async {
+                    if let Some(network) = &self.network {
+                        sidecars::set_running(&self.docker, network, true).await?;
+                    }
                     let inspect = self
                         .docker
                         .inspect_container(self.id.as_str(), None::<InspectContainerOptions>)
@@ -770,7 +934,11 @@ impl Sandbox for DockerSandbox {
                             .stop_container(self.id.as_str(), Some(StopContainerOptions { t: 1 }))
                             .await,
                         "stopping container",
-                    )
+                    )?;
+                    if let Some(network) = &self.network {
+                        sidecars::set_running(&self.docker, network, false).await?;
+                    }
+                    Ok(())
                 },
             )
             .await
@@ -787,7 +955,7 @@ impl Sandbox for DockerSandbox {
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Delete,
                 |_| async {
-                    match self
+                    let removed = match self
                         .docker
                         .remove_container(self.id.as_str(), Some(options))
                         .await
@@ -795,7 +963,11 @@ impl Sandbox for DockerSandbox {
                         Ok(()) => Ok(()),
                         Err(error) if is_not_found(&error) => Ok(()),
                         Err(error) => Err(docker_error("removing container", error)),
+                    };
+                    if let Some(network) = &self.network {
+                        sidecars::sweep(&self.docker, network).await;
                     }
+                    removed
                 },
             )
             .await
@@ -906,10 +1078,6 @@ mod tests {
         let mut spec = image_spec();
         spec.resources.gpus = Some(1);
         assert_invalid_field(&spec, "resources.gpus");
-
-        let mut spec = image_spec();
-        spec.user = Some("sandbox".to_owned());
-        assert_invalid_field(&spec, "user");
 
         let mut spec = image_spec();
         spec.timers.auto_stop_after_idle = Some(Duration::from_secs(60));

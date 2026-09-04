@@ -2,6 +2,7 @@
 //! [`SandboxProvider`] / [`Sandbox`] traits.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -10,8 +11,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sandbox_driver::{
-    Capabilities, DirEntry, Error, EventContext, EventSubject, Exec, ExecControls, ExecResult,
-    ExecSpec, ExecStreamingResult, FileMetadata, Filesystem, ForkOptions, HealthStatus,
+    Capabilities, Capability, DirEntry, Error, EventContext, EventSubject, Exec, ExecControls,
+    ExecResult, ExecSpec, ExecStreamingResult, FileMetadata, Filesystem, ForkOptions, HealthStatus,
     LifecycleTimers, LogSink, LogSource, Logs, NetworkPolicy, OutputStream, PlatformInfo,
     PreviewUrl, PreviewUrls, ProviderHealth, ProviderKind, Pty, PtyOptions, PtySession, PtySize,
     Resources, Result, Sandbox, SandboxFilter, SandboxId, SandboxSnapshotOptions, SandboxSpec,
@@ -1336,6 +1337,9 @@ impl Exec for SandboxExec {
         spec: &ExecSpec,
         controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
+        if controls.stdin.is_some() {
+            return Err(Error::unsupported(Capability::ExecStdinStream));
+        }
         let exec_id = format!(
             "x{}-{}",
             self.sandbox_id.as_str(),
@@ -1372,12 +1376,31 @@ impl Exec for SandboxExec {
                 Ok(())
             })
         });
-        // Forward cancellation as an exec/cancel request.
-        let cancel_task = controls.cancel.clone().map(|token| {
+        // Forward cancellation as an exec/cancel request. The wire has one
+        // stop level, so a kill token is forwarded the same way and the
+        // grace is the plugin's own.
+        let cancel_token = controls.cancel.clone();
+        let kill_token = controls.kill.clone();
+        let cancel_task = (cancel_token.is_some() || kill_token.is_some()).then(|| {
             let client = Arc::clone(&self.client);
             let exec_id = exec_id.clone();
             tokio::spawn(async move {
-                token.cancelled().await;
+                let cancelled = async {
+                    match cancel_token {
+                        Some(token) => token.cancelled().await,
+                        None => future::pending().await,
+                    }
+                };
+                let killed = async {
+                    match kill_token {
+                        Some(token) => token.cancelled().await,
+                        None => future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    () = cancelled => {}
+                    () = killed => {}
+                }
                 let outcome: Result<m::Empty> = client
                     .call(m::EXEC_CANCEL, &m::ExecCancelParams { exec_id })
                     .await;

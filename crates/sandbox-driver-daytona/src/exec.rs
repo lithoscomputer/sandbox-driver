@@ -8,8 +8,9 @@ use std::{mem, process};
 use async_trait::async_trait;
 use daytona_sdk::{DaytonaError, ExecuteCommandOptions, FileSystemService, ProcessService};
 use sandbox_driver::{
-    Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputCaptureBuffer,
-    OutputSanitizer, OutputSink, OutputStream, Result, SpawnSpec, StdioProcess, Termination,
+    Capability, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
+    OutputCaptureBuffer, OutputSanitizer, OutputSink, OutputStream, Result, SpawnSpec,
+    StdioProcess, Termination,
 };
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, OnceCell};
@@ -232,8 +233,30 @@ impl Exec for DaytonaExec {
     async fn run_streaming(
         &self,
         spec: &ExecSpec,
-        controls: ExecControls,
+        mut controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
+        if controls.stdin.is_some() {
+            return Err(Error::unsupported(Capability::ExecStdinStream));
+        }
+        // Daytona ends a command by deleting its session, which is one
+        // stop level: a kill token is honored as a cancel, and the grace is
+        // not configurable.
+        if let Some(kill) = controls.kill.take() {
+            let merged = CancellationToken::new();
+            let stop = merged.clone();
+            let cancel = controls.cancel.take();
+            tokio::spawn(async move {
+                match cancel {
+                    Some(cancel) => tokio::select! {
+                        () = cancel.cancelled() => {}
+                        () = kill.cancelled() => {}
+                    },
+                    None => kill.cancelled().await,
+                }
+                stop.cancel();
+            });
+            controls.cancel = Some(merged);
+        }
         // Sessions cost three extra API calls, so plain buffered runs —
         // every derived fs/search/git operation — keep the one-shot
         // endpoint; only a sink or cancel token needs the session

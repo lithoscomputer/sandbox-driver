@@ -44,6 +44,7 @@ use sandbox_driver::{
 use tokio::fs as tokio_fs;
 
 pub use crate::exec::HostExec;
+use crate::exec::effective_env;
 pub use crate::fs::HostFs;
 
 /// The host provider. Create one per process and share it.
@@ -85,8 +86,10 @@ fn host_capabilities() -> Capabilities {
     caps.exec.live_streaming = true;
     caps.exec.streams_separated = true;
     caps.exec.stdin = true;
+    caps.exec.stdin_stream = true;
     caps.exec.cancel = true;
     caps.exec.stdio_process = true;
+    caps.exec.environment = true;
     caps.fs.native = true;
     caps.fs.upload = true;
     caps.fs.download = true;
@@ -430,6 +433,10 @@ impl Sandbox for HostSandbox {
 
     fn working_directory(&self) -> &str {
         &self.working_directory
+    }
+
+    async fn environment(&self) -> Result<BTreeMap<String, String>> {
+        Ok(effective_env(&self.env))
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.id), err)]

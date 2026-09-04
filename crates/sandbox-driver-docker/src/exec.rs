@@ -14,9 +14,9 @@ use futures_util::StreamExt;
 use sandbox_driver::{
     Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputCaptureBuffer,
     OutputSanitizer, OutputSink, OutputStream, ProviderError, ProviderKind, Result, SpawnSpec,
-    StderrTail, StdioProcess, StdioProcessHandle, Termination,
+    StderrTail, StdinSource, StdioProcess, StdioProcessHandle, Termination,
 };
-use tokio::io::{AsyncWrite, AsyncWriteExt, duplex};
+use tokio::io::{AsyncWrite, AsyncWriteExt, copy, duplex};
 use tokio::time;
 
 /// The container-side interpreter the Bash contract requires.
@@ -87,20 +87,47 @@ pub(crate) fn tolerate_not_modified(
 /// Writes stdin then closes it for EOF. A command that stops reading its
 /// input (`head -1`) disconnecting the pipe is normal; any other failure
 /// means the command saw truncated input and must not pass silently.
+/// Whether a stdin write failed because the reader disconnected — normal
+/// for a command like `head -1` that stops reading.
+fn is_disconnect(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+    )
+}
+
 async fn write_stdin(mut input: Pin<Box<dyn AsyncWrite + Send>>, bytes: Vec<u8>) -> Result<()> {
-    fn is_disconnect(error: &io::Error) -> bool {
-        matches!(
-            error.kind(),
-            io::ErrorKind::BrokenPipe
-                | io::ErrorKind::ConnectionReset
-                | io::ErrorKind::ConnectionAborted
-        )
-    }
     if let Err(error) = input.write_all(&bytes).await {
         if is_disconnect(&error) {
             return Ok(());
         }
         return Err(Error::io("writing exec stdin", error));
+    }
+    if let Err(error) = input.shutdown().await {
+        if is_disconnect(&error) {
+            return Ok(());
+        }
+        return Err(Error::io("closing exec stdin", error));
+    }
+    Ok(())
+}
+
+/// Copies a streamed source into the exec stdin, then closes it for EOF.
+async fn stream_stdin_into(
+    mut input: Pin<Box<dyn AsyncWrite + Send>>,
+    source: StdinSource,
+) -> Result<()> {
+    let Some(mut reader) = source.take() else {
+        let _ = input.shutdown().await;
+        return Ok(());
+    };
+    if let Err(error) = copy(&mut reader, &mut input).await {
+        if is_disconnect(&error) {
+            return Ok(());
+        }
+        return Err(Error::io("streaming exec stdin", error));
     }
     if let Err(error) = input.shutdown().await {
         if is_disconnect(&error) {
@@ -207,15 +234,25 @@ impl DockerExec {
     /// group, waits [`TERM_GRACE_SECONDS`] for a graceful exit, then
     /// SIGKILLs. Control files are cleared before the command starts
     /// and removed on exit.
-    fn wrapped(user_command: &str, stop_file: &str, pid_file: &str, forward_stdin: bool) -> String {
+    fn wrapped(
+        user_command: &str,
+        stop_file: &str,
+        pid_file: &str,
+        forward_stdin: bool,
+        grace_seconds: u64,
+    ) -> String {
         let quoted_cmd = shell_quote(user_command);
         let stop_file = shell_quote(stop_file);
         let pid_file = shell_quote(pid_file);
+        let grace = grace_seconds.to_string();
         let (save_stdin, stdin_redirect, close_stdin) = if forward_stdin {
             ("exec 3<&0\n", "<&3", "exec 3<&-\n")
         } else {
             ("", "< /dev/null", "")
         };
+        // The stop file is empty for a polite cancel and holds `kill` for an
+        // immediate SIGKILL. The watcher reads it to pick the ladder: TERM,
+        // grace, KILL for a cancel; straight to KILL for a kill.
         format!(
             "mkdir -p /tmp/.sandbox-driver\n\
              if ! command -v setsid >/dev/null 2>&1; then\n\
@@ -226,15 +263,20 @@ impl DockerExec {
              pid_file={pid_file}\n\
              {save_stdin}rm -f \"$pid_file\"\n\
              if [ -e \"$stop_file\" ]; then\n\
+               mode=$(cat \"$stop_file\" 2>/dev/null)\n\
                rm -f \"$stop_file\"\n\
+               if [ \"$mode\" = kill ]; then exit 137; fi\n\
                exit 143\n\
              fi\n\
              (\n\
                while [ ! -e \"$stop_file\" ]; do sleep {STOP_POLL_SLEEP_SECONDS}; done\n\
                while [ ! -s \"$pid_file\" ]; do sleep {STOP_POLL_SLEEP_SECONDS}; done\n\
                child=$(cat \"$pid_file\")\n\
-               kill -TERM \"-$child\" 2>/dev/null || kill -TERM \"$child\" 2>/dev/null || true\n\
-               sleep {TERM_GRACE_SECONDS}\n\
+               mode=$(cat \"$stop_file\" 2>/dev/null)\n\
+               if [ \"$mode\" != kill ]; then\n\
+                 kill -TERM \"-$child\" 2>/dev/null || kill -TERM \"$child\" 2>/dev/null || true\n\
+                 sleep {grace}\n\
+               fi\n\
                kill -KILL \"-$child\" 2>/dev/null || kill -KILL \"$child\" 2>/dev/null || true\n\
              ) & watcher=$!\n\
              setsid {CONTAINER_BASH} -c {quoted_cmd} {stdin_redirect} &\n\
@@ -257,8 +299,18 @@ impl DockerExec {
     /// `BASH_ENV`, and reports failure: a stop that could not be
     /// requested must never masquerade as a kill.
     async fn request_stop(&self, stop_file: &str) -> Result<()> {
+        self.write_stop(stop_file, "").await
+    }
+
+    /// Requests an immediate SIGKILL by writing `kill` into the stop file.
+    async fn request_kill(&self, stop_file: &str) -> Result<()> {
+        self.write_stop(stop_file, "kill").await
+    }
+
+    async fn write_stop(&self, stop_file: &str, mode: &str) -> Result<()> {
         let command = format!(
-            "mkdir -p /tmp/.sandbox-driver && : > {}",
+            "mkdir -p /tmp/.sandbox-driver && printf '%s' {} > {}",
+            shell_quote(mode),
             shell_quote(stop_file)
         );
         let options = CreateExecOptions {
@@ -337,8 +389,19 @@ impl Exec for DockerExec {
     ) -> Result<ExecStreamingResult> {
         let started = Instant::now();
         let (stop_file, pid_file) = self.control_paths();
-        let has_stdin = spec.stdin.is_some();
-        let wrapper = Self::wrapped(&spec.command, &stop_file, &pid_file, has_stdin);
+        let grace_seconds = controls.grace.map_or_else(
+            || TERM_GRACE_SECONDS.parse().unwrap_or(2),
+            |d| d.as_secs().max(1),
+        );
+        let stream_stdin = controls.stdin.clone();
+        let has_stdin = spec.stdin.is_some() || stream_stdin.is_some();
+        let wrapper = Self::wrapped(
+            &spec.command,
+            &stop_file,
+            &pid_file,
+            has_stdin,
+            grace_seconds,
+        );
 
         let working_dir = self.resolve_dir(spec.working_dir.as_deref());
         let options = CreateExecOptions {
@@ -367,11 +430,13 @@ impl Exec for DockerExec {
             }));
         };
 
-        let stdin_task = if let Some(bytes) = spec.stdin.clone() {
-            Some(tokio::spawn(write_stdin(input, bytes)))
-        } else {
-            drop(input);
-            None
+        let stdin_task = match (stream_stdin, spec.stdin.clone()) {
+            (Some(source), _) => Some(tokio::spawn(stream_stdin_into(input, source))),
+            (None, Some(bytes)) => Some(tokio::spawn(write_stdin(input, bytes))),
+            (None, None) => {
+                drop(input);
+                None
+            }
         };
 
         let mut stdout_capture = OutputCaptureBuffer::new(controls.retained_output_limit);
@@ -388,6 +453,13 @@ impl Exec for DockerExec {
             let cancel = controls.cancel.clone();
             let cancelled = async {
                 match &cancel {
+                    Some(token) if !kill_fired => token.cancelled().await,
+                    _ => future::pending().await,
+                }
+            };
+            let kill = controls.kill.clone();
+            let killed = async {
+                match &kill {
                     Some(token) if !kill_fired => token.cancelled().await,
                     _ => future::pending().await,
                 }
@@ -461,6 +533,12 @@ impl Exec for DockerExec {
                     drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
                     self.request_stop(&stop_file).await?;
                 }
+                () = killed => {
+                    termination = Termination::Killed;
+                    kill_fired = true;
+                    drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
+                    self.request_kill(&stop_file).await?;
+                }
                 () = timeout => {
                     termination = Termination::TimedOut;
                     kill_fired = true;
@@ -515,7 +593,15 @@ impl Exec for DockerExec {
         let exit_code = self.exit_code(&exec.id).await?;
         let (stdout_bytes, stdout_stats) = stdout_capture.into_parts();
         let (stderr_bytes, stderr_stats) = stderr_capture.into_parts();
+        // The wrapper reports a signalled child as the shell's `128 + N`.
+        // Surface the signal, and for a natural exit leave the code intact
+        // so a step that deliberately exits 137 is not misread.
+        let signal = match (termination, exit_code) {
+            (Termination::Exited, Some(code)) if (129..=192).contains(&code) => Some(code - 128),
+            _ => None,
+        };
         let mut result = ExecResult::new(termination, exit_code, started.elapsed());
+        result.signal = signal;
         result.stdout = stdout_bytes;
         result.stderr = stderr_bytes;
         let mut streaming = ExecStreamingResult::new(result);
@@ -533,7 +619,8 @@ impl Exec for DockerExec {
     )]
     async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
         let (stop_file, pid_file) = self.control_paths();
-        let wrapper = Self::wrapped(&spec.command, &stop_file, &pid_file, true);
+        let grace_seconds = TERM_GRACE_SECONDS.parse().unwrap_or(2);
+        let wrapper = Self::wrapped(&spec.command, &stop_file, &pid_file, true, grace_seconds);
         let working_dir = self.resolve_dir(spec.working_dir.as_deref());
         let options = CreateExecOptions {
             attach_stdin: Some(true),
