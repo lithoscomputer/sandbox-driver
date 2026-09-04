@@ -7,19 +7,32 @@
 //! network, so [`sweep`] and [`set_running`] find them again from a handle
 //! rebuilt by `attach`, and `create` tears down what it started when any
 //! sidecar fails.
+//!
+//! # Readiness
+//!
+//! A sidecar's `health` check is the caller's statement that the service
+//! must come up and stay up. `create` waits for every sidecar that has one
+//! to report healthy, and fails — naming the sidecar and quoting the tail
+//! of its log — if it turns unhealthy or exits first. A sidecar with no
+//! health check is started and not watched: it may run for the life of
+//! the sandbox or exit at once, and either is fine. That is the shape of a
+//! one-shot job such as a database migration, and it matches GitHub
+//! Actions, where a service container without a health check is started
+//! and never waited on. A service that must be reachable needs a check.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use bollard::Docker;
 use bollard::container::{
-    Config, CreateContainerOptions, ListContainersOptions, NetworkingConfig,
+    Config, CreateContainerOptions, ListContainersOptions, LogsOptions, NetworkingConfig,
     RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use bollard::models::{
     ContainerStateStatusEnum, EndpointSettings, HealthConfig, HealthStatusEnum, HostConfig,
 };
 use bollard::network::CreateNetworkOptions;
+use futures_util::StreamExt;
 use sandbox_driver::{Error, ProviderError, Result};
 use tokio::time;
 
@@ -32,6 +45,12 @@ pub(crate) const NETWORK_LABEL: &str = "sh.sandbox-driver.network";
 const HEALTH_WAIT: Duration = Duration::from_secs(300);
 /// How often to poll a sidecar's health.
 const HEALTH_POLL: Duration = Duration::from_millis(250);
+/// Log lines quoted in a health failure: enough to show why a service
+/// died, bounded so a chatty one cannot bloat the error.
+const FAILURE_LOG_LINES: usize = 10;
+/// Bound on fetching that tail: the failure is what matters, and a slow
+/// daemon must not turn it into a hang.
+const FAILURE_LOG_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One sidecar service, parsed from `provider_config.sidecars`.
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -47,6 +66,9 @@ pub(crate) struct Sidecar {
     pub cap_add:       Vec<String>,
     pub user:          Option<String>,
     pub entrypoint:    Option<Vec<String>>,
+    /// When set, `create` waits for the sidecar to report healthy and
+    /// fails if it exits or turns unhealthy first. When unset, the sidecar
+    /// is started and not watched, so it may exit (see the module docs).
     pub health:        Option<Health>,
     pub registry_auth: Option<RegistryAuth>,
 }
@@ -86,8 +108,8 @@ fn container_name(network: &str, sidecar: &Sidecar) -> String {
 }
 
 /// Creates the network and every sidecar on it, then waits for the ones
-/// with a health check to report healthy. Tears down what it started on
-/// any failure.
+/// with a health check to report healthy; the ones without are left to
+/// run or exit as they will. Tears down what it started on any failure.
 pub(crate) async fn realize(docker: &Docker, network: &str, sidecars: &[Sidecar]) -> Result<()> {
     let mut labels = HashMap::new();
     labels.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
@@ -184,30 +206,56 @@ async fn await_health(docker: &Docker, container: &str) -> Result<()> {
         let state = inspect.state.as_ref();
         let status = state.and_then(|s| s.status);
         let health = state.and_then(|s| s.health.as_ref()).and_then(|h| h.status);
-        match (status, health) {
+        let failure = match (status, health) {
             (_, Some(HealthStatusEnum::HEALTHY)) => return Ok(()),
-            (_, Some(HealthStatusEnum::UNHEALTHY)) => {
-                return Err(Error::Provider(ProviderError::new(
-                    docker_kind(),
-                    format!("sidecar {container} reported unhealthy"),
-                )));
-            }
+            (_, Some(HealthStatusEnum::UNHEALTHY)) => Some("reported unhealthy"),
             (Some(ContainerStateStatusEnum::EXITED | ContainerStateStatusEnum::DEAD), _) => {
-                return Err(Error::Provider(ProviderError::new(
-                    docker_kind(),
-                    format!("sidecar {container} exited before it was healthy"),
-                )));
+                Some("exited before it was healthy")
             }
-            _ => {}
-        }
-        if Instant::now() >= deadline {
-            return Err(Error::Provider(ProviderError::new(
-                docker_kind(),
-                format!("sidecar {container} never reported healthy"),
-            )));
+            _ if Instant::now() >= deadline => Some("never reported healthy"),
+            _ => None,
+        };
+        if let Some(what) = failure {
+            return Err(health_failure(docker, container, what).await);
         }
         time::sleep(HEALTH_POLL).await;
     }
+}
+
+/// The error for a sidecar that failed its health wait: what happened,
+/// then the tail of its log, which is usually the only clue to why.
+async fn health_failure(docker: &Docker, container: &str, what: &str) -> Error {
+    let mut message = format!("sidecar {container} {what}");
+    match log_tail(docker, container).await {
+        Some(tail) if !tail.is_empty() => {
+            message.push_str("; last log lines:\n");
+            message.push_str(&tail);
+        }
+        Some(_) => message.push_str("; the log is empty"),
+        None => message.push_str("; the log could not be read"),
+    }
+    Error::Provider(ProviderError::new(docker_kind(), message))
+}
+
+/// The last [`FAILURE_LOG_LINES`] lines of a container's log, both
+/// streams, or `None` when the daemon could not supply them in time.
+async fn log_tail(docker: &Docker, container: &str) -> Option<String> {
+    let options = LogsOptions {
+        stdout: true,
+        stderr: true,
+        tail: FAILURE_LOG_LINES.to_string(),
+        ..Default::default()
+    };
+    let read = async {
+        let mut stream = docker.logs(container, Some(options));
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk.ok()?.into_bytes());
+        }
+        Some(bytes)
+    };
+    let bytes = time::timeout(FAILURE_LOG_TIMEOUT, read).await.ok()??;
+    Some(String::from_utf8_lossy(&bytes).trim_end().to_owned())
 }
 
 fn network_filter(network: &str) -> ListContainersOptions<String> {
