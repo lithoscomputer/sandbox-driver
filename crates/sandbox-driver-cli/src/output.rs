@@ -26,7 +26,7 @@ const OPTIONAL_CAPABILITIES: &[Capability] = &[
     Capability::LifecycleUpdateNetwork,
     Capability::LifecycleSnapshotSandbox,
     Capability::ExecStdin,
-    Capability::ExecCancel,
+    Capability::ExecStop,
     Capability::ExecStdioProcess,
     Capability::FsUpload,
     Capability::FsDownload,

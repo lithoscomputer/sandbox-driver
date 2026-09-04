@@ -13,7 +13,8 @@ use sandbox_driver::{
     FileMetadata, ForkOptions, LifecycleTimers, LogSource, NetworkPolicy, OutputSanitization,
     PlatformInfo, ProviderKind, PtyOptions, PtySize, Resources, SandboxFilter, SandboxId,
     SandboxKind, SandboxSnapshotOptions, SandboxSource, SandboxSpec, SandboxStatus, SnapshotId,
-    SnapshotMode, SnapshotSource, SnapshotSpec, SpawnSpec, Termination, VncConnection, VolumeMount,
+    SnapshotMode, SnapshotSource, SnapshotSpec, SpawnSpec, StopLevel, Termination, VncConnection,
+    VolumeMount,
 };
 use serde::{Deserialize, Serialize};
 
@@ -49,7 +50,7 @@ pub const SANDBOX_SET_LABELS: &str = "sandbox/set_labels";
 pub const SANDBOX_UPDATE_NETWORK: &str = "sandbox/update_network";
 pub const EXEC_RUN: &str = "exec/run";
 pub const EXEC_STREAM: &str = "exec/stream";
-pub const EXEC_CANCEL: &str = "exec/cancel";
+pub const EXEC_STOP: &str = "exec/stop";
 pub const EXEC_STDIO_OPEN: &str = "exec/stdio_open";
 pub const EXEC_STDIO_INPUT: &str = "exec/stdio_input";
 pub const EXEC_STDIO_CLOSE_INPUT: &str = "exec/stdio_close_input";
@@ -499,7 +500,7 @@ impl ExecResultDto {
 pub struct ExecStreamParams {
     pub sandbox_id:            String,
     /// Client-generated, routes `exec/output` notifications and
-    /// `exec/cancel` before the response arrives.
+    /// `exec/stop` before the response arrives.
     pub exec_id:               String,
     pub spec:                  ExecSpecDto,
     pub retained_output_limit: Option<usize>,
@@ -522,8 +523,10 @@ pub struct ExecOutputNotification {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ExecCancelParams {
+pub struct ExecStopParams {
     pub exec_id: String,
+    /// `term` or `kill`.
+    pub level:   StopLevel,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

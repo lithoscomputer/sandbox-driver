@@ -36,6 +36,7 @@ use crate::output::{
 const DRIVER_ERROR_EXIT: u8 = 125;
 const TIMEOUT_EXIT: u8 = 124;
 const CANCELLED_EXIT: u8 = 130;
+const KILLED_EXIT: u8 = 137;
 
 pub(crate) async fn list_providers(
     config: &Config,
@@ -576,26 +577,36 @@ async fn execute_command(
         spec.stdin = Some(bytes);
     }
 
-    let cancel = sandbox
+    // Ctrl-C is the caller's own ladder: the first sends TERM, a second
+    // sends KILL. There is no automatic escalation.
+    let stops = sandbox
         .capabilities()
         .exec
-        .cancel
-        .then(CancellationToken::new);
+        .stop
+        .then(|| (CancellationToken::new(), CancellationToken::new()));
     let controls = ExecControls {
-        cancel: cancel.clone(),
+        term: stops.as_ref().map(|(term, _)| term.clone()),
+        kill: stops.as_ref().map(|(_, kill)| kill.clone()),
         sink: Some(command_output_sink()),
         retained_output_limit: Some(0),
         ..ExecControls::default()
     };
     let execution = sandbox.exec().run_streaming(&spec, controls);
     tokio::pin!(execution);
-    let streaming = if let Some(cancel) = cancel {
+    let streaming = if let Some((term, kill)) = stops {
         tokio::select! {
             result = &mut execution => result?,
             signal = ctrl_c() => {
                 signal.context("listening for Ctrl-C")?;
-                cancel.cancel();
-                execution.await?
+                term.cancel();
+                tokio::select! {
+                    result = &mut execution => result?,
+                    signal = ctrl_c() => {
+                        signal.context("listening for Ctrl-C")?;
+                        kill.cancel();
+                        execution.await?
+                    }
+                }
             }
         }
     } else {
@@ -639,6 +650,7 @@ async fn termination_exit_code(termination: Termination, exit_code: Option<i32>)
             Ok(TIMEOUT_EXIT)
         }
         Termination::Cancelled => Ok(CANCELLED_EXIT),
+        Termination::Killed => Ok(KILLED_EXIT),
         _ => Ok(DRIVER_ERROR_EXIT),
     }
 }

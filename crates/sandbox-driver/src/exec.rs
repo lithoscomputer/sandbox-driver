@@ -49,26 +49,36 @@ pub trait Exec: Send + Sync {
     /// execution, replay the output through the sink, and report
     /// `live_streaming: false`.
     ///
-    /// Control contracts: cancellation resolves the call normally with
-    /// [`Termination::Cancelled`] after a best-effort process-group kill.
+    /// Control contracts: the two stop tokens are raw signals, not a
+    /// policy. `controls.term` sends SIGTERM to the command's process
+    /// group once and then waits; a command that ignores it keeps running
+    /// until `controls.kill` sends SIGKILL. A stop resolves the call
+    /// normally, with [`Termination::Cancelled`] for `term` and
+    /// [`Termination::Killed`] for `kill` (`Killed` wins when both fired).
+    /// A caller who wants an escalation ladder owns it: fire `term`, wait
+    /// as long as it likes, fire `kill`. A provider that cannot deliver a
+    /// signal (Daytona ends a command by deleting its session) ends the
+    /// command on either token and reports the one it honoured.
+    ///
+    /// The provider's own stops have no caller present to escalate, so
+    /// they are hard: `spec.timeout` and a failing sink SIGKILL the
+    /// command, resolving with [`Termination::TimedOut`] and
+    /// [`Termination::Cancelled`]. A caller who wants a graceful deadline
+    /// runs its own timer over `term` and `kill`.
+    ///
     /// The sink is awaited per chunk — a slow consumer backpressures the
     /// read loop. Output beyond `controls.retained_output_limit` is still
     /// drained (and counted in [`CaptureStats::omitted_bytes`]), never left
-    /// to block the process. A sink error cancels the execution.
-    ///
-    /// `controls.kill` ends the command with [`Termination::Killed`] and no
-    /// grace; `controls.grace` sets the cancel ladder's SIGTERM-to-SIGKILL
-    /// wait. A provider that cannot separate the two treats `kill` as
-    /// `cancel` and ignores `grace`. `controls.stdin` streams standard
-    /// input for the life of the command; it is capability-gated on
+    /// to block the process. `controls.stdin` streams standard input for
+    /// the life of the command; it is capability-gated on
     /// `exec.stdin_stream` and rejected with [`Error::Unsupported`] where
     /// undeclared.
     ///
-    /// A provider that does not support stdin or cancellation must reject
-    /// a call that supplies them with [`Error::Unsupported`]
-    /// (`exec.stdin` / `exec.cancel`) — never run the command with the
-    /// input silently dropped. Capability preflight is the supported way
-    /// to avoid the error.
+    /// A provider that does not support stdin or stops must reject a call
+    /// that supplies them with [`Error::Unsupported`] (`exec.stdin` /
+    /// `exec.stop`) — never run the command with the input silently
+    /// dropped. Capability preflight is the supported way to avoid the
+    /// error.
     async fn run_streaming(
         &self,
         spec: &ExecSpec,
@@ -234,20 +244,16 @@ pub type OutputSink = Arc<
 /// Process-local controls for [`Exec::run_streaming`]. Never serialized;
 /// on the wire these map to negotiated execution IDs.
 ///
-/// Two stop levels: `cancel` is the polite ladder (SIGTERM to the process
-/// group, `grace`, then SIGKILL) and resolves with
-/// [`Termination::Cancelled`]; `kill` skips the grace and SIGKILLs the
-/// group at once, resolving with [`Termination::Killed`]. A provider that
-/// cannot distinguish the two treats `kill` as `cancel`. `grace` overrides
-/// the provider's default (two seconds); a provider that cannot honor a
-/// grace ignores it.
+/// Two stop signals and no policy: `term` SIGTERMs the process group once
+/// and resolves with [`Termination::Cancelled`] when the command then
+/// ends; `kill` SIGKILLs the group and resolves with
+/// [`Termination::Killed`]. Escalation between them is the caller's.
 #[derive(Clone, Default)]
 pub struct ExecControls {
-    pub cancel:                Option<CancellationToken>,
-    /// Immediate SIGKILL of the process group, no grace.
+    /// SIGTERM to the process group, once. Nothing more follows.
+    pub term:                  Option<CancellationToken>,
+    /// SIGKILL to the process group.
     pub kill:                  Option<CancellationToken>,
-    /// How long the cancel ladder waits between SIGTERM and SIGKILL.
-    pub grace:                 Option<Duration>,
     /// Streamed standard input, written to the process as it becomes
     /// readable and closed at its EOF. Mutually exclusive with
     /// [`ExecSpec::stdin`]; capability-gated on `exec.stdin_stream`.
@@ -276,13 +282,34 @@ impl ExecControls {
         }
     }
 
-    /// Resolves when either stop token fires — the one-level view for a
-    /// provider that treats `kill` as `cancel`. Never resolves when
+    /// Resolves with the level of the first stop token to fire — the
+    /// one-level view for a provider that cannot deliver a signal and
+    /// ends the command the same way for either. Never resolves when
     /// neither token is set.
-    pub async fn stop_requested(&self) {
+    pub async fn stop_requested(&self) -> StopLevel {
         tokio::select! {
-            () = stop_signal(self.cancel.as_ref()) => {}
-            () = stop_signal(self.kill.as_ref()) => {}
+            () = stop_signal(self.term.as_ref()) => StopLevel::Term,
+            () = stop_signal(self.kill.as_ref()) => StopLevel::Kill,
+        }
+    }
+}
+
+/// Which stop token fired.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopLevel {
+    /// [`ExecControls::term`].
+    Term,
+    /// [`ExecControls::kill`].
+    Kill,
+}
+
+impl StopLevel {
+    /// The termination a provider reports for a command this stop ended.
+    pub fn termination(self) -> Termination {
+        match self {
+            Self::Term => Termination::Cancelled,
+            Self::Kill => Termination::Killed,
         }
     }
 }
@@ -290,9 +317,8 @@ impl ExecControls {
 impl fmt::Debug for ExecControls {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExecControls")
-            .field("cancel", &self.cancel.is_some())
+            .field("term", &self.term.is_some())
             .field("kill", &self.kill.is_some())
-            .field("grace", &self.grace)
             .field("stdin", &self.stdin.is_some())
             .field("sink", &self.sink.is_some())
             .field("retained_output_limit", &self.retained_output_limit)
@@ -382,8 +408,9 @@ impl fmt::Debug for StdinSource {
 #[non_exhaustive]
 pub enum Termination {
     Exited,
+    /// Ended by the provider at `spec.timeout`.
     TimedOut,
-    /// Ended by [`ExecControls::cancel`] (or a failing sink).
+    /// Ended by [`ExecControls::term`] (or a failing sink).
     Cancelled,
     /// Ended by [`ExecControls::kill`].
     Killed,
@@ -405,7 +432,7 @@ pub struct ExecResult {
     /// [`ExecResult::success`], which checks the termination.
     pub exit_code:   Option<i32>,
     /// The signal that ended the command's process, when the provider
-    /// observed one — a foreign `kill`, or the provider's own cancel
+    /// observed one — a foreign `kill`, or the caller's own stop
     /// ladder — whatever the `termination`. `None` when the process
     /// exited on its own or the provider cannot tell; a provider that only
     /// sees a shell's `128 + N` convention decodes it with

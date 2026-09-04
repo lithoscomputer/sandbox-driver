@@ -196,7 +196,7 @@ async fn events_cross_the_wire_before_operations_return() {
 }
 
 #[tokio::test]
-async fn streaming_exec_delivers_output_notifications_and_cancels() {
+async fn streaming_exec_delivers_output_notifications_and_stops() {
     let provider = connect().await;
     let sandbox = provider.create(&host_spec(), None).await.expect("create");
 
@@ -228,15 +228,15 @@ async fn streaming_exec_delivers_output_notifications_and_cancels() {
         .collect();
     assert_eq!(stdout, b"one\n");
 
-    // Cancellation crosses as exec/cancel.
+    // A term crosses as exec/stop with its level.
     let token = CancellationToken::new();
-    let cancel_after = token.clone();
+    let term_after = token.clone();
     tokio::spawn(async move {
         time::sleep(Duration::from_millis(200)).await;
-        cancel_after.cancel();
+        term_after.cancel();
     });
     let controls = ExecControls {
-        cancel: Some(token),
+        term: Some(token),
         ..ExecControls::default()
     };
     let started = Instant::now();

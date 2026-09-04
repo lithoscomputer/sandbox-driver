@@ -29,9 +29,10 @@ const BASH_ENV_VAR: &str = "BASH_ENV";
 /// backgrounded grandchild holding the pipes cannot stall the call.
 const DRAIN_GRACE: Duration = Duration::from_secs(10);
 
-/// Grace between SIGTERM and SIGKILL so processes can run traps, flush
-/// output, and release locks (a killed `git` leaves `.git/index.lock`
-/// behind otherwise).
+/// Grace between SIGTERM and SIGKILL when a stdio process is terminated
+/// through its handle, so it can run traps, flush output, and release
+/// locks (a killed `git` leaves `.git/index.lock` behind otherwise). The
+/// exec path has no ladder of its own: its caller escalates.
 const TERM_GRACE: Duration = Duration::from_secs(2);
 
 /// Inherited variables always kept, even when their name matches a
@@ -172,7 +173,8 @@ fn signal_process_group(child: &Child, signal: Signal) {
 }
 
 /// Sends SIGTERM to the process group, waits `grace` for a graceful exit,
-/// then SIGKILLs the group and the child directly.
+/// then SIGKILLs the group and the child directly: the stdio handle's
+/// `terminate`.
 ///
 /// The direct kill is the guarantee: a command that moved itself out of
 /// its process group makes the group signals miss entirely (killpg on
@@ -186,18 +188,24 @@ async fn terminate_process_group(child: &mut Child, grace: Duration) {
         if time::timeout(grace, child.wait()).await.is_ok() {
             return;
         }
-        signal_process_group(child, Signal::SIGKILL);
-        let _ = child.kill().await;
     }
     #[cfg(not(unix))]
-    {
-        let _ = grace;
-        let _ = child.kill().await;
-    }
+    let _ = grace;
+    kill_process_group(child).await;
 }
 
-/// SIGKILLs the process group and the child directly, with no grace: the
-/// [`ExecControls::kill`] path.
+/// SIGTERMs the process group, once, and returns: the
+/// [`ExecControls::term`] path. Whether the command ends is the
+/// command's business; the caller escalates to `kill` if it must.
+fn term_process_group(child: &Child) {
+    #[cfg(unix)]
+    signal_process_group(child, Signal::SIGTERM);
+    #[cfg(not(unix))]
+    let _ = child;
+}
+
+/// SIGKILLs the process group and the child directly: the
+/// [`ExecControls::kill`] path, the timeout, and a failing sink.
 async fn kill_process_group(child: &mut Child) {
     #[cfg(unix)]
     signal_process_group(child, Signal::SIGKILL);
@@ -275,7 +283,6 @@ impl Exec for HostExec {
         controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
         let started = Instant::now();
-        let grace = controls.grace.unwrap_or(TERM_GRACE);
         let stdin_reader = controls.stdin_reader(spec);
         let mut command = self.command(
             &spec.program,
@@ -309,12 +316,14 @@ impl Exec for HostExec {
         let mut stderr_capture = OutputCaptureBuffer::new(controls.retained_output_limit);
         let sink = controls.sink.as_ref();
 
-        // The process, the cancel token, and the timeout race until the
+        // The process, the stop tokens, and the timeout race until the
         // process ends; the pumps run alongside without gating any of
         // them, so a command that closes its own stdout/stderr (a
-        // daemonizing child) is still bounded by the timeout. Remaining
-        // output is drained after the process ends, bounded by
-        // `DRAIN_GRACE`.
+        // daemonizing child) is still bounded by the timeout. A `term`
+        // signals and keeps waiting — the command may exit, or the
+        // caller's `kill` may follow — so it records the termination
+        // rather than ending the race. Remaining output is drained after
+        // the process ends, bounded by `DRAIN_GRACE`.
         let mut read_error: Option<io::Error> = None;
         let mut drain_truncated = false;
         let (termination, status) = {
@@ -338,8 +347,9 @@ impl Exec for HostExec {
             });
             let mut pumps_done = false;
 
-            let mut cancelled = pin!(stop_signal(controls.cancel.as_ref()));
+            let mut termed = pin!(stop_signal(controls.term.as_ref()));
             let mut killed = pin!(stop_signal(controls.kill.as_ref()));
+            let mut term_fired = false;
 
             let mut timeout = pin!(async {
                 match spec.timeout {
@@ -360,7 +370,7 @@ impl Exec for HostExec {
                             }
                         }
                         if sink_error || read_error.is_some() {
-                            terminate_process_group(&mut child, grace).await;
+                            kill_process_group(&mut child).await;
                             break (Termination::Cancelled, None);
                         }
                     }
@@ -368,18 +378,23 @@ impl Exec for HostExec {
                         let status = wait_result.map_err(|error| {
                             Error::io("waiting for exec process", error)
                         })?;
-                        break (Termination::Exited, Some(status));
+                        let termination = if term_fired {
+                            Termination::Cancelled
+                        } else {
+                            Termination::Exited
+                        };
+                        break (termination, Some(status));
                     }
-                    () = &mut cancelled => {
-                        terminate_process_group(&mut child, grace).await;
-                        break (Termination::Cancelled, None);
+                    () = &mut termed, if !term_fired => {
+                        term_fired = true;
+                        term_process_group(&child);
                     }
                     () = &mut killed => {
                         kill_process_group(&mut child).await;
                         break (Termination::Killed, None);
                     }
                     () = &mut timeout => {
-                        terminate_process_group(&mut child, grace).await;
+                        kill_process_group(&mut child).await;
                         break (Termination::TimedOut, None);
                     }
                 }

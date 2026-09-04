@@ -33,7 +33,7 @@ The normalized public surface and the Daytona implementation include:
 - snapshot get, list, create, build-log streaming, activate, deactivate, and delete;
 - volume create, create-time mount, get, list, and delete;
 - filesystem, search, and Git operations;
-- buffered and streaming execution, finite stdin, cancellation, and bidirectional stdio;
+- buffered and streaming execution, finite stdin, term and kill stops, and bidirectional stdio;
 - separate stdout and stderr for non-PTY execution;
 - concurrent PTY input, output, resize, close, and wait;
 - output modes `Raw`, `StripAnsi`, and `StripAll`;

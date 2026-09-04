@@ -131,11 +131,11 @@ impl Drop for StdinFile {
 ///
 /// A plain run uses the one-shot `execute` endpoint: combined output
 /// after completion (`streams_separated: false`, `live_streaming:
-/// false`, stderr empty) at one API call. A run with a sink or cancel
+/// false`, stderr empty) at one API call. A run with a sink or stop
 /// token uses a command session instead: logs stream live with
-/// server-side stdout/stderr separation, cancellation and timeouts
-/// kill the command by deleting its session, and partial output
-/// survives a timeout via a final log fetch. The toolbox takes a shell
+/// server-side stdout/stderr separation, stops and timeouts kill the
+/// command by deleting its session, and partial output survives a
+/// timeout via a final log fetch. The toolbox takes a shell
 /// string on both transports, so the spec's environment, program, and
 /// arguments are quoted into one `exec env …` word list — the quoting
 /// keeps every word literal, and `env` (not `export`) lets variable names
@@ -214,7 +214,7 @@ impl Exec for DaytonaExec {
             provider_kind = "daytona",
             sandbox_id = %self.sandbox_id,
             has_stdin = spec.stdin.is_some(),
-            live_streaming = controls.sink.is_some() || controls.cancel.is_some() || controls.kill.is_some()
+            live_streaming = controls.sink.is_some() || controls.term.is_some() || controls.kill.is_some()
         ),
         err
     )]
@@ -230,9 +230,9 @@ impl Exec for DaytonaExec {
         // every derived fs/search/git operation — keep the one-shot
         // endpoint; only a sink or stop token needs the session
         // transport. Daytona ends a command by deleting its session,
-        // which is one stop level: a kill token is honored as a cancel,
-        // and the grace is not configurable.
-        if controls.sink.is_some() || controls.cancel.is_some() || controls.kill.is_some() {
+        // which is one stop level: a term and a kill end the command the
+        // same way, and the result reports whichever was asked for.
+        if controls.sink.is_some() || controls.term.is_some() || controls.kill.is_some() {
             return self.run_session(spec, controls).await;
         }
         self.run_buffered(spec, &controls).await
@@ -336,13 +336,13 @@ impl DaytonaExec {
         Ok(streaming)
     }
 
-    /// Streaming/cancellable execution through a command session.
+    /// Streaming/stoppable execution through a command session.
     ///
     /// The command runs asynchronously in a dedicated session; logs
     /// follow live with server-side stream separation; the status poll
-    /// races the timeout and the cancel token; and a non-natural end
+    /// races the timeout and the stop tokens; and a non-natural end
     /// kills the command by deleting the session. Partial output on
-    /// timeout/cancel comes from a final log fetch, deduplicated
+    /// timeout/stop comes from a final log fetch, deduplicated
     /// against what the stream already delivered.
     async fn run_session(
         &self,

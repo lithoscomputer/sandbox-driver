@@ -26,8 +26,8 @@ use tokio::time;
 pub(crate) const POSIX_SH: &str = "/bin/sh";
 /// `$0` of the wrapper shell, so the user's argv starts at `$1`.
 const WRAPPER_NAME: &str = "sandbox-driver";
-/// Grace period for draining output after a stop request. Must exceed
-/// the watcher's poll interval plus [`TERM_GRACE`].
+/// Grace period for draining output after a kill request. Must exceed
+/// the watcher's poll interval.
 const KILL_DRAIN_GRACE: Duration = Duration::from_secs(10);
 /// Bound on retrying transient `inspect_exec` failures in stdio `wait`
 /// before giving up with `Termination::Unknown`: an end that was never
@@ -36,30 +36,28 @@ const KILL_DRAIN_GRACE: Duration = Duration::from_secs(10);
 const WAIT_INSPECT_RETRY: Duration = Duration::from_secs(10);
 /// The in-container watcher's poll interval for the stop file.
 const STOP_POLL_SLEEP_SECONDS: &str = "0.1";
-/// Default grace between the watcher's SIGTERM and SIGKILL so processes
-/// can run traps, flush output, and release locks. The wrapper's `wait`
-/// returns as soon as the process exits, so a generous grace costs
-/// nothing on the normal path.
+/// Grace between a stdio handle's `terminate` SIGTERM and its SIGKILL,
+/// so the process can run traps, flush output, and release locks. The
+/// exec path has no ladder of its own: its caller escalates.
 const TERM_GRACE: Duration = Duration::from_secs(2);
 
-/// How the in-container watcher should end a command. Rendered into the
-/// stop file, which the wrapper's watcher reads to pick its ladder.
+/// The signal the in-container watcher sends the command's process
+/// group. Rendered into the stop file the watcher polls; a `kill`
+/// written after a `term` is honoured — the watcher keeps reading.
 #[derive(Clone, Copy, Debug)]
 enum StopMode {
-    /// SIGTERM the process group, wait the grace, then SIGKILL.
-    Term(Duration),
-    /// SIGKILL the process group at once.
+    /// SIGTERM the process group, once.
+    Term,
+    /// SIGKILL the process group.
     Kill,
 }
 
 impl StopMode {
-    /// The stop file's contents: `kill`, or `term <seconds>` with the
-    /// grace rounded to whole seconds (at least one) for the shell's
-    /// `sleep`.
-    fn render(self) -> String {
+    /// The stop file's contents.
+    fn render(self) -> &'static str {
         match self {
-            Self::Term(grace) => format!("term {}", grace.as_secs().max(1)),
-            Self::Kill => "kill".to_owned(),
+            Self::Term => "term",
+            Self::Kill => "kill",
         }
     }
 }
@@ -239,28 +237,27 @@ impl DockerExec {
     /// An in-container watcher polls for the stop file, so a stop that
     /// lands before the pid file exists — or before the command starts
     /// at all — still takes effect. The stop file carries a rendered
-    /// [`StopMode`]: for `term <grace>` the watcher SIGTERMs the process
-    /// group, waits the grace, then SIGKILLs; for `kill` it SIGKILLs at
-    /// once. Control files are cleared before the command starts and
-    /// removed on exit. The `wait` runs with stderr closed: dash reports a
-    /// signalled background job as `Terminated` on stderr, which would
-    /// otherwise land in the command's output.
+    /// [`StopMode`]: for `term` the watcher SIGTERMs the process group
+    /// once and keeps watching, so a later `kill` still lands; for
+    /// `kill` it SIGKILLs. There is no escalation in here: the caller
+    /// owns that. Control files are cleared before the command starts
+    /// and removed on exit. The `wait` runs with stderr closed: dash
+    /// reports a signalled background job as `Terminated` on stderr,
+    /// which would otherwise land in the command's output.
     fn wrapped(stop_file: &str, pid_file: &str, forward_stdin: bool) -> String {
         let stop_file = shell_quote(stop_file);
         let pid_file = shell_quote(pid_file);
-        let default_grace = TERM_GRACE.as_secs();
         let (save_stdin, stdin_redirect, close_stdin) = if forward_stdin {
             ("exec 3<&0\n", "<&3", "exec 3<&-\n")
         } else {
             ("", "< /dev/null", "")
         };
         // The watcher waits for a non-empty stop file so it never reads
-        // the mode mid-write; a missing grace falls back to the default.
-        // It runs with its own output on /dev/null and waits out the grace
-        // in poll ticks that end when the child is gone or the stop file
-        // turns to `kill`: a watcher that inherited the exec pipes and slept
-        // the whole grace would hold the stream open for that long after the
-        // command had already died, and a kill after a term could not land.
+        // the mode mid-write. It runs with its own output on /dev/null —
+        // a watcher that inherited the exec pipes would hold the stream
+        // open after the command had died — and after a `term` it keeps
+        // polling the file, in ticks that end when the child is gone,
+        // for a `kill` to follow.
         format!(
             "mkdir -p /tmp/.sandbox-driver\n\
              if ! command -v setsid >/dev/null 2>&1 || ! command -v env >/dev/null 2>&1; then\n\
@@ -282,15 +279,12 @@ impl DockerExec {
                child=$(cat \"$pid_file\")\n\
                mode=$(cat \"$stop_file\" 2>/dev/null)\n\
                if [ \"$mode\" != kill ]; then\n\
-                 grace=${{mode#term }}\n\
-                 [ -n \"$grace\" ] || grace={default_grace}\n\
                  kill -TERM \"-$child\" 2>/dev/null || kill -TERM \"$child\" 2>/dev/null || true\n\
-                 ticks=$((grace * 10))\n\
-                 while [ \"$ticks\" -gt 0 ] && kill -0 \"$child\" 2>/dev/null; do\n\
+                 while kill -0 \"$child\" 2>/dev/null; do\n\
                    [ \"$(cat \"$stop_file\" 2>/dev/null)\" = kill ] && break\n\
                    sleep {STOP_POLL_SLEEP_SECONDS}\n\
-                   ticks=$((ticks - 1))\n\
                  done\n\
+                 kill -0 \"$child\" 2>/dev/null || exit 0\n\
                fi\n\
                kill -KILL \"-$child\" 2>/dev/null || kill -KILL \"$child\" 2>/dev/null || true\n\
              ) >/dev/null 2>&1 & watcher=$!\n\
@@ -316,7 +310,7 @@ impl DockerExec {
     async fn request_stop(&self, stop_file: &str, mode: StopMode) -> Result<()> {
         let command = format!(
             "mkdir -p /tmp/.sandbox-driver && printf '%s' {} > {}",
-            shell_quote(&mode.render()),
+            shell_quote(mode.render()),
             shell_quote(stop_file)
         );
         let options = CreateExecOptions {
@@ -395,7 +389,6 @@ impl Exec for DockerExec {
     ) -> Result<ExecStreamingResult> {
         let started = Instant::now();
         let (stop_file, pid_file) = self.control_paths();
-        let term = StopMode::Term(controls.grace.unwrap_or(TERM_GRACE));
         let stdin_reader = controls.stdin_reader(spec);
         let wrapper = Self::wrapped(&stop_file, &pid_file, stdin_reader.is_some());
 
@@ -441,15 +434,16 @@ impl Exec for DockerExec {
         let sink: Option<&OutputSink> = controls.sink.as_ref();
 
         let mut termination = Termination::Exited;
-        // `kill_fired`: some stop was requested (no further cancel/timeout).
-        // `killed_fired`: the immediate kill was requested; a kill may follow
-        // a term — the watcher re-reads the stop file mid-grace and skips to
-        // SIGKILL — but never twice.
+        // `term_fired`: the caller's SIGTERM was requested; the command may
+        // still exit on its own or be killed afterwards. `kill_fired`: a
+        // SIGKILL was requested — by the caller, the timeout, or a failing
+        // sink — after which the stream is drained on a deadline and no
+        // further stop is sent.
+        let mut term_fired = false;
         let mut kill_fired = false;
-        let mut killed_fired = false;
         let mut drain_deadline: Option<Instant> = None;
         let mut stream_error: Option<DockerApiError> = None;
-        let mut cancelled = pin!(stop_signal(controls.cancel.as_ref()));
+        let mut termed = pin!(stop_signal(controls.term.as_ref()));
         let mut killed = pin!(stop_signal(controls.kill.as_ref()));
         loop {
             let timeout = async {
@@ -492,7 +486,7 @@ impl Exec for DockerExec {
                                     termination = Termination::Cancelled;
                                     kill_fired = true;
                                     drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                                    self.request_stop(&stop_file, term).await?;
+                                    self.request_stop(&stop_file, StopMode::Kill).await?;
                                 }
                             }
                         }
@@ -508,23 +502,23 @@ impl Exec for DockerExec {
                                     termination = Termination::Cancelled;
                                     kill_fired = true;
                                     drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                                    self.request_stop(&stop_file, term).await?;
+                                    self.request_stop(&stop_file, StopMode::Kill).await?;
                                 }
                             }
                         }
                     }
                     Some(Ok(_)) => {}
                 },
-                () = &mut cancelled, if !kill_fired => {
+                () = &mut termed, if !term_fired && !kill_fired => {
+                    // The stream stays open: the command decides whether
+                    // TERM ends it, and the caller decides whether to kill.
                     termination = Termination::Cancelled;
-                    kill_fired = true;
-                    drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                    self.request_stop(&stop_file, term).await?;
+                    term_fired = true;
+                    self.request_stop(&stop_file, StopMode::Term).await?;
                 }
-                () = &mut killed, if !killed_fired => {
+                () = &mut killed, if !kill_fired => {
                     termination = Termination::Killed;
                     kill_fired = true;
-                    killed_fired = true;
                     drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
                     self.request_stop(&stop_file, StopMode::Kill).await?;
                 }
@@ -532,7 +526,7 @@ impl Exec for DockerExec {
                     termination = Termination::TimedOut;
                     kill_fired = true;
                     drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                    self.request_stop(&stop_file, term).await?;
+                    self.request_stop(&stop_file, StopMode::Kill).await?;
                 }
                 () = drain_timeout => break,
             }
@@ -742,12 +736,29 @@ impl StdioProcessHandle for DockerStdioHandle {
         }
         // The trait offers no error channel; awaiting at least keeps
         // the request ordered before any caller-side cleanup.
+        // TERM, then KILL after the grace: the handle's own ladder, since
+        // the trait has one verb. The watcher keeps reading the stop file
+        // after a term, so the kill lands on a process that ignored it.
         if let Err(error) = self
             .exec
-            .request_stop(&self.stop_file, StopMode::Term(TERM_GRACE))
+            .request_stop(&self.stop_file, StopMode::Term)
             .await
         {
             tracing::warn!(error = %error, "stdio stop request failed");
+            return;
+        }
+        time::sleep(TERM_GRACE).await;
+        if let Ok(inspect) = self.exec.docker.inspect_exec(&self.exec_id).await {
+            if inspect.running != Some(true) {
+                return;
+            }
+        }
+        if let Err(error) = self
+            .exec
+            .request_stop(&self.stop_file, StopMode::Kill)
+            .await
+        {
+            tracing::warn!(error = %error, "stdio kill request failed");
         }
     }
 

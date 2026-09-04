@@ -118,7 +118,7 @@ for the connection. Per-sandbox capability sets travel in every
                  "timers":false,"labels":false,"update_network":false,
                  "snapshot_sandbox":false},
   "exec": {"live_streaming":false,"streams_separated":false,"stdin":false,
-            "cancel":false,"stdio_process":false,
+            "stop":false,"stdio_process":false,
             "stdin_stream":false,"environment":false},
   "fs": {"native":false,"upload":false,"download":false,"permissions":false},
   "search": {"supported":false,"native":false},
@@ -407,7 +407,7 @@ PTY and bidirectional stdio traffic always remains raw.
 | --- | --- | --- |
 | `exec/run` | `{sandbox_id, spec}` | ExecResult (below) |
 | `exec/stream` | `{sandbox_id, exec_id, spec, retained_output_limit}` | ExecStreamResult (§9) |
-| `exec/cancel` | `{exec_id}` | `{}` |
+| `exec/stop` | `{exec_id, level}` | `{}` |
 | `exec/stdio_open` | `{sandbox_id, process_id, spec}` | `{}` |
 | `exec/stdio_input` | `{process_id, data_b64}` | `{}` |
 | `exec/stdio_close_input` | `{process_id}` | `{}` |
@@ -433,9 +433,9 @@ ExecResult:
 plugin observed one — on any termination, a foreign `kill` or the
 plugin's own stop ladder alike — else absent or `null`; receivers
 tolerate its absence. `termination` ∈ `exited timed_out cancelled killed unknown`. A timeout
-
-or cancellation resolves the call **normally** with the corresponding
-termination — it is not an error. `stdin_b64`, when present, is written
+or a stop resolves the call **normally** with the corresponding
+termination — it is not an error. `cancelled` means the host's `term`
+(or a failing sink) ended the command; `killed` means its `kill` did. `stdin_b64`, when present, is written
 to the process then closed for EOF; a broken pipe while writing is not
 an error.
 
@@ -560,9 +560,11 @@ host → {"id":7,"method":"exec/stream","params":{"sandbox_id":"sb-1","exec_id":
          "spec":{"program":"cargo","args":["build"],"timeout_ms":null,…},"retained_output_limit":65536}}
 plugin → {"method":"exec/output","params":{"exec_id":"x1","stream":"stdout","data_b64":"…"}}
 plugin → {"method":"exec/output","params":{"exec_id":"x1","stream":"stderr","data_b64":"…"}}
-host → {"id":8,"method":"exec/cancel","params":{"exec_id":"x1"}}          (optional)
+host → {"id":8,"method":"exec/stop","params":{"exec_id":"x1","level":"term"}}  (optional)
 plugin → {"id":8,"result":{}}
-plugin → {"id":7,"result":{"result":{…,"termination":"cancelled"},
+host → {"id":9,"method":"exec/stop","params":{"exec_id":"x1","level":"kill"}}  (optional)
+plugin → {"id":9,"result":{}}
+plugin → {"id":7,"result":{"result":{…,"termination":"killed"},
            "streams_separated":true,"live_streaming":true,
            "stdout_capture":{"observed_bytes":…,"retained_bytes":…,"omitted_bytes":…,
                              "truncated":false},
@@ -572,8 +574,15 @@ plugin → {"id":7,"result":{"result":{…,"termination":"cancelled"},
 Rules:
 
 - `exec_id` is **host-generated** and unique per connection, so output
-  can be routed and cancellation addressed before the `exec/stream`
-  response exists.
+  can be routed and a stop addressed before the `exec/stream` response
+  exists.
+- **Stops are signals, not a policy.** `level: "term"` sends SIGTERM to
+  the command's process group once; the command keeps running until it
+  exits or a `level: "kill"` sends SIGKILL. The host owns any escalation
+  between the two. A plugin whose backend cannot deliver a signal ends
+  the command on either level and reports the termination for the level
+  it received. The plugin's own stops — `timeout_ms` elapsing, a failing
+  output notification — have no host present to escalate, so they kill.
 - Every `exec/output` for an exec must be sent **before** its
   `exec/stream` response, in the order the output was observed.
   `stream` ∈ `stdout stderr`.
@@ -598,7 +607,7 @@ Rules:
   any response beyond transient, bounded queuing. The conformance
   suite's `concurrent_streams_do_not_starve_each_other` check is the
   acceptance test.
-- `exec/cancel` for an unknown or finished `exec_id` succeeds and does
+- `exec/stop` for an unknown or finished `exec_id` succeeds and does
   nothing.
 
 ## 10. Events
@@ -709,7 +718,7 @@ A plugin is conformant when the `sandbox-driver-conformance` suite
 passes against it through `PluginProvider` — the same battery every
 in-process provider must pass, covering lifecycle, the bash probe,
 exec semantics (literal argv, exit codes, env, binary safety, stdin,
-timeout, cancellation), streaming honesty and isolation, retention accounting,
+timeout, term and kill), streaming honesty and isolation, retention accounting,
 filesystem round trips, capability honesty in both directions, label
 listing, event delivery, and service/facet-capability consistency.
 

@@ -44,8 +44,8 @@ pub enum Capability {
     LifecycleSnapshotSandbox,
     #[serde(rename = "exec.stdin")]
     ExecStdin,
-    #[serde(rename = "exec.cancel")]
-    ExecCancel,
+    #[serde(rename = "exec.stop")]
+    ExecStop,
     #[serde(rename = "exec.stdio_process")]
     ExecStdioProcess,
     #[serde(rename = "exec.stdin_stream")]
@@ -194,7 +194,7 @@ impl Capabilities {
             Capability::LifecycleUpdateNetwork => self.lifecycle.update_network,
             Capability::LifecycleSnapshotSandbox => self.lifecycle.snapshot_sandbox,
             Capability::ExecStdin => self.exec.stdin,
-            Capability::ExecCancel => self.exec.cancel,
+            Capability::ExecStop => self.exec.stop,
             Capability::ExecStdioProcess => self.exec.stdio_process,
             Capability::ExecStdinStream => self.exec.stdin_stream,
             Capability::ExecEnvironment => self.exec.environment,
@@ -278,7 +278,10 @@ pub struct ExecCaps {
     /// Stdout and stderr are genuinely separate streams.
     pub streams_separated: bool,
     pub stdin:             bool,
-    pub cancel:            bool,
+    /// The `term` and `kill` stop tokens on [`crate::ExecControls`].
+    /// Serialized as `stop`; the launch-era name was `cancel`.
+    #[serde(alias = "cancel")]
+    pub stop:              bool,
     /// Long-lived bidirectional stdio processes ([`crate::Exec::spawn_stdio`]).
     pub stdio_process:     bool,
     /// Streamed standard input on [`crate::ExecControls::stdin`].
@@ -510,7 +513,7 @@ mod tests {
                 caps.lifecycle.snapshot_sandbox = true;
             }),
             (Capability::ExecStdin, |caps| caps.exec.stdin = true),
-            (Capability::ExecCancel, |caps| caps.exec.cancel = true),
+            (Capability::ExecStop, |caps| caps.exec.stop = true),
             (Capability::ExecStdioProcess, |caps| {
                 caps.exec.stdio_process = true;
             }),

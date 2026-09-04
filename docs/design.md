@@ -128,7 +128,7 @@ Per-sandbox functionality is grouped into small **facet traits** (per the style 
 
 | Facet | Contents | Host | Docker | Daytona | boxd |
 | --- | --- | --- | --- | --- | --- |
-| `Exec` (core) | Buffered run; streaming run (callback sink, stdin, cancel, timeout); literal argv, Bash as a helper | ✔ | ✔ | ✔ (streams via log-poll fallback) | ✔ |
+| `Exec` (core) | Buffered run; streaming run (callback sink, stdin, term/kill, timeout); literal argv, Bash as a helper | ✔ | ✔ | ✔ (streams via log-poll fallback) | ✔ |
 | `StdioProcess` | Spawn long-lived bidirectional process (ACP backends) | ✔ | ✔ | ✔ (command sessions; UTF-8 payloads only — the ACP case) | ? |
 | `Filesystem` (core) | read/write/delete/exists/stat/list/move/mkdir/permissions, upload/download (binary-safe, chunked) | native | native | native (toolbox FS) | ✔ |
 | `Search` (core, derived) | grep, glob, walk — default impl derived from `Exec` (rg with grep/find fallback); provider may override | derived | derived | derived (native find/replace exists) | derived |
@@ -168,7 +168,7 @@ Two complementary mechanisms, by design:
 pub struct Capabilities {
     pub isolation: Isolation,         // none | container | vm — declared by the provider, never assumed
     pub lifecycle: LifecycleCaps,     // pause, archive, fork, resize, recover, undelete, timers…
-    pub exec: ExecCaps,               // live_streaming, streams_separated, stdin, cancel, stdio_process
+    pub exec: ExecCaps,               // live_streaming, streams_separated, stdin, stop, stdio_process
     pub fs: FsCaps,                   // native, upload, download, permissions
     pub search: SearchCaps,           // supported plus native diagnostic
     pub git: GitCaps,                 // supported plus native/hybrid diagnostic
@@ -304,9 +304,9 @@ This replaced fabro's rule that every command is Bash source. That rule made the
 
 `ExecSpec` is a plain owned serializable value — program, args, timeout, working dir, env vars, optional stdin bytes (write-then-EOF), and output sanitization — and is exactly what crosses the JSON-RPC boundary. `OutputSanitization` has three policies: `Raw` preserves every byte and is the default; `StripAnsi` removes ANSI terminal escape sequences but preserves standalone control characters; `StripAll` also removes standalone C0/C1 control characters except tab, line feed, and carriage return. Providers apply the policy before output reaches the sink, retained result, or capture statistics. Stateful filtering prevents an escape sequence from leaking when it spans streaming chunks. The policies apply only to `run` and `run_streaming`; PTY sessions and long-lived bidirectional stdio remain raw. Non-raw policies are lossy and callers must use `Raw` for binary output.
 
-A relative working dir resolves against the sandbox working directory on every provider — a conformance case pins it. Process-local control objects travel separately in `ExecControls`: the cancellation token, the async output sink, and the retention cap (head+tail with `omitted_bytes` accounting — fabro's `OutputCaptureBuffer` moves here). On the wire, controls map to negotiated IDs — a host-generated `execId` routes `exec/output` notifications and `exec/cancel` — never to serialized fields, and buffered `run` carries no streaming controls at all.
+A relative working dir resolves against the sandbox working directory on every provider — a conformance case pins it. Process-local control objects travel separately in `ExecControls`: the `term` and `kill` stop tokens, the async output sink, and the retention cap (head+tail with `omitted_bytes` accounting — fabro's `OutputCaptureBuffer` moves here). On the wire, controls map to negotiated IDs — a host-generated `execId` routes `exec/output` notifications and `exec/stop` — never to serialized fields, and buffered `run` carries no streaming controls at all.
 
-Control contracts, normative: cancellation resolves the call normally with `termination: Cancelled` after a best-effort process-group kill — SIGTERM to the group, a short grace so traps run and locks release (a killed `git` otherwise leaves `.git/index.lock`), then SIGKILL. A provider that does not support stdin or cancellation rejects a call that supplies them with `Unsupported` (`exec.stdin` / `exec.cancel`) — never runs the command with the input silently dropped. The output sink is awaited per chunk — a slow consumer backpressures the read loop rather than growing an unbounded buffer; output beyond the retention cap is still drained (and counted in `omitted_bytes`), never left to block the process. A sink that returns an error cancels the exec and reports it as such. `ExecResult` keeps `streams_separated` and `live_streaming` honesty flags — Daytona's combined-output and log-polling degradations are *reported*, not hidden.
+Control contracts, normative: **stops are signals, not a policy.** `term` sends SIGTERM to the command's process group once and the call keeps waiting; the command may exit (`termination: Cancelled`) or ignore it until `kill` sends SIGKILL (`termination: Killed`). The escalation ladder — TERM, a grace so traps run and locks release (a killed `git` otherwise leaves `.git/index.lock`), then KILL — belongs to the caller, who knows how long to wait; the library used to run one of its own under a `cancel` token, which made the primary consumer's ladder and the provider's race each other. The provider's own stops (`spec.timeout`, a failing sink) have no caller present to escalate, so they kill. A provider that cannot deliver a signal (Daytona ends a command by deleting its session) ends the command on either token and reports the level it received. A provider that does not support stdin or stops rejects a call that supplies them with `Unsupported` (`exec.stdin` / `exec.stop`) — never runs the command with the input silently dropped. The output sink is awaited per chunk — a slow consumer backpressures the read loop rather than growing an unbounded buffer; output beyond the retention cap is still drained (and counted in `omitted_bytes`), never left to block the process. A sink that returns an error cancels the exec and reports it as such. `ExecResult` keeps `streams_separated` and `live_streaming` honesty flags — Daytona's combined-output and log-polling degradations are *reported*, not hidden.
 
 `StdioProcess` keeps fabro's shape: `AsyncWrite` stdin, `AsyncRead` stdout, bounded stderr tail collector, and a handle with `terminate()`/`wait()`. This is the facet the JSON-RPC side-channel transport exists for.
 
@@ -490,7 +490,7 @@ Each of these is implementable over `Exec`/`Git`/core — the fabro survey confi
 
 ## Verification and compatibility gates
 
-- Run a common conformance suite against every provider for lifecycle, Bash, filesystem, cancellation, and capability honesty.
+- Run a common conformance suite against every provider for lifecycle, Bash, filesystem, term and kill, and capability honesty.
 - Test public workflows and JSON-RPC round trips at integration boundaries. Add property tests for protocol decoding, unknown fields, and state-transition invariants where useful.
 - Verify Rust 1.85 with default, minimal, and all supported features.
 - Before a public release, run semver checks and validate the package artifact. Record MSRV bumps, public dependency changes, and intentional protocol or API breaks.

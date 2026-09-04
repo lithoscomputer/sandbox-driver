@@ -30,7 +30,7 @@ stdout = """
     "live_streaming": true,
     "streams_separated": true,
     "stdin": true,
-    "cancel": true,
+    "stop": true,
     "stdio_process": true,
     "stdin_stream": true,
     "environment": true

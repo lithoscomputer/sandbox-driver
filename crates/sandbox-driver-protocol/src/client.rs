@@ -16,9 +16,9 @@ use sandbox_driver::{
     PreviewUrl, PreviewUrls, ProviderHealth, ProviderKind, Pty, PtyOptions, PtySession, PtySize,
     Resources, Result, Sandbox, SandboxFilter, SandboxId, SandboxSnapshotOptions, SandboxSpec,
     SandboxStatus, SnapshotFilter, SnapshotId, SnapshotProvider, SnapshotSpec, SnapshotStatus,
-    SpawnSpec, SshAccess, SshAccessInfo, StderrTail, StdioProcess, StdioProcessHandle, Termination,
-    TransportError, Vnc, VncConnection, VolumeId, VolumeProvider, VolumeSpec, VolumeStatus,
-    WebTerminal,
+    SpawnSpec, SshAccess, SshAccessInfo, StderrTail, StdioProcess, StdioProcessHandle, StopLevel,
+    Termination, TransportError, Vnc, VncConnection, VolumeId, VolumeProvider, VolumeSpec,
+    VolumeStatus, WebTerminal,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -1372,19 +1372,21 @@ impl Exec for SandboxExec {
                 .expect("exec streams lock")
                 .insert(exec_id.clone(), queue);
             let client = Arc::clone(&self.client);
-            let cancel_exec_id = exec_id.clone();
+            let stop_exec_id = exec_id.clone();
             tokio::spawn(async move {
                 while let Some((stream, chunk)) = receiver.recv().await {
                     if let Err(error) = sink(stream, chunk).await {
-                        let cancel: Result<m::Empty> = client
-                            .call(m::EXEC_CANCEL, &m::ExecCancelParams {
-                                exec_id: cancel_exec_id.clone(),
+                        // A failing sink is a hard stop on every provider.
+                        let stop: Result<m::Empty> = client
+                            .call(m::EXEC_STOP, &m::ExecStopParams {
+                                exec_id: stop_exec_id.clone(),
+                                level:   StopLevel::Kill,
                             })
                             .await;
-                        if let Err(cancel_error) = cancel {
+                        if let Err(stop_error) = stop {
                             tracing::warn!(
-                                error = %cancel_error,
-                                "plugin exec cancellation after sink failure failed"
+                                error = %stop_error,
+                                "plugin exec kill after sink failure failed"
                             );
                         }
                         return Err(error);
@@ -1393,24 +1395,35 @@ impl Exec for SandboxExec {
                 Ok(())
             })
         });
-        // Forward cancellation as an exec/cancel request. The wire has one
-        // stop level, so a kill token is forwarded the same way and the
-        // grace is the plugin's own.
-        let cancel_task = (controls.cancel.is_some() || controls.kill.is_some()).then(|| {
+        // Forward each stop token as an exec/stop request with its level.
+        // A term then a kill are two requests, in that order.
+        let stop_task = (controls.term.is_some() || controls.kill.is_some()).then(|| {
             let client = Arc::clone(&self.client);
             let exec_id = exec_id.clone();
-            let stop = ExecControls {
-                cancel: controls.cancel.clone(),
-                kill: controls.kill.clone(),
-                ..ExecControls::default()
-            };
+            let term = controls.term.clone();
+            let kill = controls.kill.clone();
             tokio::spawn(async move {
-                stop.stop_requested().await;
-                let outcome: Result<m::Empty> = client
-                    .call(m::EXEC_CANCEL, &m::ExecCancelParams { exec_id })
-                    .await;
-                if let Err(error) = outcome {
-                    tracing::warn!(error = %error, "plugin exec cancellation failed");
+                let mut termed = std::pin::pin!(sandbox_driver::stop_signal(term.as_ref()));
+                let mut killed = std::pin::pin!(sandbox_driver::stop_signal(kill.as_ref()));
+                let mut term_sent = false;
+                loop {
+                    let level = tokio::select! {
+                        () = &mut termed, if !term_sent => StopLevel::Term,
+                        () = &mut killed => StopLevel::Kill,
+                    };
+                    let outcome: Result<m::Empty> = client
+                        .call(m::EXEC_STOP, &m::ExecStopParams {
+                            exec_id: exec_id.clone(),
+                            level,
+                        })
+                        .await;
+                    if let Err(error) = outcome {
+                        tracing::warn!(error = %error, ?level, "plugin exec stop failed");
+                    }
+                    if level == StopLevel::Kill {
+                        break;
+                    }
+                    term_sent = true;
                 }
             })
         });
@@ -1443,7 +1456,7 @@ impl Exec for SandboxExec {
         } else {
             Ok(())
         };
-        if let Some(task) = cancel_task {
+        if let Some(task) = stop_task {
             task.abort();
         }
         pump_outcome?;

@@ -359,16 +359,31 @@ async fn exec_timeout_kills_a_command_that_left_its_process_group() {
 }
 
 #[tokio::test]
-async fn exec_timeout_lets_the_process_run_its_term_trap() {
+async fn exec_term_lets_the_process_run_its_term_trap() {
     let provider = HostProvider::new();
     let sandbox = provider.create(&host_spec(), None).await.expect("create");
 
     // `wait` (unlike a foreground `sleep`) lets bash handle the trap as
-    // soon as SIGTERM arrives.
-    let spec = ExecSpec::bash("trap 'echo cleaned >&2; exit 0' TERM; sleep 30 & wait")
-        .timeout(Duration::from_millis(300));
-    let result = sandbox.exec().run(&spec).await.expect("exec resolves");
-    assert_eq!(result.termination, Termination::TimedOut);
+    // soon as SIGTERM arrives. The term is the caller's signal; a timeout
+    // would kill instead.
+    let term = CancellationToken::new();
+    let term_after = term.clone();
+    tokio::spawn(async move {
+        time::sleep(Duration::from_millis(300)).await;
+        term_after.cancel();
+    });
+    let controls = ExecControls {
+        term: Some(term),
+        ..ExecControls::default()
+    };
+    let spec = ExecSpec::bash("trap 'echo cleaned >&2; exit 0' TERM; sleep 30 & wait");
+    let result = sandbox
+        .exec()
+        .run_streaming(&spec, controls)
+        .await
+        .expect("exec resolves")
+        .result;
+    assert_eq!(result.termination, Termination::Cancelled);
     assert!(
         result.stderr_lossy().contains("cleaned"),
         "the TERM trap must run before SIGKILL; stderr: {}",
@@ -396,13 +411,13 @@ async fn exec_timeout_fires_after_output_streams_close() {
 }
 
 #[tokio::test]
-async fn exec_cancellation_resolves_with_cancelled() {
+async fn exec_term_resolves_with_cancelled() {
     let provider = HostProvider::new();
     let sandbox = provider.create(&host_spec(), None).await.expect("create");
 
     let token = CancellationToken::new();
     let controls = ExecControls {
-        cancel: Some(token.clone()),
+        term: Some(token.clone()),
         ..ExecControls::default()
     };
     let cancel_after = token.clone();

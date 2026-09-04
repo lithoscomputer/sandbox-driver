@@ -87,7 +87,7 @@ fn host_capabilities() -> Capabilities {
     caps.exec.streams_separated = true;
     caps.exec.stdin = true;
     caps.exec.stdin_stream = true;
-    caps.exec.cancel = true;
+    caps.exec.stop = true;
     caps.exec.stdio_process = true;
     caps.exec.environment = true;
     caps.fs.native = true;

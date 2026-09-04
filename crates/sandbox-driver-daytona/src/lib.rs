@@ -14,9 +14,9 @@
 //! (see the stdio module). The outbound proxy is `provider_config`
 //! (`{"outbound_proxy_url": …}`), composing with a domain allow list as
 //! upstream intends rather than competing as a network policy. Plain execs run
-//! buffered through the toolbox's one-shot endpoint; a sink or cancel token
+//! buffered through the toolbox's one-shot endpoint; a sink or stop token
 //! routes through a command session, which streams logs live with
-//! separated stdout/stderr, kills on cancel/timeout by deleting the
+//! separated stdout/stderr, kills on stop/timeout by deleting the
 //! session, and preserves partial output on timeout. Stdin is delivered
 //! through a temp-file redirection inside the sandbox on both paths.
 //! Git follows Fabro's hybrid path: clone uses the native toolbox API;
@@ -786,7 +786,7 @@ fn daytona_capabilities() -> Capabilities {
     caps.lifecycle.labels = true;
     caps.lifecycle.update_network = true;
     caps.exec.stdin = true;
-    caps.exec.cancel = true;
+    caps.exec.stop = true;
     caps.exec.live_streaming = true;
     caps.exec.streams_separated = true;
     // Session-backed; UTF-8 payloads only (the ACP use case) — see the

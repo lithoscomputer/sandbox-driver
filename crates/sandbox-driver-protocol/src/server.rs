@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use sandbox_driver::{
     Capability, Error, Event, EventContext, EventObserver, ExecControls, LogSink, OutputSink,
     Result, Sandbox, SandboxId, SandboxProvider, SandboxSpec, SandboxStatus, SnapshotId,
-    StderrTail, StdioProcessHandle, TransportError, VolumeId,
+    StderrTail, StdioProcessHandle, StopLevel, TransportError, VolumeId,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -198,7 +198,8 @@ pub async fn serve(
 struct ServerState {
     provider: Arc<dyn SandboxProvider>,
     handles:  Mutex<HashMap<String, Arc<dyn Sandbox>>>,
-    execs:    Mutex<HashMap<String, CancellationToken>>,
+    /// Per in-flight exec: its `term` and `kill` tokens, in that order.
+    execs:    Mutex<HashMap<String, (CancellationToken, CancellationToken)>>,
     stdios:   Mutex<HashMap<String, Arc<ServerStdio>>>,
     ptys:     Mutex<HashMap<String, Arc<dyn sandbox_driver::PtySession>>>,
     streams:  Mutex<HashMap<String, CancellationToken>>,
@@ -216,12 +217,14 @@ struct ServerStdio {
 
 impl ServerState {
     async fn close_sessions(&self) {
+        // A closing connection has no caller left to escalate, so every
+        // in-flight exec is killed outright.
         let execs = self
             .execs
             .lock()
             .expect("execs lock")
             .drain()
-            .map(|(_, token)| token)
+            .map(|(_, (_, kill))| kill)
             .collect::<Vec<_>>();
         let streams = self
             .streams
@@ -613,12 +616,13 @@ async fn dispatch(
             let request: m::ExecStreamParams = parse(params)?;
             let handle = state.sandbox(&request.sandbox_id).await?;
             let spec = request.spec.into_spec()?;
-            let cancel = CancellationToken::new();
+            let term = CancellationToken::new();
+            let kill = CancellationToken::new();
             state
                 .execs
                 .lock()
                 .expect("execs lock")
-                .insert(request.exec_id.clone(), cancel.clone());
+                .insert(request.exec_id.clone(), (term.clone(), kill.clone()));
 
             let outbound = state.outbound.clone();
             let exec_id = request.exec_id.clone();
@@ -646,7 +650,8 @@ async fn dispatch(
             });
 
             let controls = ExecControls {
-                cancel: Some(cancel),
+                term: Some(term),
+                kill: Some(kill),
                 sink: Some(sink),
                 retained_output_limit: request.retained_output_limit,
                 ..ExecControls::default()
@@ -666,15 +671,19 @@ async fn dispatch(
                 stderr_capture:    streaming.stderr_capture,
             })
         }
-        m::EXEC_CANCEL => {
-            let request: m::ExecCancelParams = parse(params)?;
-            if let Some(token) = state
+        m::EXEC_STOP => {
+            let request: m::ExecStopParams = parse(params)?;
+            let tokens = state
                 .execs
                 .lock()
                 .expect("execs lock")
                 .get(&request.exec_id)
-            {
-                token.cancel();
+                .cloned();
+            if let Some((term, kill)) = tokens {
+                match request.level {
+                    StopLevel::Term => term.cancel(),
+                    StopLevel::Kill => kill.cancel(),
+                }
             }
             to_value(&m::Empty)
         }

@@ -15,7 +15,7 @@ use std::{mem, process};
 use daytona_sdk::{
     ProcessService, Sandbox as SdkSandbox, SessionCommandLogsResult, SessionExecuteResult,
 };
-use sandbox_driver::{Error, OutputCaptureBuffer, Result, Termination};
+use sandbox_driver::{Error, OutputCaptureBuffer, Result, StopLevel, Termination};
 use tokio::runtime::Handle;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
@@ -155,21 +155,23 @@ impl Drop for Session {
 pub(crate) struct WaitOutcome {
     pub exit_code:   Option<i32>,
     pub termination: Termination,
-    /// Fetched eagerly on timeout/cancel, before the session is deleted
+    /// Fetched eagerly on timeout/stop, before the session is deleted
     /// and the logs go with it.
     pub final_logs:  Option<SessionCommandLogsResult>,
 }
 
 /// Polls the command until it exits, the deadline passes, the caller's
 /// stop request resolves, or the sink-failure token fires (a failing
-/// sink cancels the execution). The caller owns the log-stream task and
-/// the session close.
+/// sink cancels the execution). The toolbox cannot signal a process, so
+/// either stop level ends the command the same way (the session is
+/// deleted) and the outcome reports the level the caller asked for. The
+/// caller owns the log-stream task and the session close.
 pub(crate) async fn wait_for_completion(
     session: &Session,
     command_id: &str,
     initial_exit_code: Option<i32>,
     timeout: Option<Duration>,
-    stop_requested: impl Future<Output = ()>,
+    stop_requested: impl Future<Output = StopLevel>,
     sink_failed: CancellationToken,
 ) -> Result<WaitOutcome> {
     if let Some(code) = initial_exit_code {
@@ -204,10 +206,10 @@ pub(crate) async fn wait_for_completion(
                     final_logs:  session.fetch_logs(command_id).await,
                 });
             }
-            () = &mut stop_requested => {
+            level = &mut stop_requested => {
                 return Ok(WaitOutcome {
                     exit_code:   None,
-                    termination: Termination::Cancelled,
+                    termination: level.termination(),
                     final_logs:  session.fetch_logs(command_id).await,
                 });
             }
@@ -265,7 +267,7 @@ fn plain_suffix_offset(seen: &[u8], final_bytes: &[u8]) -> usize {
     if final_bytes.starts_with(seen) {
         return seen.len();
     }
-    // The stream ahead of the snapshot: on timeout/cancel the final
+    // The stream ahead of the snapshot: on timeout/stop the final
     // fetch is taken eagerly while the stream keeps draining past it,
     // so the snapshot holds nothing new.
     if seen.starts_with(final_bytes) {
