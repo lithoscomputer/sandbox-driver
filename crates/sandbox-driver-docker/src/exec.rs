@@ -232,6 +232,11 @@ impl DockerExec {
         };
         // The watcher waits for a non-empty stop file so it never reads
         // the mode mid-write; a missing grace falls back to the default.
+        // It runs with its own output on /dev/null and waits out the grace
+        // in poll ticks that end when the child is gone or the stop file
+        // turns to `kill`: a watcher that inherited the exec pipes and slept
+        // the whole grace would hold the stream open for that long after the
+        // command had already died, and a kill after a term could not land.
         format!(
             "mkdir -p /tmp/.sandbox-driver\n\
              if ! command -v setsid >/dev/null 2>&1; then\n\
@@ -256,10 +261,15 @@ impl DockerExec {
                  grace=${{mode#term }}\n\
                  [ -n \"$grace\" ] || grace={default_grace}\n\
                  kill -TERM \"-$child\" 2>/dev/null || kill -TERM \"$child\" 2>/dev/null || true\n\
-                 sleep \"$grace\"\n\
+                 ticks=$((grace * 10))\n\
+                 while [ \"$ticks\" -gt 0 ] && kill -0 \"$child\" 2>/dev/null; do\n\
+                   [ \"$(cat \"$stop_file\" 2>/dev/null)\" = kill ] && break\n\
+                   sleep {STOP_POLL_SLEEP_SECONDS}\n\
+                   ticks=$((ticks - 1))\n\
+                 done\n\
                fi\n\
                kill -KILL \"-$child\" 2>/dev/null || kill -KILL \"$child\" 2>/dev/null || true\n\
-             ) & watcher=$!\n\
+             ) >/dev/null 2>&1 & watcher=$!\n\
              setsid {shell} -c {quoted_cmd} {stdin_redirect} &\n\
              child=$!\n\
              {close_stdin}printf '%s' \"$child\" > \"$pid_file\"\n\
@@ -408,7 +418,12 @@ impl Exec for DockerExec {
         let sink: Option<&OutputSink> = controls.sink.as_ref();
 
         let mut termination = Termination::Exited;
+        // `kill_fired`: some stop was requested (no further cancel/timeout).
+        // `killed_fired`: the immediate kill was requested; a kill may follow
+        // a term — the watcher re-reads the stop file mid-grace and skips to
+        // SIGKILL — but never twice.
         let mut kill_fired = false;
+        let mut killed_fired = false;
         let mut drain_deadline: Option<Instant> = None;
         let mut stream_error: Option<DockerApiError> = None;
         let mut cancelled = pin!(stop_signal(controls.cancel.as_ref()));
@@ -483,9 +498,10 @@ impl Exec for DockerExec {
                     drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
                     self.request_stop(&stop_file, term).await?;
                 }
-                () = &mut killed, if !kill_fired => {
+                () = &mut killed, if !killed_fired => {
                     termination = Termination::Killed;
                     kill_fired = true;
+                    killed_fired = true;
                     drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
                     self.request_stop(&stop_file, StopMode::Kill).await?;
                 }

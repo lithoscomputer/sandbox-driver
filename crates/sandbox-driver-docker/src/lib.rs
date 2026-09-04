@@ -617,6 +617,7 @@ impl SandboxProvider for DockerProvider {
                     // options belong to the main container.
                     let DockerProviderConfig {
                         init,
+                        privileged,
                         binds,
                         extra_hosts,
                         dns,
@@ -635,6 +636,7 @@ impl SandboxProvider for DockerProvider {
                         network_mode,
                         binds: non_empty(binds),
                         init: init.then_some(true),
+                        privileged: privileged.then_some(true),
                         extra_hosts: non_empty(extra_hosts),
                         dns: non_empty(dns),
                         cap_add: non_empty(cap_add),
