@@ -302,6 +302,26 @@ impl SandboxProvider for HostProvider {
 
     #[tracing::instrument(
         skip_all,
+        fields(provider_kind = %self.kind, sandbox_id = %id),
+        err
+    )]
+    async fn delete(&self, id: &SandboxId, events: Option<EventContext>) -> Result<()> {
+        let sandbox = self
+            .registry
+            .lock()
+            .expect("registry lock")
+            .get(id)
+            .cloned();
+        // An id the registry does not know is already gone.
+        let Some(sandbox) = sandbox else {
+            return Ok(());
+        };
+        let handle = sandbox.with_emitter(EventEmitter::new(self.kind.clone(), events));
+        handle.delete().await
+    }
+
+    #[tracing::instrument(
+        skip_all,
         fields(provider_kind = %self.kind, label_count = filter.labels.len()),
         err
     )]

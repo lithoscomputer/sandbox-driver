@@ -253,6 +253,19 @@ impl sandbox_driver::SandboxProvider for PluginProvider {
         Ok(self.wrap_handle(outcome?, events))
     }
 
+    async fn delete(&self, id: &SandboxId, events: Option<EventContext>) -> Result<()> {
+        let event_request = self.client.register_events(events.as_ref());
+        let outcome: Result<m::Empty> = self
+            .client
+            .call(m::SANDBOX_DELETE, &m::AttachParams {
+                sandbox_id: id.as_str().to_owned(),
+                events:     event_request.clone(),
+            })
+            .await;
+        self.client.unregister_events(event_request.as_ref());
+        outcome.map(|_| ())
+    }
+
     async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>> {
         let result: m::ListResult = self
             .client

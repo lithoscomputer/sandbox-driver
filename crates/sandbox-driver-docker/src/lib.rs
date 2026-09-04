@@ -408,6 +408,30 @@ fn status_from_inspect(id: SandboxId, inspect: &ContainerInspectResponse) -> San
     status
 }
 
+/// Whether an inspected container is one this provider created. Anything
+/// else is not a sandbox, whatever else it is.
+fn is_managed(inspect: &ContainerInspectResponse) -> bool {
+    inspect
+        .config
+        .as_ref()
+        .and_then(|config| config.labels.as_ref())
+        .and_then(|labels| labels.get(MANAGED_LABEL))
+        .map(String::as_str)
+        == Some("true")
+}
+
+/// The managed sidecar network an inspected container joined, if any: a
+/// user-defined network named after the sandbox, recovered from the
+/// container's network mode so a rebuilt handle or a delete by id sweeps
+/// the sidecars too.
+fn sidecar_network_of(inspect: &ContainerInspectResponse) -> Option<String> {
+    inspect
+        .host_config
+        .as_ref()
+        .and_then(|host| host.network_mode.clone())
+        .filter(|mode| is_sidecar_network(mode))
+}
+
 /// Labels the provider writes for itself, never reported as the caller's.
 fn is_internal_label(key: &str) -> bool {
     key == MANAGED_LABEL
@@ -739,18 +763,14 @@ impl SandboxProvider for DockerProvider {
                 Action::Attach,
                 |_| async move {
                     let inspect = self.inspect(id.as_str()).await?;
-                    let config = inspect.config.as_ref();
-                    let labels = config.and_then(|config| config.labels.as_ref());
-                    if labels
-                        .and_then(|labels| labels.get(MANAGED_LABEL))
-                        .map(String::as_str)
-                        != Some("true")
-                    {
+                    if !is_managed(&inspect) {
                         return Err(Error::NotFound {
                             resource: ResourceKind::Sandbox,
                             id:       id.as_str().to_owned(),
                         });
                     }
+                    let config = inspect.config.as_ref();
+                    let labels = config.and_then(|config| config.labels.as_ref());
                     let working_dir = config
                         .and_then(|config| config.working_dir.clone())
                         .unwrap_or_else(|| DEFAULT_WORKING_DIRECTORY.to_owned());
@@ -763,13 +783,7 @@ impl SandboxProvider for DockerProvider {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    // A sidecar network is a user-defined one named after the
-                    // sandbox; recover it so this handle sweeps sidecars too.
-                    let network = inspect
-                        .host_config
-                        .as_ref()
-                        .and_then(|host| host.network_mode.clone())
-                        .filter(|mode| is_sidecar_network(mode));
+                    let network = sidecar_network_of(&inspect);
                     let container_id = inspect.id.clone().unwrap_or_else(|| id.as_str().to_owned());
                     Ok(self.handle(
                         container_id,
@@ -780,6 +794,55 @@ impl SandboxProvider for DockerProvider {
                         network,
                         handle_emitter,
                     ) as Arc<dyn Sandbox>)
+                },
+            )
+            .await
+    }
+
+    #[tracing::instrument(
+        skip_all,
+        fields(provider_kind = %self.kind, sandbox_id = %id),
+        err
+    )]
+    async fn delete(&self, id: &SandboxId, events: Option<EventContext>) -> Result<()> {
+        let emitter = EventEmitter::new(self.kind.clone(), events);
+        emitter
+            .run(
+                EventSubject::sandbox(Some(id.clone())),
+                Action::Delete,
+                |_| async move {
+                    // Docker state alone decides what to remove: no handle
+                    // and no exec, so a stopped or wedged container goes the
+                    // same way as a running one.
+                    let inspect = match self.inspect(id.as_str()).await {
+                        Ok(inspect) => inspect,
+                        Err(Error::NotFound { .. }) => return Ok(()),
+                        Err(error) => return Err(error),
+                    };
+                    // A container this provider did not create is unknown to
+                    // it, and deleting an unknown id succeeds by doing nothing.
+                    if !is_managed(&inspect) {
+                        return Ok(());
+                    }
+                    let network = sidecar_network_of(&inspect);
+                    let container_id = inspect.id.clone().unwrap_or_else(|| id.as_str().to_owned());
+                    let options = RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    };
+                    let removed = match self
+                        .docker
+                        .remove_container(&container_id, Some(options))
+                        .await
+                    {
+                        Ok(()) => Ok(()),
+                        Err(error) if is_not_found(&error) => Ok(()),
+                        Err(error) => Err(docker_error("removing container", error)),
+                    };
+                    if let Some(network) = &network {
+                        sidecars::sweep(&self.docker, network).await;
+                    }
+                    removed
                 },
             )
             .await

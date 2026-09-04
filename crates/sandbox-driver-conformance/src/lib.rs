@@ -142,6 +142,9 @@ impl Conformance {
             ("delete_is_idempotent", |ctx| {
                 Box::pin(delete_is_idempotent(ctx))
             }),
+            ("provider_deletes_by_id", |ctx| {
+                Box::pin(provider_deletes_by_id(ctx))
+            }),
             ("attach_unknown_id_is_not_found", |ctx| {
                 Box::pin(attach_unknown_id_is_not_found(ctx))
             }),
@@ -487,6 +490,40 @@ async fn delete_is_idempotent(ctx: &Conformance) -> CheckOutcome {
         .delete()
         .await
         .map_err(|error| format!("second delete failed: {error}"))?;
+    PASS
+}
+
+/// `SandboxProvider::delete` removes a sandbox with no handle involved,
+/// and succeeds again for the same id and for an id the provider never
+/// had.
+async fn provider_deletes_by_id(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.create().await?;
+    let id = sandbox.id().clone();
+    drop(sandbox);
+    ctx.provider
+        .delete(&id, None)
+        .await
+        .map_err(|error| format!("delete by id failed: {error}"))?;
+    if let Ok(handle) = ctx.provider.attach(&id, None).await {
+        let state = handle
+            .describe()
+            .await
+            .map_or(SandboxState::Deleted, |status| status.state);
+        if !matches!(state, SandboxState::Deleted | SandboxState::Deleting) {
+            cleanup(&handle).await;
+            return fail(format!("sandbox still {state:?} after delete by id"));
+        }
+    }
+    ctx.provider
+        .delete(&id, None)
+        .await
+        .map_err(|error| format!("second delete by id failed: {error}"))?;
+    let unknown =
+        SandboxId::try_new("conformance-does-not-exist").map_err(|error| error.to_string())?;
+    ctx.provider
+        .delete(&unknown, None)
+        .await
+        .map_err(|error| format!("delete of an unknown id failed: {error}"))?;
     PASS
 }
 

@@ -215,15 +215,14 @@ async fn execute_sandbox(
             Ok(0)
         }
         SandboxCommand::Delete(args) => {
-            let sandbox = attach(provider, &args.id, event_context).await?;
-            sandbox.delete().await?;
-            write_action(
-                provider.kind().as_str(),
-                sandbox.id().as_str(),
-                "deleted",
-                output,
-            )
-            .await?;
+            // By id, with no attach: a sandbox no handle can be built for is
+            // still removed, and an unknown id is already gone.
+            let id = parse_sandbox_id(&args.id)?;
+            provider
+                .delete(&id, event_context)
+                .await
+                .with_context(|| format!("deleting sandbox {:?}", args.id))?;
+            write_action(provider.kind().as_str(), id.as_str(), "deleted", output).await?;
             Ok(0)
         }
         SandboxCommand::Exec(args) => {

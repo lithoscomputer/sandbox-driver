@@ -336,7 +336,10 @@ not interpret either value. They must not contain secrets.
 
 All take `{sandbox_id}` and return `{}` unless noted. Optional verbs are
 capability-gated (§5); `sandbox/delete` must be idempotent (deleting an
-unknown or already-deleting sandbox succeeds).
+unknown or already-deleting sandbox succeeds). `sandbox/delete` is a
+provider-level operation by id: it needs no prior `sandbox/attach`, so a
+sandbox that no handle can be built for is still removed, and it accepts
+the optional `events` object of §8.2.
 
 `sandbox/start`, `sandbox/stop`, `sandbox/delete`, `sandbox/pause`,
 `sandbox/resume`, `sandbox/archive`, `sandbox/recover`,

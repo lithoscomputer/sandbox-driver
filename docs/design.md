@@ -214,6 +214,8 @@ pub trait SandboxProvider: Send + Sync {
         -> Result<Arc<dyn Sandbox>, Error>;               // re-attach by persisted ID
     async fn undelete(&self, id: &SandboxId, events: Option<EventContext>)
         -> Result<Arc<dyn Sandbox>, Error>;               // optional; restore a deleted sandbox
+    async fn delete(&self, id: &SandboxId, events: Option<EventContext>)
+        -> Result<(), Error>;                             // by id, no handle; idempotent; default = attach + delete
     async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>, Error>;
 
     /// Reachability + credential check for preflight and diagnostics.

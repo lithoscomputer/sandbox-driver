@@ -492,9 +492,31 @@ async fn dispatch(
                 .await?;
             to_value(&m::PlatformInfoResult { platform })
         }
+        m::SANDBOX_DELETE => {
+            // Delete is a provider-level operation by id: no prior attach is
+            // needed, and a sandbox no handle can be built for (stopped,
+            // wedged, half-created) is still removed. A handle this
+            // connection already holds is used so its event route sees the
+            // delete.
+            let request: m::AttachParams = parse(params)?;
+            let remembered = state
+                .handles
+                .lock()
+                .expect("handles lock")
+                .get(&request.sandbox_id)
+                .cloned();
+            if let Some(handle) = remembered {
+                handle.delete().await?;
+            } else {
+                let sandbox_id = SandboxId::try_new(&request.sandbox_id)
+                    .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
+                let events = state.event_context(request.events);
+                state.provider.delete(&sandbox_id, events).await?;
+            }
+            to_value(&m::Empty)
+        }
         m::SANDBOX_START
         | m::SANDBOX_STOP
-        | m::SANDBOX_DELETE
         | m::SANDBOX_PAUSE
         | m::SANDBOX_RESUME
         | m::SANDBOX_ARCHIVE
@@ -505,7 +527,6 @@ async fn dispatch(
             match method {
                 m::SANDBOX_START => handle.start().await?,
                 m::SANDBOX_STOP => handle.stop().await?,
-                m::SANDBOX_DELETE => handle.delete().await?,
                 m::SANDBOX_PAUSE => handle.pause().await?,
                 m::SANDBOX_RESUME => handle.resume().await?,
                 m::SANDBOX_ARCHIVE => handle.archive().await?,

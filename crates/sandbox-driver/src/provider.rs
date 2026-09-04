@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::capabilities::{Capabilities, Capability};
-use crate::error::{Error, Result};
+use crate::error::{Error, ResourceKind, Result};
 use crate::event::EventContext;
 use crate::id::{ProviderKind, SandboxId, SnapshotId, VolumeId};
 use crate::logs::LogSink;
@@ -55,6 +55,26 @@ pub trait SandboxProvider: Send + Sync {
     ) -> Result<Arc<dyn Sandbox>> {
         let _ = (id, events);
         Err(Error::unsupported(Capability::LifecycleUndelete))
+    }
+
+    /// Deletes a sandbox by ID without building a handle first.
+    ///
+    /// Idempotent: an ID the provider does not know, or a sandbox already
+    /// deleted, succeeds. This is the call for a reconciler that sweeps
+    /// what an earlier process left behind: it needs no working handle,
+    /// so a sandbox that is stopped, wedged, or half-created is removed
+    /// the same as a running one. The default attaches and deletes, which
+    /// is correct for every provider; a provider overrides it when it can
+    /// remove the sandbox from its own records or backend directly.
+    async fn delete(&self, id: &SandboxId, events: Option<EventContext>) -> Result<()> {
+        match self.attach(id, events).await {
+            Ok(sandbox) => sandbox.delete().await,
+            Err(Error::NotFound {
+                resource: ResourceKind::Sandbox,
+                ..
+            }) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Lists sandboxes this provider manages. Providers that cannot
