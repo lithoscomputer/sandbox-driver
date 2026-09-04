@@ -107,6 +107,7 @@ async fn start_all(
             network_mode: Some(network.to_owned()),
             dns: non_empty(sidecar.dns.clone()),
             cap_add: non_empty(sidecar.cap_add.clone()),
+            privileged: sidecar.privileged.then_some(true),
             ..Default::default()
         };
         let config = Config {

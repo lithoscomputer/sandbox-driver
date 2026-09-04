@@ -122,6 +122,9 @@ pub struct Sidecar {
     pub user:          Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint:    Option<Vec<String>>,
+    /// Run the sidecar privileged: what a Docker-in-Docker service needs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub privileged:    bool,
     /// When set, `create` waits for the sidecar to report healthy and
     /// fails if it exits or turns unhealthy first. When unset, the sidecar
     /// is started and not watched, so it may exit.
@@ -142,6 +145,7 @@ impl Sidecar {
             cap_add:       Vec::new(),
             user:          None,
             entrypoint:    None,
+            privileged:    false,
             health:        None,
             registry_auth: None,
         }
@@ -203,6 +207,7 @@ mod tests {
             .env
             .insert("POSTGRES_PASSWORD".to_owned(), "x".to_owned());
         sidecar.health = Some(Health::new("pg_isready"));
+        sidecar.privileged = true;
         let config = DockerProviderConfig {
             init: true,
             platform: Some("linux/amd64".to_owned()),
@@ -228,6 +233,7 @@ mod tests {
             parsed.sidecars[0].health.as_ref().map(|h| h.cmd.as_str()),
             Some("pg_isready")
         );
+        assert!(parsed.sidecars[0].privileged);
     }
 
     #[test]
