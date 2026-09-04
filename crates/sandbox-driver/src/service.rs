@@ -29,9 +29,9 @@ use crate::id::ServiceId;
 pub trait Services: Send + Sync {
     /// Starts a background service and returns its identifier.
     ///
-    /// The command follows the Bash contract of [`crate::ExecSpec`] and
-    /// runs detached from the spawning exec (its own session), with
-    /// stdout and stderr captured for [`Services::logs`].
+    /// The command is Bash source, run as [`crate::ExecSpec::bash`] runs
+    /// it, detached from the spawning exec (its own session), with stdout
+    /// and stderr captured for [`Services::logs`].
     async fn spawn(&self, spec: &ServiceSpec) -> Result<ServiceId>;
 
     /// Observed status. An unknown id reports not running rather than
