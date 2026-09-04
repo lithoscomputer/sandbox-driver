@@ -16,8 +16,23 @@ use sandbox_driver::{
     SnapshotSpec, Termination,
 };
 use sandbox_driver_protocol::methods::{
-    ForkOptionsDto, SandboxSnapshotOptionsDto, SandboxSpecDto, SnapshotSourceDto, SnapshotSpecDto,
+    ForkOptionsDto, FsWriteParams, SandboxSnapshotOptionsDto, SandboxSpecDto, SnapshotSourceDto,
+    SnapshotSpecDto,
 };
+
+#[test]
+fn version_two_file_writes_without_a_length_still_decode() {
+    let request: FsWriteParams = serde_json::from_str(
+        r#"{
+        "sandbox_id": "host:test",
+        "path": "file.bin",
+        "channel": {"channel_id": 7, "token": "test-token"}
+    }"#,
+    )
+    .expect("earlier version two write request");
+    assert_eq!(request.content_length, None);
+    assert!(!request.append);
+}
 
 /// The version-1 launch shape of the capability set, exactly as a plugin
 /// built against the first protocol release sends it — before

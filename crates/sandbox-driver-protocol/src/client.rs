@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::io;
 use std::path::Path;
 use std::pin::pin;
 use std::process::Stdio;
@@ -1775,18 +1776,21 @@ impl SandboxFs {
         path: &str,
         offset: Option<u64>,
         length: Option<u64>,
-    ) -> Result<Vec<u8>> {
+        output: &mut (dyn AsyncWrite + Unpin + Send),
+    ) -> Result<()> {
         let (channel, receiver) = self.client.listener.expect();
         let accepted = Arc::new(AtomicBool::new(false));
         let collect_accepted = Arc::clone(&accepted);
         let collect = async move {
             let Channel { mut reader, .. } = receiver.accept().await?;
             collect_accepted.store(true, Ordering::SeqCst);
-            let mut content = Vec::new();
             loop {
                 match reader.read().await? {
-                    Some((FrameKind::Stdout, payload)) => content.extend(payload),
-                    Some((FrameKind::Eof, _)) | None => return Ok(content),
+                    Some((FrameKind::Stdout, payload)) => output
+                        .write_all(&payload)
+                        .await
+                        .map_err(|error| Error::io("writing downloaded file", error))?,
+                    Some((FrameKind::Eof, _)) | None => return Ok(()),
                     Some(_) => {}
                 }
             }
@@ -1798,24 +1802,50 @@ impl SandboxFs {
             offset,
             length,
         };
-        let (_, content) = call_with_pump(
+        call_with_pump(
             self.client.call::<_, m::Empty>(m::FS_READ, &params),
             collect,
             &accepted,
             m::FS_READ,
         )
         .await?;
-        Ok(content)
+        Ok(())
     }
 
-    async fn write_through_channel(&self, path: &str, content: &[u8], append: bool) -> Result<()> {
+    async fn write_through_channel(
+        &self,
+        path: &str,
+        input: &mut (dyn AsyncRead + Unpin + Send),
+        length: u64,
+        append: bool,
+    ) -> Result<()> {
         let (channel, receiver) = self.client.listener.expect();
         let accepted = Arc::new(AtomicBool::new(false));
         let send_accepted = Arc::clone(&accepted);
         let send = async move {
             let Channel { mut writer, .. } = receiver.accept().await?;
             send_accepted.store(true, Ordering::SeqCst);
-            writer.write(FrameKind::Stdin, content).await?;
+            let mut input = input.take(length);
+            let mut buffer = vec![0; 64 * 1024];
+            loop {
+                let read = input
+                    .read(&mut buffer)
+                    .await
+                    .map_err(|error| Error::io("reading upload source", error))?;
+                if read == 0 {
+                    if input.limit() != 0 {
+                        return Err(Error::io(
+                            "reading upload source",
+                            io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "source ended before its declared length",
+                            ),
+                        ));
+                    }
+                    break;
+                }
+                writer.write(FrameKind::Stdin, &buffer[..read]).await?;
+            }
             writer.finish().await
         };
         let params = m::FsWriteParams {
@@ -1823,6 +1853,7 @@ impl SandboxFs {
             path: path.to_owned(),
             channel,
             append,
+            content_length: Some(length),
         };
         call_with_pump(
             self.client.call::<_, m::Empty>(m::FS_WRITE, &params),
@@ -1838,19 +1869,48 @@ impl SandboxFs {
 #[async_trait]
 impl Filesystem for SandboxFs {
     async fn read(&self, path: &str) -> Result<Vec<u8>> {
-        self.read_through_channel(path, None, None).await
+        let mut content = Vec::new();
+        self.read_to(path, &mut content).await?;
+        Ok(content)
     }
 
     async fn read_range(&self, path: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
-        self.read_through_channel(path, Some(offset), length).await
+        let mut content = Vec::new();
+        self.read_through_channel(path, Some(offset), length, &mut content)
+            .await?;
+        Ok(content)
     }
 
-    async fn write(&self, path: &str, content: &[u8]) -> Result<()> {
-        self.write_through_channel(path, content, false).await
+    async fn write(&self, path: &str, mut content: &[u8]) -> Result<()> {
+        let length = content.len() as u64;
+        self.write_from(path, &mut content, length).await
     }
 
-    async fn write_append(&self, path: &str, content: &[u8]) -> Result<()> {
-        self.write_through_channel(path, content, true).await
+    async fn write_append(&self, path: &str, mut content: &[u8]) -> Result<()> {
+        let length = content.len() as u64;
+        self.write_through_channel(path, &mut content, length, true)
+            .await
+    }
+
+    async fn read_to(
+        &self,
+        path: &str,
+        output: &mut (dyn AsyncWrite + Unpin + Send),
+    ) -> Result<()> {
+        self.read_through_channel(path, None, None, output).await?;
+        output
+            .flush()
+            .await
+            .map_err(|error| Error::io("flushing file output", error))
+    }
+
+    async fn write_from(
+        &self,
+        path: &str,
+        input: &mut (dyn AsyncRead + Unpin + Send),
+        length: u64,
+    ) -> Result<()> {
+        self.write_through_channel(path, input, length, false).await
     }
 
     async fn delete(&self, path: &str, recursive: bool) -> Result<()> {
@@ -1926,24 +1986,27 @@ impl Filesystem for SandboxFs {
     }
 
     async fn upload(&self, local: &Path, remote: &str) -> Result<()> {
-        // The channel carries any size in bounded frames; the file is read
-        // once and written once.
-        let content = tokio_fs::read(local)
+        let mut file = tokio_fs::File::open(local)
             .await
             .map_err(|error| Error::io(format!("reading {}", local.display()), error))?;
-        self.write(remote, &content).await
+        let length = file
+            .metadata()
+            .await
+            .map_err(|error| Error::io(format!("reading metadata of {}", local.display()), error))?
+            .len();
+        self.write_from(remote, &mut file, length).await
     }
 
     async fn download(&self, remote: &str, local: &Path) -> Result<()> {
-        let content = self.read(remote).await?;
         if let Some(parent) = local.parent() {
             tokio_fs::create_dir_all(parent).await.map_err(|error| {
                 Error::io(format!("creating parent of {}", local.display()), error)
             })?;
         }
-        tokio_fs::write(local, content)
+        let mut file = tokio_fs::File::create(local)
             .await
-            .map_err(|error| Error::io(format!("writing {}", local.display()), error))
+            .map_err(|error| Error::io(format!("writing {}", local.display()), error))?;
+        self.read_to(remote, &mut file).await
     }
 }
 

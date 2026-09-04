@@ -17,8 +17,8 @@ use sandbox_driver::{
 };
 use sandbox_driver_host::HostProvider;
 use sandbox_driver_protocol::{PluginProvider, serve};
-use tokio::io::{AsyncWrite, AsyncWriteExt, duplex, split};
-use tokio::time;
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter, copy, duplex, repeat, split};
+use tokio::{fs, time};
 use tokio_util::sync::CancellationToken;
 
 type SeenChunks = Arc<Mutex<Vec<(OutputStream, Vec<u8>)>>>;
@@ -81,7 +81,7 @@ async fn create_exec_fs_delete_round_trip() {
     assert_eq!(result.stdout, b"wire\0bytes");
     assert_eq!(result.stderr, b"stderr-payload");
 
-    // Filesystem across base64.
+    // Binary filesystem content crosses the data channel.
     let fs = sandbox.fs();
     fs.write("dir/file.bin", &[0u8, 159, 146, 150])
         .await
@@ -112,6 +112,167 @@ async fn create_exec_fs_delete_round_trip() {
         "managed workspace removed through the wire"
     );
     provider.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn file_transfers_make_progress_before_input_finishes() {
+    const LENGTH: u64 = 8 * 1024 * 1024 + 17;
+    const BYTE: u8 = 0xa5;
+    let provider = connect().await;
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+    let (mut input, mut producer) = duplex(64 * 1024);
+    let path = PathBuf::from(sandbox.working_directory()).join("nested/large.bin");
+    let produce = async {
+        copy(&mut repeat(BYTE).take(64 * 1024), &mut producer)
+            .await
+            .expect("first chunk");
+        // The server must write before the source reaches EOF. A server
+        // that collects the full channel cannot pass this handshake.
+        time::timeout(Duration::from_secs(10), async {
+            loop {
+                if fs::metadata(&path)
+                    .await
+                    .is_ok_and(|metadata| metadata.len() > 0)
+                {
+                    break;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("file grows while the source remains open");
+        copy(&mut repeat(BYTE).take(LENGTH - 64 * 1024), &mut producer)
+            .await
+            .expect("remaining chunks");
+        // No shutdown: the receiver must stop at the declared length.
+    };
+    let transfer = sandbox
+        .fs()
+        .write_from("nested/large.bin", &mut input, LENGTH);
+    let (result, ()) = time::timeout(Duration::from_secs(20), async {
+        tokio::join!(transfer, produce)
+    })
+    .await
+    .expect("streaming write completes");
+    result.expect("write file");
+
+    let mut output = BufWriter::with_capacity(32 * 1024, ByteSink::new(BYTE));
+    sandbox
+        .fs()
+        .read_to("nested/large.bin", &mut output)
+        .await
+        .expect("read file");
+    assert_eq!(
+        output.get_ref().written,
+        LENGTH,
+        "read_to flushes the final partial buffer"
+    );
+
+    let downloaded = PathBuf::from(sandbox.working_directory()).join("local/nested/download.bin");
+    sandbox
+        .fs()
+        .download("nested/large.bin", &downloaded)
+        .await
+        .expect("download");
+    sandbox
+        .fs()
+        .upload(&downloaded, "uploaded.bin")
+        .await
+        .expect("upload");
+    let mut uploaded = ByteSink::new(BYTE);
+    sandbox
+        .fs()
+        .read_to("uploaded.bin", &mut uploaded)
+        .await
+        .expect("read uploaded file");
+    assert_eq!(uploaded.written, LENGTH);
+    sandbox.delete().await.expect("delete");
+    provider.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn file_transfer_failures_return_without_hanging() {
+    let provider = connect().await;
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+    let error = time::timeout(
+        Duration::from_secs(5),
+        sandbox
+            .fs()
+            .write_from("short.bin", &mut b"short".as_slice(), 1024 * 1024),
+    )
+    .await
+    .expect("short source terminates transfer")
+    .expect_err("short source fails");
+    assert!(
+        matches!(error, Error::Io { source, .. } if source.kind() == io::ErrorKind::UnexpectedEof)
+    );
+
+    sandbox
+        .fs()
+        .write_from("large.bin", &mut repeat(0), 8 * 1024 * 1024)
+        .await
+        .expect("large file");
+    let error = time::timeout(
+        Duration::from_secs(5),
+        sandbox.fs().read_to("large.bin", &mut FailingWriter),
+    )
+    .await
+    .expect("failed sink terminates transfer")
+    .expect_err("failed sink fails");
+    assert!(
+        matches!(error, Error::Io { source, .. } if source.kind() == io::ErrorKind::BrokenPipe)
+    );
+
+    sandbox
+        .fs()
+        .write("small.bin", b"buffered")
+        .await
+        .expect("small file");
+    let mut buffered_failure = BufWriter::with_capacity(1024, FailingWriter);
+    let error = sandbox
+        .fs()
+        .read_to("small.bin", &mut buffered_failure)
+        .await
+        .expect_err("flush failure propagates");
+    assert!(
+        matches!(error, Error::Io { source, .. } if source.kind() == io::ErrorKind::BrokenPipe)
+    );
+    sandbox.delete().await.expect("delete");
+    provider.shutdown().await.expect("shutdown");
+}
+
+struct ByteSink {
+    byte:    u8,
+    written: u64,
+}
+
+impl ByteSink {
+    fn new(byte: u8) -> Self {
+        Self { byte, written: 0 }
+    }
+}
+
+impl AsyncWrite for ByteSink {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        assert!(
+            buffer.iter().all(|byte| *byte == self.byte),
+            "file content preserved"
+        );
+        self.written += buffer.len() as u64;
+        Poll::Ready(Ok(buffer.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        panic!("read_to must leave its output open");
+    }
 }
 
 #[tokio::test]

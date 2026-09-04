@@ -10,7 +10,7 @@
 //! program that needs only these — Petri's step runner, say — runs on any
 //! Linux image with a POSIX userland.
 
-use std::io::{self, Cursor};
+use std::io;
 use std::path::Path;
 use std::result::Result as StdResult;
 use std::sync::Arc;
@@ -20,17 +20,20 @@ use async_trait::async_trait;
 use bollard::Docker;
 use bollard::container::{DownloadFromContainerOptions, UploadToContainerOptions};
 use bollard::errors::Error as DockerApiError;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream};
 use sandbox_driver::{
     DerivedFs, DirEntry, Error, Exec, ExecSpec, FileMetadata, Filesystem, ResourceKind, Result,
 };
 use tokio::fs;
-use tokio::sync::OnceCell;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{OnceCell, mpsc};
+use tokio_util::bytes::Bytes;
 
 use crate::exec::{docker_error, is_not_found};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const TAR_BLOCK: usize = 512;
+const TRANSFER_CHUNK_BYTES: usize = 64 * 1024;
 
 pub(crate) struct DockerFs {
     docker:       Docker,
@@ -128,16 +131,15 @@ impl DockerFs {
         Ok(target)
     }
 
-    /// Streams the archive of `container_path` and returns the bytes of
-    /// its first regular file within `offset` and `length`, or `None`
-    /// when the archived resource is not a regular file (a symlink, which
-    /// the archive API returns as-is, or a directory).
-    async fn read_archived(
+    /// Streams the requested file bytes to `output`. A non-file archive
+    /// returns false without writing, so the caller can follow a symlink.
+    async fn read_archived_to(
         &self,
         container_path: &str,
         offset: u64,
         length: Option<u64>,
-    ) -> Result<Option<Vec<u8>>> {
+        output: &mut (dyn AsyncWrite + Unpin + Send),
+    ) -> Result<bool> {
         let options = DownloadFromContainerOptions {
             path: container_path.to_owned(),
         };
@@ -145,7 +147,7 @@ impl DockerFs {
             .docker
             .download_from_container(&self.container_id, Some(options));
         let mut scanner = TarScanner::new(offset, length);
-        while let Some(chunk) = stream.next().await {
+        'archive: while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|error| {
                 if is_not_found(&error) {
                     Error::NotFound {
@@ -156,13 +158,79 @@ impl DockerFs {
                     docker_error("downloading file", error)
                 }
             })?;
-            if scanner.feed(&chunk)? {
-                // Everything wanted is in hand; the rest of the archive is
-                // dropped with the stream.
-                break;
+            for chunk in chunk.chunks(TRANSFER_CHUNK_BYTES) {
+                let done = scanner.feed(chunk)?;
+                output
+                    .write_all(&scanner.collected)
+                    .await
+                    .map_err(|error| Error::io("writing downloaded file", error))?;
+                scanner.collected.clear();
+                if done {
+                    break 'archive;
+                }
             }
         }
-        scanner.finish()
+        Ok(scanner.finish()?.is_some())
+    }
+
+    async fn read_range_to(
+        &self,
+        path: &str,
+        offset: u64,
+        length: Option<u64>,
+        output: &mut (dyn AsyncWrite + Unpin + Send),
+    ) -> Result<()> {
+        let container_path = self.resolve(path);
+        if self
+            .read_archived_to(&container_path, offset, length, output)
+            .await?
+        {
+            return Ok(());
+        }
+        let target = self.resolve_link(&container_path).await?;
+        if self
+            .read_archived_to(&target, offset, length, output)
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(Error::invalid_spec(
+                "path",
+                format!("{path:?} is not a regular file"),
+            ))
+        }
+    }
+
+    /// Creates only missing directories before consuming the file input.
+    /// Retrying a small directory archive never requires replaying input.
+    async fn prepare_parent(&self, parent: &str, mode: u32, owner: Owner) -> Result<()> {
+        for root in Path::new(parent).ancestors() {
+            let root = root.to_string_lossy();
+            let below = parent
+                .strip_prefix(root.as_ref())
+                .unwrap_or_default()
+                .trim_matches('/');
+            let mut dirs: Vec<String> = Vec::new();
+            for component in below.split('/').filter(|part| !part.is_empty()) {
+                let dir = match dirs.last() {
+                    Some(previous) => format!("{previous}/{component}"),
+                    None => component.to_owned(),
+                };
+                dirs.push(dir);
+            }
+            match self
+                .upload_tar(&root, directory_archive(&dirs, mode, owner)?)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) if is_not_found(&error) => {}
+                Err(error) => return Err(docker_error("creating upload directories", error)),
+            }
+        }
+        Err(Error::io(
+            format!("creating parent directory {parent}"),
+            io::Error::other("no existing ancestor accepted the upload"),
+        ))
     }
 }
 
@@ -337,39 +405,89 @@ fn is_runtime_path(container_path: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
-/// One archive to upload at `root`: the directories `dirs` (relative to
-/// `root`, shallowest first, each with `dir_mode`) and then one regular
-/// file at `file` (relative to `root`).
-fn upload_archive(
-    dirs: &[String],
-    dir_mode: u32,
-    file: &str,
-    bytes: &[u8],
-    file_mode: u32,
-    owner: Owner,
-) -> Result<Vec<u8>> {
-    let tar_io = |error| Error::io("building upload archive", error);
+/// A small archive containing only directories, never file content.
+fn directory_archive(dirs: &[String], mode: u32, owner: Owner) -> Result<Vec<u8>> {
+    let tar_io = |error| Error::io("building directory archive", error);
     let mut builder = tar::Builder::new(Vec::new());
     for dir in dirs {
         let mut header = tar::Header::new_gnu();
         header.set_entry_type(tar::EntryType::Directory);
         header.set_size(0);
-        header.set_mode(dir_mode);
+        header.set_mode(mode);
         header.set_uid(owner.uid);
         header.set_gid(owner.gid);
         builder
             .append_data(&mut header, format!("{dir}/"), io::empty())
             .map_err(tar_io)?;
     }
+    builder.into_inner().map_err(tar_io)
+}
+
+/// Encodes a file header, including tar's long-name extension when needed.
+/// The builder writes an empty entry; its final header is updated with the
+/// streamed length and its end-of-archive blocks are replaced by the stream.
+fn file_archive_header(file: &str, length: u64, mode: u32, owner: Owner) -> Result<Vec<u8>> {
+    let tar_io = |error| Error::io("building upload header", error);
     let mut header = tar::Header::new_gnu();
-    header.set_size(bytes.len() as u64);
-    header.set_mode(file_mode);
+    header.set_size(0);
+    header.set_mode(mode);
     header.set_uid(owner.uid);
     header.set_gid(owner.gid);
+    let mut builder = tar::Builder::new(Vec::new());
     builder
-        .append_data(&mut header, file, Cursor::new(bytes))
+        .append_data(&mut header, file, io::empty())
         .map_err(tar_io)?;
-    builder.into_inner().map_err(tar_io)
+    let mut prefix = builder.into_inner().map_err(tar_io)?;
+    prefix.truncate(prefix.len() - 2 * TAR_BLOCK);
+    header.set_size(length);
+    header.set_cksum();
+    let start = prefix.len() - TAR_BLOCK;
+    prefix[start..].copy_from_slice(header.as_bytes());
+    Ok(prefix)
+}
+
+/// Produces a tar body in bounded chunks. The source is borrowed by the
+/// caller's operation; cancellation drops this future and the upload together.
+async fn send_file_archive(
+    sender: mpsc::Sender<Bytes>,
+    prefix: Vec<u8>,
+    input: &mut (dyn AsyncRead + Unpin + Send),
+    length: u64,
+) -> Result<()> {
+    let send = |bytes| async {
+        sender.send(bytes).await.map_err(|_| {
+            Error::io(
+                "streaming upload archive",
+                io::Error::new(io::ErrorKind::BrokenPipe, "upload stopped reading"),
+            )
+        })
+    };
+    send(prefix.into()).await?;
+    let mut remaining = length;
+    let mut buffer = vec![0; TRANSFER_CHUNK_BYTES];
+    while remaining > 0 {
+        let wanted = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+        let read = input
+            .read(&mut buffer[..wanted])
+            .await
+            .map_err(|error| Error::io("reading upload source", error))?;
+        if read == 0 {
+            return Err(Error::io(
+                "reading upload source",
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "source ended before the declared file length",
+                ),
+            ));
+        }
+        send(Bytes::copy_from_slice(&buffer[..read])).await?;
+        remaining -= read as u64;
+    }
+    let padding = (TAR_BLOCK as u64 - length % TAR_BLOCK as u64) % TAR_BLOCK as u64;
+    let padding = usize::try_from(padding).expect("tar padding fits in one block");
+    send(vec![0; padding + 2 * TAR_BLOCK].into()).await
 }
 
 #[async_trait]
@@ -389,19 +507,21 @@ impl Filesystem for DockerFs {
         err
     )]
     async fn read_range(&self, path: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
-        let container_path = self.resolve(path);
-        if let Some(bytes) = self.read_archived(&container_path, offset, length).await? {
-            return Ok(bytes);
-        }
-        // A symlink comes back from the archive API as-is: follow it once.
-        let target = self.resolve_link(&container_path).await?;
-        match self.read_archived(&target, offset, length).await? {
-            Some(bytes) => Ok(bytes),
-            None => Err(Error::invalid_spec(
-                "path",
-                format!("{path:?} is not a regular file"),
-            )),
-        }
+        let mut bytes = Vec::new();
+        self.read_range_to(path, offset, length, &mut bytes).await?;
+        Ok(bytes)
+    }
+
+    async fn read_to(
+        &self,
+        path: &str,
+        output: &mut (dyn AsyncWrite + Unpin + Send),
+    ) -> Result<()> {
+        self.read_range_to(path, 0, None, output).await?;
+        output
+            .flush()
+            .await
+            .map_err(|error| Error::io("flushing downloaded file", error))
     }
 
     #[tracing::instrument(
@@ -414,50 +534,48 @@ impl Filesystem for DockerFs {
         err
     )]
     async fn write(&self, path: &str, content: &[u8]) -> Result<()> {
+        let mut input = content;
+        self.write_from(path, &mut input, content.len() as u64)
+            .await
+    }
+
+    async fn write_from(
+        &self,
+        path: &str,
+        input: &mut (dyn AsyncRead + Unpin + Send),
+        length: u64,
+    ) -> Result<()> {
         let container_path = self.resolve(path);
         let (parent, file_name) = split_container_path(&container_path)?;
-        // Runtime files stay owner-private (fabro's rule): they can hold
-        // materialized secrets, and per-file 0600 keeps protecting them
-        // even if an ancestor's 0700 is ever loosened.
-        let runtime_path = is_runtime_path(&container_path);
-        let (file_mode, dir_mode) = if runtime_path {
+        let (file_mode, dir_mode) = if is_runtime_path(&container_path) {
             (0o600, 0o700)
         } else {
             (0o644, 0o755)
         };
         let owner = self.owner().await;
-        // Upload at the deepest existing ancestor, carrying only the
-        // directories below it, so an existing directory is never
-        // re-written with the archive's mode and ownership.
-        for root in Path::new(&parent).ancestors() {
-            let root = root.to_string_lossy();
-            let below = parent
-                .strip_prefix(root.as_ref())
-                .unwrap_or_default()
-                .trim_matches('/');
-            let mut dirs: Vec<String> = Vec::new();
-            for component in below.split('/').filter(|part| !part.is_empty()) {
-                let dir = match dirs.last() {
-                    Some(previous) => format!("{previous}/{component}"),
-                    None => component.to_owned(),
-                };
-                dirs.push(dir);
-            }
-            let file = match dirs.last() {
-                Some(deepest) => format!("{deepest}/{file_name}"),
-                None => file_name.clone(),
-            };
-            let archive = upload_archive(&dirs, dir_mode, &file, content, file_mode, owner)?;
-            match self.upload_tar(&root, archive).await {
-                Ok(()) => return Ok(()),
-                Err(error) if is_not_found(&error) => {}
-                Err(error) => return Err(docker_error("uploading file", error)),
-            }
-        }
-        Err(Error::io(
-            format!("creating parent directory {parent}"),
-            io::Error::other("no existing ancestor accepted the upload"),
-        ))
+        self.prepare_parent(&parent, dir_mode, owner).await?;
+        let prefix = file_archive_header(&file_name, length, file_mode, owner)?;
+        let (sender, receiver) = mpsc::channel(2);
+        let body = stream::unfold(receiver, |mut receiver| async {
+            receiver.recv().await.map(|bytes| (bytes, receiver))
+        });
+        let upload = async {
+            self.docker
+                .upload_to_container_streaming(
+                    &self.container_id,
+                    Some(UploadToContainerOptions {
+                        path:                     parent,
+                        no_overwrite_dir_non_dir: "false".to_owned(),
+                    }),
+                    body,
+                )
+                .await
+                .map_err(|error| docker_error("uploading file", error))
+        };
+        // Poll upload first so a daemon rejection keeps its provider error
+        // instead of being replaced by the producer's closed-channel error.
+        tokio::try_join!(biased; upload, send_file_archive(sender, prefix, input, length))?;
+        Ok(())
     }
 
     #[tracing::instrument(
@@ -522,23 +640,28 @@ impl Filesystem for DockerFs {
 
     #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container_id), err)]
     async fn upload(&self, local: &Path, remote: &str) -> Result<()> {
-        let bytes = fs::read(local)
+        let mut input = fs::File::open(local)
             .await
             .map_err(|error| Error::io(format!("reading {}", local.display()), error))?;
-        self.write(remote, &bytes).await
+        let length = input
+            .metadata()
+            .await
+            .map_err(|error| Error::io(format!("reading metadata for {}", local.display()), error))?
+            .len();
+        self.write_from(remote, &mut input, length).await
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container_id), err)]
     async fn download(&self, remote: &str, local: &Path) -> Result<()> {
-        let bytes = self.read(remote).await?;
         if let Some(parent) = local.parent() {
             fs::create_dir_all(parent)
                 .await
                 .map_err(|error| Error::io(format!("creating {}", parent.display()), error))?;
         }
-        fs::write(local, bytes)
+        let mut output = fs::File::create(local)
             .await
-            .map_err(|error| Error::io(format!("writing {}", local.display()), error))
+            .map_err(|error| Error::io(format!("writing {}", local.display()), error))?;
+        self.read_to(remote, &mut output).await
     }
 }
 
@@ -551,7 +674,67 @@ mod tests {
     use super::*;
 
     fn single_file_tar(name: &str, bytes: &[u8]) -> Vec<u8> {
-        upload_archive(&[], 0o755, name, bytes, 0o644, Owner::default()).expect("tar builds")
+        let mut archive =
+            file_archive_header(name, bytes.len() as u64, 0o644, Owner::default()).expect("header");
+        archive.extend_from_slice(bytes);
+        archive.resize(
+            archive.len().div_ceil(TAR_BLOCK) * TAR_BLOCK + 2 * TAR_BLOCK,
+            0,
+        );
+        archive
+    }
+
+    #[tokio::test]
+    async fn upload_archive_streams_long_names_and_leaves_extra_input_unread() {
+        let name = format!("{}.bin", "long".repeat(40));
+        let content = vec![b'x'; TRANSFER_CHUNK_BYTES * 4 + 19];
+        let mut input = content.as_slice();
+        let length = content.len() as u64 - 3;
+        let prefix = file_archive_header(&name, length, 0o600, Owner {
+            uid: 1000,
+            gid: 1001,
+        })
+        .expect("header");
+        let (sender, mut receiver) = mpsc::channel(2);
+        let collect = async {
+            let mut archive = Vec::new();
+            while let Some(bytes) = receiver.recv().await {
+                let bytes: Bytes = bytes;
+                assert!(bytes.len() <= TRANSFER_CHUNK_BYTES);
+                archive.extend(bytes);
+            }
+            archive
+        };
+        let (outcome, archive) = tokio::join!(
+            send_file_archive(sender, prefix, &mut input, length),
+            collect
+        );
+        outcome.expect("streamed archive");
+        assert_eq!(input, b"xxx");
+        let mut archive = tar::Archive::new(archive.as_slice());
+        let mut entries = archive.entries().expect("entries");
+        let mut entry = entries.next().expect("file").expect("valid file");
+        assert_eq!(entry.path().expect("path").to_string_lossy(), name);
+        assert_eq!(entry.header().mode().expect("mode"), 0o600);
+        assert_eq!(entry.header().uid().expect("uid"), 1000);
+        assert_eq!(entry.header().gid().expect("gid"), 1001);
+        let mut bytes = Vec::new();
+        io::Read::read_to_end(&mut entry, &mut bytes).expect("content");
+        assert_eq!(bytes, content[..content.len() - 3]);
+        assert!(entries.next().is_none());
+    }
+
+    #[tokio::test]
+    async fn upload_archive_rejects_short_input_without_completing_the_tar() {
+        let prefix = file_archive_header("file", 6, 0o644, Owner::default()).expect("header");
+        let (sender, mut receiver) = mpsc::channel(2);
+        let drain = async { while receiver.recv().await.is_some() {} };
+        let mut input = b"short".as_slice();
+        let (outcome, ()) = tokio::join!(send_file_archive(sender, prefix, &mut input, 6), drain);
+        let error = outcome.expect_err("short source");
+        assert!(
+            matches!(error, Error::Io { source, .. } if source.kind() == io::ErrorKind::UnexpectedEof)
+        );
     }
 
     #[test]
@@ -568,15 +751,15 @@ mod tests {
             uid: 1000,
             gid: 1000,
         };
-        let bytes = upload_archive(
-            &["a".to_owned(), "a/b".to_owned()],
-            0o700,
-            "a/b/blob.json",
-            b"{}",
-            0o600,
-            owner,
-        )
-        .expect("tar builds");
+        let mut bytes = directory_archive(&["a".to_owned(), "a/b".to_owned()], 0o700, owner)
+            .expect("directories");
+        bytes.truncate(bytes.len() - 2 * TAR_BLOCK);
+        bytes.extend(file_archive_header("a/b/blob.json", 2, 0o600, owner).expect("file header"));
+        bytes.extend(b"{}");
+        bytes.resize(
+            bytes.len().div_ceil(TAR_BLOCK) * TAR_BLOCK + 2 * TAR_BLOCK,
+            0,
+        );
         let mut archive = tar::Archive::new(bytes.as_slice());
         let entries: Vec<_> = archive
             .entries()
