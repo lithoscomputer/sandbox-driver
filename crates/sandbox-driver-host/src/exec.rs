@@ -4,7 +4,6 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::process::Stdio;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use std::{env, fs, future, io};
 
@@ -21,7 +20,9 @@ use tokio::process::{Child, Command};
 use tokio::sync::watch;
 use tokio::time;
 
-/// The variable the Bash contract requires stripping before every run.
+/// Bash sources this file at startup. Dropped from the inherited
+/// environment so a worker's startup file never runs inside a sandboxed
+/// `bash -c`; [`sandbox_driver::ExecSpec::bash`] blanks it per command.
 const BASH_ENV_VAR: &str = "BASH_ENV";
 
 /// Bound on draining remaining output after the process has ended, so a
@@ -87,13 +88,14 @@ pub(crate) fn effective_env(base_env: &BTreeMap<String, String>) -> BTreeMap<Str
 
 /// Command execution on the local machine.
 ///
-/// Implements the Bash contract: every command runs as `bash -c <command>`
-/// with `bash` resolved through the caller's `PATH` (NixOS has no
-/// `/bin/bash`), no login mode, no option changes, and `BASH_ENV` removed
-/// — including from spec-provided env. The parent environment is cleared
-/// and rebuilt through a fail-closed secret filter, so ambient worker
-/// credentials never reach sandboxed commands. Processes run in their own
-/// process group so cancellation and timeouts kill the whole tree.
+/// Spawns the spec's program and arguments directly; the program is
+/// resolved through the command's own `PATH` (the effective environment
+/// below, overlaid with the spec env), so a spec that sets `PATH` also
+/// chooses where its program comes from. The parent environment is
+/// cleared and rebuilt through a fail-closed secret filter, so ambient
+/// worker credentials never reach sandboxed commands. Processes run in
+/// their own process group so cancellation and timeouts kill the whole
+/// tree.
 pub struct HostExec {
     working_dir:                PathBuf,
     base_env:                   BTreeMap<String, String>,
@@ -102,7 +104,6 @@ pub struct HostExec {
     /// forever. Designated directories stay caller-owned and are never
     /// created here.
     recreate_missing_workspace: bool,
-    bash_path:                  OnceLock<PathBuf>,
 }
 
 impl HostExec {
@@ -115,25 +116,7 @@ impl HostExec {
             working_dir,
             base_env,
             recreate_missing_workspace,
-            bash_path: OnceLock::new(),
         }
-    }
-
-    /// Resolves, then remembers, the Bash this sandbox runs commands
-    /// with. Every spawn goes through here so a spec-provided `PATH`
-    /// cannot make spawning fail and a single sandbox can never split
-    /// across two interpreters.
-    fn bash(&self) -> Result<PathBuf> {
-        if let Some(path) = self.bash_path.get() {
-            return Ok(path.clone());
-        }
-        let resolved = resolve_bash_on_path().ok_or_else(|| {
-            Error::io(
-                "resolving bash",
-                io::Error::new(io::ErrorKind::NotFound, "no `bash` on PATH"),
-            )
-        })?;
-        Ok(self.bash_path.get_or_init(|| resolved).clone())
     }
 
     fn resolve_dir(&self, dir: Option<&str>) -> PathBuf {
@@ -153,6 +136,7 @@ impl HostExec {
     fn command(
         &self,
         program: &str,
+        args: &[String],
         working_dir: Option<&str>,
         env: &BTreeMap<String, String>,
     ) -> Result<Command> {
@@ -160,51 +144,17 @@ impl HostExec {
             fs::create_dir_all(&self.working_dir)
                 .map_err(|error| Error::io("recreating managed workspace", error))?;
         }
-        let mut command = Command::new(self.bash()?);
-        command.arg("-c").arg(program);
+        let mut command = Command::new(program);
+        command.args(args);
         command.current_dir(self.resolve_dir(working_dir));
         command.env_clear();
         command.envs(effective_env(&self.base_env));
-        for (key, value) in env {
-            if key != BASH_ENV_VAR {
-                command.env(key, value);
-            }
-        }
+        command.envs(env);
         #[cfg(unix)]
         command.process_group(0);
         command.kill_on_drop(true);
         Ok(command)
     }
-}
-
-fn resolve_bash_on_path() -> Option<PathBuf> {
-    let paths = env::var_os("PATH")?;
-    // Windows resolves executables through PATHEXT (`bash.exe`), so the
-    // bare name alone would never match a Git Bash install.
-    #[cfg(windows)]
-    let extensions: Vec<String> = env::var_os("PATHEXT")
-        .map(|value| {
-            value
-                .to_string_lossy()
-                .split(';')
-                .map(str::to_ascii_lowercase)
-                .collect()
-        })
-        .unwrap_or_else(|| vec![".exe".to_owned(), ".cmd".to_owned(), ".bat".to_owned()]);
-    for dir in env::split_paths(&paths) {
-        let candidate = dir.join("bash");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        #[cfg(windows)]
-        for extension in &extensions {
-            let candidate = dir.join(format!("bash{extension}"));
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
 }
 
 #[cfg(unix)]
@@ -327,7 +277,12 @@ impl Exec for HostExec {
         let started = Instant::now();
         let grace = controls.grace.unwrap_or(TERM_GRACE);
         let stdin_reader = controls.stdin_reader(spec);
-        let mut command = self.command(&spec.command, spec.working_dir.as_deref(), &spec.env)?;
+        let mut command = self.command(
+            &spec.program,
+            &spec.args,
+            spec.working_dir.as_deref(),
+            &spec.env,
+        )?;
         command.stdin(if stdin_reader.is_some() {
             Stdio::piped()
         } else {
@@ -338,7 +293,7 @@ impl Exec for HostExec {
 
         let mut child = command
             .spawn()
-            .map_err(|error| Error::io("spawning bash for exec", error))?;
+            .map_err(|error| Error::io("spawning exec process", error))?;
 
         // Write-then-EOF, concurrently with output pumping so a large
         // write cannot deadlock against a full output pipe.
@@ -500,15 +455,19 @@ impl Exec for HostExec {
 
     #[tracing::instrument(skip_all, fields(provider_kind = "host"), err)]
     async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
-        let program = format!("exec {}", spec.command);
-        let mut command = self.command(&program, spec.working_dir.as_deref(), &spec.env)?;
+        let mut command = self.command(
+            &spec.program,
+            &spec.args,
+            spec.working_dir.as_deref(),
+            &spec.env,
+        )?;
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
 
         let mut child = command
             .spawn()
-            .map_err(|error| Error::io("spawning bash for stdio process", error))?;
+            .map_err(|error| Error::io("spawning stdio process", error))?;
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");

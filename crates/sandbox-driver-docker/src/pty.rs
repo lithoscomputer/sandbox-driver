@@ -11,11 +11,11 @@ use bollard::container::LogOutput;
 use bollard::errors::Error as DockerApiError;
 use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecOptions, StartExecResults};
 use futures_util::{Stream, StreamExt};
-use sandbox_driver::{Error, Pty, PtyOptions, PtySession, PtySize, Result};
+use sandbox_driver::{BASH_ENV_VAR, Error, Pty, PtyOptions, PtySession, PtySize, Result};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-use crate::exec::{BASH_ENV_VAR, docker_error, shell_quote};
+use crate::exec::{docker_error, shell_quote};
 
 const DEFAULT_TERM: &str = "xterm-256color";
 const DEFAULT_LANG: &str = "C.UTF-8";
@@ -152,7 +152,7 @@ impl DockerPtySession {
                 tty: Some(false),
                 // Bash, not sh: dash's `kill` builtin rejects the `--`
                 // separator the group kills need ("Illegal number: -"),
-                // and the image contract already requires bash.
+                // and a PTY session is an interactive bash already.
                 cmd: Some(vec!["bash".to_owned(), "-c".to_owned(), command]),
                 working_dir: Some("/".to_owned()),
                 env: Some(vec![format!("{BASH_ENV_VAR}=")]),

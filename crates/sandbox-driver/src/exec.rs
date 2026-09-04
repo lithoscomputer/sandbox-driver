@@ -15,18 +15,30 @@ use crate::capabilities::Capability;
 use crate::error::{Error, Result};
 use crate::sanitize::OutputSanitization;
 
+/// The interpreter [`ExecSpec::bash`] names, resolved through `PATH`
+/// (NixOS has no `/bin/bash`).
+const BASH: &str = "bash";
+const BASH_COMMAND_FLAG: &str = "-c";
+/// Bash sources this file before running `-c` source; the helper blanks
+/// it so a sandbox environment cannot run code ahead of the script.
+pub const BASH_ENV_VAR: &str = "BASH_ENV";
+
 /// Command execution inside a sandbox.
 ///
-/// # The Bash contract (normative)
+/// # The exec contract (normative)
 ///
-/// `command` is Bash source, evaluated as `bash -c <command>`, non-login.
-/// Implementations select the interpreter, never its options: no `errexit`,
-/// no `pipefail`, no POSIX mode, never a fallback to `sh`, never a
-/// provider's ambient shell. A caller wanting other semantics writes them
-/// into the command. `BASH_ENV` is stripped before every invocation.
-/// Buffered and streaming execution must not differ in interpreter or
-/// options. The [`crate::run_bash_probe`] helper verifies this contract and
-/// belongs in every provider's conformance run.
+/// A spec names a program and its arguments, and a provider executes that
+/// vector directly, with `execvp` semantics: `program` is resolved through
+/// the command's `PATH` when it contains no slash, and every argument
+/// reaches the process unchanged. No shell is involved, so nothing is
+/// split, globbed, or expanded. Buffered and streaming execution must not
+/// differ in how the vector is run.
+///
+/// A caller who wants shell semantics asks for them with
+/// [`ExecSpec::bash`], which is the one place the Bash contract lives. The
+/// [`crate::run_bash_probe`] helper verifies that a sandbox can serve it,
+/// and belongs in every provider's conformance run because the
+/// exec-derived facets are Bash scripts.
 #[async_trait]
 pub trait Exec: Send + Sync {
     /// Runs a command to completion, buffering output.
@@ -76,15 +88,18 @@ pub trait Exec: Send + Sync {
 /// Serializable execution request — exactly what crosses the JSON-RPC
 /// boundary. Process-local control objects travel in [`ExecControls`].
 ///
-/// `Debug` redacts the command (it can embed credentialed URLs — the
+/// `Debug` redacts the arguments (they can embed credentialed URLs — the
 /// git credential rewrite does), env values, and stdin, so tracing a
 /// spec can never leak them; fabro enforced the same rule by omitting
 /// `Debug` entirely.
 #[derive(Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ExecSpec {
-    /// Bash source; see the trait-level contract.
-    pub command:             String,
+    /// The executable, resolved through the command's `PATH` when it has
+    /// no slash; see the trait-level contract.
+    pub program:             String,
+    /// Arguments after the program, passed unchanged.
+    pub args:                Vec<String>,
     /// `None` waits forever. [`ExecSpec::new`] starts at
     /// [`ExecSpec::DEFAULT_TIMEOUT`]; opt out with
     /// [`ExecSpec::no_timeout`].
@@ -107,15 +122,47 @@ impl ExecSpec {
     /// fail-safe without forcing the choice.
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3600);
 
-    pub fn new(command: impl Into<String>) -> Self {
+    /// A spec that runs `program` with no arguments; add them with
+    /// [`ExecSpec::arg`] or [`ExecSpec::args`].
+    pub fn new(program: impl Into<String>) -> Self {
         Self {
-            command:             command.into(),
+            program:             program.into(),
+            args:                Vec::new(),
             timeout:             Some(Self::DEFAULT_TIMEOUT),
             working_dir:         None,
             env:                 BTreeMap::new(),
             stdin:               None,
             output_sanitization: OutputSanitization::Raw,
         }
+    }
+
+    /// A spec that evaluates `script` as Bash source: the argv
+    /// `bash -c <script>`, non-login, with Bash's options untouched (no
+    /// `errexit`, no `pipefail`, no POSIX mode) and `BASH_ENV` blanked in
+    /// the spec env so no startup file runs first. A script wanting other
+    /// options sets them itself. This is the Bash contract; it holds
+    /// wherever the sandbox has `bash` on `PATH`, which
+    /// [`crate::run_bash_probe`] verifies.
+    pub fn bash(script: impl Into<String>) -> Self {
+        Self::new(BASH)
+            .args([BASH_COMMAND_FLAG, &script.into()])
+            .env_var(BASH_ENV_VAR, "")
+    }
+
+    #[must_use]
+    pub fn arg(mut self, arg: impl Into<String>) -> Self {
+        self.args.push(arg.into());
+        self
+    }
+
+    #[must_use]
+    pub fn args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.args.extend(args.into_iter().map(Into::into));
+        self
     }
 
     /// Deliberately unbounded: wait forever on the command.
@@ -159,7 +206,8 @@ impl ExecSpec {
 impl fmt::Debug for ExecSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExecSpec")
-            .field("command", &"<redacted>")
+            .field("program", &self.program)
+            .field("args", &"<redacted>")
             .field("timeout", &self.timeout)
             .field("working_dir", &self.working_dir)
             .field("env_keys", &self.env.keys().collect::<Vec<_>>())
@@ -481,13 +529,14 @@ impl ExecStreamingResult {
     }
 }
 
-/// Serializable spawn request for [`Exec::spawn_stdio`]. The command is
-/// Bash source under the same contract as [`ExecSpec::command`].
-/// `Debug` redacts the command and env values, as on [`ExecSpec`].
+/// Serializable spawn request for [`Exec::spawn_stdio`]. The program and
+/// arguments run under the same contract as [`ExecSpec`]. `Debug` redacts
+/// the arguments and env values, as on [`ExecSpec`].
 #[derive(Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct SpawnSpec {
-    pub command:     String,
+    pub program:     String,
+    pub args:        Vec<String>,
     pub working_dir: Option<String>,
     pub env:         BTreeMap<String, String>,
 }
@@ -495,7 +544,8 @@ pub struct SpawnSpec {
 impl fmt::Debug for SpawnSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SpawnSpec")
-            .field("command", &"<redacted>")
+            .field("program", &self.program)
+            .field("args", &"<redacted>")
             .field("working_dir", &self.working_dir)
             .field("env_keys", &self.env.keys().collect::<Vec<_>>())
             .finish()
@@ -503,12 +553,51 @@ impl fmt::Debug for SpawnSpec {
 }
 
 impl SpawnSpec {
-    pub fn new(command: impl Into<String>) -> Self {
+    /// A spec that spawns `program` with no arguments; add them with
+    /// [`SpawnSpec::arg`] or [`SpawnSpec::args`].
+    pub fn new(program: impl Into<String>) -> Self {
         Self {
-            command:     command.into(),
+            program:     program.into(),
+            args:        Vec::new(),
             working_dir: None,
             env:         BTreeMap::new(),
         }
+    }
+
+    /// A spec that evaluates `script` as Bash source, under the same
+    /// contract as [`ExecSpec::bash`].
+    pub fn bash(script: impl Into<String>) -> Self {
+        let mut spec = Self::new(BASH).args([BASH_COMMAND_FLAG, &script.into()]);
+        spec.env.insert(BASH_ENV_VAR.to_owned(), String::new());
+        spec
+    }
+
+    #[must_use]
+    pub fn arg(mut self, arg: impl Into<String>) -> Self {
+        self.args.push(arg.into());
+        self
+    }
+
+    #[must_use]
+    pub fn args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    #[must_use]
+    pub fn working_dir(mut self, dir: impl Into<String>) -> Self {
+        self.working_dir = Some(dir.into());
+        self
+    }
+
+    #[must_use]
+    pub fn env_var(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.insert(key.into(), value.into());
+        self
     }
 }
 
@@ -623,19 +712,32 @@ mod tests {
     }
 
     #[test]
+    fn bash_helper_is_bash_dash_c_with_bash_env_blanked() {
+        let spec = ExecSpec::bash("echo $HOME");
+        assert_eq!(spec.program, "bash");
+        assert_eq!(spec.args, ["-c", "echo $HOME"]);
+        assert_eq!(spec.env.get("BASH_ENV").map(String::as_str), Some(""));
+
+        let spawn = SpawnSpec::bash("cat");
+        assert_eq!(spawn.program, "bash");
+        assert_eq!(spawn.args, ["-c", "cat"]);
+        assert_eq!(spawn.env.get("BASH_ENV").map(String::as_str), Some(""));
+    }
+
+    #[test]
     fn exec_and_spawn_spec_debug_redact_secrets() {
-        let spec = ExecSpec::new("curl https://user:hunter2@host/")
+        let spec = ExecSpec::new("curl")
+            .arg("https://user:hunter2@host/")
             .env_var("API_TOKEN", "hunter2")
             .stdin(b"hunter2".to_vec());
         let debug = format!("{spec:?}");
         assert!(!debug.contains("hunter2"), "debug: {debug}");
+        assert!(debug.contains("curl"), "the program stays visible: {debug}");
         assert!(debug.contains("API_TOKEN"), "keys stay visible: {debug}");
 
-        let spawn = SpawnSpec {
-            command:     "run --token hunter2".to_owned(),
-            working_dir: None,
-            env:         BTreeMap::from([("API_TOKEN".to_owned(), "hunter2".to_owned())]),
-        };
+        let spawn = SpawnSpec::new("run")
+            .args(["--token", "hunter2"])
+            .env_var("API_TOKEN", "hunter2");
         let debug = format!("{spawn:?}");
         assert!(!debug.contains("hunter2"), "debug: {debug}");
         assert!(debug.contains("API_TOKEN"), "keys stay visible: {debug}");

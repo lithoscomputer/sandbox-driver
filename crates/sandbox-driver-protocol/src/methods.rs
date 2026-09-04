@@ -397,7 +397,9 @@ pub struct UpdateNetworkParams {
 /// [`ExecSpec`] with the stdin payload in base64.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExecSpecDto {
-    pub command:             String,
+    pub program:             String,
+    #[serde(default)]
+    pub args:                Vec<String>,
     pub timeout_ms:          Option<u64>,
     pub working_dir:         Option<String>,
     pub env:                 BTreeMap<String, String>,
@@ -409,7 +411,8 @@ pub struct ExecSpecDto {
 impl ExecSpecDto {
     pub fn from_spec(spec: &ExecSpec) -> Self {
         Self {
-            command:             spec.command.clone(),
+            program:             spec.program.clone(),
+            args:                spec.args.clone(),
             timeout_ms:          spec
                 .timeout
                 .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
@@ -421,7 +424,7 @@ impl ExecSpecDto {
     }
 
     pub fn into_spec(self) -> Result<ExecSpec, sandbox_driver::Error> {
-        let mut spec = ExecSpec::new(self.command);
+        let mut spec = ExecSpec::new(self.program).args(self.args);
         // Wire semantics are authoritative: an absent timeout means
         // unbounded, so the constructor's default must not leak in.
         spec.timeout = self.timeout_ms.map(Duration::from_millis);

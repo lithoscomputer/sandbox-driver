@@ -36,12 +36,14 @@ async fn close_kills_a_shell_that_ignores_term() {
     time::sleep(Duration::from_millis(300)).await;
     session.close().await.expect("close");
 
-    // The shell must be gone; the container's only long-lived process
-    // is its `sleep infinity` init.
+    // The interactive `sh -l` must be gone; the container's only
+    // long-lived process is its `sleep infinity` init. Match on the
+    // arguments, because the exec wrapper running this listing is a
+    // `sh -c` itself.
     let listing = sandbox
         .exec()
         .run(
-            &ExecSpec::new("ps -e -o comm= | grep -c '^sh$' || true")
+            &ExecSpec::bash("ps -e -o args= | grep -c '^sh -l' || true")
                 .timeout(Duration::from_secs(10)),
         )
         .await

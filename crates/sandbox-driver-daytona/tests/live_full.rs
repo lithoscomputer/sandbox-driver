@@ -458,7 +458,7 @@ async fn tcp_probe(sandbox: &dyn sandbox_driver::Sandbox) -> Result<String, Stri
     let result = sandbox
         .exec()
         .run(
-            &ExecSpec::new(
+            &ExecSpec::bash(
                 "if timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null; \
                  then printf reachable; else printf blocked; fi",
             )
@@ -556,7 +556,11 @@ async fn stop_resize_archive_restore_lifecycle() {
         // The sandbox must still work after the full cycle.
         let result = sandbox
             .exec()
-            .run(&sandbox_driver::ExecSpec::new("echo restored").timeout(Duration::from_secs(60)))
+            .run(
+                &sandbox_driver::ExecSpec::new("echo")
+                    .arg("restored")
+                    .timeout(Duration::from_secs(60)),
+            )
             .await
             .map_err(|error| format!("exec after restore: {error}"))?;
         if !result.success() || !result.stdout_lossy().contains("restored") {
@@ -652,7 +656,7 @@ async fn fork_and_snapshot_modes_preserve_their_declared_state() {
         let setup = source
             .exec()
             .run(
-                &ExecSpec::new(
+                &ExecSpec::bash(
                     "printf preserved > /tmp/sd-state-marker; \
                      nohup bash -c 'exec -a sandbox-driver-live-process sleep 3600' \
                      </dev/null >/dev/null 2>&1 & \
@@ -748,7 +752,7 @@ async fn fork_and_snapshot_modes_preserve_their_declared_state() {
         let cold_check = cold_restore
             .exec()
             .run(
-                &ExecSpec::new(
+                &ExecSpec::bash(
                     "test \"$(cat /tmp/sd-state-marker)\" = preserved; \
                      pid=$(cat /tmp/sd-state-pid); \
                      if test -r \"/proc/$pid/cmdline\" && \
@@ -821,7 +825,7 @@ async fn filesystem_snapshot_restores_files_without_processes() {
         let setup = source
             .exec()
             .run(
-                &ExecSpec::new(
+                &ExecSpec::bash(
                     "printf preserved > /tmp/sd-cold-marker; \
                      nohup bash -c 'exec -a sandbox-driver-cold-process sleep 3600' \
                      </dev/null >/dev/null 2>&1 & \
@@ -864,7 +868,7 @@ async fn filesystem_snapshot_restores_files_without_processes() {
         let check = sandbox
             .exec()
             .run(
-                &ExecSpec::new(
+                &ExecSpec::bash(
                     "test \"$(cat /tmp/sd-cold-marker)\" = preserved; \
                      pid=$(cat /tmp/sd-cold-pid); \
                      if test -r \"/proc/$pid/cmdline\" && \
@@ -901,7 +905,7 @@ async fn assert_live_process(
     let result = sandbox
         .exec()
         .run(
-            &ExecSpec::new(
+            &ExecSpec::bash(
                 "pid=$(cat /tmp/sd-state-pid); \
                  test -r \"/proc/$pid/cmdline\"; \
                  tr '\\0' ' ' < \"/proc/$pid/cmdline\" | \
@@ -996,7 +1000,8 @@ async fn snapshot_provider_round_trip() {
         let result = sandbox
             .exec()
             .run(
-                &sandbox_driver::ExecSpec::new("cat /etc/debian_version")
+                &sandbox_driver::ExecSpec::new("cat")
+                    .arg("/etc/debian_version")
                     .timeout(Duration::from_secs(60)),
             )
             .await;

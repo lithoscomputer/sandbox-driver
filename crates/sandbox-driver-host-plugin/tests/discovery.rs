@@ -36,7 +36,7 @@ async fn launch_verifies_checksum_and_scrubs_environment() {
         .create(&SandboxSpec::new(SandboxSource::HostDirectory), None)
         .await
         .expect("create");
-    let spec = ExecSpec::new(
+    let spec = ExecSpec::bash(
         "printf '%s:%s' \"${SD_DISCOVERY_MARKER:-unset}\" \"${CARGO_MANIFEST_DIR:-scrubbed}\"",
     )
     .timeout(Duration::from_secs(30));

@@ -154,6 +154,27 @@ pub(crate) fn shell_quote(value: &str) -> String {
     quoted
 }
 
+/// `exec env KEY=VALUE… program args…` as one shell word list, each word
+/// single-quoted. The toolbox API takes a shell string, so this is the one
+/// place the exec contract's argv is turned back into shell — and the
+/// quoting is what keeps it literal. The environment rides on `env`
+/// rather than `export` so that names which are not shell identifiers
+/// (`INPUT_INCLUDE-HIDDEN-FILES`) reach the program too.
+pub(crate) fn exec_line(env: &BTreeMap<String, String>, program: &str, args: &[String]) -> String {
+    let mut line = String::from("exec env");
+    for (key, value) in env {
+        line.push(' ');
+        line.push_str(&shell_quote(&format!("{key}={value}")));
+    }
+    line.push(' ');
+    line.push_str(&shell_quote(program));
+    for arg in args {
+        line.push(' ');
+        line.push_str(&shell_quote(arg));
+    }
+    line
+}
+
 pub(crate) fn is_not_found(error: &DaytonaError) -> bool {
     matches!(error, DaytonaError::NotFound { .. })
 }
@@ -1498,7 +1519,11 @@ impl Sandbox for DaytonaSandbox {
         // machine — regardless of flag order.
         let result = self
             .exec
-            .run(&ExecSpec::new("uname -s -r -m").timeout(Duration::from_secs(60)))
+            .run(
+                &ExecSpec::new("uname")
+                    .args(["-s", "-r", "-m"])
+                    .timeout(Duration::from_secs(60)),
+            )
             .await?;
         let text = result.stdout_lossy();
         let mut parts = text.split_whitespace();

@@ -25,7 +25,7 @@ use tokio::time;
 
 use crate::exec::{build_session_script, wrap_session_script};
 use crate::session::Session;
-use crate::{DaytonaClient, daytona_error};
+use crate::{DaytonaClient, daytona_error, exec_line};
 
 /// Buffered bytes per stdio pipe.
 const PIPE_CAPACITY: usize = 64 * 1024;
@@ -44,7 +44,8 @@ pub(crate) async fn spawn(
         .map_err(|error| daytona_error("fetching sandbox", error))?;
 
     let mut session = Session::create(&sandbox).await?;
-    let program = wrap_session_script(&build_session_script(cwd, &spec.env, &spec.command));
+    let command = exec_line(&spec.env, &spec.program, &spec.args);
+    let program = wrap_session_script(&build_session_script(cwd, &command));
     let started = match session.execute(&program).await {
         Ok(result) => result,
         Err(error) => {

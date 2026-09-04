@@ -548,7 +548,11 @@ async fn execute_command(
     options: &ExecOptions,
     command: &[String],
 ) -> Result<u8> {
-    let mut spec = ExecSpec::new(shell_join(command));
+    // clap guarantees at least one word; it is the program.
+    let (program, args) = command
+        .split_first()
+        .context("a command to execute is required")?;
+    let mut spec = ExecSpec::new(program).args(args);
     if let Some(working_dir) = &options.working_dir {
         spec.working_dir = Some(working_dir.clone());
     }
@@ -638,14 +642,6 @@ async fn termination_exit_code(termination: Termination, exit_code: Option<i32>)
         Termination::Cancelled => Ok(CANCELLED_EXIT),
         _ => Ok(DRIVER_ERROR_EXIT),
     }
-}
-
-fn shell_join(parts: &[String]) -> String {
-    parts
-        .iter()
-        .map(|part| format!("'{}'", part.replace('\'', "'\\''")))
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 async fn execute_shell(sandbox: &dyn Sandbox) -> Result<u8> {
@@ -798,18 +794,6 @@ async fn execute_fs(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn shell_join_preserves_each_argument() {
-        assert_eq!(
-            shell_join(&[
-                "printf".to_owned(),
-                "%s\\n".to_owned(),
-                "it's safe; $(false)".to_owned(),
-            ]),
-            "'printf' '%s\\n' 'it'\\''s safe; $(false)'"
-        );
-    }
 
     #[test]
     fn assignments_split_only_on_the_first_equals_sign() {

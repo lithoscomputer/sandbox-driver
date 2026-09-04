@@ -8,13 +8,17 @@
 //! the daemon's archive API (single-call transfers of any size, reads
 //! that work on stopped containers), while metadata operations stay
 //! exec-derived — so `Capabilities::fs` still reports `native: false`.
-//! Every image must provide `/bin/bash` (the
-//! Bash contract) and a Linux userland with `stat`, `find`, `base64`,
-//! and `setsid` (kill semantics need a separate session; an image
-//! without it fails every exec with a clear message). Because Docker advertises
-//! the normalized Search, Git, and background-services facets, the image must
-//! also provide the commands documented by [`sandbox_driver::Search`] and
-//! [`sandbox_driver::Services`], plus `git`, on `PATH`.
+//! Every image must provide `/bin/sh`, `env`, and `setsid` for the exec
+//! wrapper (kill semantics need a separate session, and `env` carries
+//! the command's environment past the shell; an image without either
+//! fails every exec with a clear message). The exec-derived facets are
+//! Bash scripts, so an image that serves them must also provide `bash` on
+//! `PATH` and a Linux userland with `stat`, `find`, and `base64`. Because
+//! Docker advertises the normalized Search, Git, and background-services
+//! facets, the image must also provide the commands documented by
+//! [`sandbox_driver::Search`] and [`sandbox_driver::Services`], plus `git`,
+//! on `PATH`. A program that needs none of that — Petri's step runner, say
+//! — runs on any Linux image.
 //!
 //! # Runtime behavior
 //!
@@ -46,32 +50,25 @@ use bollard::image::CreateImageOptions;
 use bollard::models::{ContainerInspectResponse, ContainerStateStatusEnum, HostConfig};
 use futures_util::StreamExt;
 use sandbox_driver::{
-    Action, Capabilities, Error, EventContext, EventEmitter, EventSubject, Exec, ExecSpec,
-    Filesystem, HealthStatus, Isolation, LifecycleTimers, NetworkPolicy, OperationReporter,
-    PlatformInfo, Progress, ProgressCode, ProviderError, ProviderHealth, ProviderKind, Pty,
-    PtyCaps, ResourceKind, Result, Sandbox, SandboxFilter, SandboxId, SandboxKind, SandboxProvider,
-    SandboxSource, SandboxSpec, SandboxState, SandboxStatus, ShellCommand,
+    Action, BASH_ENV_VAR, Capabilities, Error, EventContext, EventEmitter, EventSubject, Exec,
+    ExecSpec, Filesystem, HealthStatus, Isolation, LifecycleTimers, NetworkPolicy,
+    OperationReporter, PlatformInfo, Progress, ProgressCode, ProviderError, ProviderHealth,
+    ProviderKind, Pty, PtyCaps, ResourceKind, Result, Sandbox, SandboxFilter, SandboxId,
+    SandboxKind, SandboxProvider, SandboxSource, SandboxSpec, SandboxState, SandboxStatus,
+    ShellCommand,
 };
 use serde::Deserialize;
 
 use crate::access::DockerShellCommand;
 pub use crate::exec::DockerExec;
 use crate::exec::{
-    BASH_ENV_VAR, CONTAINER_BASH, docker_error, docker_kind, is_conflict, is_not_found,
-    is_not_modified, shell_quote, tolerate_not_modified,
+    POSIX_SH, docker_error, docker_kind, is_conflict, is_not_found, is_not_modified, shell_quote,
+    tolerate_not_modified,
 };
 use crate::fs::DockerFs;
 use crate::pty::DockerPty;
 
 pub(crate) const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
-/// Records the `provider_config.shell` choice on the container so `attach`
-/// resolves the same interpreter `create` did.
-const SHELL_LABEL: &str = "sh.sandbox-driver.shell";
-/// The `shell` value that probes for bash and falls back to `/bin/sh`.
-const SHELL_AUTO: &str = "auto";
-/// The POSIX shell every Linux image provides; the init command and the
-/// `auto` probe run under it.
-const POSIX_SH: &str = "/bin/sh";
 const DEFAULT_WORKING_DIRECTORY: &str = "/workspace";
 const RUNTIME_DIRECTORY_PARENT: &str = "/tmp/sandbox-driver";
 pub(crate) const RUNTIME_DIRECTORY: &str = "/tmp/sandbox-driver/runtime";
@@ -116,8 +113,8 @@ impl RegistryAuth {
 /// Options the Docker provider reads from `SandboxSpec::provider_config`.
 ///
 /// Schema (all fields optional, unknown fields rejected):
-/// `auto_pull` (default `true`), `init`, `privileged`, `platform`, `shell`,
-/// `binds`, `extra_hosts`, `dns`, `cap_add`, `registry_auth`, and `sidecars`.
+/// `auto_pull` (default `true`), `init`, `privileged`, `platform`, `binds`,
+/// `extra_hosts`, `dns`, `cap_add`, `registry_auth`, and `sidecars`.
 /// The typed fields are the Docker-only escape hatch for what the portable
 /// spec does not carry: bind mounts, an init process, privilege, a pull and
 /// create platform, extra host entries, DNS servers, added capabilities, and
@@ -125,13 +122,6 @@ impl RegistryAuth {
 /// portable `SandboxSpec::user`; an `entrypoint` override is a sidecar-only
 /// field, because the scope container runs a fixed init and steps go through
 /// `docker exec`.
-///
-/// `shell` selects the interpreter every exec wrapper runs under. The default
-/// is `/bin/bash`, the Bash contract. `"auto"` probes the started container
-/// for `/bin/bash` and falls back to `/bin/sh` when the image has none
-/// (alpine); an explicit absolute path is used as given. Under a non-bash
-/// shell the Bash contract does not hold and the exec-derived facets, which
-/// are bash scripts, are unsupported — the caller owns that trade.
 #[derive(Debug, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct DockerProviderConfig {
@@ -139,7 +129,6 @@ struct DockerProviderConfig {
     init:          bool,
     privileged:    bool,
     platform:      Option<String>,
-    shell:         Option<String>,
     binds:         Vec<BindMount>,
     extra_hosts:   Vec<String>,
     dns:           Vec<String>,
@@ -155,7 +144,6 @@ impl Default for DockerProviderConfig {
             init:          false,
             privileged:    false,
             platform:      None,
-            shell:         None,
             binds:         Vec::new(),
             extra_hosts:   Vec::new(),
             dns:           Vec::new(),
@@ -278,34 +266,8 @@ impl DockerProvider {
             })
     }
 
-    /// The interpreter for a container's exec wrappers, from its recorded
-    /// `shell` choice: the default bash, an explicit path, or — for `auto` —
-    /// a probe of the running container for `/bin/bash`, falling back to
-    /// `/bin/sh`.
-    async fn resolve_shell(&self, container_id: &str, choice: Option<&str>) -> Result<String> {
-        match choice {
-            None => Ok(CONTAINER_BASH.to_owned()),
-            Some(SHELL_AUTO) => {
-                let probe = DockerExec::new(
-                    self.docker.clone(),
-                    container_id.to_owned(),
-                    "/".to_owned(),
-                    BTreeMap::new(),
-                    POSIX_SH.to_owned(),
-                );
-                let result = probe
-                    .run(&ExecSpec::new("test -x /bin/bash").timeout(Duration::from_secs(30)))
-                    .await?;
-                Ok(if result.success() {
-                    CONTAINER_BASH.to_owned()
-                } else {
-                    POSIX_SH.to_owned()
-                })
-            }
-            Some(path) => Ok(path.to_owned()),
-        }
-    }
-
+    /// Builds a handle from Docker state alone: no exec runs here, so
+    /// `attach` works on a stopped container too.
     fn handle(
         &self,
         container_id: String,
@@ -314,7 +276,6 @@ impl DockerProvider {
         labels: BTreeMap<String, String>,
         env: BTreeMap<String, String>,
         network: Option<String>,
-        shell: String,
         events: EventEmitter,
     ) -> Arc<DockerSandbox> {
         let pty = DockerPty::new(
@@ -328,7 +289,6 @@ impl DockerProvider {
             container_id.clone(),
             working_dir.clone(),
             env,
-            shell,
         ));
         let fs = DockerFs::new(
             self.docker.clone(),
@@ -450,7 +410,7 @@ fn status_from_inspect(id: SandboxId, inspect: &ContainerInspectResponse) -> San
 
 /// Labels the provider writes for itself, never reported as the caller's.
 fn is_internal_label(key: &str) -> bool {
-    key == MANAGED_LABEL || key == SHELL_LABEL
+    key == MANAGED_LABEL
 }
 
 /// Whether a container's network mode names a managed sidecar network
@@ -560,14 +520,6 @@ impl SandboxProvider for DockerProvider {
             ));
         }
         let config_options = provider_config(&spec.provider_config)?;
-        if let Some(shell) = &config_options.shell {
-            if shell != SHELL_AUTO && !shell.starts_with('/') {
-                return Err(Error::invalid_spec(
-                    "provider_config.shell",
-                    "expected \"auto\" or an absolute interpreter path",
-                ));
-            }
-        }
         let base_network = network_mode(&spec.network)?;
         // Sidecars live on one user-defined network the main container
         // joins, named after the sandbox. They need a named sandbox.
@@ -662,8 +614,7 @@ impl SandboxProvider for DockerProvider {
                         .collect();
                     env_entries.push(format!("{BASH_ENV_VAR}="));
                     // The init script is POSIX and runs under /bin/sh, which
-                    // every Linux image has, so an image without bash still
-                    // starts; the exec interpreter is chosen separately.
+                    // every Linux image has.
                     let config = Config {
                         image: Some(reference.clone()),
                         user: spec.user.clone(),
@@ -756,13 +707,6 @@ impl SandboxProvider for DockerProvider {
                         provider.code = Some("exited".to_owned());
                         return Err(sweep_on_error(Error::Provider(provider)).await);
                     }
-                    let shell = match self
-                        .resolve_shell(&created.id, config_options.shell.as_deref())
-                        .await
-                    {
-                        Ok(shell) => shell,
-                        Err(error) => return Err(sweep_on_error(error).await),
-                    };
                     Ok(self.handle(
                         created.id,
                         spec.name.clone(),
@@ -770,7 +714,6 @@ impl SandboxProvider for DockerProvider {
                         spec.labels.clone(),
                         spec.env.clone(),
                         sidecar_network.clone(),
-                        shell,
                         handle_emitter,
                     ) as Arc<dyn Sandbox>)
                 },
@@ -828,10 +771,6 @@ impl SandboxProvider for DockerProvider {
                         .and_then(|host| host.network_mode.clone())
                         .filter(|mode| is_sidecar_network(mode));
                     let container_id = inspect.id.clone().unwrap_or_else(|| id.as_str().to_owned());
-                    let shell_choice = labels
-                        .and_then(|labels| labels.get(SHELL_LABEL))
-                        .map(String::as_str);
-                    let shell = self.resolve_shell(&container_id, shell_choice).await?;
                     Ok(self.handle(
                         container_id,
                         normalized_container_name(inspect.name.as_deref()),
@@ -839,7 +778,6 @@ impl SandboxProvider for DockerProvider {
                         user_labels,
                         BTreeMap::new(),
                         network,
-                        shell,
                         handle_emitter,
                     ) as Arc<dyn Sandbox>)
                 },
@@ -992,7 +930,11 @@ impl Sandbox for DockerSandbox {
         // machine — regardless of flag order.
         let result = self
             .exec
-            .run(&ExecSpec::new("uname -s -r -m").timeout(Duration::from_secs(30)))
+            .run(
+                &ExecSpec::new("uname")
+                    .args(["-s", "-r", "-m"])
+                    .timeout(Duration::from_secs(30)),
+            )
             .await?;
         let text = result.stdout_lossy();
         let mut parts = text.split_whitespace();

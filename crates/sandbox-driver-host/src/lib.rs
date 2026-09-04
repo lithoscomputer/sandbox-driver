@@ -338,9 +338,7 @@ pub struct HostSandbox {
     labels:            BTreeMap<String, String>,
     state:             Arc<Mutex<SandboxState>>,
     env:               BTreeMap<String, String>,
-    /// Shared across attached handles: one sandbox resolves Bash once
-    /// (`HostExec` remembers it), so two handles can never split across
-    /// two interpreters when `PATH` changes mid-process.
+    /// Shared across attached handles.
     exec:              Arc<HostExec>,
     fs:                HostFs,
     events:            EventEmitter,
@@ -443,7 +441,11 @@ impl Sandbox for HostSandbox {
     async fn platform_info(&self) -> Result<PlatformInfo> {
         let version = self
             .exec
-            .run(&ExecSpec::new("uname -r").timeout(Duration::from_secs(10)))
+            .run(
+                &ExecSpec::new("uname")
+                    .arg("-r")
+                    .timeout(Duration::from_secs(10)),
+            )
             .await
             .map(|result| result.stdout_lossy().trim().to_owned())
             .unwrap_or_default();

@@ -109,7 +109,7 @@ SDK:
 
 ## Execution and wire semantics
 
-- The Bash contract is `bash -c`, non-login, without implicit `errexit` or `pipefail`, and with `BASH_ENV` removed.
+- Exec takes a program and arguments and runs them directly, with no shell. `ExecSpec::bash(script)` is the helper for Bash source: `bash -c`, non-login, without implicit `errexit` or `pipefail`, and with `BASH_ENV` blanked. The exec-derived facets use it.
 - Dropping a streaming operation must cancel its provider-side work. The plugin transport sends `stream/cancel` for dropped log and build-log follows.
 - Plugin stdio and PTY output use sequential long polling. Only one output read per stream ID can be outstanding.
 - A caller must drain stdout while waiting for a long-lived process. This matches normal pipe backpressure.

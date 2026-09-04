@@ -212,7 +212,8 @@ pub(crate) struct RunArgs {
     #[arg(long)]
     pub keep: bool,
 
-    /// Command and arguments to execute. Separate them with `--`.
+    /// Program and arguments to execute, passed as given (no shell).
+    /// Separate them with `--`; wrap them in `bash -c` for shell syntax.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     pub command: Vec<String>,
 }
@@ -245,7 +246,8 @@ pub(crate) struct ExecArgs {
     #[command(flatten)]
     pub options: ExecOptions,
 
-    /// Command and arguments to execute. Separate them with `--`.
+    /// Program and arguments to execute, passed as given (no shell).
+    /// Separate them with `--`; wrap them in `bash -c` for shell syntax.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     pub command: Vec<String>,
 }

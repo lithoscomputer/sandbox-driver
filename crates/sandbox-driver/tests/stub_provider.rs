@@ -20,7 +20,7 @@ struct StubExec;
 impl Exec for StubExec {
     async fn run(&self, spec: &ExecSpec) -> Result<ExecResult> {
         let mut result = ExecResult::new(Termination::Exited, Some(0), Duration::from_millis(1));
-        if spec.command.contains("fabro-bash-ready") {
+        if spec.args.iter().any(|arg| arg.contains("fabro-bash-ready")) {
             result.stdout = b"fabro-bash-ready".to_vec();
         }
         Ok(result)

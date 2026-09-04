@@ -373,16 +373,27 @@ does not expose these Boxd-only operations.
 
 ### 8.4 Exec
 
-The command contract: `command` is **Bash source**, run as
-`bash -c <command>`, non-login, no `errexit`/`pipefail`/POSIX mode,
-never a fallback to `sh`, `BASH_ENV` stripped. Buffered and streaming
-execution must not differ in interpreter or options.
+The exec contract: `program` and `args` are an **argument vector**, run
+directly with `execvp` semantics. `program` is resolved through the
+command's `PATH` when it contains no slash; every element of `args`
+reaches the process unchanged. No shell is involved: nothing is split,
+globbed, or expanded. A plugin whose backend takes a shell string must
+quote the vector so it stays literal. Buffered and streaming execution
+must not differ in how the vector is run.
+
+A host that wants shell semantics sends them explicitly, as
+`{"program":"bash","args":["-c","<script>"],"env":{"BASH_ENV":""}}` — the
+`ExecSpec::bash` helper on the Rust side. The exec-derived facets and the
+bash probe (§12) are sent that way, so a plugin's sandbox must have `bash`
+on `PATH` to serve them.
 
 The exec spec DTO:
 
 ```json
-{"command":"echo hi","timeout_ms":30000,"working_dir":null,"env":{},"stdin_b64":null,"output_sanitization":"strip_ansi"}
+{"program":"echo","args":["hi"],"timeout_ms":30000,"working_dir":null,"env":{},"stdin_b64":null,"output_sanitization":"strip_ansi"}
 ```
+
+`args` may be omitted and means `[]`.
 
 `output_sanitization` is optional. Its values are `raw`, `strip_ansi`,
 and `strip_all`; omission means `raw`. A plugin applies this policy to
@@ -542,7 +553,7 @@ kill it after a grace period.
 
 ```
 host → {"id":7,"method":"exec/stream","params":{"sandbox_id":"sb-1","exec_id":"x1",
-         "spec":{"command":"cargo build","timeout_ms":null,…},"retained_output_limit":65536}}
+         "spec":{"program":"cargo","args":["build"],"timeout_ms":null,…},"retained_output_limit":65536}}
 plugin → {"method":"exec/output","params":{"exec_id":"x1","stream":"stdout","data_b64":"…"}}
 plugin → {"method":"exec/output","params":{"exec_id":"x1","stream":"stderr","data_b64":"…"}}
 host → {"id":8,"method":"exec/cancel","params":{"exec_id":"x1"}}          (optional)
@@ -692,9 +703,9 @@ implementation is `sandbox_driver_protocol::discovery`.
 
 A plugin is conformant when the `sandbox-driver-conformance` suite
 passes against it through `PluginProvider` — the same battery every
-in-process provider must pass, covering lifecycle, the Bash contract,
-exec semantics (exit codes, env, binary safety, stdin, timeout,
-cancellation), streaming honesty and isolation, retention accounting,
+in-process provider must pass, covering lifecycle, the bash probe,
+exec semantics (literal argv, exit codes, env, binary safety, stdin,
+timeout, cancellation), streaming honesty and isolation, retention accounting,
 filesystem round trips, capability honesty in both directions, label
 listing, event delivery, and service/facet-capability consistency.
 

@@ -39,7 +39,7 @@ async fn late_terminate_leaves_no_stray_stop_file() {
     let listing = sandbox
         .exec()
         .run(
-            &ExecSpec::new("ls /tmp/.sandbox-driver 2>/dev/null || true")
+            &ExecSpec::bash("ls /tmp/.sandbox-driver 2>/dev/null || true")
                 .timeout(Duration::from_secs(10)),
         )
         .await

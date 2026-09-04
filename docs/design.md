@@ -4,7 +4,7 @@ A library for driving sandboxes. Initial providers: **Daytona**, **Docker**, **H
 
 ## Inputs
 
-- **fabro** — the de-facto trait: filesystem, exec (buffered / streaming / bidirectional stdio), grep/glob/walk, lifecycle, preview URLs, SSH, auto-stop, events, the Bash contract and probe, plus a git/credential surface we deliberately leave above this crate.
+- **fabro** — the de-facto trait: filesystem, exec (buffered / streaming / bidirectional stdio), grep/glob/walk, lifecycle, preview URLs, SSH, auto-stop, events, the bash probe, plus a git/credential surface we deliberately leave above this crate. Fabro's exec took Bash source; this library takes an argument vector and offers Bash as a helper (see Exec below).
 - **Daytona** (docs + `daytona-sdk-rust`) — the richest provider: pause/resume distinct from stop/start, archive, fork with ancestry, live-sandbox snapshots including memory, TTL and four auto-intervals, snapshots and volumes as first-class resources, per-region toolbox daemon (fs/git/process/PTY/LSP/computer-use), preview links with signed URLs, SSH tokens, network block/allow lists. The normalized interface includes resize, but the current Daytona API and SDK do not expose a working resize operation.
 - **boxd** (deferred) — considered only where its behavior overlaps the normalized interface. Boxd-only capabilities are not included yet.
 
@@ -128,7 +128,7 @@ Per-sandbox functionality is grouped into small **facet traits** (per the style 
 
 | Facet | Contents | Host | Docker | Daytona | boxd |
 | --- | --- | --- | --- | --- | --- |
-| `Exec` (core) | Buffered run; streaming run (callback sink, stdin, cancel, timeout); Bash contract | ✔ | ✔ | ✔ (streams via log-poll fallback) | ✔ |
+| `Exec` (core) | Buffered run; streaming run (callback sink, stdin, cancel, timeout); literal argv, Bash as a helper | ✔ | ✔ | ✔ (streams via log-poll fallback) | ✔ |
 | `StdioProcess` | Spawn long-lived bidirectional process (ACP backends) | ✔ | ✔ | ✔ (command sessions; UTF-8 payloads only — the ACP case) | ? |
 | `Filesystem` (core) | read/write/delete/exists/stat/list/move/mkdir/permissions, upload/download (binary-safe, chunked) | native | native | native (toolbox FS) | ✔ |
 | `Search` (core, derived) | grep, glob, walk — default impl derived from `Exec` (rg with grep/find fallback); provider may override | derived | derived | derived (native find/replace exists) | derived |
@@ -278,7 +278,7 @@ pub trait Sandbox: Send + Sync {
 
 Why lifecycle verbs are flat methods rather than one `perform(Action)` method: callers read naturally, signatures differ (`fork` returns a handle and `snapshot` returns an ID), and the JSON-RPC mapping is one method per verb either way. The `Unsupported` error plus capability flags carries the optionality.
 
-### Exec (and the Bash contract)
+### Exec (and the argv contract)
 
 ```rust
 #[async_trait]
@@ -290,14 +290,17 @@ pub trait Exec: Send + Sync {
 }
 ```
 
-Carried over from fabro **verbatim, as normative spec text**, because it is the load-bearing invariant of the whole system:
+The normative contract, and the load-bearing invariant of the whole system:
 
-- `command` is Bash source, evaluated as `bash -c <command>`, non-login, no `errexit`/`pipefail`/POSIX mode, never a fallback to `sh`, never a provider's ambient shell. Callers wanting other semantics write them into the command.
-- `BASH_ENV` is stripped before every invocation.
-- Buffered and streaming exec must not differ in interpreter or options.
-- The library ships the **bash probe** (`fabro-bash-ready` check) as a helper; the `activate` convenience runs it. This goes into the conformance suite.
+- `ExecSpec` names a `program` and its `args`. A provider executes that vector directly, with `execvp` semantics: the program is resolved through the command's `PATH` when it has no slash, and every argument reaches the process unchanged. No shell is involved anywhere, so nothing is split, globbed, or expanded. A provider whose backend only takes a shell string (Daytona) quotes the vector so it stays literal.
+- Buffered and streaming exec must not differ in how the vector is run.
+- **Bash is a helper, not a provider rule.** `ExecSpec::bash(script)` is the argv `bash -c <script>`, non-login, with Bash's options untouched (no `errexit`/`pipefail`/POSIX mode) and `BASH_ENV` blanked in the spec env. It is the one place the old Bash contract is written down. The exec-derived facets (filesystem, search, git, services) are Bash scripts and use it, so a sandbox that serves them needs `bash` on `PATH`; a caller that only runs its own programs (Petri's step runner) needs nothing but the program.
+- Providers still blank `BASH_ENV` at the sandbox level (Docker container env, Daytona sandbox env, the host's inherited env), because an image can carry the variable and a caller may send `bash -c` by hand.
+- The library ships the **bash probe** (`fabro-bash-ready` check) as a helper; the `activate` convenience runs it. It verifies the helper works in a sandbox, and goes into the conformance suite.
 
-`ExecSpec` is a plain owned serializable value — command, timeout, working dir, env vars, optional stdin bytes (write-then-EOF), and output sanitization — and is exactly what crosses the JSON-RPC boundary. `OutputSanitization` has three policies: `Raw` preserves every byte and is the default; `StripAnsi` removes ANSI terminal escape sequences but preserves standalone control characters; `StripAll` also removes standalone C0/C1 control characters except tab, line feed, and carriage return. Providers apply the policy before output reaches the sink, retained result, or capture statistics. Stateful filtering prevents an escape sequence from leaking when it spans streaming chunks. The policies apply only to `run` and `run_streaming`; PTY sessions and long-lived bidirectional stdio remain raw. Non-raw policies are lossy and callers must use `Raw` for binary output.
+This replaced fabro's rule that every command is Bash source. That rule made the primary consumer quote `exec 'prog' 'arg'…` into a script only for the provider to wrap it in a shell again, forced a per-image "which shell" setting on Docker, and made `attach` run a probe exec. An argv contract has none of that.
+
+`ExecSpec` is a plain owned serializable value — program, args, timeout, working dir, env vars, optional stdin bytes (write-then-EOF), and output sanitization — and is exactly what crosses the JSON-RPC boundary. `OutputSanitization` has three policies: `Raw` preserves every byte and is the default; `StripAnsi` removes ANSI terminal escape sequences but preserves standalone control characters; `StripAll` also removes standalone C0/C1 control characters except tab, line feed, and carriage return. Providers apply the policy before output reaches the sink, retained result, or capture statistics. Stateful filtering prevents an escape sequence from leaking when it spans streaming chunks. The policies apply only to `run` and `run_streaming`; PTY sessions and long-lived bidirectional stdio remain raw. Non-raw policies are lossy and callers must use `Raw` for binary output.
 
 A relative working dir resolves against the sandbox working directory on every provider — a conformance case pins it. Process-local control objects travel separately in `ExecControls`: the cancellation token, the async output sink, and the retention cap (head+tail with `omitted_bytes` accounting — fabro's `OutputCaptureBuffer` moves here). On the wire, controls map to negotiated IDs — a host-generated `execId` routes `exec/output` notifications and `exec/cancel` — never to serialized fields, and buffered `run` carries no streaming controls at all.
 

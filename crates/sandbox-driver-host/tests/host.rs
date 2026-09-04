@@ -211,7 +211,7 @@ async fn exec_honors_env_working_dir_and_stdin() {
     let provider = HostProvider::new();
     let sandbox = provider.create(&host_spec(), None).await.expect("create");
 
-    let spec = ExecSpec::new("echo \"$GREETING $(basename \"$PWD\")\"; cat")
+    let spec = ExecSpec::bash("echo \"$GREETING $(basename \"$PWD\")\"; cat")
         .env_var("GREETING", "hello")
         .stdin(b"from-stdin".to_vec())
         .timeout(Duration::from_secs(10));
@@ -237,7 +237,7 @@ async fn exec_filters_inherited_secrets_but_trusts_spec_env() {
     let provider = HostProvider::new();
     let sandbox = provider.create(&host_spec(), None).await.expect("create");
 
-    let spec = ExecSpec::new(
+    let spec = ExecSpec::bash(
         "echo \"${SD_TEST_WORKER_TOKEN:-absent} ${SPEC_DEPLOY_TOKEN:-absent} ${HOME:+home}\"",
     )
     .env_var("SPEC_DEPLOY_TOKEN", "explicit")
@@ -267,29 +267,55 @@ async fn exec_never_sources_bash_env() {
     // SAFETY: no other thread reads the environment at this point.
     unsafe { env::set_var("BASH_ENV", &startup) };
 
-    // Both the inherited and the spec-provided BASH_ENV must be dropped.
-    let spec = ExecSpec::new("echo ok")
-        .env_var("BASH_ENV", &startup)
-        .timeout(Duration::from_secs(10));
-    let result = sandbox.exec().run(&spec).await.expect("exec");
-    assert!(result.success(), "stderr: {}", result.stderr_lossy());
-    assert_eq!(result.stdout_lossy(), "ok\n");
+    // The helper blanks BASH_ENV itself; a hand-built `bash -c` relies on
+    // the inherited variable being dropped from the effective environment.
+    for spec in [
+        ExecSpec::bash("echo ok"),
+        ExecSpec::new("bash").args(["-c", "echo ok"]),
+    ] {
+        let result = sandbox
+            .exec()
+            .run(&spec.timeout(Duration::from_secs(10)))
+            .await
+            .expect("exec");
+        assert!(result.success(), "stderr: {}", result.stderr_lossy());
+        assert_eq!(result.stdout_lossy(), "ok\n");
+    }
 
     sandbox.delete().await.expect("delete");
 }
 
 #[tokio::test]
-async fn exec_survives_a_hermetic_spec_path() {
+async fn exec_resolves_the_program_through_the_spec_path() {
     let provider = HostProvider::new();
     let sandbox = provider.create(&host_spec(), None).await.expect("create");
 
-    // Bash is resolved through the worker's PATH once and cached, so a
-    // hermetic PATH in spec env must not break spawning.
-    let spec = ExecSpec::new("echo ok")
-        .env_var("PATH", "/nonexistent")
+    // A bare program comes from the command's own PATH, so a spec that
+    // sets PATH chooses where its program is found.
+    let bin = format!("{}/bin", sandbox.working_directory());
+    sandbox
+        .fs()
+        .write("bin/hello", b"#!/bin/sh\nprintf from-spec-path\n")
+        .await
+        .expect("write");
+    sandbox
+        .fs()
+        .set_permissions("bin/hello", 0o755)
+        .await
+        .expect("chmod");
+    let spec = ExecSpec::new("hello")
+        .env_var("PATH", &bin)
         .timeout(Duration::from_secs(10));
     let result = sandbox.exec().run(&spec).await.expect("exec");
     assert!(result.success(), "stderr: {}", result.stderr_lossy());
+    assert_eq!(result.stdout_lossy(), "from-spec-path");
+
+    // An absolute program needs no PATH at all.
+    let spec = ExecSpec::new("/bin/echo")
+        .arg("ok")
+        .env_var("PATH", "/nonexistent")
+        .timeout(Duration::from_secs(10));
+    let result = sandbox.exec().run(&spec).await.expect("exec");
     assert_eq!(result.stdout_lossy(), "ok\n");
 
     sandbox.delete().await.expect("delete");
@@ -300,7 +326,9 @@ async fn exec_timeout_kills_the_process_tree() {
     let provider = HostProvider::new();
     let sandbox = provider.create(&host_spec(), None).await.expect("create");
 
-    let spec = ExecSpec::new("sleep 30").timeout(Duration::from_millis(300));
+    let spec = ExecSpec::new("sleep")
+        .arg("30")
+        .timeout(Duration::from_millis(300));
     let started = Instant::now();
     let result = sandbox.exec().run(&spec).await.expect("exec resolves");
     assert_eq!(result.termination, Termination::TimedOut);
@@ -318,7 +346,7 @@ async fn exec_timeout_kills_a_command_that_left_its_process_group() {
     // that joins the test runner's process group, so both group signals
     // (aimed at the child's original group, now empty) miss. Only the
     // direct kill fallback ends it before the sleep does.
-    let spec = ExecSpec::new(
+    let spec = ExecSpec::bash(
         r#"exec perl -e '$SIG{TERM} = "IGNORE"; use POSIX (); POSIX::setpgid(0, getpgrp(getppid())); sleep 30'"#,
     )
     .timeout(Duration::from_millis(300));
@@ -337,7 +365,7 @@ async fn exec_timeout_lets_the_process_run_its_term_trap() {
 
     // `wait` (unlike a foreground `sleep`) lets bash handle the trap as
     // soon as SIGTERM arrives.
-    let spec = ExecSpec::new("trap 'echo cleaned >&2; exit 0' TERM; sleep 30 & wait")
+    let spec = ExecSpec::bash("trap 'echo cleaned >&2; exit 0' TERM; sleep 30 & wait")
         .timeout(Duration::from_millis(300));
     let result = sandbox.exec().run(&spec).await.expect("exec resolves");
     assert_eq!(result.termination, Termination::TimedOut);
@@ -358,7 +386,7 @@ async fn exec_timeout_fires_after_output_streams_close() {
     // `exec >/dev/null 2>&1` drops the pipe write ends, so both output
     // streams reach EOF while the process keeps running — the shape of
     // any daemonizing command. The timeout must still fire.
-    let spec = ExecSpec::new("exec >/dev/null 2>&1; sleep 30").timeout(Duration::from_millis(300));
+    let spec = ExecSpec::bash("exec >/dev/null 2>&1; sleep 30").timeout(Duration::from_millis(300));
     let started = Instant::now();
     let result = sandbox.exec().run(&spec).await.expect("exec resolves");
     assert_eq!(result.termination, Termination::TimedOut);
@@ -382,7 +410,7 @@ async fn exec_cancellation_resolves_with_cancelled() {
         time::sleep(Duration::from_millis(200)).await;
         cancel_after.cancel();
     });
-    let spec = ExecSpec::new("sleep 30");
+    let spec = ExecSpec::new("sleep").arg("30");
     let result = sandbox
         .exec()
         .run_streaming(&spec, controls)
@@ -411,8 +439,9 @@ async fn streaming_separates_streams_and_caps_retention() {
         retained_output_limit: Some(1000),
         ..ExecControls::default()
     };
-    let spec = ExecSpec::new("echo err-line >&2; for i in $(seq 1 2000); do echo payload-$i; done")
-        .timeout(Duration::from_secs(30));
+    let spec =
+        ExecSpec::bash("echo err-line >&2; for i in $(seq 1 2000); do echo payload-$i; done")
+            .timeout(Duration::from_secs(30));
     let result = sandbox
         .exec()
         .run_streaming(&spec, controls)
@@ -476,7 +505,7 @@ async fn spawn_stdio_terminate_interrupts_an_inflight_wait() {
 
     let process = sandbox
         .exec()
-        .spawn_stdio(&SpawnSpec::new("sleep 30"))
+        .spawn_stdio(&SpawnSpec::new("sleep").arg("30"))
         .await
         .expect("spawn");
     let handle: Arc<dyn StdioProcessHandle> = Arc::from(process.handle);
@@ -604,7 +633,7 @@ async fn pinned_clone_attaches_the_admitted_branch() {
     let workspace = sandbox.working_directory().to_owned();
 
     // A source repo whose main advanced past the commit being pinned.
-    let setup = ExecSpec::new(
+    let setup = ExecSpec::bash(
         "git init -q -b main src && cd src && \
          git -c user.name=T -c user.email=t@example.com commit -q --allow-empty -m one && \
          git rev-parse HEAD && \
@@ -632,7 +661,8 @@ async fn pinned_clone_attaches_the_admitted_branch() {
     assert!(!status.detached);
     let head = exec
         .run(
-            &ExecSpec::new(format!("git -C {repo} rev-parse HEAD"))
+            &ExecSpec::new("git")
+                .args(["-C", &repo, "rev-parse", "HEAD"])
                 .timeout(Duration::from_secs(10)),
         )
         .await
@@ -649,7 +679,9 @@ async fn normalized_git_drives_a_real_repository() {
     let exec = sandbox.exec();
     let workspace = sandbox.working_directory().to_owned();
 
-    let init = ExecSpec::new("git init -q -b main repo").timeout(Duration::from_secs(30));
+    let init = ExecSpec::new("git")
+        .args(["init", "-q", "-b", "main", "repo"])
+        .timeout(Duration::from_secs(30));
     let result = exec.run(&init).await.expect("git init");
     assert!(result.success(), "stderr: {}", result.stderr_lossy());
     let repo = format!("{workspace}/repo");

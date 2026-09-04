@@ -182,7 +182,7 @@ impl Filesystem for DockerFs {
                 } else {
                     format!("mkdir -p -- {}", shell_quote(&parent))
                 };
-                let spec = ExecSpec::new(mkdir).timeout(MKDIR_TIMEOUT);
+                let spec = ExecSpec::bash(mkdir).timeout(MKDIR_TIMEOUT);
                 let result = self.exec.run(&spec).await?;
                 if !result.success() {
                     return Err(Error::io(

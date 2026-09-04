@@ -163,6 +163,9 @@ impl Conformance {
             ("exec_env_vars_apply", |ctx| {
                 Box::pin(exec_env_vars_apply(ctx))
             }),
+            ("exec_argv_is_literal", |ctx| {
+                Box::pin(exec_argv_is_literal(ctx))
+            }),
             ("exec_output_is_binary_safe", |ctx| {
                 Box::pin(exec_output_is_binary_safe(ctx))
             }),
@@ -619,7 +622,11 @@ async fn relative_working_dir_resolves(ctx: &Conformance) -> CheckOutcome {
     let outcome = async {
         let mkdir = sandbox
             .exec()
-            .run(&ExecSpec::new("mkdir -p cwd-probe").timeout(Duration::from_secs(30)))
+            .run(
+                &ExecSpec::new("mkdir")
+                    .args(["-p", "cwd-probe"])
+                    .timeout(Duration::from_secs(30)),
+            )
             .await
             .map_err(|error| format!("mkdir failed: {error}"))?;
         if !mkdir.success() {
@@ -654,7 +661,7 @@ async fn exec_reports_exit_codes(ctx: &Conformance) -> CheckOutcome {
     let outcome = async {
         let result = sandbox
             .exec()
-            .run(&ExecSpec::new("exit 7").timeout(Duration::from_secs(30)))
+            .run(&ExecSpec::bash("exit 7").timeout(Duration::from_secs(30)))
             .await
             .map_err(|error| format!("exec failed: {error}"))?;
         if result.exit_code != Some(7) {
@@ -673,7 +680,7 @@ async fn exec_reports_exit_codes(ctx: &Conformance) -> CheckOutcome {
 async fn exec_env_vars_apply(ctx: &Conformance) -> CheckOutcome {
     let sandbox = ctx.ready().await?;
     let outcome = async {
-        let spec = ExecSpec::new("printf '%s' \"$CONFORMANCE_VALUE\"")
+        let spec = ExecSpec::bash("printf '%s' \"$CONFORMANCE_VALUE\"")
             .env_var("CONFORMANCE_VALUE", "expected-value")
             .timeout(Duration::from_secs(30));
         let result = sandbox
@@ -687,6 +694,55 @@ async fn exec_env_vars_apply(ctx: &Conformance) -> CheckOutcome {
                 result.stdout_lossy()
             ));
         }
+        // A name that is not a shell identifier must reach the program
+        // too (GitHub Actions passes `INPUT_INCLUDE-HIDDEN-FILES`); a
+        // provider that routes env through a POSIX shell's own
+        // environment drops it.
+        let spec = ExecSpec::new("printenv")
+            .arg("CONFORMANCE-DASHED")
+            .env_var("CONFORMANCE-DASHED", "dashed-value")
+            .timeout(Duration::from_secs(30));
+        let result = sandbox
+            .exec()
+            .run(&spec)
+            .await
+            .map_err(|error| format!("exec failed: {error}"))?;
+        if result.stdout_lossy().trim() != "dashed-value" {
+            return fail(format!(
+                "non-identifier environment variable missing: {:?} (exit {:?})",
+                result.stdout_lossy(),
+                result.exit_code
+            ));
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+/// The exec contract: arguments reach the program unchanged. A provider
+/// that routes argv through a shell must quote it so nothing expands.
+async fn exec_argv_is_literal(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let hostile = "$CONFORMANCE_VALUE `id` $(id) * ; it's \"quoted\"";
+        let spec = ExecSpec::new("printf")
+            .args(["%s|%s", hostile, "second arg"])
+            .env_var("CONFORMANCE_VALUE", "expanded")
+            .timeout(Duration::from_secs(30));
+        let result = sandbox
+            .exec()
+            .run(&spec)
+            .await
+            .map_err(|error| format!("exec failed: {error}"))?;
+        let expected = format!("{hostile}|second arg");
+        if result.stdout_lossy() != expected {
+            return fail(format!(
+                "argv was not literal: {:?} (expected {expected:?})",
+                result.stdout_lossy()
+            ));
+        }
         PASS
     }
     .await;
@@ -697,7 +753,7 @@ async fn exec_env_vars_apply(ctx: &Conformance) -> CheckOutcome {
 async fn exec_output_is_binary_safe(ctx: &Conformance) -> CheckOutcome {
     let sandbox = ctx.ready().await?;
     let outcome = async {
-        let spec = ExecSpec::new("printf 'a\\0b\\x01c'").timeout(Duration::from_secs(30));
+        let spec = ExecSpec::bash("printf 'a\\0b\\x01c'").timeout(Duration::from_secs(30));
         let result = sandbox
             .exec()
             .run(&spec)
@@ -720,7 +776,7 @@ async fn exec_output_sanitization_is_consistent(ctx: &Conformance) -> CheckOutco
 
         let raw = sandbox
             .exec()
-            .run(&ExecSpec::new(command))
+            .run(&ExecSpec::bash(command))
             .await
             .map_err(|error| format!("raw exec failed: {error}"))?;
         if raw.stdout != b"\x1b[31mred\x1b[0m\x07\x01\n" {
@@ -729,7 +785,7 @@ async fn exec_output_sanitization_is_consistent(ctx: &Conformance) -> CheckOutco
 
         let ansi = sandbox
             .exec()
-            .run(&ExecSpec::new(command).output_sanitization(OutputSanitization::StripAnsi))
+            .run(&ExecSpec::bash(command).output_sanitization(OutputSanitization::StripAnsi))
             .await
             .map_err(|error| format!("StripAnsi exec failed: {error}"))?;
         if ansi.stdout != b"red\x07\x01\n" {
@@ -752,7 +808,7 @@ async fn exec_output_sanitization_is_consistent(ctx: &Conformance) -> CheckOutco
             ..ExecControls::default()
         };
         let spec =
-            ExecSpec::new("printf '\\033'; sleep 0.05; printf '[31mred\\033[0m\\007\\001\\n'")
+            ExecSpec::bash("printf '\\033'; sleep 0.05; printf '[31mred\\033[0m\\007\\001\\n'")
                 .output_sanitization(OutputSanitization::StripAll)
                 .timeout(Duration::from_secs(30));
         let all = sandbox
@@ -822,7 +878,9 @@ async fn exec_timeout_terminates(ctx: &Conformance) -> CheckOutcome {
     let sandbox = ctx.ready().await?;
     let outcome = async {
         let started = Instant::now();
-        let spec = ExecSpec::new("sleep 300").timeout(Duration::from_secs(2));
+        let spec = ExecSpec::new("sleep")
+            .arg("300")
+            .timeout(Duration::from_secs(2));
         let result = sandbox
             .exec()
             .run(&spec)
@@ -887,7 +945,7 @@ async fn exec_stop_terminates(
         });
         let streaming = sandbox
             .exec()
-            .run_streaming(&ExecSpec::new("sleep 300"), build(token))
+            .run_streaming(&ExecSpec::new("sleep").arg("300"), build(token))
             .await
             .map_err(|error| format!("exec failed: {error}"))?;
         if !accepted.contains(&streaming.result.termination) {
@@ -908,7 +966,7 @@ async fn exec_reports_a_foreign_signal(ctx: &Conformance) -> CheckOutcome {
     let outcome = async {
         // The command signals its own process; the provider reports the
         // signal number even though the shell only sees `128 + N`.
-        let spec = ExecSpec::new("kill -TERM $$; sleep 5").timeout(Duration::from_secs(30));
+        let spec = ExecSpec::bash("kill -TERM $$; sleep 5").timeout(Duration::from_secs(30));
         let result = sandbox
             .exec()
             .run(&spec)
@@ -1000,7 +1058,7 @@ async fn exec_streaming_is_honest(ctx: &Conformance) -> CheckOutcome {
             ..ExecControls::default()
         };
         let spec =
-            ExecSpec::new("echo to-stdout; echo to-stderr >&2").timeout(Duration::from_secs(30));
+            ExecSpec::bash("echo to-stdout; echo to-stderr >&2").timeout(Duration::from_secs(30));
         let streaming = sandbox
             .exec()
             .run_streaming(&spec, controls)
@@ -1051,7 +1109,7 @@ async fn exec_retention_accounting_is_consistent(ctx: &Conformance) -> CheckOutc
             retained_output_limit: Some(512),
             ..ExecControls::default()
         };
-        let spec = ExecSpec::new("for i in $(seq 1 500); do echo payload-line-$i; done")
+        let spec = ExecSpec::bash("for i in $(seq 1 500); do echo payload-line-$i; done")
             .timeout(Duration::from_secs(60));
         let streaming = sandbox
             .exec()
@@ -1104,7 +1162,7 @@ async fn concurrent_streams_do_not_starve_each_other(ctx: &Conformance) -> Check
             })),
             ..ExecControls::default()
         };
-        let slow_spec = ExecSpec::new("for i in $(seq 1 20); do echo slow-$i; sleep 0.05; done")
+        let slow_spec = ExecSpec::bash("for i in $(seq 1 20); do echo slow-$i; sleep 0.05; done")
             .timeout(Duration::from_secs(60));
         let slow_exec = sandbox.exec();
         let mut slow_task = std::pin::pin!(slow_exec.run_streaming(&slow_spec, slow_controls));
@@ -1134,7 +1192,9 @@ async fn concurrent_streams_do_not_starve_each_other(ctx: &Conformance) -> Check
             })),
             ..ExecControls::default()
         };
-        let fast_spec = ExecSpec::new("echo fast-done").timeout(Duration::from_secs(30));
+        let fast_spec = ExecSpec::new("echo")
+            .arg("fast-done")
+            .timeout(Duration::from_secs(30));
         let race_started = Instant::now();
         let mut fast_and_describe = std::pin::pin!(async {
             tokio::join!(
@@ -1385,7 +1445,7 @@ async fn git_round_trip(ctx: &Conformance) -> CheckOutcome {
         let setup = sandbox
             .exec()
             .run(
-                &ExecSpec::new(
+                &ExecSpec::bash(
                     "rm -rf conformance-git && \
                      mkdir conformance-git && \
                      cd conformance-git && \
@@ -1431,7 +1491,7 @@ async fn git_round_trip(ctx: &Conformance) -> CheckOutcome {
         let origin = sandbox
             .exec()
             .run(
-                &ExecSpec::new(
+                &ExecSpec::bash(
                     "git remote set-url origin \"$CONFORMANCE_REMOTE\" && \
                      git fetch -q origin \
                          +refs/heads/main:refs/remotes/origin/main && \
@@ -1517,7 +1577,8 @@ async fn git_round_trip(ctx: &Conformance) -> CheckOutcome {
         let remote_feature = sandbox
             .exec()
             .run(
-                &ExecSpec::new("git --git-dir=remote.git rev-parse refs/heads/feature")
+                &ExecSpec::new("git")
+                    .args(["--git-dir=remote.git", "rev-parse", "refs/heads/feature"])
                     .working_dir("conformance-git")
                     .timeout(Duration::from_secs(30)),
             )
@@ -1537,7 +1598,7 @@ async fn git_round_trip(ctx: &Conformance) -> CheckOutcome {
         let upstream = sandbox
             .exec()
             .run(
-                &ExecSpec::new(
+                &ExecSpec::bash(
                     "printf 'upstream\\n' > upstream.txt && \
                      git add -- upstream.txt && \
                      git -c user.name=Conformance \
@@ -1707,7 +1768,11 @@ async fn pause_resume_cycle(ctx: &Conformance) -> CheckOutcome {
         // The sandbox must still work after the cycle.
         let result = sandbox
             .exec()
-            .run(&ExecSpec::new("echo alive").timeout(Duration::from_secs(30)))
+            .run(
+                &ExecSpec::new("echo")
+                    .arg("alive")
+                    .timeout(Duration::from_secs(30)),
+            )
             .await
             .map_err(|error| format!("exec after resume failed: {error}"))?;
         if !result.success() {
@@ -1735,7 +1800,7 @@ async fn fork_preserves_live_process_state(ctx: &Conformance) -> CheckOutcome {
     let prepare = sandbox
         .exec()
         .run(
-            &ExecSpec::new(
+            &ExecSpec::bash(
                 "printf preserved > /tmp/sandbox-driver-fork-marker; \
                  nohup sh -c 'echo $$ > /tmp/sandbox-driver-fork-pid; \
                  while :; do sleep 1; done' </dev/null >/dev/null 2>&1 & \
@@ -1778,7 +1843,7 @@ async fn fork_preserves_live_process_state(ctx: &Conformance) -> CheckOutcome {
         let result = forked
             .exec()
             .run(
-                &ExecSpec::new(
+                &ExecSpec::bash(
                     "pid=$(cat /tmp/sandbox-driver-fork-pid); \
                      kill -0 \"$pid\"; printf '%s ' \"$pid\"; \
                      cat /tmp/sandbox-driver-fork-marker",

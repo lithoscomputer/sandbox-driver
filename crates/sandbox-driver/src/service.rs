@@ -106,7 +106,8 @@ impl Services for ServicesFacet<'_> {
 #[derive(Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ServiceSpec {
-    /// Bash source, under the [`crate::Exec`] command contract.
+    /// Bash source. The exec-derived implementation runs it through
+    /// [`crate::ExecSpec::bash`], inside its own session script.
     pub command:     String,
     #[serde(default)]
     pub working_dir: Option<String>,

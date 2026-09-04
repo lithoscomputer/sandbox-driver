@@ -10,6 +10,10 @@ use crate::error::{Error, Result};
 use crate::exec::{Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, Termination};
 
 /// Replays a queue of canned results while recording every command.
+///
+/// A Bash spec ([`ExecSpec::bash`]) is recorded as its script, so tests
+/// of the exec-derived facets assert on the source they build; any other
+/// spec is recorded as its program followed by its arguments.
 pub(crate) struct ScriptedExec {
     responses: Mutex<VecDeque<ExecResult>>,
     commands:  Mutex<Vec<String>>,
@@ -46,13 +50,27 @@ impl ScriptedExec {
     }
 }
 
+fn recorded(spec: &ExecSpec) -> String {
+    match (spec.program.as_str(), spec.args.as_slice()) {
+        ("bash", [flag, script]) if flag == "-c" => script.clone(),
+        (program, args) => {
+            let mut rendered = program.to_owned();
+            for arg in args {
+                rendered.push(' ');
+                rendered.push_str(arg);
+            }
+            rendered
+        }
+    }
+}
+
 #[async_trait]
 impl Exec for ScriptedExec {
     async fn run(&self, spec: &ExecSpec) -> Result<ExecResult> {
         self.commands
             .lock()
             .expect("commands lock")
-            .push(spec.command.clone());
+            .push(recorded(spec));
         self.responses
             .lock()
             .expect("responses lock")

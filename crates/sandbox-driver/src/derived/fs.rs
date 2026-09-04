@@ -38,7 +38,7 @@ impl DerivedFs {
     }
 
     async fn run(&self, label: &'static str, command: String) -> Result<ExecResult> {
-        let spec = ExecSpec::new(command).timeout(FS_TIMEOUT);
+        let spec = ExecSpec::bash(command).timeout(FS_TIMEOUT);
         let result = self.exec.run(&spec).await?;
         if result.success() {
             return Ok(result);
@@ -184,7 +184,7 @@ impl Filesystem for DerivedFs {
     }
 
     async fn exists(&self, path: &str) -> Result<bool> {
-        let spec = ExecSpec::new(format!("[ -e {} ]", shell_quote(path))).timeout(FS_TIMEOUT);
+        let spec = ExecSpec::bash(format!("[ -e {} ]", shell_quote(path))).timeout(FS_TIMEOUT);
         let result = self.exec.run(&spec).await?;
         Ok(result.exit_code == Some(0))
     }

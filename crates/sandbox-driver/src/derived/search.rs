@@ -34,8 +34,8 @@ impl<'e> DerivedSearch<'e> {
         *self
             .ripgrep
             .get_or_init(|| async {
-                let spec =
-                    ExecSpec::new("command -v rg >/dev/null 2>&1").timeout(Duration::from_secs(10));
+                let spec = ExecSpec::bash("command -v rg >/dev/null 2>&1")
+                    .timeout(Duration::from_secs(10));
                 match self.exec.run(&spec).await {
                     Ok(result) => result.success(),
                     Err(_) => false,
@@ -57,7 +57,7 @@ async fn run_match_command(
     command: String,
     timeout: Duration,
 ) -> Result<Option<ExecResult>> {
-    let spec = ExecSpec::new(command).timeout(timeout);
+    let spec = ExecSpec::bash(command).timeout(timeout);
     let result = exec.run(&spec).await?;
     let truncated_at_source =
         result.termination == Termination::Exited && result.exit_code == Some(SIGPIPE_EXIT);
@@ -239,14 +239,14 @@ impl Search for DerivedSearch<'_> {
         // GNU find first: sizes come along. `-printf` is missing from BSD
         // find, which fails and triggers the portable fallback.
         let gnu = guarded(&format!("{expr} -printf '%s\\0%P\\0'"));
-        let spec = ExecSpec::new(gnu).timeout(WALK_TIMEOUT);
+        let spec = ExecSpec::bash(gnu).timeout(WALK_TIMEOUT);
         let result = self.exec.run(&spec).await?;
         if result.success() {
             return Ok(parse_gnu_walk(&result.stdout));
         }
 
         let posix = guarded(&format!("{expr} -print0"));
-        let spec = ExecSpec::new(posix).timeout(WALK_TIMEOUT);
+        let spec = ExecSpec::bash(posix).timeout(WALK_TIMEOUT);
         let result = self.exec.run(&spec).await?;
         if !result.success() {
             return Err(Error::Exec(

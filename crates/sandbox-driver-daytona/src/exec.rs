@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +17,7 @@ use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 use crate::session::{Session, missing_suffix, wait_for_completion};
-use crate::{DaytonaClient, daytona_error, is_server_timeout, shell_quote, stdio};
+use crate::{DaytonaClient, daytona_error, exec_line, is_server_timeout, shell_quote, stdio};
 
 /// Bound on waiting for the log stream to close after the command has
 /// its outcome; a stream that will not end is abandoned.
@@ -136,11 +135,13 @@ impl Drop for StdinFile {
 /// token uses a command session instead: logs stream live with
 /// server-side stdout/stderr separation, cancellation and timeouts
 /// kill the command by deleting its session, and partial output
-/// survives a timeout via a final log fetch. On both transports the
-/// Bash contract is enforced by wrapping the command in
-/// `/bin/bash -c …` with `BASH_ENV` blanked; environment variables
-/// cross as `export` statements because the API's `envs` field is not
-/// reliably applied.
+/// survives a timeout via a final log fetch. The toolbox takes a shell
+/// string on both transports, so the spec's environment, program, and
+/// arguments are quoted into one `exec env …` word list — the quoting
+/// keeps every word literal, and `env` (not `export`) lets variable names
+/// that are not shell identifiers through. The environment crosses in the
+/// command because the API's `envs` field is not reliably applied.
+/// `BASH_ENV` is unset in the composing shell first.
 pub struct DaytonaExec {
     client:      DaytonaClient,
     sandbox_id:  String,
@@ -186,25 +187,12 @@ impl DaytonaExec {
     }
 
     fn compose(spec: &ExecSpec, stdin_path: Option<&str>) -> String {
+        // Sandbox-level hygiene: the composing shell must not carry an
+        // image's BASH_ENV into a `bash -c` the caller sends. The spec
+        // env applies afterwards, as given.
         let mut program = String::from("unset BASH_ENV\n");
-        for (key, value) in &spec.env {
-            // The unset above runs first, so a spec-provided BASH_ENV
-            // would re-arm startup-file injection into the inner bash;
-            // the exec contract strips it on every transport.
-            if key == "BASH_ENV" {
-                continue;
-            }
-            // Quote the key as well as the value: a malformed key must
-            // corrupt nothing but its own export.
-            program.push_str("export ");
-            program.push_str(&shell_quote(key));
-            program.push('=');
-            program.push_str(&shell_quote(value));
-            program.push('\n');
-        }
-        program.push_str("exec /bin/bash -c ");
-        program.push_str(&shell_quote(&spec.command));
-        // Write-then-EOF as a file redirection on the inner bash.
+        program.push_str(&exec_line(&spec.env, &spec.program, &spec.args));
+        // Write-then-EOF as a file redirection on the program.
         if let Some(path) = stdin_path {
             program.push_str(" < ");
             program.push_str(&shell_quote(path));
@@ -373,12 +361,13 @@ impl DaytonaExec {
             None => None,
         };
 
-        let command = match &stdin_file {
-            Some(file) => format!("(\n{}\n) < {}", spec.command, shell_quote(&file.path)),
-            None => spec.command.clone(),
-        };
+        let mut command = exec_line(&spec.env, &spec.program, &spec.args);
+        if let Some(file) = &stdin_file {
+            command.push_str(" < ");
+            command.push_str(&shell_quote(&file.path));
+        }
         let cwd = self.resolve_dir(spec.working_dir.as_deref());
-        let program = wrap_session_script(&build_session_script(&cwd, &spec.env, &command));
+        let program = wrap_session_script(&build_session_script(&cwd, &command));
 
         let mut session = match Session::create(&sandbox).await {
             Ok(session) => session,
@@ -638,30 +627,18 @@ impl StreamSide {
 }
 
 /// Bash source run inside the session's `/bin/bash -c`: pin the working
-/// directory, blank `BASH_ENV` (overriding any caller value), export
-/// the spec env with both halves quoted, then run the command in a
-/// subshell so its exit status is the script's.
-pub(crate) fn build_session_script(
-    cwd: &str,
-    env: &BTreeMap<String, String>,
-    command: &str,
-) -> String {
-    let mut lines = vec![format!("cd {} || exit $?", shell_quote(cwd))];
-    lines.push("export BASH_ENV=''".to_owned());
-    for (key, value) in env {
-        if key == "BASH_ENV" {
-            continue;
-        }
-        lines.push(format!(
-            "export {}={}",
-            shell_quote(key),
-            shell_quote(value)
-        ));
-    }
-    lines.push("(".to_owned());
-    lines.push(command.to_owned());
-    lines.push(")".to_owned());
-    lines.join("\n")
+/// directory, blank `BASH_ENV` (sandbox-level hygiene; the command's own
+/// env comes with it, see [`crate::exec_line`]), then run the command in
+/// a subshell so its exit status is the script's.
+pub(crate) fn build_session_script(cwd: &str, command: &str) -> String {
+    [
+        format!("cd {} || exit $?", shell_quote(cwd)),
+        "export BASH_ENV=''".to_owned(),
+        "(".to_owned(),
+        command.to_owned(),
+        ")".to_owned(),
+    ]
+    .join("\n")
 }
 
 /// The command handed to the session: one quoted `/bin/bash -c` so the
@@ -689,28 +666,47 @@ mod tests {
     }
 
     #[test]
-    fn compose_strips_a_spec_provided_bash_env() {
-        let spec = ExecSpec::new("true").env_var("BASH_ENV", "/tmp/startup");
+    fn compose_unsets_the_ambient_bash_env_before_the_spec_env() {
+        let spec = ExecSpec::bash("true");
         let program = DaytonaExec::compose(&spec, None);
-        assert!(program.starts_with("unset BASH_ENV\n"));
-        assert!(!program.contains("export BASH_ENV"));
+        // The helper's blank travels like any other spec variable.
+        assert_eq!(
+            program,
+            "unset BASH_ENV\nexec env 'BASH_ENV=' 'bash' '-c' 'true'"
+        );
     }
 
     #[test]
-    fn compose_quotes_env_keys_and_values() {
-        let spec = ExecSpec::new("true").env_var("X;injected", "a b");
+    fn compose_quotes_env_assignments_whole() {
+        let spec = ExecSpec::new("true")
+            .env_var("X;injected", "a b")
+            .env_var("INPUT_INCLUDE-HIDDEN-FILES", "true");
         let program = DaytonaExec::compose(&spec, None);
-        // A metacharacter in a key corrupts only its own export instead
-        // of splicing extra shell before the command.
-        assert!(program.contains("export 'X;injected'='a b'\n"), "{program}");
+        // A metacharacter in a key corrupts nothing: the assignment is one
+        // quoted word to `env`, which also admits names that are not shell
+        // identifiers.
+        assert!(
+            program.ends_with("exec env 'INPUT_INCLUDE-HIDDEN-FILES=true' 'X;injected=a b' 'true'"),
+            "{program}"
+        );
+    }
+
+    #[test]
+    fn compose_keeps_every_argument_literal() {
+        let spec = ExecSpec::new("printf").args(["%s", "$HOME; rm -rf /", "it's"]);
+        let program = DaytonaExec::compose(&spec, None);
+        assert!(
+            program.ends_with("exec env 'printf' '%s' '$HOME; rm -rf /' 'it'\\''s'"),
+            "{program}"
+        );
     }
 
     #[test]
     fn compose_redirects_stdin_from_the_temp_file() {
-        let spec = ExecSpec::new("wc -c");
+        let spec = ExecSpec::new("wc").arg("-c");
         let program = DaytonaExec::compose(&spec, Some("/tmp/.sandbox-driver-stdin-1-2"));
         assert!(
-            program.ends_with("exec /bin/bash -c 'wc -c' < '/tmp/.sandbox-driver-stdin-1-2'"),
+            program.ends_with("exec env 'wc' '-c' < '/tmp/.sandbox-driver-stdin-1-2'"),
             "{program}"
         );
     }

@@ -73,7 +73,7 @@ async fn create_exec_fs_delete_round_trip() {
         .expect("probe over the wire");
 
     // Buffered exec with stdin and binary-safe output.
-    let spec = ExecSpec::new("printf 'wire\\0bytes'; cat >&2")
+    let spec = ExecSpec::bash("printf 'wire\\0bytes'; cat >&2")
         .stdin(b"stderr-payload".to_vec())
         .timeout(Duration::from_secs(10));
     let result = sandbox.exec().run(&spec).await.expect("exec");
@@ -123,7 +123,7 @@ async fn derived_git_is_selected_transparently_over_the_wire() {
 
     let result = sandbox
         .exec()
-        .run(&ExecSpec::new("git init -q -b main repo"))
+        .run(&ExecSpec::new("git").args(["init", "-q", "-b", "main", "repo"]))
         .await
         .expect("git init over wire");
     assert!(result.success(), "stderr: {}", result.stderr_lossy());
@@ -212,7 +212,7 @@ async fn streaming_exec_delivers_output_notifications_and_cancels() {
         })),
         ..ExecControls::default()
     };
-    let spec = ExecSpec::new("echo one; echo two >&2").timeout(Duration::from_secs(10));
+    let spec = ExecSpec::bash("echo one; echo two >&2").timeout(Duration::from_secs(10));
     let streaming = sandbox
         .exec()
         .run_streaming(&spec, controls)
@@ -242,7 +242,7 @@ async fn streaming_exec_delivers_output_notifications_and_cancels() {
     let started = Instant::now();
     let streaming = sandbox
         .exec()
-        .run_streaming(&ExecSpec::new("sleep 30"), controls)
+        .run_streaming(&ExecSpec::new("sleep").arg("30"), controls)
         .await
         .expect("stream resolves");
     assert_eq!(streaming.result.termination, Termination::Cancelled);
@@ -258,8 +258,10 @@ async fn slow_calls_do_not_block_fast_calls() {
     let sandbox = provider.create(&host_spec(), None).await.expect("create");
 
     let slow_exec = sandbox.exec();
-    let slow = ExecSpec::new("sleep 2; echo slow").timeout(Duration::from_secs(30));
-    let fast = ExecSpec::new("echo fast").timeout(Duration::from_secs(30));
+    let slow = ExecSpec::bash("sleep 2; echo slow").timeout(Duration::from_secs(30));
+    let fast = ExecSpec::new("echo")
+        .arg("fast")
+        .timeout(Duration::from_secs(30));
 
     let started = Instant::now();
     let (slow_result, fast_result) = tokio::join!(slow_exec.run(&slow), sandbox.exec().run(&fast));

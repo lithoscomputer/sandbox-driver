@@ -7,12 +7,14 @@ use crate::sandbox::Sandbox;
 use crate::state::SandboxState;
 use crate::wait::{WaitOptions, wait_for_stable_state, wait_for_state};
 
-/// Bash contract probe, carried over from fabro. Run through the exec
-/// facet on a fresh sandbox and after every resume, before reporting the
-/// sandbox usable. Fails when `BASH_ENV` is set, Bash is missing, the
-/// shell is a login shell, or POSIX mode is active. Success requires exit
-/// 0 and stdout `fabro-bash-ready` — surrounding whitespace tolerated,
-/// because exec transports pad or normalize output.
+/// Bash contract probe, carried over from fabro. Run through
+/// [`ExecSpec::bash`] on a fresh sandbox and after every resume, before
+/// reporting the sandbox usable: the exec-derived facets are Bash scripts,
+/// so a sandbox that cannot serve the helper cannot serve them. Fails when
+/// `BASH_ENV` is set, Bash is missing, the shell is a login shell, or
+/// POSIX mode is active. Success requires exit 0 and stdout
+/// `fabro-bash-ready` — surrounding whitespace tolerated, because exec
+/// transports pad or normalize output.
 pub const BASH_PROBE_SCRIPT: &str = r#"
 if [ -n "${BASH_ENV:-}" ]; then echo "probe: BASH_ENV is set" >&2; exit 1; fi
 if [ -z "${BASH_VERSION:-}" ]; then echo "probe: not running under bash" >&2; exit 1; fi
@@ -35,7 +37,7 @@ const PROBE_OK_MARKER: &str = "fabro-bash-ready";
 /// "Bash runs but the streaming contract is broken".
 #[tracing::instrument(skip_all, err)]
 pub async fn run_bash_probe(exec: &dyn Exec) -> Result<()> {
-    let spec = ExecSpec::new(BASH_PROBE_SCRIPT).timeout(PROBE_TIMEOUT);
+    let spec = ExecSpec::bash(BASH_PROBE_SCRIPT).timeout(PROBE_TIMEOUT);
     let result = exec.run(&spec).await?;
     check_probe_result("bash probe", result)?;
 

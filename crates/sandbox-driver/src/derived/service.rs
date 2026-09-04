@@ -40,7 +40,7 @@ impl<'e> DerivedServices<'e> {
     }
 
     async fn run(&self, label: &'static str, command: String) -> Result<ExecResult> {
-        let spec = ExecSpec::new(command).timeout(SERVICE_TIMEOUT);
+        let spec = ExecSpec::bash(command).timeout(SERVICE_TIMEOUT);
         let result = self.exec.run(&spec).await?;
         if result.success() {
             return Ok(result);

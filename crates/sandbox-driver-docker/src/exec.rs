@@ -12,17 +12,20 @@ use bollard::errors::Error as DockerApiError;
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use futures_util::StreamExt;
 use sandbox_driver::{
-    Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputCaptureBuffer,
-    OutputSanitizer, OutputSink, OutputStream, ProviderError, ProviderKind, Result, SpawnSpec,
-    StderrTail, StdioProcess, StdioProcessHandle, Termination, feed_stdin, stop_signal,
+    BASH_ENV_VAR, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
+    OutputCaptureBuffer, OutputSanitizer, OutputSink, OutputStream, ProviderError, ProviderKind,
+    Result, SpawnSpec, StderrTail, StdioProcess, StdioProcessHandle, Termination, feed_stdin,
+    stop_signal,
 };
 use tokio::io::{AsyncWriteExt, duplex};
 use tokio::time;
 
-/// The container-side interpreter the Bash contract requires: the default
-/// [`DockerExec`] shell.
-pub(crate) const CONTAINER_BASH: &str = "/bin/bash";
-pub(crate) const BASH_ENV_VAR: &str = "BASH_ENV";
+/// The POSIX shell every Linux image provides. The exec wrapper, the stop
+/// request, and the container's init command run under it; the user's
+/// program never does.
+pub(crate) const POSIX_SH: &str = "/bin/sh";
+/// `$0` of the wrapper shell, so the user's argv starts at `$1`.
+const WRAPPER_NAME: &str = "sandbox-driver";
 /// Grace period for draining output after a stop request. Must exceed
 /// the watcher's poll interval plus [`TERM_GRACE`].
 const KILL_DRAIN_GRACE: Duration = Duration::from_secs(10);
@@ -128,21 +131,27 @@ pub(crate) fn shell_quote(value: &str) -> String {
 /// Command execution inside one container.
 ///
 /// Docker cannot kill an exec instance, so every command runs under a
-/// wrapper that puts it in its own session and pairs it with an
+/// `/bin/sh` wrapper that puts it in its own session and pairs it with an
 /// in-container watcher; timeout and cancellation request a stop by
 /// creating a stop file through a second exec, and the watcher kills
 /// the process group (SIGTERM, grace, SIGKILL) whenever the stop lands
 /// — even before the command starts. The wrapper's `wait` forwards the
 /// child's exit code.
+///
+/// The environment and the program reach the wrapper as its positional
+/// parameters — `KEY=VALUE`… `program` `args`… — and are executed with
+/// `setsid env "$@"`, so no shell ever interprets them. The environment
+/// travels through `env` rather than the exec's own environment on
+/// purpose: `/bin/sh` is dash on most images, and dash drops variables
+/// whose names are not identifiers (`INPUT_INCLUDE-HIDDEN-FILES`, which
+/// GitHub Actions passes) when it spawns a child. `env` sets them as
+/// given. One consequence: `env` reads a leading word containing `=` as
+/// an assignment, so a program whose name contains `=` cannot be run.
 pub struct DockerExec {
     docker:       Docker,
     container_id: String,
     working_dir:  String,
     base_env:     BTreeMap<String, String>,
-    /// The interpreter every wrapper runs under: [`CONTAINER_BASH`] by
-    /// default (the Bash contract), or the shell `provider_config.shell`
-    /// selected for an image without bash.
-    shell:        String,
     exec_counter: AtomicU64,
 }
 
@@ -152,28 +161,47 @@ impl DockerExec {
         container_id: String,
         working_dir: String,
         base_env: BTreeMap<String, String>,
-        shell: String,
     ) -> Self {
         Self {
             docker,
             container_id,
             working_dir,
             base_env,
-            shell,
             exec_counter: AtomicU64::new(0),
         }
     }
 
+    /// The command's environment as `env` arguments: the sandbox's base
+    /// env with `BASH_ENV` blanked (an image can carry one, and it would
+    /// run inside any `bash -c` a caller sends), then the spec env as
+    /// given.
     fn env_entries(&self, extra: &BTreeMap<String, String>) -> Vec<String> {
         let mut entries: Vec<String> = self
             .base_env
             .iter()
-            .chain(extra)
             .filter(|(key, _)| key.as_str() != BASH_ENV_VAR)
             .map(|(key, value)| format!("{key}={value}"))
             .collect();
         entries.push(format!("{BASH_ENV_VAR}="));
+        entries.extend(extra.iter().map(|(key, value)| format!("{key}={value}")));
         entries
+    }
+
+    /// The `Cmd` of a wrapped exec: the wrapper under `/bin/sh`, then the
+    /// environment, program, and arguments as its positional parameters.
+    fn wrapped_cmd(
+        wrapper: String,
+        env: Vec<String>,
+        program: &str,
+        args: &[String],
+    ) -> Vec<String> {
+        let mut cmd = Vec::with_capacity(env.len() + args.len() + 5);
+        cmd.extend([POSIX_SH.to_owned(), "-c".to_owned(), wrapper]);
+        cmd.push(WRAPPER_NAME.to_owned());
+        cmd.extend(env);
+        cmd.push(program.to_owned());
+        cmd.extend(args.iter().cloned());
+        cmd
     }
 
     /// Resolves a relative working directory against the sandbox
@@ -205,7 +233,8 @@ impl DockerExec {
         (format!("{prefix}.stop"), format!("{prefix}.pid"))
     }
 
-    /// Wraps a user command so a stop request is honored at any point.
+    /// The `/bin/sh` wrapper that runs `env "$@"` — the environment,
+    /// program, and arguments — so a stop request is honored at any point.
     ///
     /// An in-container watcher polls for the stop file, so a stop that
     /// lands before the pid file exists — or before the command starts
@@ -213,15 +242,10 @@ impl DockerExec {
     /// [`StopMode`]: for `term <grace>` the watcher SIGTERMs the process
     /// group, waits the grace, then SIGKILLs; for `kill` it SIGKILLs at
     /// once. Control files are cleared before the command starts and
-    /// removed on exit.
-    fn wrapped(
-        shell: &str,
-        user_command: &str,
-        stop_file: &str,
-        pid_file: &str,
-        forward_stdin: bool,
-    ) -> String {
-        let quoted_cmd = shell_quote(user_command);
+    /// removed on exit. The `wait` runs with stderr closed: dash reports a
+    /// signalled background job as `Terminated` on stderr, which would
+    /// otherwise land in the command's output.
+    fn wrapped(stop_file: &str, pid_file: &str, forward_stdin: bool) -> String {
         let stop_file = shell_quote(stop_file);
         let pid_file = shell_quote(pid_file);
         let default_grace = TERM_GRACE.as_secs();
@@ -239,8 +263,8 @@ impl DockerExec {
         // command had already died, and a kill after a term could not land.
         format!(
             "mkdir -p /tmp/.sandbox-driver\n\
-             if ! command -v setsid >/dev/null 2>&1; then\n\
-               echo 'sandbox-driver: the container image must provide setsid' >&2\n\
+             if ! command -v setsid >/dev/null 2>&1 || ! command -v env >/dev/null 2>&1; then\n\
+               echo 'sandbox-driver: the container image must provide setsid and env' >&2\n\
                exit 127\n\
              fi\n\
              stop_file={stop_file}\n\
@@ -270,10 +294,10 @@ impl DockerExec {
                fi\n\
                kill -KILL \"-$child\" 2>/dev/null || kill -KILL \"$child\" 2>/dev/null || true\n\
              ) >/dev/null 2>&1 & watcher=$!\n\
-             setsid {shell} -c {quoted_cmd} {stdin_redirect} &\n\
+             setsid env \"$@\" {stdin_redirect} &\n\
              child=$!\n\
              {close_stdin}printf '%s' \"$child\" > \"$pid_file\"\n\
-             wait \"$child\"\n\
+             wait \"$child\" 2>/dev/null\n\
              status=$?\n\
              kill \"$watcher\" 2>/dev/null || true\n\
              wait \"$watcher\" 2>/dev/null || true\n\
@@ -296,7 +320,7 @@ impl DockerExec {
             shell_quote(stop_file)
         );
         let options = CreateExecOptions {
-            cmd: Some(vec![self.shell.clone(), "-c".to_owned(), command]),
+            cmd: Some(vec![POSIX_SH.to_owned(), "-c".to_owned(), command]),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
             tty: Some(false),
@@ -373,13 +397,7 @@ impl Exec for DockerExec {
         let (stop_file, pid_file) = self.control_paths();
         let term = StopMode::Term(controls.grace.unwrap_or(TERM_GRACE));
         let stdin_reader = controls.stdin_reader(spec);
-        let wrapper = Self::wrapped(
-            &self.shell,
-            &spec.command,
-            &stop_file,
-            &pid_file,
-            stdin_reader.is_some(),
-        );
+        let wrapper = Self::wrapped(&stop_file, &pid_file, stdin_reader.is_some());
 
         let working_dir = self.resolve_dir(spec.working_dir.as_deref());
         let options = CreateExecOptions {
@@ -387,9 +405,14 @@ impl Exec for DockerExec {
             attach_stdout: Some(true),
             attach_stderr: Some(true),
             tty: Some(false),
-            cmd: Some(vec![self.shell.clone(), "-c".to_owned(), wrapper]),
+            cmd: Some(Self::wrapped_cmd(
+                wrapper,
+                self.env_entries(&spec.env),
+                &spec.program,
+                &spec.args,
+            )),
             working_dir: Some(working_dir),
-            env: Some(self.env_entries(&spec.env)),
+            env: Some(vec![format!("{BASH_ENV_VAR}=")]),
             ..Default::default()
         };
         let exec = self
@@ -578,16 +601,21 @@ impl Exec for DockerExec {
     )]
     async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
         let (stop_file, pid_file) = self.control_paths();
-        let wrapper = Self::wrapped(&self.shell, &spec.command, &stop_file, &pid_file, true);
+        let wrapper = Self::wrapped(&stop_file, &pid_file, true);
         let working_dir = self.resolve_dir(spec.working_dir.as_deref());
         let options = CreateExecOptions {
             attach_stdin: Some(true),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
             tty: Some(false),
-            cmd: Some(vec![self.shell.clone(), "-c".to_owned(), wrapper]),
+            cmd: Some(Self::wrapped_cmd(
+                wrapper,
+                self.env_entries(&spec.env),
+                &spec.program,
+                &spec.args,
+            )),
             working_dir: Some(working_dir),
-            env: Some(self.env_entries(&spec.env)),
+            env: Some(vec![format!("{BASH_ENV_VAR}=")]),
             ..Default::default()
         };
         let exec = self
@@ -667,7 +695,6 @@ impl Exec for DockerExec {
                 self.container_id.clone(),
                 self.working_dir.clone(),
                 self.base_env.clone(),
-                self.shell.clone(),
             ),
             exec_id: exec.id,
             stop_file,

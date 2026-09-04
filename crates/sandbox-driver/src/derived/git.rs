@@ -46,7 +46,7 @@ impl<'e> DerivedGit<'e> {
             command.push(' ');
             command.push_str(&shell_quote(arg));
         }
-        let mut spec = ExecSpec::new(command).timeout(timeout);
+        let mut spec = ExecSpec::bash(command).timeout(timeout);
         if let Some(repo) = repo {
             spec = spec.working_dir(repo.to_owned());
         }
