@@ -420,21 +420,10 @@ where
 fn handle_info(handle: &Arc<dyn Sandbox>, status: SandboxStatus) -> m::HandleInfo {
     m::HandleInfo {
         status,
-        capabilities: wire_capabilities(handle.capabilities()),
+        capabilities: handle.capabilities().clone(),
         working_directory: handle.working_directory().to_owned(),
         runtime_directory: handle.runtime_directory().map(str::to_owned),
     }
-}
-
-/// Masks off the exec capabilities the wire protocol does not carry yet:
-/// streamed stdin has no channel and `Sandbox::environment` has no method,
-/// so a plugin never advertises them, whatever the wrapped provider can do
-/// in process.
-fn wire_capabilities(capabilities: &sandbox_driver::Capabilities) -> sandbox_driver::Capabilities {
-    let mut capabilities = capabilities.clone();
-    capabilities.exec.stdin_stream = false;
-    capabilities.exec.environment = false;
-    capabilities
 }
 
 #[tracing::instrument(skip_all, fields(method = method))]
@@ -462,7 +451,7 @@ async fn dispatch(
                     kind:    state.provider.kind().clone(),
                     version: env!("CARGO_PKG_VERSION").to_owned(),
                 },
-                capabilities:     wire_capabilities(state.provider.capabilities()),
+                capabilities:     state.provider.capabilities().clone(),
             })
         }
         m::SANDBOX_CREATE => {

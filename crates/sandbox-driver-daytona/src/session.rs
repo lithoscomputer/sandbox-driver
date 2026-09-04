@@ -8,7 +8,7 @@
 //! deleting the session kills the command. Ported from fabro's
 //! session transport.
 
-use std::future::pending;
+use std::future::{Future, pending};
 use std::time::Duration;
 use std::{mem, process};
 
@@ -161,15 +161,15 @@ pub(crate) struct WaitOutcome {
 }
 
 /// Polls the command until it exits, the deadline passes, the caller's
-/// token fires, or the sink-failure token fires (a failing sink cancels
-/// the execution). The caller owns the log-stream task and the session
-/// close.
+/// stop request resolves, or the sink-failure token fires (a failing
+/// sink cancels the execution). The caller owns the log-stream task and
+/// the session close.
 pub(crate) async fn wait_for_completion(
     session: &Session,
     command_id: &str,
     initial_exit_code: Option<i32>,
     timeout: Option<Duration>,
-    cancel: Option<CancellationToken>,
+    stop_requested: impl Future<Output = ()>,
     sink_failed: CancellationToken,
 ) -> Result<WaitOutcome> {
     if let Some(code) = initial_exit_code {
@@ -185,13 +185,7 @@ pub(crate) async fn wait_for_completion(
             None => pending().await,
         }
     };
-    let cancelled = async {
-        match &cancel {
-            Some(token) => token.cancelled().await,
-            None => pending().await,
-        }
-    };
-    tokio::pin!(deadline, cancelled);
+    tokio::pin!(deadline, stop_requested);
     loop {
         tokio::select! {
             () = time::sleep(STATUS_POLL) => {
@@ -210,7 +204,7 @@ pub(crate) async fn wait_for_completion(
                     final_logs:  session.fetch_logs(command_id).await,
                 });
             }
-            () = &mut cancelled => {
+            () = &mut stop_requested => {
                 return Ok(WaitOutcome {
                     exit_code:   None,
                     termination: Termination::Cancelled,

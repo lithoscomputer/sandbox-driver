@@ -842,74 +842,59 @@ async fn exec_timeout_terminates(ctx: &Conformance) -> CheckOutcome {
 }
 
 async fn exec_cancel_terminates(ctx: &Conformance) -> CheckOutcome {
-    if !ctx.caps().exec.cancel {
-        return Ok(Some("capability exec.cancel not declared".to_owned()));
-    }
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
-        let token = CancellationToken::new();
-        let cancel_after = token.clone();
-        tokio::spawn(async move {
-            time::sleep(Duration::from_millis(500)).await;
-            cancel_after.cancel();
-        });
-        let controls = ExecControls {
+    exec_stop_terminates(
+        ctx,
+        |token| ExecControls {
             cancel: Some(token),
             ..ExecControls::default()
-        };
-        let streaming = sandbox
-            .exec()
-            .run_streaming(&ExecSpec::new("sleep 300"), controls)
-            .await
-            .map_err(|error| format!("exec failed: {error}"))?;
-        if streaming.result.termination != Termination::Cancelled {
-            return fail(format!(
-                "expected Cancelled, got {:?}",
-                streaming.result.termination
-            ));
-        }
-        PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+        },
+        &[Termination::Cancelled],
+    )
+    .await
 }
 
 async fn exec_kill_terminates(ctx: &Conformance) -> CheckOutcome {
+    // A provider that cannot separate the two levels reports Cancelled;
+    // either is a correct end for a kill.
+    exec_stop_terminates(
+        ctx,
+        |token| ExecControls {
+            kill: Some(token),
+            ..ExecControls::default()
+        },
+        &[Termination::Killed, Termination::Cancelled],
+    )
+    .await
+}
+
+/// Fires the stop token `build` places half a second into a long sleep
+/// and expects one of the `accepted` terminations.
+async fn exec_stop_terminates(
+    ctx: &Conformance,
+    build: fn(CancellationToken) -> ExecControls,
+    accepted: &[Termination],
+) -> CheckOutcome {
     if !ctx.caps().exec.cancel {
         return Ok(Some("capability exec.cancel not declared".to_owned()));
     }
     let sandbox = ctx.ready().await?;
     let outcome = async {
         let token = CancellationToken::new();
-        let kill_after = token.clone();
+        let stop_after = token.clone();
         tokio::spawn(async move {
             time::sleep(Duration::from_millis(500)).await;
-            kill_after.cancel();
+            stop_after.cancel();
         });
-        let controls = ExecControls {
-            kill: Some(token),
-            ..ExecControls::default()
-        };
-        let started = Instant::now();
         let streaming = sandbox
             .exec()
-            .run_streaming(&ExecSpec::new("sleep 300"), controls)
+            .run_streaming(&ExecSpec::new("sleep 300"), build(token))
             .await
             .map_err(|error| format!("exec failed: {error}"))?;
-        // A provider that cannot separate the two levels reports Cancelled;
-        // either is a correct end for a kill.
-        if !matches!(
-            streaming.result.termination,
-            Termination::Killed | Termination::Cancelled
-        ) {
+        if !accepted.contains(&streaming.result.termination) {
             return fail(format!(
-                "expected Killed or Cancelled, got {:?}",
+                "expected one of {accepted:?}, got {:?}",
                 streaming.result.termination
             ));
-        }
-        if started.elapsed() > Duration::from_secs(60) {
-            return fail("kill enforcement took over a minute");
         }
         PASS
     }

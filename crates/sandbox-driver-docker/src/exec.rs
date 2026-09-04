@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::pin::Pin;
+use std::pin::pin;
 use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,16 +14,17 @@ use futures_util::StreamExt;
 use sandbox_driver::{
     Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputCaptureBuffer,
     OutputSanitizer, OutputSink, OutputStream, ProviderError, ProviderKind, Result, SpawnSpec,
-    StderrTail, StdinSource, StdioProcess, StdioProcessHandle, Termination,
+    StderrTail, StdioProcess, StdioProcessHandle, Termination, feed_stdin, stop_signal,
 };
-use tokio::io::{AsyncWrite, AsyncWriteExt, copy, duplex};
+use tokio::io::{AsyncWriteExt, duplex};
 use tokio::time;
 
-/// The container-side interpreter the Bash contract requires.
-const CONTAINER_BASH: &str = "/bin/bash";
+/// The container-side interpreter the Bash contract requires: the default
+/// [`DockerExec`] shell.
+pub(crate) const CONTAINER_BASH: &str = "/bin/bash";
 pub(crate) const BASH_ENV_VAR: &str = "BASH_ENV";
 /// Grace period for draining output after a stop request. Must exceed
-/// the watcher's poll interval plus [`TERM_GRACE_SECONDS`].
+/// the watcher's poll interval plus [`TERM_GRACE`].
 const KILL_DRAIN_GRACE: Duration = Duration::from_secs(10);
 /// Bound on retrying transient `inspect_exec` failures in stdio `wait`
 /// before giving up with `Termination::Unknown`: an end that was never
@@ -32,14 +33,40 @@ const KILL_DRAIN_GRACE: Duration = Duration::from_secs(10);
 const WAIT_INSPECT_RETRY: Duration = Duration::from_secs(10);
 /// The in-container watcher's poll interval for the stop file.
 const STOP_POLL_SLEEP_SECONDS: &str = "0.1";
-/// Grace between the watcher's SIGTERM and SIGKILL so processes can run
-/// traps, flush output, and release locks. The wrapper's `wait` returns
-/// as soon as the process exits, so a generous grace costs nothing on
-/// the normal path.
-const TERM_GRACE_SECONDS: &str = "2";
+/// Default grace between the watcher's SIGTERM and SIGKILL so processes
+/// can run traps, flush output, and release locks. The wrapper's `wait`
+/// returns as soon as the process exits, so a generous grace costs
+/// nothing on the normal path.
+const TERM_GRACE: Duration = Duration::from_secs(2);
+
+/// How the in-container watcher should end a command. Rendered into the
+/// stop file, which the wrapper's watcher reads to pick its ladder.
+#[derive(Clone, Copy, Debug)]
+enum StopMode {
+    /// SIGTERM the process group, wait the grace, then SIGKILL.
+    Term(Duration),
+    /// SIGKILL the process group at once.
+    Kill,
+}
+
+impl StopMode {
+    /// The stop file's contents: `kill`, or `term <seconds>` with the
+    /// grace rounded to whole seconds (at least one) for the shell's
+    /// `sleep`.
+    fn render(self) -> String {
+        match self {
+            Self::Term(grace) => format!("term {}", grace.as_secs().max(1)),
+            Self::Kill => "kill".to_owned(),
+        }
+    }
+}
+
+pub(crate) fn docker_kind() -> ProviderKind {
+    ProviderKind::try_new("docker").expect("static kind is valid")
+}
 
 pub(crate) fn docker_error(context: &str, error: DockerApiError) -> Error {
-    let kind = ProviderKind::try_new("docker").expect("static kind is valid");
+    let kind = docker_kind();
     let status_code = match &error {
         DockerApiError::DockerResponseServerError { status_code, .. } => Some(*status_code),
         _ => None,
@@ -84,60 +111,6 @@ pub(crate) fn tolerate_not_modified(
     }
 }
 
-/// Writes stdin then closes it for EOF. A command that stops reading its
-/// input (`head -1`) disconnecting the pipe is normal; any other failure
-/// means the command saw truncated input and must not pass silently.
-/// Whether a stdin write failed because the reader disconnected — normal
-/// for a command like `head -1` that stops reading.
-fn is_disconnect(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::BrokenPipe
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::ConnectionAborted
-    )
-}
-
-async fn write_stdin(mut input: Pin<Box<dyn AsyncWrite + Send>>, bytes: Vec<u8>) -> Result<()> {
-    if let Err(error) = input.write_all(&bytes).await {
-        if is_disconnect(&error) {
-            return Ok(());
-        }
-        return Err(Error::io("writing exec stdin", error));
-    }
-    if let Err(error) = input.shutdown().await {
-        if is_disconnect(&error) {
-            return Ok(());
-        }
-        return Err(Error::io("closing exec stdin", error));
-    }
-    Ok(())
-}
-
-/// Copies a streamed source into the exec stdin, then closes it for EOF.
-async fn stream_stdin_into(
-    mut input: Pin<Box<dyn AsyncWrite + Send>>,
-    source: StdinSource,
-) -> Result<()> {
-    let Some(mut reader) = source.take() else {
-        let _ = input.shutdown().await;
-        return Ok(());
-    };
-    if let Err(error) = copy(&mut reader, &mut input).await {
-        if is_disconnect(&error) {
-            return Ok(());
-        }
-        return Err(Error::io("streaming exec stdin", error));
-    }
-    if let Err(error) = input.shutdown().await {
-        if is_disconnect(&error) {
-            return Ok(());
-        }
-        return Err(Error::io("closing exec stdin", error));
-    }
-    Ok(())
-}
-
 pub(crate) fn shell_quote(value: &str) -> String {
     let mut quoted = String::with_capacity(value.len() + 2);
     quoted.push('\'');
@@ -166,6 +139,10 @@ pub struct DockerExec {
     container_id: String,
     working_dir:  String,
     base_env:     BTreeMap<String, String>,
+    /// The interpreter every wrapper runs under: [`CONTAINER_BASH`] by
+    /// default (the Bash contract), or the shell `provider_config.shell`
+    /// selected for an image without bash.
+    shell:        String,
     exec_counter: AtomicU64,
 }
 
@@ -175,12 +152,14 @@ impl DockerExec {
         container_id: String,
         working_dir: String,
         base_env: BTreeMap<String, String>,
+        shell: String,
     ) -> Self {
         Self {
             docker,
             container_id,
             working_dir,
             base_env,
+            shell,
             exec_counter: AtomicU64::new(0),
         }
     }
@@ -230,29 +209,29 @@ impl DockerExec {
     ///
     /// An in-container watcher polls for the stop file, so a stop that
     /// lands before the pid file exists — or before the command starts
-    /// at all — still takes effect. The watcher SIGTERMs the process
-    /// group, waits [`TERM_GRACE_SECONDS`] for a graceful exit, then
-    /// SIGKILLs. Control files are cleared before the command starts
-    /// and removed on exit.
+    /// at all — still takes effect. The stop file carries a rendered
+    /// [`StopMode`]: for `term <grace>` the watcher SIGTERMs the process
+    /// group, waits the grace, then SIGKILLs; for `kill` it SIGKILLs at
+    /// once. Control files are cleared before the command starts and
+    /// removed on exit.
     fn wrapped(
+        shell: &str,
         user_command: &str,
         stop_file: &str,
         pid_file: &str,
         forward_stdin: bool,
-        grace_seconds: u64,
     ) -> String {
         let quoted_cmd = shell_quote(user_command);
         let stop_file = shell_quote(stop_file);
         let pid_file = shell_quote(pid_file);
-        let grace = grace_seconds.to_string();
+        let default_grace = TERM_GRACE.as_secs();
         let (save_stdin, stdin_redirect, close_stdin) = if forward_stdin {
             ("exec 3<&0\n", "<&3", "exec 3<&-\n")
         } else {
             ("", "< /dev/null", "")
         };
-        // The stop file is empty for a polite cancel and holds `kill` for an
-        // immediate SIGKILL. The watcher reads it to pick the ladder: TERM,
-        // grace, KILL for a cancel; straight to KILL for a kill.
+        // The watcher waits for a non-empty stop file so it never reads
+        // the mode mid-write; a missing grace falls back to the default.
         format!(
             "mkdir -p /tmp/.sandbox-driver\n\
              if ! command -v setsid >/dev/null 2>&1; then\n\
@@ -269,17 +248,19 @@ impl DockerExec {
                exit 143\n\
              fi\n\
              (\n\
-               while [ ! -e \"$stop_file\" ]; do sleep {STOP_POLL_SLEEP_SECONDS}; done\n\
+               while [ ! -s \"$stop_file\" ]; do sleep {STOP_POLL_SLEEP_SECONDS}; done\n\
                while [ ! -s \"$pid_file\" ]; do sleep {STOP_POLL_SLEEP_SECONDS}; done\n\
                child=$(cat \"$pid_file\")\n\
                mode=$(cat \"$stop_file\" 2>/dev/null)\n\
                if [ \"$mode\" != kill ]; then\n\
+                 grace=${{mode#term }}\n\
+                 [ -n \"$grace\" ] || grace={default_grace}\n\
                  kill -TERM \"-$child\" 2>/dev/null || kill -TERM \"$child\" 2>/dev/null || true\n\
-                 sleep {grace}\n\
+                 sleep \"$grace\"\n\
                fi\n\
                kill -KILL \"-$child\" 2>/dev/null || kill -KILL \"$child\" 2>/dev/null || true\n\
              ) & watcher=$!\n\
-             setsid {CONTAINER_BASH} -c {quoted_cmd} {stdin_redirect} &\n\
+             setsid {shell} -c {quoted_cmd} {stdin_redirect} &\n\
              child=$!\n\
              {close_stdin}printf '%s' \"$child\" > \"$pid_file\"\n\
              wait \"$child\"\n\
@@ -291,30 +272,21 @@ impl DockerExec {
         )
     }
 
-    /// Requests a stop by creating the stop file the in-container
-    /// watcher polls for; a stop that arrives before the command starts
-    /// is honored by the wrapper's pre-check. Runs from `/` — the exec
-    /// being stopped may have removed the working directory the
-    /// container would otherwise start this one in — with a blank
-    /// `BASH_ENV`, and reports failure: a stop that could not be
+    /// Requests a stop by writing the rendered `mode` into the stop file
+    /// the in-container watcher polls for; a stop that arrives before
+    /// the command starts is honored by the wrapper's pre-check. Runs
+    /// from `/` — the exec being stopped may have removed the working
+    /// directory the container would otherwise start this one in — with
+    /// a blank `BASH_ENV`, and reports failure: a stop that could not be
     /// requested must never masquerade as a kill.
-    async fn request_stop(&self, stop_file: &str) -> Result<()> {
-        self.write_stop(stop_file, "").await
-    }
-
-    /// Requests an immediate SIGKILL by writing `kill` into the stop file.
-    async fn request_kill(&self, stop_file: &str) -> Result<()> {
-        self.write_stop(stop_file, "kill").await
-    }
-
-    async fn write_stop(&self, stop_file: &str, mode: &str) -> Result<()> {
+    async fn request_stop(&self, stop_file: &str, mode: StopMode) -> Result<()> {
         let command = format!(
             "mkdir -p /tmp/.sandbox-driver && printf '%s' {} > {}",
-            shell_quote(mode),
+            shell_quote(&mode.render()),
             shell_quote(stop_file)
         );
         let options = CreateExecOptions {
-            cmd: Some(vec![CONTAINER_BASH.to_owned(), "-c".to_owned(), command]),
+            cmd: Some(vec![self.shell.clone(), "-c".to_owned(), command]),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
             tty: Some(false),
@@ -389,27 +361,23 @@ impl Exec for DockerExec {
     ) -> Result<ExecStreamingResult> {
         let started = Instant::now();
         let (stop_file, pid_file) = self.control_paths();
-        let grace_seconds = controls.grace.map_or_else(
-            || TERM_GRACE_SECONDS.parse().unwrap_or(2),
-            |d| d.as_secs().max(1),
-        );
-        let stream_stdin = controls.stdin.clone();
-        let has_stdin = spec.stdin.is_some() || stream_stdin.is_some();
+        let term = StopMode::Term(controls.grace.unwrap_or(TERM_GRACE));
+        let stdin_reader = controls.stdin_reader(spec);
         let wrapper = Self::wrapped(
+            &self.shell,
             &spec.command,
             &stop_file,
             &pid_file,
-            has_stdin,
-            grace_seconds,
+            stdin_reader.is_some(),
         );
 
         let working_dir = self.resolve_dir(spec.working_dir.as_deref());
         let options = CreateExecOptions {
-            attach_stdin: Some(has_stdin),
+            attach_stdin: Some(stdin_reader.is_some()),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
             tty: Some(false),
-            cmd: Some(vec![CONTAINER_BASH.to_owned(), "-c".to_owned(), wrapper]),
+            cmd: Some(vec![self.shell.clone(), "-c".to_owned(), wrapper]),
             working_dir: Some(working_dir),
             env: Some(self.env_entries(&spec.env)),
             ..Default::default()
@@ -430,14 +398,8 @@ impl Exec for DockerExec {
             }));
         };
 
-        let stdin_task = match (stream_stdin, spec.stdin.clone()) {
-            (Some(source), _) => Some(tokio::spawn(stream_stdin_into(input, source))),
-            (None, Some(bytes)) => Some(tokio::spawn(write_stdin(input, bytes))),
-            (None, None) => {
-                drop(input);
-                None
-            }
-        };
+        // A command without stdin gets the attached input closed at once.
+        let stdin_task = stdin_reader.map(|reader| tokio::spawn(feed_stdin(input, reader)));
 
         let mut stdout_capture = OutputCaptureBuffer::new(controls.retained_output_limit);
         let mut stderr_capture = OutputCaptureBuffer::new(controls.retained_output_limit);
@@ -449,21 +411,9 @@ impl Exec for DockerExec {
         let mut kill_fired = false;
         let mut drain_deadline: Option<Instant> = None;
         let mut stream_error: Option<DockerApiError> = None;
+        let mut cancelled = pin!(stop_signal(controls.cancel.as_ref()));
+        let mut killed = pin!(stop_signal(controls.kill.as_ref()));
         loop {
-            let cancel = controls.cancel.clone();
-            let cancelled = async {
-                match &cancel {
-                    Some(token) if !kill_fired => token.cancelled().await,
-                    _ => future::pending().await,
-                }
-            };
-            let kill = controls.kill.clone();
-            let killed = async {
-                match &kill {
-                    Some(token) if !kill_fired => token.cancelled().await,
-                    _ => future::pending().await,
-                }
-            };
             let timeout = async {
                 match spec.timeout {
                     Some(timeout) if !kill_fired => {
@@ -504,7 +454,7 @@ impl Exec for DockerExec {
                                     termination = Termination::Cancelled;
                                     kill_fired = true;
                                     drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                                    self.request_stop(&stop_file).await?;
+                                    self.request_stop(&stop_file, term).await?;
                                 }
                             }
                         }
@@ -520,30 +470,30 @@ impl Exec for DockerExec {
                                     termination = Termination::Cancelled;
                                     kill_fired = true;
                                     drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                                    self.request_stop(&stop_file).await?;
+                                    self.request_stop(&stop_file, term).await?;
                                 }
                             }
                         }
                     }
                     Some(Ok(_)) => {}
                 },
-                () = cancelled => {
+                () = &mut cancelled, if !kill_fired => {
                     termination = Termination::Cancelled;
                     kill_fired = true;
                     drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                    self.request_stop(&stop_file).await?;
+                    self.request_stop(&stop_file, term).await?;
                 }
-                () = killed => {
+                () = &mut killed, if !kill_fired => {
                     termination = Termination::Killed;
                     kill_fired = true;
                     drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                    self.request_kill(&stop_file).await?;
+                    self.request_stop(&stop_file, StopMode::Kill).await?;
                 }
                 () = timeout => {
                     termination = Termination::TimedOut;
                     kill_fired = true;
                     drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                    self.request_stop(&stop_file).await?;
+                    self.request_stop(&stop_file, term).await?;
                 }
                 () = drain_timeout => break,
             }
@@ -594,14 +544,7 @@ impl Exec for DockerExec {
         let (stdout_bytes, stdout_stats) = stdout_capture.into_parts();
         let (stderr_bytes, stderr_stats) = stderr_capture.into_parts();
         // The wrapper reports a signalled child as the shell's `128 + N`.
-        // Surface the signal, and for a natural exit leave the code intact
-        // so a step that deliberately exits 137 is not misread.
-        let signal = match (termination, exit_code) {
-            (Termination::Exited, Some(code)) if (129..=192).contains(&code) => Some(code - 128),
-            _ => None,
-        };
-        let mut result = ExecResult::new(termination, exit_code, started.elapsed());
-        result.signal = signal;
+        let mut result = ExecResult::from_shell_status(termination, exit_code, started.elapsed());
         result.stdout = stdout_bytes;
         result.stderr = stderr_bytes;
         let mut streaming = ExecStreamingResult::new(result);
@@ -619,15 +562,14 @@ impl Exec for DockerExec {
     )]
     async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
         let (stop_file, pid_file) = self.control_paths();
-        let grace_seconds = TERM_GRACE_SECONDS.parse().unwrap_or(2);
-        let wrapper = Self::wrapped(&spec.command, &stop_file, &pid_file, true, grace_seconds);
+        let wrapper = Self::wrapped(&self.shell, &spec.command, &stop_file, &pid_file, true);
         let working_dir = self.resolve_dir(spec.working_dir.as_deref());
         let options = CreateExecOptions {
             attach_stdin: Some(true),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
             tty: Some(false),
-            cmd: Some(vec![CONTAINER_BASH.to_owned(), "-c".to_owned(), wrapper]),
+            cmd: Some(vec![self.shell.clone(), "-c".to_owned(), wrapper]),
             working_dir: Some(working_dir),
             env: Some(self.env_entries(&spec.env)),
             ..Default::default()
@@ -709,6 +651,7 @@ impl Exec for DockerExec {
                 self.container_id.clone(),
                 self.working_dir.clone(),
                 self.base_env.clone(),
+                self.shell.clone(),
             ),
             exec_id: exec.id,
             stop_file,
@@ -755,7 +698,11 @@ impl StdioProcessHandle for DockerStdioHandle {
         }
         // The trait offers no error channel; awaiting at least keeps
         // the request ordered before any caller-side cleanup.
-        if let Err(error) = self.exec.request_stop(&self.stop_file).await {
+        if let Err(error) = self
+            .exec
+            .request_stop(&self.stop_file, StopMode::Term(TERM_GRACE))
+            .await
+        {
             tracing::warn!(error = %error, "stdio stop request failed");
         }
     }

@@ -118,7 +118,8 @@ for the connection. Per-sandbox capability sets travel in every
                  "timers":false,"labels":false,"update_network":false,
                  "snapshot_sandbox":false},
   "exec": {"live_streaming":false,"streams_separated":false,"stdin":false,
-            "cancel":false,"stdio_process":false},
+            "cancel":false,"stdio_process":false,
+            "stdin_stream":false,"environment":false},
   "fs": {"native":false,"upload":false,"download":false,"permissions":false},
   "search": {"supported":false,"native":false},
   "git": {"supported":false,"native":false},
@@ -146,9 +147,11 @@ Rules:
   work; an undeclared operation must fail with the `unsupported` error
   kind (§7). Capabilities optimize failure timing; the error is still
   the enforcement.
-- **The version-1 mask.** Native search/git/service passthrough and local
-  shell commands do not cross the wire. A host forces `search.native`,
-  `git.native`, `services.native`, and `access.shell_command` to false.
+- **The version-1 mask.** Native search/git/service passthrough, local
+  shell commands, streamed stdin, and the effective-environment query do
+  not cross the wire. A host forces `search.native`, `git.native`,
+  `services.native`, `access.shell_command`, `exec.stdin_stream`, and
+  `exec.environment` to false.
   `search.supported`, `git.supported`, and `services.supported` remain true when
   the complete facets can run through `exec/run`; the host then selects the
   exec-derived implementations.
@@ -408,11 +411,14 @@ PTY and bidirectional stdio traffic always remains raw.
 ExecResult:
 
 ```json
-{"stdout_b64":"…","stderr_b64":"…","exit_code":0,
+{"stdout_b64":"…","stderr_b64":"…","exit_code":0,"signal":null,
  "termination":"exited","duration_ms":12}
 ```
 
-`termination` ∈ `exited timed_out cancelled killed unknown`. A timeout
+`signal` is additive: the signal number that ended the process when the
+plugin observed one, else absent or `null`; receivers tolerate its
+absence. `termination` ∈ `exited timed_out cancelled killed unknown`. A timeout
+
 or cancellation resolves the call **normally** with the corresponding
 termination — it is not an error. `stdin_b64`, when present, is written
 to the process then closed for EOF; a broken pipe while writing is not

@@ -80,8 +80,8 @@ pub use event::{
 };
 pub use exec::{
     CaptureStats, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputSink,
-    OutputStream, SpawnSpec, StderrTail, StdinSource, StdioProcess, StdioProcessHandle,
-    Termination,
+    OutputStream, SpawnSpec, StderrTail, StdinReader, StdinSource, StdioProcess,
+    StdioProcessHandle, Termination, feed_stdin, stop_signal,
 };
 pub use fs::{DirEntry, FileKind, FileMetadata, Filesystem};
 pub use git::{

@@ -52,20 +52,36 @@ use sandbox_driver::{
     PtyCaps, ResourceKind, Result, Sandbox, SandboxFilter, SandboxId, SandboxKind, SandboxProvider,
     SandboxSource, SandboxSpec, SandboxState, SandboxStatus, ShellCommand,
 };
+use serde::Deserialize;
 
 use crate::access::DockerShellCommand;
 pub use crate::exec::DockerExec;
 use crate::exec::{
-    BASH_ENV_VAR, docker_error, is_conflict, is_not_found, is_not_modified, shell_quote,
-    tolerate_not_modified,
+    BASH_ENV_VAR, CONTAINER_BASH, docker_error, docker_kind, is_conflict, is_not_found,
+    is_not_modified, shell_quote, tolerate_not_modified,
 };
 use crate::fs::DockerFs;
 use crate::pty::DockerPty;
 
-const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
+pub(crate) const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
+/// Records the `provider_config.shell` choice on the container so `attach`
+/// resolves the same interpreter `create` did.
+const SHELL_LABEL: &str = "sh.sandbox-driver.shell";
+/// The `shell` value that probes for bash and falls back to `/bin/sh`.
+const SHELL_AUTO: &str = "auto";
+/// The POSIX shell every Linux image provides; the init command and the
+/// `auto` probe run under it.
+const POSIX_SH: &str = "/bin/sh";
 const DEFAULT_WORKING_DIRECTORY: &str = "/workspace";
 const RUNTIME_DIRECTORY_PARENT: &str = "/tmp/sandbox-driver";
 pub(crate) const RUNTIME_DIRECTORY: &str = "/tmp/sandbox-driver/runtime";
+
+/// `Some(items)` when there are any; Docker's optional list fields read
+/// an empty list and an absent one the same way, so the absent form is
+/// the cleaner request.
+pub(crate) fn non_empty<T>(items: Vec<T>) -> Option<Vec<T>> {
+    (!items.is_empty()).then_some(items)
+}
 
 /// A single host-to-container bind mount.
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -74,7 +90,6 @@ pub(crate) struct BindMount {
     pub host:      String,
     pub container: String,
     /// `rw` (default) or `ro`.
-    #[serde(default)]
     pub mode:      Option<String>,
 }
 
@@ -84,7 +99,6 @@ pub(crate) struct BindMount {
 pub(crate) struct RegistryAuth {
     pub username: String,
     pub password: String,
-    #[serde(default)]
     pub server:   Option<String>,
 }
 
@@ -102,71 +116,87 @@ impl RegistryAuth {
 /// Options the Docker provider reads from `SandboxSpec::provider_config`.
 ///
 /// Schema (all fields optional, unknown fields rejected):
-/// `auto_pull` (default `true`), `init`, `binds`, `extra_hosts`, `dns`,
-/// `cap_add`, `registry_auth`, and `sidecars`. The typed fields are the
-/// Docker-only escape hatch for what the portable spec does not carry:
-/// bind mounts, an init process, extra host entries, DNS servers, added
-/// capabilities, and sidecar service containers. A container-level
-/// `user` rides on the portable `SandboxSpec::user`; an `entrypoint`
-/// override is a sidecar-only field, because the scope container runs a
-/// fixed init and steps go through `docker exec`.
+/// `auto_pull` (default `true`), `init`, `privileged`, `platform`, `shell`,
+/// `binds`, `extra_hosts`, `dns`, `cap_add`, `registry_auth`, and `sidecars`.
+/// The typed fields are the Docker-only escape hatch for what the portable
+/// spec does not carry: bind mounts, an init process, privilege, a pull and
+/// create platform, extra host entries, DNS servers, added capabilities, and
+/// sidecar service containers. A container-level `user` rides on the
+/// portable `SandboxSpec::user`; an `entrypoint` override is a sidecar-only
+/// field, because the scope container runs a fixed init and steps go through
+/// `docker exec`.
+///
+/// `shell` selects the interpreter every exec wrapper runs under. The default
+/// is `/bin/bash`, the Bash contract. `"auto"` probes the started container
+/// for `/bin/bash` and falls back to `/bin/sh` when the image has none
+/// (alpine); an explicit absolute path is used as given. Under a non-bash
+/// shell the Bash contract does not hold and the exec-derived facets, which
+/// are bash scripts, are unsupported — the caller owns that trade.
 #[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 struct DockerProviderConfig {
-    #[serde(default = "default_true")]
     auto_pull:     bool,
-    #[serde(default)]
     init:          bool,
-    #[serde(default)]
+    privileged:    bool,
+    platform:      Option<String>,
+    shell:         Option<String>,
     binds:         Vec<BindMount>,
-    #[serde(default)]
     extra_hosts:   Vec<String>,
-    #[serde(default)]
     dns:           Vec<String>,
-    #[serde(default)]
     cap_add:       Vec<String>,
-    #[serde(default)]
     registry_auth: Option<RegistryAuth>,
-    #[serde(default)]
     sidecars:      Vec<sidecars::Sidecar>,
 }
 
-fn default_true() -> bool {
-    true
-}
-
-fn provider_config(value: &serde_json::Value) -> Result<DockerProviderConfig> {
-    match value {
-        serde_json::Value::Null => Ok(DockerProviderConfig {
+impl Default for DockerProviderConfig {
+    fn default() -> Self {
+        Self {
             auto_pull:     true,
             init:          false,
+            privileged:    false,
+            platform:      None,
+            shell:         None,
             binds:         Vec::new(),
             extra_hosts:   Vec::new(),
             dns:           Vec::new(),
             cap_add:       Vec::new(),
             registry_auth: None,
             sidecars:      Vec::new(),
-        }),
-        serde_json::Value::Object(_) => serde_json::from_value(value.clone())
+        }
+    }
+}
+
+fn provider_config(value: &serde_json::Value) -> Result<DockerProviderConfig> {
+    match value {
+        serde_json::Value::Null => Ok(DockerProviderConfig::default()),
+        serde_json::Value::Object(_) => DockerProviderConfig::deserialize(value)
             .map_err(|error| Error::invalid_spec("provider_config", error.to_string())),
         _ => Err(Error::invalid_spec("provider_config", "expected an object")),
     }
 }
 
-/// Pulls an image if it is not present, using registry credentials when
-/// given. Shared by the main-image path and sidecars.
+/// Whether the daemon has `reference` locally. Only a definitive "not
+/// present" is `false`; a daemon or transport failure surfaces as what
+/// it is.
+pub(crate) async fn image_present(docker: &Docker, reference: &str) -> Result<bool> {
+    match docker.inspect_image(reference).await {
+        Ok(_) => Ok(true),
+        Err(error) if is_not_found(&error) => Ok(false),
+        Err(error) => Err(docker_error("inspecting image", error)),
+    }
+}
+
+/// Pulls an image, using registry credentials when given, and waits for
+/// the pull to finish. Shared by the main-image path and sidecars.
 pub(crate) async fn pull_image(
     docker: &Docker,
     reference: &str,
     auth: Option<&RegistryAuth>,
+    platform: Option<&str>,
 ) -> Result<()> {
-    match docker.inspect_image(reference).await {
-        Ok(_) => return Ok(()),
-        Err(error) if is_not_found(&error) => {}
-        Err(error) => return Err(docker_error("inspecting image", error)),
-    }
     let credentials = auth.map(RegistryAuth::to_credentials);
-    let mut stream = docker.create_image(Some(pull_options(reference)), None, credentials);
+    let mut stream =
+        docker.create_image(Some(pull_options(reference, platform)), None, credentials);
     while let Some(progress) = stream.next().await {
         progress.map_err(|error| docker_error("pulling image", error))?;
     }
@@ -191,7 +221,7 @@ impl DockerProvider {
             .await
             .map_err(|error| docker_error("pinging the docker daemon", error))?;
         Ok(Self {
-            kind: ProviderKind::try_new("docker").expect("static kind is valid"),
+            kind: docker_kind(),
             capabilities: docker_capabilities(),
             docker,
         })
@@ -203,14 +233,11 @@ impl DockerProvider {
         reference: &str,
         auto_pull: bool,
         auth: Option<&RegistryAuth>,
+        platform: Option<&str>,
         reporter: &OperationReporter,
     ) -> Result<()> {
-        match self.docker.inspect_image(reference).await {
-            Ok(_) => return Ok(()),
-            // Only a definitive "not present" justifies a pull; a daemon
-            // or transport failure must surface as what it is.
-            Err(error) if is_not_found(&error) => {}
-            Err(error) => return Err(docker_error("inspecting image", error)),
+        if image_present(&self.docker, reference).await? {
+            return Ok(());
         }
         if !auto_pull {
             return Err(Error::Provider(ProviderError::new(
@@ -227,14 +254,7 @@ impl DockerProvider {
                     .message(format!("pulling image {reference}")),
             )
             .await;
-        let credentials = auth.map(RegistryAuth::to_credentials);
-        let mut stream = self
-            .docker
-            .create_image(Some(pull_options(reference)), None, credentials);
-        while let Some(progress) = stream.next().await {
-            progress.map_err(|error| docker_error("pulling image", error))?;
-        }
-        Ok(())
+        pull_image(&self.docker, reference, auth, platform).await
     }
 
     #[tracing::instrument(
@@ -258,6 +278,34 @@ impl DockerProvider {
             })
     }
 
+    /// The interpreter for a container's exec wrappers, from its recorded
+    /// `shell` choice: the default bash, an explicit path, or — for `auto` —
+    /// a probe of the running container for `/bin/bash`, falling back to
+    /// `/bin/sh`.
+    async fn resolve_shell(&self, container_id: &str, choice: Option<&str>) -> Result<String> {
+        match choice {
+            None => Ok(CONTAINER_BASH.to_owned()),
+            Some(SHELL_AUTO) => {
+                let probe = DockerExec::new(
+                    self.docker.clone(),
+                    container_id.to_owned(),
+                    "/".to_owned(),
+                    BTreeMap::new(),
+                    POSIX_SH.to_owned(),
+                );
+                let result = probe
+                    .run(&ExecSpec::new("test -x /bin/bash").timeout(Duration::from_secs(30)))
+                    .await?;
+                Ok(if result.success() {
+                    CONTAINER_BASH.to_owned()
+                } else {
+                    POSIX_SH.to_owned()
+                })
+            }
+            Some(path) => Ok(path.to_owned()),
+        }
+    }
+
     fn handle(
         &self,
         container_id: String,
@@ -266,6 +314,7 @@ impl DockerProvider {
         labels: BTreeMap<String, String>,
         env: BTreeMap<String, String>,
         network: Option<String>,
+        shell: String,
         events: EventEmitter,
     ) -> Arc<DockerSandbox> {
         let pty = DockerPty::new(
@@ -279,6 +328,7 @@ impl DockerProvider {
             container_id.clone(),
             working_dir.clone(),
             env,
+            shell,
         ));
         let fs = DockerFs::new(
             self.docker.clone(),
@@ -306,10 +356,12 @@ impl DockerProvider {
 /// Splits an image reference for the pull API. An empty tag pulls every
 /// tag of the repository, so bare references default to `latest`; digest
 /// references pass through whole.
-fn pull_options(reference: &str) -> CreateImageOptions<'static, String> {
+fn pull_options(reference: &str, platform: Option<&str>) -> CreateImageOptions<'static, String> {
+    let platform = platform.unwrap_or_default().to_owned();
     if reference.contains('@') {
         return CreateImageOptions {
             from_image: reference.to_owned(),
+            platform,
             ..Default::default()
         };
     }
@@ -322,6 +374,7 @@ fn pull_options(reference: &str) -> CreateImageOptions<'static, String> {
     CreateImageOptions {
         from_image: repo,
         tag,
+        platform,
         ..Default::default()
     }
 }
@@ -386,7 +439,7 @@ fn status_from_inspect(id: SandboxId, inspect: &ContainerInspectResponse) -> San
         if let Some(labels) = &config.labels {
             status.labels = labels
                 .iter()
-                .filter(|(key, _)| *key != MANAGED_LABEL)
+                .filter(|(key, _)| !is_internal_label(key))
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
         }
@@ -395,12 +448,16 @@ fn status_from_inspect(id: SandboxId, inspect: &ContainerInspectResponse) -> San
     status
 }
 
+/// Labels the provider writes for itself, never reported as the caller's.
+fn is_internal_label(key: &str) -> bool {
+    key == MANAGED_LABEL || key == SHELL_LABEL
+}
+
 /// Whether a container's network mode names a managed sidecar network
-/// (`<sandbox>-net`) rather than a standard Docker mode.
+/// (`<sandbox>-net`) rather than a standard Docker mode or another
+/// container's namespace.
 fn is_sidecar_network(mode: &str) -> bool {
-    mode.ends_with("-net")
-        && !matches!(mode, "bridge" | "host" | "none" | "default")
-        && !mode.starts_with("container:")
+    mode.ends_with("-net") && !mode.starts_with("container:")
 }
 
 fn normalized_container_name(name: Option<&str>) -> Option<String> {
@@ -503,6 +560,14 @@ impl SandboxProvider for DockerProvider {
             ));
         }
         let config_options = provider_config(&spec.provider_config)?;
+        if let Some(shell) = &config_options.shell {
+            if shell != SHELL_AUTO && !shell.starts_with('/') {
+                return Err(Error::invalid_spec(
+                    "provider_config.shell",
+                    "expected \"auto\" or an absolute interpreter path",
+                ));
+            }
+        }
         let base_network = network_mode(&spec.network)?;
         // Sidecars live on one user-defined network the main container
         // joins, named after the sandbox. They need a named sandbox.
@@ -526,6 +591,7 @@ impl SandboxProvider for DockerProvider {
                         reference,
                         config_options.auto_pull,
                         config_options.registry_auth.as_ref(),
+                        config_options.platform.as_deref(),
                         &reporter,
                     )
                     .await?;
@@ -547,9 +613,18 @@ impl SandboxProvider for DockerProvider {
                         .collect();
                     labels.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
 
+                    // The image and sidecars are up; the rest of the
+                    // options belong to the main container.
+                    let DockerProviderConfig {
+                        init,
+                        binds,
+                        extra_hosts,
+                        dns,
+                        cap_add,
+                        ..
+                    } = config_options;
                     let network_mode = sidecar_network.clone().or(base_network);
-                    let binds: Vec<String> = config_options
-                        .binds
+                    let binds: Vec<String> = binds
                         .iter()
                         .map(|bind| {
                             let mode = bind.mode.as_deref().unwrap_or("rw");
@@ -558,13 +633,11 @@ impl SandboxProvider for DockerProvider {
                         .collect();
                     let host_config = HostConfig {
                         network_mode,
-                        binds: (!binds.is_empty()).then_some(binds),
-                        init: config_options.init.then_some(true),
-                        extra_hosts: (!config_options.extra_hosts.is_empty())
-                            .then(|| config_options.extra_hosts.clone()),
-                        dns: (!config_options.dns.is_empty()).then(|| config_options.dns.clone()),
-                        cap_add: (!config_options.cap_add.is_empty())
-                            .then(|| config_options.cap_add.clone()),
+                        binds: non_empty(binds),
+                        init: init.then_some(true),
+                        extra_hosts: non_empty(extra_hosts),
+                        dns: non_empty(dns),
+                        cap_add: non_empty(cap_add),
                         memory: spec
                             .resources
                             .memory_mb
@@ -586,11 +659,14 @@ impl SandboxProvider for DockerProvider {
                         .map(|(key, value)| format!("{key}={value}"))
                         .collect();
                     env_entries.push(format!("{BASH_ENV_VAR}="));
+                    // The init script is POSIX and runs under /bin/sh, which
+                    // every Linux image has, so an image without bash still
+                    // starts; the exec interpreter is chosen separately.
                     let config = Config {
                         image: Some(reference.clone()),
                         user: spec.user.clone(),
                         cmd: Some(vec![
-                            "/bin/bash".to_owned(),
+                            POSIX_SH.to_owned(),
                             "-c".to_owned(),
                             format!(
                                 "mkdir -p {working_dir} {runtime_dir} && chmod 0700 \
@@ -606,10 +682,13 @@ impl SandboxProvider for DockerProvider {
                         host_config: Some(host_config),
                         ..Default::default()
                     };
-                    let options = spec.name.clone().map(|name| CreateContainerOptions {
-                        name,
-                        platform: None,
-                    });
+                    let options =
+                        (spec.name.is_some() || config_options.platform.is_some()).then(|| {
+                            CreateContainerOptions {
+                                name:     spec.name.clone().unwrap_or_default(),
+                                platform: config_options.platform.clone(),
+                            }
+                        });
                     // From here a failure must sweep the sidecars it started.
                     let sweep_on_error = |error: Error| async {
                         if let Some(network) = &sidecar_network {
@@ -641,6 +720,47 @@ impl SandboxProvider for DockerProvider {
                     {
                         return Err(sweep_on_error(docker_error("starting container", error)).await);
                     }
+                    // `start` returning is not the container running: an init
+                    // that exits at once (a missing interpreter, a bad user)
+                    // leaves a stopped container every exec would then 409 on.
+                    // Fail create instead, naming the cause.
+                    let started = match self.inspect(&created.id).await {
+                        Ok(inspect) => inspect,
+                        Err(error) => return Err(sweep_on_error(error).await),
+                    };
+                    if map_state(&started) != SandboxState::Running {
+                        let exit = started
+                            .state
+                            .as_ref()
+                            .and_then(|state| state.exit_code)
+                            .unwrap_or_default();
+                        let _ = self
+                            .docker
+                            .remove_container(
+                                &created.id,
+                                Some(RemoveContainerOptions {
+                                    force: true,
+                                    ..Default::default()
+                                }),
+                            )
+                            .await;
+                        let mut provider = ProviderError::new(
+                            self.kind.clone(),
+                            format!(
+                                "container exited immediately after start (exit code {exit}); \
+                                 the image must run its init under /bin/sh as the configured user"
+                            ),
+                        );
+                        provider.code = Some("exited".to_owned());
+                        return Err(sweep_on_error(Error::Provider(provider)).await);
+                    }
+                    let shell = match self
+                        .resolve_shell(&created.id, config_options.shell.as_deref())
+                        .await
+                    {
+                        Ok(shell) => shell,
+                        Err(error) => return Err(sweep_on_error(error).await),
+                    };
                     Ok(self.handle(
                         created.id,
                         spec.name.clone(),
@@ -648,6 +768,7 @@ impl SandboxProvider for DockerProvider {
                         spec.labels.clone(),
                         spec.env.clone(),
                         sidecar_network.clone(),
+                        shell,
                         handle_emitter,
                     ) as Arc<dyn Sandbox>)
                 },
@@ -692,7 +813,7 @@ impl SandboxProvider for DockerProvider {
                         .map(|labels| {
                             labels
                                 .iter()
-                                .filter(|(key, _)| *key != MANAGED_LABEL)
+                                .filter(|(key, _)| !is_internal_label(key))
                                 .map(|(key, value)| (key.clone(), value.clone()))
                                 .collect()
                         })
@@ -704,13 +825,19 @@ impl SandboxProvider for DockerProvider {
                         .as_ref()
                         .and_then(|host| host.network_mode.clone())
                         .filter(|mode| is_sidecar_network(mode));
+                    let container_id = inspect.id.clone().unwrap_or_else(|| id.as_str().to_owned());
+                    let shell_choice = labels
+                        .and_then(|labels| labels.get(SHELL_LABEL))
+                        .map(String::as_str);
+                    let shell = self.resolve_shell(&container_id, shell_choice).await?;
                     Ok(self.handle(
-                        inspect.id.clone().unwrap_or_else(|| id.as_str().to_owned()),
+                        container_id,
                         normalized_container_name(inspect.name.as_deref()),
                         working_dir,
                         user_labels,
                         BTreeMap::new(),
                         network,
+                        shell,
                         handle_emitter,
                     ) as Arc<dyn Sandbox>)
                 },
@@ -1043,28 +1170,28 @@ mod tests {
 
     #[test]
     fn pull_options_default_a_bare_reference_to_latest() {
-        let options = pull_options("ubuntu");
+        let options = pull_options("ubuntu", None);
         assert_eq!(options.from_image, "ubuntu");
         assert_eq!(options.tag, "latest");
     }
 
     #[test]
     fn pull_options_split_an_explicit_tag() {
-        let options = pull_options("debian:stable-slim");
+        let options = pull_options("debian:stable-slim", None);
         assert_eq!(options.from_image, "debian");
         assert_eq!(options.tag, "stable-slim");
     }
 
     #[test]
     fn pull_options_treat_a_registry_port_as_untagged() {
-        let options = pull_options("registry:5000/img");
+        let options = pull_options("registry:5000/img", None);
         assert_eq!(options.from_image, "registry:5000/img");
         assert_eq!(options.tag, "latest");
     }
 
     #[test]
     fn pull_options_pass_digest_references_through() {
-        let options = pull_options("img@sha256:abc123");
+        let options = pull_options("img@sha256:abc123", None);
         assert_eq!(options.from_image, "img@sha256:abc123");
         assert_eq!(options.tag, "");
     }

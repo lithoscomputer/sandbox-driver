@@ -20,15 +20,14 @@ use bollard::models::{
     ContainerStateStatusEnum, EndpointSettings, HealthConfig, HealthStatusEnum, HostConfig,
 };
 use bollard::network::CreateNetworkOptions;
-use sandbox_driver::{Error, ProviderError, ProviderKind, Result};
+use sandbox_driver::{Error, ProviderError, Result};
 use tokio::time;
 
-use crate::exec::{docker_error, is_not_found, tolerate_not_modified};
+use crate::exec::{docker_error, docker_kind, is_not_found, tolerate_not_modified};
+use crate::{MANAGED_LABEL, RegistryAuth, image_present, non_empty, pull_image};
 
 /// The label every sidecar carries, naming its network.
 pub(crate) const NETWORK_LABEL: &str = "sh.sandbox-driver.network";
-/// The managed marker, matching the provider's own.
-const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
 /// How long to wait for every sidecar to report healthy.
 const HEALTH_WAIT: Duration = Duration::from_secs(300);
 /// How often to poll a sidecar's health.
@@ -46,14 +45,10 @@ pub(crate) struct Sidecar {
     pub dns:           Vec<String>,
     #[serde(default)]
     pub cap_add:       Vec<String>,
-    #[serde(default)]
     pub user:          Option<String>,
-    #[serde(default)]
     pub entrypoint:    Option<Vec<String>>,
-    #[serde(default)]
     pub health:        Option<Health>,
-    #[serde(default)]
-    pub registry_auth: Option<super::RegistryAuth>,
+    pub registry_auth: Option<RegistryAuth>,
 }
 
 /// A sidecar health check, mapped onto Docker's own.
@@ -62,18 +57,10 @@ pub(crate) struct Sidecar {
 pub(crate) struct Health {
     /// The `CMD-SHELL` command, run by the container's default shell.
     pub cmd:             String,
-    #[serde(default)]
     pub interval_ms:     Option<u64>,
-    #[serde(default)]
     pub timeout_ms:      Option<u64>,
-    #[serde(default)]
     pub retries:         Option<u64>,
-    #[serde(default)]
     pub start_period_ms: Option<u64>,
-}
-
-fn kind() -> ProviderKind {
-    ProviderKind::try_new("docker").expect("static kind is valid")
 }
 
 fn ms_to_ns(ms: u64) -> i64 {
@@ -93,13 +80,15 @@ impl Health {
     }
 }
 
+/// The container name of `sidecar` on `network`.
+fn container_name(network: &str, sidecar: &Sidecar) -> String {
+    format!("{network}-{}", sidecar.name)
+}
+
 /// Creates the network and every sidecar on it, then waits for the ones
 /// with a health check to report healthy. Tears down what it started on
 /// any failure.
 pub(crate) async fn realize(docker: &Docker, network: &str, sidecars: &[Sidecar]) -> Result<()> {
-    if sidecars.is_empty() {
-        return Ok(());
-    }
     let mut labels = HashMap::new();
     labels.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
     labels.insert(NETWORK_LABEL.to_owned(), network.to_owned());
@@ -128,8 +117,10 @@ async fn start_all(
     labels: &HashMap<String, String>,
 ) -> Result<()> {
     for sidecar in sidecars {
-        super::pull_image(docker, &sidecar.image, sidecar.registry_auth.as_ref()).await?;
-        let container = format!("{network}-{}", sidecar.name);
+        if !image_present(docker, &sidecar.image).await? {
+            pull_image(docker, &sidecar.image, sidecar.registry_auth.as_ref(), None).await?;
+        }
+        let container = container_name(network, sidecar);
         let env: Vec<String> = sidecar
             .env
             .iter()
@@ -143,13 +134,13 @@ async fn start_all(
         endpoints.insert(network.to_owned(), endpoint);
         let host_config = HostConfig {
             network_mode: Some(network.to_owned()),
-            dns: (!sidecar.dns.is_empty()).then(|| sidecar.dns.clone()),
-            cap_add: (!sidecar.cap_add.is_empty()).then(|| sidecar.cap_add.clone()),
+            dns: non_empty(sidecar.dns.clone()),
+            cap_add: non_empty(sidecar.cap_add.clone()),
             ..Default::default()
         };
         let config = Config {
             image: Some(sidecar.image.clone()),
-            env: (!env.is_empty()).then_some(env),
+            env: non_empty(env),
             user: sidecar.user.clone(),
             entrypoint: sidecar.entrypoint.clone(),
             labels: Some(labels.clone()),
@@ -177,7 +168,7 @@ async fn start_all(
     }
     for sidecar in sidecars {
         if sidecar.health.is_some() {
-            await_health(docker, &format!("{network}-{}", sidecar.name)).await?;
+            await_health(docker, &container_name(network, sidecar)).await?;
         }
     }
     Ok(())
@@ -197,13 +188,13 @@ async fn await_health(docker: &Docker, container: &str) -> Result<()> {
             (_, Some(HealthStatusEnum::HEALTHY)) => return Ok(()),
             (_, Some(HealthStatusEnum::UNHEALTHY)) => {
                 return Err(Error::Provider(ProviderError::new(
-                    kind(),
+                    docker_kind(),
                     format!("sidecar {container} reported unhealthy"),
                 )));
             }
             (Some(ContainerStateStatusEnum::EXITED | ContainerStateStatusEnum::DEAD), _) => {
                 return Err(Error::Provider(ProviderError::new(
-                    kind(),
+                    docker_kind(),
                     format!("sidecar {container} exited before it was healthy"),
                 )));
             }
@@ -211,7 +202,7 @@ async fn await_health(docker: &Docker, container: &str) -> Result<()> {
         }
         if Instant::now() >= deadline {
             return Err(Error::Provider(ProviderError::new(
-                kind(),
+                docker_kind(),
                 format!("sidecar {container} never reported healthy"),
             )));
         }

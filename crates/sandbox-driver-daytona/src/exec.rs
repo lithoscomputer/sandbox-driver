@@ -226,42 +226,25 @@ impl Exec for DaytonaExec {
             provider_kind = "daytona",
             sandbox_id = %self.sandbox_id,
             has_stdin = spec.stdin.is_some(),
-            live_streaming = controls.sink.is_some() || controls.cancel.is_some()
+            live_streaming = controls.sink.is_some() || controls.cancel.is_some() || controls.kill.is_some()
         ),
         err
     )]
     async fn run_streaming(
         &self,
         spec: &ExecSpec,
-        mut controls: ExecControls,
+        controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
         if controls.stdin.is_some() {
             return Err(Error::unsupported(Capability::ExecStdinStream));
         }
-        // Daytona ends a command by deleting its session, which is one
-        // stop level: a kill token is honored as a cancel, and the grace is
-        // not configurable.
-        if let Some(kill) = controls.kill.take() {
-            let merged = CancellationToken::new();
-            let stop = merged.clone();
-            let cancel = controls.cancel.take();
-            tokio::spawn(async move {
-                match cancel {
-                    Some(cancel) => tokio::select! {
-                        () = cancel.cancelled() => {}
-                        () = kill.cancelled() => {}
-                    },
-                    None => kill.cancelled().await,
-                }
-                stop.cancel();
-            });
-            controls.cancel = Some(merged);
-        }
         // Sessions cost three extra API calls, so plain buffered runs —
         // every derived fs/search/git operation — keep the one-shot
-        // endpoint; only a sink or cancel token needs the session
-        // transport.
-        if controls.sink.is_some() || controls.cancel.is_some() {
+        // endpoint; only a sink or stop token needs the session
+        // transport. Daytona ends a command by deleting its session,
+        // which is one stop level: a kill token is honored as a cancel,
+        // and the grace is not configurable.
+        if controls.sink.is_some() || controls.cancel.is_some() || controls.kill.is_some() {
             return self.run_session(spec, controls).await;
         }
         self.run_buffered(spec, &controls).await
@@ -356,7 +339,7 @@ impl DaytonaExec {
         capture.push(&stdout);
         let (retained, stats) = capture.into_parts();
 
-        let mut result = ExecResult::new(termination, exit_code, started.elapsed());
+        let mut result = ExecResult::from_shell_status(termination, exit_code, started.elapsed());
         result.stdout = retained;
         let mut streaming = ExecStreamingResult::new(result);
         streaming.streams_separated = false;
@@ -482,7 +465,7 @@ impl DaytonaExec {
             &command_id,
             session_exec.exit_code,
             spec.timeout,
-            controls.cancel.clone(),
+            controls.stop_requested(),
             sink_failed.clone(),
         )
         .await
@@ -599,7 +582,7 @@ impl DaytonaExec {
         let exit_code = (termination == Termination::Exited)
             .then_some(outcome.exit_code)
             .flatten();
-        let mut result = ExecResult::new(termination, exit_code, started.elapsed());
+        let mut result = ExecResult::from_shell_status(termination, exit_code, started.elapsed());
         result.stdout = stdout_bytes;
         result.stderr = stderr_bytes;
         let mut streaming = ExecStreamingResult::new(result);

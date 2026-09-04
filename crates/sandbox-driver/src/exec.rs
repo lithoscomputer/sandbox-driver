@@ -1,13 +1,14 @@
 use std::collections::BTreeMap;
-use std::fmt;
 use std::future::Future;
+use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
+use std::{fmt, future, io};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy};
 use tokio_util::sync::CancellationToken;
 
 use crate::capabilities::Capability;
@@ -209,6 +210,35 @@ pub struct ExecControls {
     pub retained_output_limit: Option<usize>,
 }
 
+impl ExecControls {
+    /// The standard input the command should be fed, if any: the streamed
+    /// source when set, else the fixed [`ExecSpec::stdin`] bytes. The two
+    /// never coexist (the control-plane contract), so a stream wins when
+    /// both are given; a source another consumer already took reads as
+    /// empty. Providers feed the reader with [`feed_stdin`].
+    pub fn stdin_reader(&self, spec: &ExecSpec) -> Option<StdinReader> {
+        match (&self.stdin, &spec.stdin) {
+            (Some(source), _) => Some(
+                source
+                    .take()
+                    .unwrap_or_else(|| Box::pin(Cursor::new(Vec::new()))),
+            ),
+            (None, Some(bytes)) => Some(Box::pin(Cursor::new(bytes.clone()))),
+            (None, None) => None,
+        }
+    }
+
+    /// Resolves when either stop token fires — the one-level view for a
+    /// provider that treats `kill` as `cancel`. Never resolves when
+    /// neither token is set.
+    pub async fn stop_requested(&self) {
+        tokio::select! {
+            () = stop_signal(self.cancel.as_ref()) => {}
+            () = stop_signal(self.kill.as_ref()) => {}
+        }
+    }
+}
+
 impl fmt::Debug for ExecControls {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExecControls")
@@ -222,18 +252,27 @@ impl fmt::Debug for ExecControls {
     }
 }
 
+/// Resolves when an optional token is cancelled; never resolves when
+/// there is no token, so it slots into a `select!` arm unconditionally.
+pub async fn stop_signal(token: Option<&CancellationToken>) {
+    match token {
+        Some(token) => token.cancelled().await,
+        None => future::pending().await,
+    }
+}
+
+/// The boxed reader a [`StdinSource`] hands to the running provider.
+pub type StdinReader = Pin<Box<dyn AsyncRead + Send>>;
+
 /// A streamed standard input for [`ExecControls::stdin`].
 ///
 /// The reader is handed over exactly once: the provider that runs the
 /// command takes it, so a cloned `ExecControls` shares one source. The
 /// source is closed for EOF when the reader ends; a process that stops
 /// reading its input disconnecting the pipe is not an error.
-/// The boxed reader a [`StdinSource`] hands to the running provider.
-type BoxedReader = Pin<Box<dyn AsyncRead + Send>>;
-
 #[derive(Clone)]
 pub struct StdinSource {
-    reader: Arc<Mutex<Option<BoxedReader>>>,
+    reader: Arc<Mutex<Option<StdinReader>>>,
 }
 
 impl StdinSource {
@@ -244,12 +283,43 @@ impl StdinSource {
     }
 
     /// Takes the reader; `None` once a provider has already taken it.
-    pub fn take(&self) -> Option<BoxedReader> {
+    pub fn take(&self) -> Option<StdinReader> {
         self.reader
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
     }
+}
+
+/// Copies `reader` into the process stdin, then closes it for EOF. A
+/// command that stops reading its input (`head -1`) disconnecting the
+/// pipe is normal; any other failure means the command saw truncated
+/// input and must not pass silently.
+pub async fn feed_stdin<W: AsyncWrite + Unpin>(
+    mut stdin: W,
+    mut reader: StdinReader,
+) -> Result<()> {
+    fn is_disconnect(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            io::ErrorKind::BrokenPipe
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+        )
+    }
+    if let Err(error) = copy(&mut reader, &mut stdin).await {
+        if is_disconnect(&error) {
+            return Ok(());
+        }
+        return Err(Error::io("writing exec stdin", error));
+    }
+    if let Err(error) = stdin.shutdown().await {
+        if is_disconnect(&error) {
+            return Ok(());
+        }
+        return Err(Error::io("closing exec stdin", error));
+    }
+    Ok(())
 }
 
 impl fmt::Debug for StdinSource {
@@ -310,13 +380,22 @@ impl ExecResult {
     }
 
     /// Reads a shell-reported status: `128 + N` means the child died of
-    /// signal `N`, anything else is an ordinary exit code. A process that
-    /// deliberately exits with such a code is indistinguishable — the
-    /// convention is the best a wrapper shell can report.
-    pub fn from_shell_status(termination: Termination, status: i32, duration: Duration) -> Self {
-        let mut result = Self::new(termination, Some(status), duration);
-        if (129..=192).contains(&status) {
-            result.signal = Some(status - 128);
+    /// signal `N`, anything else is an ordinary exit code. The code is
+    /// kept intact either way, and only a natural exit is decoded — a
+    /// provider's own cancel ladder is reported by `termination`, not
+    /// here. A process that deliberately exits with such a code is
+    /// indistinguishable; the convention is the best a wrapper shell can
+    /// report.
+    pub fn from_shell_status(
+        termination: Termination,
+        status: Option<i32>,
+        duration: Duration,
+    ) -> Self {
+        let mut result = Self::new(termination, status, duration);
+        if let (Termination::Exited, Some(code)) = (termination, status) {
+            if (129..=192).contains(&code) {
+                result.signal = Some(code - 128);
+            }
         }
         result
     }

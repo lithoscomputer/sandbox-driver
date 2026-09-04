@@ -2,7 +2,6 @@
 //! [`SandboxProvider`] / [`Sandbox`] traits.
 
 use std::collections::{BTreeMap, HashMap};
-use std::future;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -539,11 +538,16 @@ impl Vnc for SandboxAccess {
 /// Native search/git/service passthrough and local shell commands remain
 /// process-local. The normalized stdio, PTY, logs, browser access,
 /// snapshots, volumes, preview URLs, and SSH facets cross the wire.
+/// Streamed stdin has no channel and `Sandbox::environment` no method in
+/// protocol version 1, so those are masked too, whatever the plugin
+/// declares.
 fn mask_wire_capabilities(capabilities: &mut Capabilities) {
     capabilities.search.native = false;
     capabilities.git.native = false;
     capabilities.services.native = false;
     capabilities.access.shell_command = false;
+    capabilities.exec.stdin_stream = false;
+    capabilities.exec.environment = false;
 }
 
 /// One in-flight chunk of streamed exec output.
@@ -1379,28 +1383,16 @@ impl Exec for SandboxExec {
         // Forward cancellation as an exec/cancel request. The wire has one
         // stop level, so a kill token is forwarded the same way and the
         // grace is the plugin's own.
-        let cancel_token = controls.cancel.clone();
-        let kill_token = controls.kill.clone();
-        let cancel_task = (cancel_token.is_some() || kill_token.is_some()).then(|| {
+        let cancel_task = (controls.cancel.is_some() || controls.kill.is_some()).then(|| {
             let client = Arc::clone(&self.client);
             let exec_id = exec_id.clone();
+            let stop = ExecControls {
+                cancel: controls.cancel.clone(),
+                kill: controls.kill.clone(),
+                ..ExecControls::default()
+            };
             tokio::spawn(async move {
-                let cancelled = async {
-                    match cancel_token {
-                        Some(token) => token.cancelled().await,
-                        None => future::pending().await,
-                    }
-                };
-                let killed = async {
-                    match kill_token {
-                        Some(token) => token.cancelled().await,
-                        None => future::pending().await,
-                    }
-                };
-                tokio::select! {
-                    () = cancelled => {}
-                    () = killed => {}
-                }
+                stop.stop_requested().await;
                 let outcome: Result<m::Empty> = client
                     .call(m::EXEC_CANCEL, &m::ExecCancelParams { exec_id })
                     .await;

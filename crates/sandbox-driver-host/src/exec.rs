@@ -14,10 +14,10 @@ use nix::sys::signal::Signal;
 use sandbox_driver::{
     Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputCaptureBuffer,
     OutputSanitization, OutputSanitizer, OutputSink, OutputStream, Result, SpawnSpec, StderrTail,
-    StdinSource, StdioProcess, StdioProcessHandle, Termination,
+    StdioProcess, StdioProcessHandle, Termination, feed_stdin, stop_signal,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, copy};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::{Child, Command};
 use tokio::sync::watch;
 use tokio::time;
 
@@ -164,16 +164,8 @@ impl HostExec {
         command.arg("-c").arg(program);
         command.current_dir(self.resolve_dir(working_dir));
         command.env_clear();
-        for (key, value) in env::vars_os() {
-            // Keys that are not UTF-8 cannot be checked, so fail closed.
-            let Some(key_str) = key.to_str() else {
-                continue;
-            };
-            if key_str != BASH_ENV_VAR && !inherited_var_is_sensitive(key_str) {
-                command.env(&key, &value);
-            }
-        }
-        for (key, value) in self.base_env.iter().chain(env) {
+        command.envs(effective_env(&self.base_env));
+        for (key, value) in env {
             if key != BASH_ENV_VAR {
                 command.env(key, value);
             }
@@ -262,60 +254,6 @@ async fn kill_process_group(child: &mut Child) {
     let _ = child.kill().await;
 }
 
-/// Writes stdin then closes it for EOF. A command that stops reading its
-/// input (`head -1`) disconnecting the pipe is normal; any other failure
-/// means the command saw truncated input and must not pass silently.
-/// Whether a stdin write failed because the reader disconnected — normal
-/// for a command like `head -1` that stops reading.
-fn is_disconnect(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::BrokenPipe
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::ConnectionAborted
-    )
-}
-
-async fn write_stdin(mut stdin: ChildStdin, bytes: Vec<u8>) -> Result<()> {
-    if let Err(error) = stdin.write_all(&bytes).await {
-        if is_disconnect(&error) {
-            return Ok(());
-        }
-        return Err(Error::io("writing exec stdin", error));
-    }
-    if let Err(error) = stdin.shutdown().await {
-        if is_disconnect(&error) {
-            return Ok(());
-        }
-        return Err(Error::io("closing exec stdin", error));
-    }
-    Ok(())
-}
-
-/// Copies a streamed source into the process stdin, then closes it for
-/// EOF. A command that stops reading disconnecting the pipe is normal;
-/// any other failure means the command saw truncated input.
-async fn stream_stdin_into(mut stdin: ChildStdin, source: StdinSource) -> Result<()> {
-    let Some(mut reader) = source.take() else {
-        // Another consumer already took the reader; nothing to write.
-        let _ = stdin.shutdown().await;
-        return Ok(());
-    };
-    if let Err(error) = copy(&mut reader, &mut stdin).await {
-        if is_disconnect(&error) {
-            return Ok(());
-        }
-        return Err(Error::io("streaming exec stdin", error));
-    }
-    if let Err(error) = stdin.shutdown().await {
-        if is_disconnect(&error) {
-            return Ok(());
-        }
-        return Err(Error::io("closing exec stdin", error));
-    }
-    Ok(())
-}
-
 enum PumpEnd {
     Eof,
     SinkError,
@@ -388,10 +326,9 @@ impl Exec for HostExec {
     ) -> Result<ExecStreamingResult> {
         let started = Instant::now();
         let grace = controls.grace.unwrap_or(TERM_GRACE);
-        let stream_stdin = controls.stdin.clone();
-        let wants_stdin = spec.stdin.is_some() || stream_stdin.is_some();
+        let stdin_reader = controls.stdin_reader(spec);
         let mut command = self.command(&spec.command, spec.working_dir.as_deref(), &spec.env)?;
-        command.stdin(if wants_stdin {
+        command.stdin(if stdin_reader.is_some() {
             Stdio::piped()
         } else {
             Stdio::null()
@@ -404,16 +341,12 @@ impl Exec for HostExec {
             .map_err(|error| Error::io("spawning bash for exec", error))?;
 
         // Write-then-EOF, concurrently with output pumping so a large
-        // write cannot deadlock against a full output pipe. A streamed
-        // source is copied for the life of the command; a fixed
-        // `spec.stdin` is written once. The two never coexist (the
-        // control-plane contract), so a stream wins if both are set.
-        let child_stdin = child.stdin.take();
-        let stdin_task = match (child_stdin, stream_stdin, spec.stdin.clone()) {
-            (Some(stdin), Some(source), _) => Some(tokio::spawn(stream_stdin_into(stdin, source))),
-            (Some(stdin), None, Some(bytes)) => Some(tokio::spawn(write_stdin(stdin, bytes))),
-            _ => None,
-        };
+        // write cannot deadlock against a full output pipe.
+        let stdin_task = child
+            .stdin
+            .take()
+            .zip(stdin_reader)
+            .map(|(stdin, reader)| tokio::spawn(feed_stdin(stdin, reader)));
 
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
@@ -450,20 +383,9 @@ impl Exec for HostExec {
             });
             let mut pumps_done = false;
 
-            let cancel = controls.cancel.clone();
-            let mut cancelled = pin!(async {
-                match &cancel {
-                    Some(token) => token.cancelled().await,
-                    None => future::pending().await,
-                }
-            });
-            let kill = controls.kill.clone();
-            let mut killed = pin!(async {
-                match &kill {
-                    Some(token) => token.cancelled().await,
-                    None => future::pending().await,
-                }
-            });
+            let mut cancelled = pin!(stop_signal(controls.cancel.as_ref()));
+            let mut killed = pin!(stop_signal(controls.kill.as_ref()));
+
             let mut timeout = pin!(async {
                 match spec.timeout {
                     Some(timeout) => time::sleep(timeout).await,
