@@ -582,7 +582,8 @@ impl Exec for DockerExec {
         let exit_code = self.exit_code(&exec.id).await?;
         let (stdout_bytes, stdout_stats) = stdout_capture.into_parts();
         let (stderr_bytes, stderr_stats) = stderr_capture.into_parts();
-        // The wrapper reports a signalled child as the shell's `128 + N`.
+        // The wrapper reports a signalled child as the shell's `128 + N`,
+        // for a foreign kill and for the watcher's own TERM or KILL alike.
         let mut result = ExecResult::from_shell_status(termination, exit_code, started.elapsed());
         result.stdout = stdout_bytes;
         result.stderr = stderr_bytes;

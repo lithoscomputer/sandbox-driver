@@ -430,8 +430,9 @@ ExecResult:
 ```
 
 `signal` is additive: the signal number that ended the process when the
-plugin observed one, else absent or `null`; receivers tolerate its
-absence. `termination` ∈ `exited timed_out cancelled killed unknown`. A timeout
+plugin observed one — on any termination, a foreign `kill` or the
+plugin's own stop ladder alike — else absent or `null`; receivers
+tolerate its absence. `termination` ∈ `exited timed_out cancelled killed unknown`. A timeout
 
 or cancellation resolves the call **normally** with the corresponding
 termination — it is not an error. `stdin_b64`, when present, is written

@@ -929,6 +929,16 @@ async fn exec_timeout_terminates(ctx: &Conformance) -> CheckOutcome {
         if started.elapsed() > Duration::from_secs(60) {
             return fail("timeout enforcement took over a minute");
         }
+        // A timeout runs the polite ladder; `sleep` honors TERM. A
+        // provider that observes the ending signal must say so.
+        if let Some(signal) = result.signal {
+            if signal != SIGTERM {
+                return fail(format!(
+                    "expected signal {SIGTERM} on timeout, got {signal} (code {:?})",
+                    result.exit_code
+                ));
+            }
+        }
         PASS
     }
     .await;
@@ -936,7 +946,11 @@ async fn exec_timeout_terminates(ctx: &Conformance) -> CheckOutcome {
     outcome
 }
 
+const SIGKILL: i32 = 9;
+const SIGTERM: i32 = 15;
+
 async fn exec_cancel_terminates(ctx: &Conformance) -> CheckOutcome {
+    // `sleep` honors TERM, so the polite ladder ends it with that signal.
     exec_stop_terminates(
         ctx,
         |token| ExecControls {
@@ -944,13 +958,14 @@ async fn exec_cancel_terminates(ctx: &Conformance) -> CheckOutcome {
             ..ExecControls::default()
         },
         &[Termination::Cancelled],
+        &[SIGTERM],
     )
     .await
 }
 
 async fn exec_kill_terminates(ctx: &Conformance) -> CheckOutcome {
-    // A provider that cannot separate the two levels reports Cancelled;
-    // either is a correct end for a kill.
+    // A provider that cannot separate the two levels reports Cancelled and
+    // runs its ladder; either is a correct end for a kill.
     exec_stop_terminates(
         ctx,
         |token| ExecControls {
@@ -958,16 +973,20 @@ async fn exec_kill_terminates(ctx: &Conformance) -> CheckOutcome {
             ..ExecControls::default()
         },
         &[Termination::Killed, Termination::Cancelled],
+        &[SIGKILL, SIGTERM],
     )
     .await
 }
 
 /// Fires the stop token `build` places half a second into a long sleep
-/// and expects one of the `accepted` terminations.
+/// and expects one of the `accepted` terminations. A provider that
+/// observes the ending signal must report one of `accepted_signals`; one
+/// that cannot observe it reports none.
 async fn exec_stop_terminates(
     ctx: &Conformance,
     build: fn(CancellationToken) -> ExecControls,
     accepted: &[Termination],
+    accepted_signals: &[i32],
 ) -> CheckOutcome {
     if !ctx.caps().exec.cancel {
         return Ok(Some("capability exec.cancel not declared".to_owned()));
@@ -990,6 +1009,14 @@ async fn exec_stop_terminates(
                 "expected one of {accepted:?}, got {:?}",
                 streaming.result.termination
             ));
+        }
+        if let Some(signal) = streaming.result.signal {
+            if !accepted_signals.contains(&signal) {
+                return fail(format!(
+                    "expected a signal in {accepted_signals:?}, got {signal} (code {:?})",
+                    streaming.result.exit_code
+                ));
+            }
         }
         PASS
     }

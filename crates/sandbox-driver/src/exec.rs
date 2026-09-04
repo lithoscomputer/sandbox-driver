@@ -406,9 +406,10 @@ pub struct ExecResult {
     pub exit_code:   Option<i32>,
     /// The signal that ended the command's process, when the provider
     /// observed one — a foreign `kill`, or the provider's own cancel
-    /// ladder. `None` when the process exited on its own or the provider
-    /// cannot tell; a provider that only sees a shell's `128 + N`
-    /// convention may decode it here.
+    /// ladder — whatever the `termination`. `None` when the process
+    /// exited on its own or the provider cannot tell; a provider that only
+    /// sees a shell's `128 + N` convention decodes it with
+    /// [`ExecResult::from_shell_status`].
     #[serde(default)]
     pub signal:      Option<i32>,
     pub termination: Termination,
@@ -429,9 +430,11 @@ impl ExecResult {
 
     /// Reads a shell-reported status: `128 + N` means the child died of
     /// signal `N`, anything else is an ordinary exit code. The code is
-    /// kept intact either way, and only a natural exit is decoded — a
-    /// provider's own cancel ladder is reported by `termination`, not
-    /// here. A process that deliberately exits with such a code is
+    /// kept intact either way. The signal is decoded for every
+    /// termination: a foreign `kill` on a natural exit, and the signal the
+    /// provider's own ladder landed on a cancelled, killed, or timed-out
+    /// command — `termination` says who stopped it, `signal` says how.
+    /// A process that deliberately exits with such a code is
     /// indistinguishable; the convention is the best a wrapper shell can
     /// report.
     pub fn from_shell_status(
@@ -440,7 +443,7 @@ impl ExecResult {
         duration: Duration,
     ) -> Self {
         let mut result = Self::new(termination, status, duration);
-        if let (Termination::Exited, Some(code)) = (termination, status) {
+        if let Some(code) = status {
             if (129..=192).contains(&code) {
                 result.signal = Some(code - 128);
             }
@@ -709,6 +712,32 @@ mod tests {
         let spec = ExecSpec::new("true");
         assert_eq!(spec.timeout, Some(ExecSpec::DEFAULT_TIMEOUT));
         assert_eq!(ExecSpec::new("true").no_timeout().timeout, None);
+    }
+
+    #[test]
+    fn shell_status_decodes_the_signal_for_every_termination() {
+        let duration = Duration::from_millis(1);
+        for termination in [
+            Termination::Exited,
+            Termination::Cancelled,
+            Termination::Killed,
+            Termination::TimedOut,
+        ] {
+            let result = ExecResult::from_shell_status(termination, Some(143), duration);
+            assert_eq!(result.signal, Some(15), "{termination:?}");
+            assert_eq!(result.exit_code, Some(143), "the code stays intact");
+            let result = ExecResult::from_shell_status(termination, Some(137), duration);
+            assert_eq!(result.signal, Some(9), "{termination:?}");
+        }
+        // Ordinary codes, and no code at all, carry no signal.
+        assert_eq!(
+            ExecResult::from_shell_status(Termination::Exited, Some(7), duration).signal,
+            None
+        );
+        assert_eq!(
+            ExecResult::from_shell_status(Termination::Cancelled, None, duration).signal,
+            None
+        );
     }
 
     #[test]
