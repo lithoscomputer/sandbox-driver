@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use sandbox_driver::{DirEntry, Error, FileKind, FileMetadata, Filesystem, ResourceKind, Result};
 use tokio::fs;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, copy};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, BufReader, copy_buf};
+
+const TRANSFER_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Native filesystem access rooted at the sandbox workspace.
 ///
@@ -83,10 +85,13 @@ impl Filesystem for HostFs {
         let mut file = fs::File::open(&full)
             .await
             .map_err(read_error(path, &full))?;
-        copy(&mut file, output)
-            .await
-            .map(|_| ())
-            .map_err(io_error(format!("copying {} to output", full.display())))
+        copy_buf(
+            &mut BufReader::with_capacity(TRANSFER_BUFFER_BYTES, &mut file),
+            output,
+        )
+        .await
+        .map(|_| ())
+        .map_err(io_error(format!("copying {} to output", full.display())))
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "host", offset), err)]
@@ -144,7 +149,8 @@ impl Filesystem for HostFs {
         }
         let outcome = async {
             let mut file = fs::File::create(&full).await?;
-            let copied = copy(&mut input.take(length), &mut file).await?;
+            let mut input = BufReader::with_capacity(TRANSFER_BUFFER_BYTES, input.take(length));
+            let copied = copy_buf(&mut input, &mut file).await?;
             if copied != length {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
