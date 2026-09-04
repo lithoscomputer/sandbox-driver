@@ -751,7 +751,8 @@ mod tests {
                 transport_failure,
             });
             let fs = DockerFs::new(
-                Docker::connect_with_local_defaults().expect("docker client"),
+                Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+                    .expect("docker client"),
                 "test-container".to_owned(),
                 "/workspace".to_owned(),
                 exec.clone(),
