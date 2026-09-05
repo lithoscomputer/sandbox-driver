@@ -7,12 +7,17 @@
 //! as the conformance run does.
 
 use std::collections::HashMap;
+use std::error::Error as StdError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{env, future, process};
 
 use bollard::Docker;
-use bollard::container::ListContainersOptions;
+use bollard::container::{
+    Config, CreateContainerOptions, InspectContainerOptions, KillContainerOptions,
+    ListContainersOptions, StartContainerOptions,
+};
+use bollard::errors::Error as DockerError;
 use sandbox_driver::{
     Error, ExecControls, ExecSpec, OneShotSpec, OutputStream, SandboxFilter, SandboxProvider,
     SandboxSource, SandboxSpec, Termination,
@@ -25,6 +30,108 @@ use tokio_util::sync::CancellationToken;
 
 const ALPINE: &str = "alpine:3.20";
 const WORKSPACE: &str = "/workspace";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restarting_a_stopped_sandbox_sweeps_old_one_shots_but_live_start_preserves_them() {
+    let Ok(provider) = DockerProvider::connect().await else {
+        return;
+    };
+    let docker = Docker::connect_with_local_defaults().expect("local Docker connection");
+    let sandbox = provider
+        .create(&alpine_spec("restart-one-shot"), None)
+        .await
+        .expect("create sandbox");
+    let result = async {
+        let lingering = docker
+            .create_container(None::<CreateContainerOptions<String>>, Config {
+                image: Some(ALPINE.to_owned()),
+                cmd: Some(vec!["sleep".to_owned(), "600".to_owned()]),
+                labels: Some(HashMap::from([(
+                    "sh.sandbox-driver.one-shot".to_owned(),
+                    sandbox.id().as_str().to_owned(),
+                )])),
+                ..Default::default()
+            })
+            .await?;
+        docker
+            .start_container(&lingering.id, None::<StartContainerOptions<String>>)
+            .await?;
+        sandbox.start().await?;
+        let live = docker
+            .inspect_container(&lingering.id, None::<InspectContainerOptions>)
+            .await?;
+        docker
+            .kill_container(
+                sandbox.id().as_str(),
+                Some(KillContainerOptions { signal: "KILL" }),
+            )
+            .await?;
+        sandbox.start().await?;
+        let removed = docker
+            .inspect_container(&lingering.id, None::<InspectContainerOptions>)
+            .await;
+        Ok::<_, Box<dyn StdError>>((live, removed))
+    }
+    .await;
+    sandbox
+        .delete()
+        .await
+        .expect("delete sandbox and one-shots after any error");
+    let (live, removed) = result.expect("restart through the provider");
+    assert_eq!(live.state.and_then(|state| state.running), Some(true));
+    assert!(matches!(
+        removed,
+        Err(DockerError::DockerResponseServerError {
+            status_code: 404,
+            ..
+        })
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_shots_share_a_host_network_helpers_namespace_and_workspace() {
+    let Some(provider) = over_the_wire().await else {
+        return;
+    };
+    let mut spec = alpine_spec("host-network");
+    spec.provider_config = DockerProviderConfig {
+        host_network: true,
+        ..Default::default()
+    }
+    .into_value();
+    let sandbox = provider
+        .create(&spec, None)
+        .await
+        .expect("create host-network helper");
+    let result = async {
+        let helper = sandbox
+            .exec()
+            .run(&ExecSpec::new("readlink").arg("/proc/self/ns/net"))
+            .await?;
+        let one_shot = sandbox
+            .one_shot()
+            .expect("one-shot facet")
+            .run(
+                &OneShotSpec::registry(ALPINE)
+                    .entrypoint("sh")
+                    .args(["-c", "echo shared > marker; readlink /proc/self/ns/net"]),
+                ExecControls::default(),
+            )
+            .await?;
+        let marker = sandbox.fs().read("marker").await?;
+        Ok::<_, Error>((helper, one_shot, marker))
+    }
+    .await;
+    sandbox
+        .delete()
+        .await
+        .expect("delete helper after success or error");
+    let (helper, one_shot, marker) = result.expect("execute through both facets");
+    assert!(helper.success());
+    assert!(one_shot.result.success());
+    assert_eq!(helper.stdout, one_shot.result.stdout);
+    assert_eq!(marker, b"shared\n");
+}
 
 /// The Docker provider behind the plugin protocol, as Petri drives it.
 async fn over_the_wire() -> Option<PluginProvider> {

@@ -936,6 +936,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -1833,6 +1834,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -1976,17 +1978,36 @@ name = "sandbox-driver-daytona"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bollard",
  "daytona-api-client",
  "daytona-sdk",
+ "futures-util",
+ "http",
+ "hyper-rustls",
+ "hyper-util",
  "rand 0.10.2",
+ "rustls",
  "sandbox-driver",
  "sandbox-driver-conformance",
+ "sandbox-driver-daytona-config",
+ "sandbox-driver-docker",
  "sandbox-driver-protocol",
+ "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "sandbox-driver-daytona-config"
+version = "0.1.0"
+dependencies = [
+ "sandbox-driver-docker-config",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -166,11 +166,19 @@ impl DockerProvider {
     pub fn connect_unverified() -> Result<Self> {
         let docker = Docker::connect_with_local_defaults()
             .map_err(|error| docker_error("connecting to the docker daemon", error))?;
-        Ok(Self {
+        Ok(Self::from_client(docker))
+    }
+
+    /// Use a caller-configured daemon connection, including an authenticated
+    /// custom transport. This does not contact the daemon;
+    /// [`SandboxProvider::health`] verifies the connection. The caller owns
+    /// endpoint and TLS configuration.
+    pub fn from_client(docker: Docker) -> Self {
+        Self {
             kind: docker_kind(),
             capabilities: docker_capabilities(),
             docker,
-        })
+        }
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = %self.kind), err)]
@@ -307,7 +315,9 @@ fn pull_options(reference: &str, platform: Option<&str>) -> CreateImageOptions<'
     }
 }
 
-fn docker_capabilities() -> Capabilities {
+/// Docker's capability set, also used by providers that compose a Docker
+/// sandbox inside another resource. Reading it does not contact a daemon.
+pub fn docker_capabilities() -> Capabilities {
     let mut caps = Capabilities::minimal(Isolation::Container);
     caps.lifecycle.pause = true;
     caps.exec.live_streaming = true;
@@ -539,7 +549,21 @@ impl SandboxProvider for DockerProvider {
             ));
         }
         let config_options = provider_config(&spec.provider_config)?;
-        let base_network = network_mode(&spec.network)?;
+        let base_network = if config_options.host_network {
+            if !matches!(
+                spec.network,
+                NetworkPolicy::ProviderDefault | NetworkPolicy::AllowAll
+            ) || !config_options.sidecars.is_empty()
+            {
+                return Err(Error::invalid_spec(
+                    "provider_config.host_network",
+                    "host networking requires unrestricted networking and no sidecars",
+                ));
+            }
+            Some("host".to_owned())
+        } else {
+            network_mode(&spec.network)?
+        };
         // Sidecars live on one user-defined network the main container
         // joins, named after the sandbox. They need a named sandbox.
         let sidecar_network = if config_options.sidecars.is_empty() {
@@ -1061,6 +1085,13 @@ impl Sandbox for DockerSandbox {
                             .unpause_container(self.id.as_str())
                             .await
                             .map_err(|error| docker_error("unpausing container", error));
+                    }
+                    // A daemon or VM crash may have ended the sandbox
+                    // without running stop's one-shot cleanup. Sweep those
+                    // resources before restarting it. Starting an already
+                    // running sandbox must preserve its active one-shots.
+                    if inspect.state.as_ref().and_then(|state| state.running) != Some(true) {
+                        one_shot::sweep(&self.docker, self.id.as_str()).await;
                     }
                     // Already-running (304) is success; a vanished container is
                     // not — start's postcondition is a running sandbox, so 404

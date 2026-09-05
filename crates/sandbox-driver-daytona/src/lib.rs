@@ -51,10 +51,12 @@
 //! changing the process environment.
 
 mod access;
+mod docker_transport;
 mod exec;
 mod fs;
 mod git;
 mod logs;
+mod nested_docker;
 mod pty;
 mod session;
 mod stdio;
@@ -83,7 +85,7 @@ use daytona_sdk::{
 use sandbox_driver::{
     Action, AuthError, Capabilities, Capability, Error, EventContext, EventEmitter, EventSubject,
     Exec, ExecSpec, Filesystem, ForkOptions, Git, HealthStatus, Isolation, LifecycleTimers,
-    LogSink, Logs, LogsCaps, NetworkPolicy, PlatformInfo, PreviewUrls, ProviderError,
+    LogSink, Logs, LogsCaps, NetworkPolicy, OneShot, PlatformInfo, PreviewUrls, ProviderError,
     ProviderHealth, ProviderKind, Pty, PtyCaps, ResourceKind, Resources, Result, Sandbox,
     SandboxFilter, SandboxId, SandboxKind, SandboxProvider, SandboxSnapshotOptions, SandboxSource,
     SandboxSpec, SandboxState, SandboxStatus, SnapshotCaps, SnapshotFilter, SnapshotId,
@@ -91,6 +93,10 @@ use sandbox_driver::{
     SshAccess, Vnc, VolumeCaps, VolumeId, VolumeProvider, VolumeSpec, VolumeState, VolumeStatus,
     WebTerminal,
 };
+pub use sandbox_driver_daytona_config::{
+    DaytonaProviderConfig, DockerExecutionTarget, NestedDockerConfig,
+};
+use serde::Deserialize;
 use tokio::time;
 
 pub use crate::access::DaytonaAccess;
@@ -98,6 +104,7 @@ pub use crate::exec::DaytonaExec;
 pub use crate::fs::DaytonaFs;
 pub use crate::git::DaytonaGit;
 pub use crate::logs::DaytonaLogs;
+use crate::nested_docker::NestedDocker;
 pub use crate::pty::DaytonaPty;
 
 const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
@@ -126,7 +133,10 @@ const SNAPSHOT_ACTIVATE_POLL: Duration = Duration::from_secs(5);
 const LIST_PAGE_SIZE: i32 = 100;
 
 fn is_internal_label(key: &str) -> bool {
-    matches!(key, MANAGED_LABEL | WORKING_DIRECTORY_LABEL)
+    matches!(
+        key,
+        MANAGED_LABEL | WORKING_DIRECTORY_LABEL | nested_docker::TARGET_LABEL
+    )
 }
 
 /// Scopes every sandbox-driver Daytona operation may need, paired with
@@ -724,6 +734,20 @@ async fn build_handle(
     };
     let id = SandboxId::try_new(&sdk.id)
         .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
+    let nested = sdk
+        .labels
+        .get(nested_docker::TARGET_LABEL)
+        .map(|label| {
+            nested_docker::parse_target(label)
+                .map(|target| NestedDocker::new(client, &sdk.id, &working_dir, target))
+        })
+        .transpose()?;
+    let mut capabilities = narrowed_capabilities(base_capabilities, sdk.sandbox_class);
+    capabilities.one_shot = None;
+    capabilities.exec.stdin_stream = false;
+    if let Some(nested) = &nested {
+        nested.capabilities(&mut capabilities);
+    }
     Ok(Arc::new(DaytonaSandbox {
         exec: DaytonaExec::new(Arc::clone(client), sdk.id.clone(), working_dir.clone()),
         git: DaytonaGit::new(Arc::clone(client), sdk.id.clone(), working_dir.clone()),
@@ -733,10 +757,11 @@ async fn build_handle(
         pty: DaytonaPty::new(Arc::clone(client), sdk.id.clone(), working_dir.clone()),
         id,
         name: (!sdk.name.is_empty()).then(|| sdk.name.clone()),
-        capabilities: narrowed_capabilities(base_capabilities, sdk.sandbox_class),
+        capabilities,
         client: Arc::clone(client),
         sdk_id: sdk.id,
         working_dir,
+        nested,
         events,
     }))
 }
@@ -792,6 +817,9 @@ fn daytona_capabilities() -> Capabilities {
     // Session-backed; UTF-8 payloads only (the ACP use case) — see the
     // stdio module.
     caps.exec.stdio_process = true;
+    caps.exec.environment = true;
+    caps.exec.stdin_stream = true;
+    caps.one_shot = sandbox_driver_docker::docker_capabilities().one_shot;
     caps.fs.native = true;
     caps.fs.upload = true;
     caps.fs.download = true;
@@ -874,54 +902,13 @@ fn narrowed_capabilities(base: &Capabilities, class: Option<DaytonaSandboxClass>
     caps
 }
 
-/// Options the Daytona provider reads from `SandboxSpec::provider_config`.
-///
-/// Schema: `{"outbound_proxy_url": string}` — routes the sandbox's
-/// HTTP(S) traffic through the proxy via the standard proxy environment
-/// variables at creation (convenience routing; combine with a domain
-/// allow list for network-layer enforcement). A separate concern from
-/// `NetworkPolicy`, matching the upstream API where the proxy composes
-/// with an allow list. Unknown fields are rejected so typos fail loudly.
-struct DaytonaProviderConfig {
-    outbound_proxy_url: Option<String>,
-}
-
 fn provider_config(value: &serde_json::Value) -> Result<DaytonaProviderConfig> {
-    let mut config = DaytonaProviderConfig {
-        outbound_proxy_url: None,
-    };
     match value {
-        serde_json::Value::Null => {}
-        serde_json::Value::Object(fields) => {
-            for (key, field) in fields {
-                match key.as_str() {
-                    "outbound_proxy_url" => {
-                        config.outbound_proxy_url = Some(
-                            field
-                                .as_str()
-                                .ok_or_else(|| {
-                                    Error::invalid_spec(
-                                        "provider_config.outbound_proxy_url",
-                                        "expected a string",
-                                    )
-                                })?
-                                .to_owned(),
-                        );
-                    }
-                    other => {
-                        return Err(Error::invalid_spec(
-                            "provider_config",
-                            format!("unknown field {other:?}"),
-                        ));
-                    }
-                }
-            }
-        }
-        _ => {
-            return Err(Error::invalid_spec("provider_config", "expected an object"));
-        }
+        serde_json::Value::Null => Ok(DaytonaProviderConfig::default()),
+        serde_json::Value::Object(_) => DaytonaProviderConfig::deserialize(value)
+            .map_err(|error| Error::invalid_spec("provider_config", error.to_string())),
+        _ => Err(Error::invalid_spec("provider_config", "expected an object")),
     }
-    Ok(config)
 }
 
 fn base_params(spec: &SandboxSpec) -> Result<SandboxBaseParams> {
@@ -941,6 +928,13 @@ fn base_params(spec: &SandboxSpec) -> Result<SandboxBaseParams> {
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     labels.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
+    if let Some(docker) = &config.docker {
+        nested_docker::validate(docker, spec)?;
+        labels.insert(
+            nested_docker::TARGET_LABEL.to_owned(),
+            nested_docker::target_label(docker.target).to_owned(),
+        );
+    }
     if let Some(working_directory) = &spec.working_directory {
         labels.insert(
             WORKING_DIRECTORY_LABEL.to_owned(),
@@ -965,7 +959,11 @@ fn base_params(spec: &SandboxSpec) -> Result<SandboxBaseParams> {
             env
         }),
         labels: Some(labels),
-        public: spec.public,
+        public: if config.docker.is_some() {
+            Some(false)
+        } else {
+            spec.public
+        },
         target: spec.region.clone(),
         auto_stop_interval: spec.timers.auto_stop_after_idle.map(minutes),
         auto_pause_interval: spec.timers.auto_pause_after_idle.map(minutes),
@@ -1117,7 +1115,21 @@ impl SandboxProvider for DaytonaProvider {
                     {
                         return Err(self.cleanup_failed_create(&created.id, error).await);
                     }
-                    Ok(self.handle(created, handle_emitter).await? as Arc<dyn Sandbox>)
+                    let sdk_id = created.id.clone();
+                    let handle = match self.handle(created, handle_emitter).await {
+                        Ok(handle) => handle,
+                        Err(error) => return Err(self.cleanup_failed_create(&sdk_id, error).await),
+                    };
+                    if let Some(config) = provider_config(&spec.provider_config)?.docker {
+                        let nested = handle
+                            .nested
+                            .as_ref()
+                            .expect("create stores the Docker target label");
+                        if let Err(error) = nested.create(&config, &spec.env).await {
+                            return Err(self.cleanup_failed_create(&sdk_id, error).await);
+                        }
+                    }
+                    Ok(handle as Arc<dyn Sandbox>)
                 },
             )
             .await
@@ -1308,6 +1320,7 @@ pub struct DaytonaSandbox {
     client:       DaytonaClient,
     sdk_id:       String,
     working_dir:  String,
+    nested:       Option<NestedDocker>,
     exec:         DaytonaExec,
     git:          DaytonaGit,
     fs:           DaytonaFs,
@@ -1318,6 +1331,21 @@ pub struct DaytonaSandbox {
 }
 
 impl DaytonaSandbox {
+    fn container(&self) -> Option<&NestedDocker> {
+        self.nested
+            .as_ref()
+            .filter(|nested| nested.targets_container())
+    }
+
+    async fn start_with_docker(&self) -> Result<()> {
+        self.start_inner().await?;
+        if let Some(nested) = &self.nested {
+            nested.stopped().await;
+            nested.sandbox().await?;
+        }
+        Ok(())
+    }
+
     async fn sdk(&self) -> Result<daytona_sdk::Sandbox> {
         self.client
             .get(&self.sdk_id)
@@ -1513,8 +1541,35 @@ impl Sandbox for DaytonaSandbox {
         Some(RUNTIME_DIRECTORY)
     }
 
+    async fn environment(&self) -> Result<BTreeMap<String, String>> {
+        if let Some(container) = self.container() {
+            return container.sandbox().await?.environment().await;
+        }
+        let result = self.exec.run(&ExecSpec::new("env").arg("-0")).await?;
+        if !result.success() {
+            return Err(Error::Provider(ProviderError::new(
+                ProviderKind::try_new("daytona").expect("constant provider kind"),
+                "reading VM environment failed",
+            )));
+        }
+        let output = String::from_utf8(result.stdout)
+            .map_err(|error| docker_transport::transport_error("decoding VM environment", error))?;
+        output
+            .split_terminator('\0')
+            .map(|entry| {
+                let (key, value) = entry.split_once('=').ok_or_else(|| {
+                    Error::invalid_spec("environment", "expected KEY=VALUE entries")
+                })?;
+                Ok((key.to_owned(), value.to_owned()))
+            })
+            .collect()
+    }
+
     #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
     async fn platform_info(&self) -> Result<PlatformInfo> {
+        if let Some(container) = self.container() {
+            return container.sandbox().await?.platform_info().await;
+        }
         // uname prints its fields in canonical order — sysname, release,
         // machine — regardless of flag order.
         let result = self
@@ -1539,7 +1594,7 @@ impl Sandbox for DaytonaSandbox {
             .run(
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Start,
-                |_| self.start_inner(),
+                |_| self.start_with_docker(),
             )
             .await
     }
@@ -1550,7 +1605,13 @@ impl Sandbox for DaytonaSandbox {
             .run(
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Stop,
-                |_| self.stop_inner(),
+                |_| async {
+                    self.stop_inner().await?;
+                    if let Some(nested) = &self.nested {
+                        nested.stopped().await;
+                    }
+                    Ok(())
+                },
             )
             .await
     }
@@ -1561,7 +1622,13 @@ impl Sandbox for DaytonaSandbox {
             .run(
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Delete,
-                |_| self.delete_inner(),
+                |_| async {
+                    self.delete_inner().await?;
+                    if let Some(nested) = &self.nested {
+                        nested.stopped().await;
+                    }
+                    Ok(())
+                },
             )
             .await
     }
@@ -1619,7 +1686,7 @@ impl Sandbox for DaytonaSandbox {
             .run(
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Resume,
-                |_| self.start_inner(),
+                |_| self.start_with_docker(),
             )
             .await
     }
@@ -1850,6 +1917,12 @@ impl Sandbox for DaytonaSandbox {
             .collect();
         all.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
         all.insert(WORKING_DIRECTORY_LABEL.to_owned(), self.working_dir.clone());
+        if let Some(nested) = &self.nested {
+            all.insert(
+                nested_docker::TARGET_LABEL.to_owned(),
+                nested.target_label().to_owned(),
+            );
+        }
         self.events
             .run(
                 EventSubject::sandbox(Some(self.id.clone())),
@@ -1866,15 +1939,21 @@ impl Sandbox for DaytonaSandbox {
     }
 
     fn exec(&self) -> &dyn Exec {
-        &self.exec
+        self.container()
+            .map_or(&self.exec as &dyn Exec, |nested| nested)
     }
 
     fn fs(&self) -> &dyn Filesystem {
-        &self.fs
+        self.container()
+            .map_or(&self.fs as &dyn Filesystem, |nested| nested)
     }
 
     fn provider_git(&self) -> Option<&dyn Git> {
-        Some(&self.git)
+        self.container().is_none().then_some(&self.git)
+    }
+
+    fn one_shot(&self) -> Option<&dyn OneShot> {
+        self.nested.as_ref().map(|nested| nested as &dyn OneShot)
     }
 
     fn preview_urls(&self) -> Option<&dyn PreviewUrls> {
@@ -1882,23 +1961,32 @@ impl Sandbox for DaytonaSandbox {
     }
 
     fn ssh(&self) -> Option<&dyn SshAccess> {
-        Some(&self.access)
+        self.capabilities.access.ssh.then_some(&self.access)
     }
 
     fn pty(&self) -> Option<&dyn Pty> {
-        Some(&self.pty)
+        Some(
+            self.container()
+                .map_or(&self.pty as &dyn Pty, |nested| nested),
+        )
     }
 
     fn logs(&self) -> Option<&dyn Logs> {
-        Some(&self.logs)
+        self.capabilities
+            .logs
+            .as_ref()
+            .map(|_| &self.logs as &dyn Logs)
     }
 
     fn web_terminal(&self) -> Option<&dyn WebTerminal> {
-        Some(&self.access)
+        self.capabilities
+            .access
+            .web_terminal
+            .then_some(&self.access)
     }
 
     fn vnc(&self) -> Option<&dyn Vnc> {
-        Some(&self.access)
+        self.capabilities.access.vnc.then_some(&self.access)
     }
 }
 
@@ -2564,6 +2652,57 @@ mod tests {
         // $BASH_ENV at startup, before any per-exec strip can run.
         assert_eq!(env.get("BASH_ENV").map(String::as_str), Some(""));
         assert_eq!(env.get("KEEP").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn nested_docker_keeps_private_preview_and_only_nonsecret_target_metadata() {
+        let mut spec = SandboxSpec::new(SandboxSource::Image {
+            reference: "runner:dind".to_owned(),
+        });
+        spec.labels
+            .insert(nested_docker::TARGET_LABEL.to_owned(), "spoofed".to_owned());
+        let options = sandbox_driver_docker::DockerProviderConfig {
+            registry_auth: Some(sandbox_driver_docker::RegistryAuth {
+                username: "private-user".to_owned(),
+                password: "private-password".to_owned(),
+                server:   None,
+            }),
+            ..Default::default()
+        };
+        spec.provider_config = DaytonaProviderConfig {
+            docker: Some(NestedDockerConfig {
+                image: "private-image".to_owned(),
+                target: DockerExecutionTarget::Container,
+                user: None,
+                options,
+            }),
+            ..Default::default()
+        }
+        .into_value();
+        let base = base_params(&spec).unwrap();
+        assert_eq!(base.public, Some(false));
+        let labels = base.labels.unwrap();
+        assert_eq!(labels[nested_docker::TARGET_LABEL], "container");
+        assert!(!format!("{labels:?}").contains("private-"));
+        spec.public = Some(true);
+        assert!(matches!(base_params(&spec), Err(Error::InvalidSpec { .. })));
+    }
+
+    #[test]
+    fn nested_docker_rejects_vm_sidecars_and_caller_binds_before_provisioning() {
+        let mut spec = SandboxSpec::new(SandboxSource::Image {
+            reference: "runner:dind".to_owned(),
+        });
+        for docker in [
+            serde_json::json!({"image":"alpine", "target":"virtual_machine", "options":{"sidecars":[{"name":"db","image":"postgres"}]}}),
+            serde_json::json!({"image":"alpine", "options":{"binds":[{"host":"/private","container":"/workspace"}]}}),
+            serde_json::json!({"image":"alpine", "options":{"host_network":true}}),
+            serde_json::json!({"image":" "}),
+            serde_json::json!({"image":"alpine", "typo":true}),
+        ] {
+            spec.provider_config = serde_json::json!({"docker":docker});
+            assert!(matches!(base_params(&spec), Err(Error::InvalidSpec { .. })));
+        }
     }
 
     #[test]

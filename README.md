@@ -9,7 +9,8 @@ snapshots, and volumes behind one capability-discoverable interface.
 | `sandbox-driver-host` | Host (local) provider — directories, no isolation |
 | `sandbox-driver-docker` | Docker provider — containers with a workspace volume, one-shot containers, sidecars, image pulls |
 | `sandbox-driver-docker-config` | The Docker provider's `provider_config` as plain Serde types, for hosts on the wire |
-| `sandbox-driver-daytona` | Daytona provider — cloud VMs, snapshots, volumes |
+| `sandbox-driver-daytona` | Daytona provider — cloud VMs, nested Docker, snapshots, volumes |
+| `sandbox-driver-daytona-config` | Typed Daytona and nested Docker configuration for plugin clients |
 | `sandbox-driver-protocol` | JSON-RPC plugin protocol (version 2, with per-operation data channels): serve any provider, adapt any plugin |
 | `sandbox-driver-conformance` | Black-box conformance suite every provider must pass |
 | `sandbox-driver-{host,docker,daytona}-plugin` | The three providers as plugin executables: `sandbox-driver-host`, `sandbox-driver-docker`, `sandbox-driver-daytona` |
@@ -21,6 +22,23 @@ process and served over the plugin wire; the Daytona suite runs live with
 
 See `docs/design.md` for the interface design
 and `docs/protocol.md` for the normative plugin wire protocol.
+
+## Nested Docker on Daytona
+
+Daytona can own a nested job container, sidecars, and one-shot action containers.
+Use `DaytonaProviderConfig` from `sandbox-driver-daytona-config`. The runner
+snapshot must include `start-docker` and Python 3. Container traffic crosses a
+private authenticated preview. VM stop and delete own the full resource fence.
+See [the design](docs/design.md#nested-docker-on-daytona) for configuration and
+restart behavior.
+
+The transport has deterministic local tests. The hosted integration remains an
+explicit live gate:
+
+```sh
+# Set DAYTONA_API_KEY and SANDBOX_DRIVER_DAYTONA_DIND_SNAPSHOT first.
+cargo nextest run --locked -p sandbox-driver-daytona --test nested_docker --run-ignored only
+```
 
 ## CLI
 

@@ -36,6 +36,9 @@ pub struct DockerProviderConfig {
     /// Run an init process as PID 1 so zombies are reaped.
     pub init:          bool,
     pub privileged:    bool,
+    /// Share the daemon host's network namespace. Requires the default or
+    /// allow-all network policy and cannot be combined with sidecars.
+    pub host_network:  bool,
     /// The platform to pull and create for, such as `linux/amd64`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub platform:      Option<String>,
@@ -58,6 +61,7 @@ impl Default for DockerProviderConfig {
             auto_pull:     true,
             init:          false,
             privileged:    false,
+            host_network:  false,
             platform:      None,
             binds:         Vec::new(),
             extra_hosts:   Vec::new(),

@@ -11,17 +11,27 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+bollard.workspace = true
 daytona-api-client.workspace = true
 daytona-sdk.workspace = true
+http.workspace = true
+hyper-rustls.workspace = true
+hyper-util.workspace = true
 rand.workspace = true
+rustls.workspace = true
 sandbox-driver.workspace = true
+sandbox-driver-daytona-config.workspace = true
+sandbox-driver-docker.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+futures-util.workspace = true
 sandbox-driver-conformance.workspace = true
 sandbox-driver-protocol = { path = "../sandbox-driver-protocol" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio-rustls = "0.26"
 tracing-subscriber.workspace = true

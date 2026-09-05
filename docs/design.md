@@ -136,7 +136,7 @@ Per-sandbox functionality is grouped into small **facet traits** (per the style 
 | `Services` (derived) | Background processes that outlive their exec (MCP servers, dev servers): spawn / status / logs / stop — default impl derived from `Exec` (`setsid` + pidfile, fabro's proven pattern); state is per-boot | derived | derived | derived | derived |
 | `Pty` | create/resize/kill + bidirectional byte stream (fabro's `TerminalSession`) | ✔ | ✔ (exec+tty) | ✔ (websocket) | ✔ (console) |
 | `Logs` | Provider-side logs: build/provision logs, entrypoint output, sandbox event log; streaming follow | — | ✔ (container logs) | ✔ | ? |
-| `OneShot` | Ephemeral containers in the sandbox's world: same workspace, same network namespace, own image (registry or built from the workspace); stream, term/kill, timeout; ended by the sandbox's `stop`/`delete` | — | ✔ (workspace volume, `container:` network) | future (inside the VM) | — |
+| `OneShot` | Ephemeral containers in the sandbox's world: same workspace, same network namespace, own image (registry or built from the workspace); stream, term/kill, timeout; ended by the sandbox's `stop`/`delete` | — | ✔ (workspace volume, `container:` network) | ✔ (with nested Docker configured) | — |
 | `PreviewUrls` | port → `{ url, headers }`; signed expiring URLs; revocation | \~ (localhost) | future (port map) | ✔ | ✔ (HTTPS proxies) |
 | `SshAccess` | Return a ready-to-run SSH command; optional exact TTL and token revocation are separate capabilities | — | — | ✔ | ✔ |
 | `ShellCommand` | A local command string that opens a shell (Docker's `docker exec -it …`) — distinct from real SSH | trivial | ✔ | — | — |
@@ -384,6 +384,18 @@ pub struct SandboxSpec {
 ```
 
 `provider_config` is the pressure valve: Daytona's GPU type preference lists, spot instances, linked sandboxes, warm-pool hints, and future boxd golden-image options live there without polluting the common spec. It crosses the JSON-RPC boundary opaquely. Each provider crate exports its shape as a type — the Docker provider's `DockerProviderConfig` with `into_value()` — so an in-process consumer builds it type-checked and the provider parses it back through the same type; only the wire sees untyped JSON.
+
+### Nested Docker on Daytona
+
+`sandbox-driver-daytona-config` defines `DaytonaProviderConfig`. Its optional `docker` field contains `NestedDockerConfig`: an `image`, an execution `target` (`container` or `virtual_machine`), an optional container `user`, and Docker provider `options`. Unknown fields are rejected. The outer sandbox source, provisioning kind, resources, and timers still describe the Daytona sandbox.
+
+The runner must provide `start-docker` and Python 3. The provider starts Docker and a VM-owned bridge to its Unix socket. Docker traffic uses an authenticated private HTTPS preview, including binary streaming and HTTP upgrades. Public preview access is rejected. Start and attach obtain a new preview token after a VM restart. Transport failures do not replay operations.
+
+With the `container` target, execution, files, environment, git, PTY, services, and one-shot containers use the nested Docker sandbox. With `virtual_machine`, ordinary operations stay in the VM; a helper container shares its workspace and host network so one-shots run in the same environment. Sidecar containers require the `container` target. The provider owns workspace binds and network placement. The Docker provider separately supports `host_network: true` with unrestricted networking and no sidecars.
+
+The VM owns all nested resources. Stop fences the whole VM; delete removes it. Restart reattaches the existing named job container and preserves its workspace. It does not replace a missing job container. Docker start sweeps old one-shots when restarting a stopped sandbox and preserves active one-shots when already running. Only the execution target is stored in Daytona labels. Registry credentials and container configuration are not stored there. Nested containers retain VM lifecycle capabilities; VM desktop, SSH, and log facets are absent from a container execution target.
+
+Local tests cover the transport and bridge. The ignored live gate additionally requires `DAYTONA_API_KEY` and `SANDBOX_DRIVER_DAYTONA_DIND_SNAPSHOT`, a VM snapshot with at least 2 CPUs and 4 GiB of memory. The hosted preview's behavior still needs that live run before production use.
 
 `working_directory` is the final workspace directory chosen before creation. A provider creates it when needed, uses it as the default for relative file and process operations, and returns the same value from handles created by `attach`. The Host provider treats an explicit path as caller-owned and does not delete it.
 
