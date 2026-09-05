@@ -140,6 +140,13 @@ pub struct ProviderHealth {
     /// enumerate them (e.g. Daytona API key scopes).
     #[serde(default)]
     pub missing_permissions: Vec<String>,
+    /// Stable, non-secret identity of the backend's resource namespace,
+    /// such as a cloud organization ID. Credential rotation must preserve
+    /// it when the replacement credential addresses the same resources.
+    /// Hosts can combine this with the endpoint to protect recovery from
+    /// accidentally attaching or deleting resources in another account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity:            Option<String>,
 }
 
 impl ProviderHealth {
@@ -148,6 +155,7 @@ impl ProviderHealth {
             status,
             message: None,
             missing_permissions: Vec::new(),
+            identity: None,
         }
     }
 }

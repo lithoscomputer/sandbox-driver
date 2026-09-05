@@ -16,9 +16,26 @@ use sandbox_driver::{
     SnapshotSpec, Termination,
 };
 use sandbox_driver_protocol::methods::{
-    ForkOptionsDto, FsWriteParams, SandboxSnapshotOptionsDto, SandboxSpecDto, SnapshotSourceDto,
-    SnapshotSpecDto,
+    ForkOptionsDto, FsWriteParams, HealthResult, SandboxSnapshotOptionsDto, SandboxSpecDto,
+    SnapshotSourceDto, SnapshotSpecDto,
 };
+
+#[test]
+fn health_identity_is_optional_and_survives_the_wire() {
+    let legacy: HealthResult =
+        serde_json::from_str(r#"{"health":{"status":"ok"}}"#).expect("old health response");
+    assert!(legacy.health.identity.is_none());
+    let identified: HealthResult = serde_json::from_str(
+        r#"{"health":{"status":"ok","identity":"organization:example","future_field":true}}"#,
+    )
+    .expect("new health response");
+    assert_eq!(
+        identified.health.identity.as_deref(),
+        Some("organization:example")
+    );
+    let encoded = serde_json::to_value(identified).expect("encode health response");
+    assert_eq!(encoded["health"]["identity"], "organization:example");
+}
 
 #[test]
 fn version_two_file_writes_without_a_length_still_decode() {

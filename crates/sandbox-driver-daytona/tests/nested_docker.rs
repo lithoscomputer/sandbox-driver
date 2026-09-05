@@ -13,9 +13,12 @@ use sandbox_driver::{
 use sandbox_driver_daytona::{
     DaytonaProvider, DaytonaProviderConfig, DockerExecutionTarget, NestedDockerConfig,
 };
-use sandbox_driver_docker::Sidecar;
+use sandbox_driver_docker::{Health, Sidecar};
+use support::init_diagnostics;
 use tokio::process::Command;
 use tokio::time::timeout;
+
+mod support;
 
 #[tokio::test]
 async fn vm_bridge_preserves_binary_transfers_and_half_close() {
@@ -40,15 +43,21 @@ async fn vm_bridge_preserves_binary_transfers_and_half_close() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires DAYTONA_API_KEY and SANDBOX_DRIVER_DAYTONA_DIND_SNAPSHOT"]
-async fn nested_job_sidecars_one_shots_and_restart_share_the_vm_lifecycle() {
+async fn nested_job_sidecars_one_shots_and_restart_share_the_sandbox_lifecycle() {
+    init_diagnostics();
     env::var("DAYTONA_API_KEY").expect("live gate requires DAYTONA_API_KEY");
     let snapshot = env::var("SANDBOX_DRIVER_DAYTONA_DIND_SNAPSHOT")
-        .expect("set a VM snapshot with start-docker, Python 3, at least 2 CPU and 4 GiB");
+        .expect("set a snapshot with start-docker, Python 3, at least 2 CPU and 4 GiB");
+    let kind = match env::var("SANDBOX_DRIVER_DAYTONA_KIND").as_deref() {
+        Ok("virtual_machine") => SandboxKind::VirtualMachine,
+        Ok("container") | Err(_) => SandboxKind::Container,
+        Ok(_) => panic!("SANDBOX_DRIVER_DAYTONA_KIND must be container or virtual_machine"),
+    };
     let provider = DaytonaProvider::connect().await.unwrap();
     let mut spec = SandboxSpec::new(SandboxSource::Snapshot {
         id: SnapshotId::try_new(snapshot).unwrap(),
     })
-    .sandbox_kind(SandboxKind::VirtualMachine)
+    .sandbox_kind(kind)
     .working_directory("/workspace");
     spec.user = Some("root".to_owned());
     spec.timers.auto_stop_after_idle = Some(Duration::ZERO);
@@ -56,8 +65,9 @@ async fn nested_job_sidecars_one_shots_and_restart_share_the_vm_lifecycle() {
     service.entrypoint = Some(vec![
         "sh".to_owned(),
         "-c".to_owned(),
-        "mkdir -p /www; echo ready >/www/index.html; exec httpd -f -p 8080 -h /www".to_owned(),
+        "while true; do printf 'HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nready\n' | nc -l -p 8080; done".to_owned(),
     ]);
+    service.health = Some(Health::new("wget -qO- http://127.0.0.1:8080"));
     let mut options = sandbox_driver_docker::DockerProviderConfig::default();
     options.sidecars.push(service);
     spec.provider_config = DaytonaProviderConfig {
@@ -72,6 +82,7 @@ async fn nested_job_sidecars_one_shots_and_restart_share_the_vm_lifecycle() {
     .into_value();
     let sandbox = provider.create(&spec, None).await.unwrap();
     let outcome = AssertUnwindSafe(async {
+        tracing::info!("nested live gate: files");
         sandbox
             .fs()
             .write_from("binary", &mut [0, 255, 128, 10].as_slice(), 4)
@@ -79,6 +90,7 @@ async fn nested_job_sidecars_one_shots_and_restart_share_the_vm_lifecycle() {
         let mut binary = Vec::new();
         sandbox.fs().read_to("binary", &mut binary).await?;
         assert_eq!(binary, [0, 255, 128, 10]);
+        tracing::info!("nested live gate: exec");
         let result = sandbox
             .exec()
             .run_streaming(
@@ -91,6 +103,7 @@ async fn nested_job_sidecars_one_shots_and_restart_share_the_vm_lifecycle() {
             .await?;
         assert_eq!(result.result.exit_code, Some(0));
         assert!(result.result.stdout_lossy().contains("ready"));
+        tracing::info!("nested live gate: one-shot");
         let result = sandbox
             .one_shot()
             .unwrap()
@@ -104,6 +117,7 @@ async fn nested_job_sidecars_one_shots_and_restart_share_the_vm_lifecycle() {
             .await?;
         assert_eq!(result.result.exit_code, Some(0));
         assert_eq!(sandbox.fs().read("one-shot").await?, b"kept");
+        tracing::info!("nested live gate: restart");
         sandbox.stop().await?;
         let attached = provider.attach(sandbox.id(), None).await?;
         attached.start().await?;

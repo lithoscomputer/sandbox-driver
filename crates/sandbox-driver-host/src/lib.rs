@@ -400,19 +400,21 @@ impl SandboxProvider for HostProvider {
             else {
                 continue;
             };
-            let sandbox = match self.load(&id).await {
-                Ok(sandbox) => sandbox,
+            // Reading the record is enough to report a sandbox. Building a
+            // handle here would allocate process groups and cache a tombstone
+            // for every resource the registry has ever held.
+            let record = match registry::read(&self.root, &id).await {
+                Ok(record) => record,
                 Err(Error::NotFound { .. }) => continue,
                 Err(error) => return Err(error),
             };
-            let status = sandbox.status().await;
-            if status.state != SandboxState::Deleted
+            if record.state != SandboxState::Deleted
                 && filter
                     .labels
                     .iter()
-                    .all(|(key, value)| status.labels.get(key) == Some(value))
+                    .all(|(key, value)| record.labels.get(key) == Some(value))
             {
-                statuses.push(status);
+                statuses.push(record.status(record.state));
             }
         }
         Ok(statuses)
@@ -424,20 +426,17 @@ pub struct HostSandbox {
     root:              PathBuf,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     groups:            Arc<ProcessGroups>,
-    id:                SandboxId,
-    name:              Option<String>,
+    /// Identity and metadata exactly as the registry stores them. Its
+    /// `state` is the value last written to disk; `state` below is the
+    /// live one shared across attached handles.
+    record:            Record,
     capabilities:      Capabilities,
-    workspace:         PathBuf,
-    ownership:         WorkspaceOwnership,
-    labels:            BTreeMap<String, String>,
     state:             Arc<Mutex<SandboxState>>,
-    env:               BTreeMap<String, String>,
     /// Shared across attached handles.
     exec:              Arc<HostExec>,
     fs:                HostFs,
     events:            EventEmitter,
     working_directory: String,
-    created_at:        SystemTime,
 }
 
 impl HostSandbox {
@@ -467,33 +466,20 @@ impl HostSandbox {
             root,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             groups,
-            id: record.id,
-            name: record.name,
             capabilities,
             working_directory: record.workspace.to_string_lossy().into_owned(),
             fs: HostFs::new(record.workspace.clone()),
-            workspace: record.workspace,
-            ownership: record.ownership,
-            labels: record.labels,
             state: Arc::new(Mutex::new(record.state)),
-            env: record.env,
+            record,
             exec: Arc::new(exec),
             events,
-            created_at: record.created_at,
         })
     }
 
     async fn persist(&self, state: SandboxState) -> Result<()> {
         registry::write(&self.root, &Record {
-            version: 1,
-            id: self.id.clone(),
-            name: self.name.clone(),
-            workspace: self.workspace.clone(),
-            ownership: self.ownership,
-            env: self.env.clone(),
-            labels: self.labels.clone(),
             state,
-            created_at: self.created_at,
+            ..self.record.clone()
         })
         .await
     }
@@ -503,50 +489,37 @@ impl HostSandbox {
             root: self.root.clone(),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             groups: self.groups.clone(),
-            id: self.id.clone(),
-            name: self.name.clone(),
+            record: self.record.clone(),
             capabilities: self.capabilities.clone(),
-            workspace: self.workspace.clone(),
-            ownership: self.ownership,
-            labels: self.labels.clone(),
             state: Arc::clone(&self.state),
-            env: self.env.clone(),
             exec: Arc::clone(&self.exec),
-            fs: HostFs::new(self.workspace.clone()),
+            fs: HostFs::new(self.record.workspace.clone()),
             events,
             working_directory: self.working_directory.clone(),
-            created_at: self.created_at,
         }
     }
 
     /// The workspace directory on the local filesystem.
     pub fn workspace(&self) -> &Path {
-        &self.workspace
+        &self.record.workspace
     }
 
     async fn status(&self) -> SandboxStatus {
-        let state = *self.state.lock().await;
-        let mut status = SandboxStatus::new(self.id.clone(), state);
-        status.name.clone_from(&self.name);
-        status.provider_state = format!("{state:?}").to_lowercase();
-        status.labels = self.labels.clone();
-        status.workspace_ownership = Some(self.ownership);
-        status.created_at = Some(self.created_at);
-        status
+        self.record.status(*self.state.lock().await)
     }
 }
 
 #[async_trait]
 impl Sandbox for HostSandbox {
     fn id(&self) -> &SandboxId {
-        &self.id
+        &self.record.id
     }
 
     fn capabilities(&self) -> &Capabilities {
         &self.capabilities
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.id), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.record.id), err)]
     async fn describe(&self) -> Result<SandboxStatus> {
         Ok(self.status().await)
     }
@@ -556,10 +529,10 @@ impl Sandbox for HostSandbox {
     }
 
     async fn environment(&self) -> Result<BTreeMap<String, String>> {
-        Ok(effective_env(&self.env))
+        Ok(effective_env(&self.record.env))
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.id), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.record.id), err)]
     async fn platform_info(&self) -> Result<PlatformInfo> {
         let version = self
             .exec
@@ -579,16 +552,16 @@ impl Sandbox for HostSandbox {
     }
 
     /// Permit work after a successful stop, preserving the workspace.
-    #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.id), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.record.id), err)]
     async fn start(&self) -> Result<()> {
         self.events
             .run(
-                EventSubject::sandbox(Some(self.id.clone())),
+                EventSubject::sandbox(Some(self.record.id.clone())),
                 Action::Start,
                 |_| async {
                     let mut state = self.state.lock().await;
                     if *state == SandboxState::Deleted {
-                        return Err(registry::missing(&self.id));
+                        return Err(registry::missing(&self.record.id));
                     }
                     #[cfg(any(target_os = "linux", target_os = "macos"))]
                     self.groups.start().await?;
@@ -601,11 +574,11 @@ impl Sandbox for HostSandbox {
     }
 
     /// End this sandbox's work while retaining its workspace.
-    #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.id), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.record.id), err)]
     async fn stop(&self) -> Result<()> {
         self.events
             .run(
-                EventSubject::sandbox(Some(self.id.clone())),
+                EventSubject::sandbox(Some(self.record.id.clone())),
                 Action::Stop,
                 |_| async {
                     let mut state = self.state.lock().await;
@@ -622,11 +595,11 @@ impl Sandbox for HostSandbox {
             .await
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.id), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.record.id), err)]
     async fn delete(&self) -> Result<()> {
         self.events
             .run(
-                EventSubject::sandbox(Some(self.id.clone())),
+                EventSubject::sandbox(Some(self.record.id.clone())),
                 Action::Delete,
                 |_| async {
                     let mut state = self.state.lock().await;
@@ -635,15 +608,15 @@ impl Sandbox for HostSandbox {
                     }
                     #[cfg(any(target_os = "linux", target_os = "macos"))]
                     self.groups.stop().await?;
-                    if self.ownership == WorkspaceOwnership::Managed {
-                        match tokio_fs::remove_dir_all(&self.workspace).await {
+                    if self.record.ownership == WorkspaceOwnership::Managed {
+                        match tokio_fs::remove_dir_all(&self.record.workspace).await {
                             Ok(()) => {}
                             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                             Err(error) => {
                                 return Err(Error::io(
                                     format!(
                                         "removing managed workspace {}",
-                                        self.workspace.display()
+                                        self.record.workspace.display()
                                     ),
                                     error,
                                 ));

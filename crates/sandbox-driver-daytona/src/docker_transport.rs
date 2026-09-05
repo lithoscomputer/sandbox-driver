@@ -1,9 +1,12 @@
 //! Authenticated Docker HTTP transport through a private Daytona preview.
 
 use std::error::Error as StdError;
+use std::io;
 
+use bollard::errors::Error as BollardError;
 use bollard::{API_DEFAULT_VERSION, Docker};
-use http::{HeaderMap, HeaderName, HeaderValue, Uri};
+use http::header::{CONTENT_TYPE, UPGRADE};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -52,7 +55,22 @@ fn connect_with_connector(
         move |mut request: bollard::BollardRequest| {
             let client = client.clone();
             request.headers_mut().extend(headers.clone());
-            Box::pin(async move { client.request(request).await.map_err(Into::into) })
+            let upgrade = request.headers().contains_key(UPGRADE);
+            Box::pin(async move {
+                let response = client.request(request).await?;
+                if upgrade && response.status() != StatusCode::SWITCHING_PROTOCOLS {
+                    return Err(BollardError::IOError {
+                        err: io::Error::other(format!(
+                            "Docker preview returned {} instead of an upgrade (content type \
+                             {:?}, upgrade {:?})",
+                            response.status(),
+                            response.headers().get(CONTENT_TYPE),
+                            response.headers().get(UPGRADE)
+                        )),
+                    });
+                }
+                Ok(response)
+            })
         },
         Some(preview.url.trim_end_matches('/')),
         120,

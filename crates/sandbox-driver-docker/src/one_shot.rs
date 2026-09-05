@@ -257,17 +257,16 @@ fn one_shot_filter(sandbox_id: &str) -> ListContainersOptions<String> {
 }
 
 /// Removes every one-shot container of `sandbox_id`, running or not.
-/// Best-effort, as the sidecar sweep is: a missing container is fine.
-pub(crate) async fn sweep(docker: &Docker, sandbox_id: &str) {
-    let Ok(containers) = docker
+/// A missing container is fine; other failures must keep lifecycle cleanup
+/// pending so the owner can retry it.
+pub(crate) async fn sweep(docker: &Docker, sandbox_id: &str) -> Result<()> {
+    let containers = docker
         .list_containers(Some(one_shot_filter(sandbox_id)))
         .await
-    else {
-        return;
-    };
+        .map_err(|error| docker_error("listing one-shot containers", error))?;
     for container in containers {
         if let Some(id) = container.id {
-            let _ = docker
+            match docker
                 .remove_container(
                     &id,
                     Some(RemoveContainerOptions {
@@ -276,9 +275,15 @@ pub(crate) async fn sweep(docker: &Docker, sandbox_id: &str) {
                         ..Default::default()
                     }),
                 )
-                .await;
+                .await
+            {
+                Ok(()) => {}
+                Err(error) if is_not_found(&error) => {}
+                Err(error) => return Err(docker_error("removing one-shot container", error)),
+            }
         }
     }
+    Ok(())
 }
 
 #[async_trait]

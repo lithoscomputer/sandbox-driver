@@ -68,7 +68,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use daytona_api_client::apis::{Error as ApiError, api_keys_api, sandbox_api, snapshots_api};
+use daytona_api_client::apis::{Error as ApiError, sandbox_api, snapshots_api};
 use daytona_api_client::models::api_key_list::Permissions;
 use daytona_api_client::models::sandbox::SandboxClass as DaytonaSandboxClass;
 use daytona_api_client::models::snapshot_dto::SandboxClass as DaytonaSnapshotClass;
@@ -84,14 +84,14 @@ use daytona_sdk::{
 };
 use sandbox_driver::{
     Action, AuthError, Capabilities, Capability, Error, EventContext, EventEmitter, EventSubject,
-    Exec, ExecSpec, Filesystem, ForkOptions, Git, HealthStatus, Isolation, LifecycleTimers,
-    LogSink, Logs, LogsCaps, NetworkPolicy, OneShot, PlatformInfo, PreviewUrls, ProviderError,
-    ProviderHealth, ProviderKind, Pty, PtyCaps, ResourceKind, Resources, Result, Sandbox,
-    SandboxFilter, SandboxId, SandboxKind, SandboxProvider, SandboxSnapshotOptions, SandboxSource,
-    SandboxSpec, SandboxState, SandboxStatus, SnapshotCaps, SnapshotFilter, SnapshotId,
-    SnapshotMode, SnapshotProvider, SnapshotSource, SnapshotSpec, SnapshotState, SnapshotStatus,
-    SshAccess, Vnc, VolumeCaps, VolumeId, VolumeProvider, VolumeSpec, VolumeState, VolumeStatus,
-    WebTerminal,
+    Exec, ExecFailure, ExecSpec, Filesystem, ForkOptions, Git, HealthStatus, Isolation,
+    LifecycleTimers, LogSink, Logs, LogsCaps, NetworkPolicy, OneShot, PlatformInfo, PreviewUrls,
+    ProviderError, ProviderHealth, ProviderKind, Pty, PtyCaps, ResourceKind, Resources, Result,
+    Sandbox, SandboxFilter, SandboxId, SandboxKind, SandboxProvider, SandboxSnapshotOptions,
+    SandboxSource, SandboxSpec, SandboxState, SandboxStatus, SnapshotCaps, SnapshotFilter,
+    SnapshotId, SnapshotMode, SnapshotProvider, SnapshotSource, SnapshotSpec, SnapshotState,
+    SnapshotStatus, SshAccess, Vnc, VolumeCaps, VolumeId, VolumeProvider, VolumeSpec, VolumeState,
+    VolumeStatus, WebTerminal,
 };
 pub use sandbox_driver_daytona_config::{
     DaytonaProviderConfig, DockerExecutionTarget, NestedDockerConfig,
@@ -127,6 +127,18 @@ const TRANSITION_POLL: Duration = Duration::from_secs(1);
 const SNAPSHOT_ACTIVATE_BUDGET: Duration = Duration::from_secs(900);
 const SNAPSHOT_ACTIVATE_POLL: Duration = Duration::from_secs(5);
 
+/// The current-key endpoint includes its effective organization, which the
+/// generated SDK model currently discards. Read only health metadata here;
+/// neither the credential nor its masked value belongs in provider identity.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CurrentApiKey {
+    name:            String,
+    permissions:     Vec<Permissions>,
+    #[serde(default)]
+    organization_id: Option<String>,
+}
+
 /// Items requested per page when listing sandboxes or snapshots. The
 /// paginated endpoints truncate an unpaged request to their own default
 /// page size, so listings must walk `total_pages` explicitly.
@@ -137,6 +149,37 @@ fn is_internal_label(key: &str) -> bool {
         key,
         MANAGED_LABEL | WORKING_DIRECTORY_LABEL | nested_docker::TARGET_LABEL
     )
+}
+
+/// The labels Daytona stores for a sandbox: the caller's, minus anything
+/// that would spoof internal metadata, plus the internal set itself. Both
+/// `create` and `set_labels` build them here, so replacing a sandbox's
+/// labels cannot drop the nested-Docker target and demote it to a plain
+/// VM on the next attach.
+fn stored_labels(
+    caller: &BTreeMap<String, String>,
+    working_directory: Option<&str>,
+    docker_target: Option<DockerExecutionTarget>,
+) -> HashMap<String, String> {
+    let mut labels: HashMap<String, String> = caller
+        .iter()
+        .filter(|(key, _)| !is_internal_label(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    labels.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
+    if let Some(working_directory) = working_directory {
+        labels.insert(
+            WORKING_DIRECTORY_LABEL.to_owned(),
+            working_directory.to_owned(),
+        );
+    }
+    if let Some(target) = docker_target {
+        labels.insert(
+            nested_docker::TARGET_LABEL.to_owned(),
+            nested_docker::target_label(target).to_owned(),
+        );
+    }
+    labels
 }
 
 /// Scopes every sandbox-driver Daytona operation may need, paired with
@@ -921,26 +964,14 @@ fn base_params(spec: &SandboxSpec) -> Result<SandboxBaseParams> {
         NetworkPolicy::DomainAllowList { domains } => (None, None, Some(domains.clone())),
         _ => return Err(Error::invalid_spec("network", "unsupported network policy")),
     };
-    let mut labels: HashMap<String, String> = spec
-        .labels
-        .iter()
-        .filter(|(key, _)| !is_internal_label(key))
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
-    labels.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
     if let Some(docker) = &config.docker {
         nested_docker::validate(docker, spec)?;
-        labels.insert(
-            nested_docker::TARGET_LABEL.to_owned(),
-            nested_docker::target_label(docker.target).to_owned(),
-        );
     }
-    if let Some(working_directory) = &spec.working_directory {
-        labels.insert(
-            WORKING_DIRECTORY_LABEL.to_owned(),
-            working_directory.clone(),
-        );
-    }
+    let labels = stored_labels(
+        &spec.labels,
+        spec.working_directory.as_deref(),
+        config.docker.as_ref().map(|docker| docker.target),
+    );
     Ok(SandboxBaseParams {
         name: spec.name.clone(),
         user: spec.user.clone(),
@@ -1037,6 +1068,7 @@ impl SandboxProvider for DaytonaProvider {
         spec.validate()?;
         validate_supported_creation_fields(spec)?;
         let base = base_params(spec)?;
+        let nested_docker = provider_config(&spec.provider_config)?.docker;
         let params = match &spec.source {
             SandboxSource::Image { reference } => {
                 if spec.sandbox_kind == Some(SandboxKind::VirtualMachine) {
@@ -1120,12 +1152,8 @@ impl SandboxProvider for DaytonaProvider {
                         Ok(handle) => handle,
                         Err(error) => return Err(self.cleanup_failed_create(&sdk_id, error).await),
                     };
-                    if let Some(config) = provider_config(&spec.provider_config)?.docker {
-                        let nested = handle
-                            .nested
-                            .as_ref()
-                            .expect("create stores the Docker target label");
-                        if let Err(error) = nested.create(&config, &spec.env).await {
+                    if let (Some(config), Some(nested)) = (&nested_docker, handle.nested.as_ref()) {
+                        if let Err(error) = nested.create(config, &spec.env).await {
                             return Err(self.cleanup_failed_create(&sdk_id, error).await);
                         }
                     }
@@ -1241,15 +1269,34 @@ impl SandboxProvider for DaytonaProvider {
             return Ok(health);
         }
         let mut health = ProviderHealth::new(HealthStatus::Ok);
+        // JWT authentication requires an explicit organization. A successful
+        // authenticated list above verifies access to that namespace.
+        health.identity = self
+            .client
+            .organization_id()
+            .map(|id| format!("organization:{id}"));
         // Scope enumeration works only for API-key credentials; a JWT
         // credential proved itself above and skips it, as does a control
         // plane without key introspection.
-        if let Ok(key) = api_keys_api::get_current_api_key(
-            self.client.api_configuration(),
-            self.client.organization_id(),
-        )
-        .await
+        let config = self.client.api_configuration();
+        let mut request = config
+            .client
+            .get(format!("{}/api-keys/current", config.base_path));
+        if let Some(token) = &config.bearer_access_token {
+            request = request.bearer_auth(token);
+        }
+        if let Some(organization) = self.client.organization_id() {
+            request = request.header("X-Daytona-Organization-ID", organization);
+        }
+        if let Ok(response) = request.send().await
+            && let Ok(response) = response.error_for_status()
+            && let Ok(key) = response.json::<CurrentApiKey>().await
         {
+            // API keys select their organization even when configuration
+            // supplies no organization header. The server's value wins.
+            if let Some(organization) = key.organization_id.filter(|id| !id.is_empty()) {
+                health.identity = Some(format!("organization:{organization}"));
+            }
             health.missing_permissions = REQUIRED_PERMISSIONS
                 .iter()
                 .filter(|(permission, _)| !key.permissions.contains(permission))
@@ -1337,10 +1384,20 @@ impl DaytonaSandbox {
             .filter(|nested| nested.targets_container())
     }
 
-    async fn start_with_docker(&self) -> Result<()> {
-        self.start_inner().await?;
+    /// The nested Docker client holds a preview token scoped to one
+    /// running VM generation, so every verb that ends that generation
+    /// clears it here. Keeping the contract in one place is why `pause`
+    /// and `archive` cannot forget it.
+    async fn vm_generation_ended(&self) {
         if let Some(nested) = &self.nested {
             nested.stopped().await;
+        }
+    }
+
+    async fn start_with_docker(&self) -> Result<()> {
+        self.start_inner().await?;
+        self.vm_generation_ended().await;
+        if let Some(nested) = &self.nested {
             nested.sandbox().await?;
         }
         Ok(())
@@ -1547,10 +1604,16 @@ impl Sandbox for DaytonaSandbox {
         }
         let result = self.exec.run(&ExecSpec::new("env").arg("-0")).await?;
         if !result.success() {
-            return Err(Error::Provider(ProviderError::new(
-                ProviderKind::try_new("daytona").expect("constant provider kind"),
-                "reading VM environment failed",
-            )));
+            return Err(Error::Exec(
+                ExecFailure::new(
+                    "reading VM environment",
+                    result.termination,
+                    result.exit_code,
+                    result.stdout,
+                    result.stderr,
+                )
+                .with_duration(result.duration),
+            ));
         }
         let output = String::from_utf8(result.stdout)
             .map_err(|error| docker_transport::transport_error("decoding VM environment", error))?;
@@ -1607,9 +1670,7 @@ impl Sandbox for DaytonaSandbox {
                 Action::Stop,
                 |_| async {
                     self.stop_inner().await?;
-                    if let Some(nested) = &self.nested {
-                        nested.stopped().await;
-                    }
+                    self.vm_generation_ended().await;
                     Ok(())
                 },
             )
@@ -1624,9 +1685,7 @@ impl Sandbox for DaytonaSandbox {
                 Action::Delete,
                 |_| async {
                     self.delete_inner().await?;
-                    if let Some(nested) = &self.nested {
-                        nested.stopped().await;
-                    }
+                    self.vm_generation_ended().await;
                     Ok(())
                 },
             )
@@ -1646,7 +1705,9 @@ impl Sandbox for DaytonaSandbox {
                     let mut sdk = self.sdk().await?;
                     sdk.archive()
                         .await
-                        .map_err(|error| daytona_error("archiving sandbox", error))
+                        .map_err(|error| daytona_error("archiving sandbox", error))?;
+                    self.vm_generation_ended().await;
+                    Ok(())
                 },
             )
             .await
@@ -1669,7 +1730,9 @@ impl Sandbox for DaytonaSandbox {
                     let mut sdk = self.sdk().await?;
                     sdk.pause_with_timeout(TRANSITION_BUDGET)
                         .await
-                        .map_err(|error| daytona_error("pausing sandbox", error))
+                        .map_err(|error| daytona_error("pausing sandbox", error))?;
+                    self.vm_generation_ended().await;
+                    Ok(())
                 },
             )
             .await
@@ -1910,19 +1973,11 @@ impl Sandbox for DaytonaSandbox {
         err
     )]
     async fn set_labels(&self, labels: &BTreeMap<String, String>) -> Result<()> {
-        let mut all: HashMap<String, String> = labels
-            .iter()
-            .filter(|(key, _)| !is_internal_label(key))
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        all.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
-        all.insert(WORKING_DIRECTORY_LABEL.to_owned(), self.working_dir.clone());
-        if let Some(nested) = &self.nested {
-            all.insert(
-                nested_docker::TARGET_LABEL.to_owned(),
-                nested.target_label().to_owned(),
-            );
-        }
+        let all = stored_labels(
+            labels,
+            Some(&self.working_dir),
+            self.nested.as_ref().map(NestedDocker::target),
+        );
         self.events
             .run(
                 EventSubject::sandbox(Some(self.id.clone())),
@@ -2469,6 +2524,26 @@ mod tests {
     use std::error::Error as _;
 
     use super::*;
+
+    #[test]
+    fn current_key_identity_uses_its_organization_and_ignores_credentials() {
+        let first: CurrentApiKey = serde_json::from_value(serde_json::json!({
+            "name": "original", "value": "masked-original", "userId": "user-a",
+            "organizationId": "organization-a", "permissions": []
+        }))
+        .expect("current key");
+        let rotated: CurrentApiKey = serde_json::from_value(serde_json::json!({
+            "name": "rotated", "value": "masked-rotated", "userId": "user-b",
+            "organizationId": "organization-a", "permissions": []
+        }))
+        .expect("rotated key in the same organization");
+        let changed: CurrentApiKey = serde_json::from_value(serde_json::json!({
+            "name": "other", "organizationId": "organization-b", "permissions": []
+        }))
+        .expect("key in another organization");
+        assert_eq!(first.organization_id, rotated.organization_id);
+        assert_ne!(first.organization_id, changed.organization_id);
+    }
 
     fn api_error(status_code: u16, message: &str) -> DaytonaError {
         DaytonaError::Api {

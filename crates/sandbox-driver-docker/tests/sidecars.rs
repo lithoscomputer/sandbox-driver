@@ -5,7 +5,7 @@
 
 use std::process;
 
-use sandbox_driver::{SandboxProvider, SandboxSource, SandboxSpec};
+use sandbox_driver::{ExecSpec, SandboxProvider, SandboxSource, SandboxSpec};
 use sandbox_driver_docker::DockerProvider;
 
 const TEST_IMAGE: &str = "buildpack-deps:noble";
@@ -73,4 +73,42 @@ async fn a_dead_health_checked_sidecar_fails_create_with_its_log() {
     if let Ok(id) = sandbox_driver::SandboxId::try_new(spec.name.clone().expect("named")) {
         let _ = provider.delete(&id, None).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restarted_services_are_healthy_before_work_resumes() {
+    let Ok(provider) = DockerProvider::connect().await else {
+        return;
+    };
+    let spec = spec_with_sidecar(
+        "restart",
+        &serde_json::json!({
+            "name": "web",
+            "image": SIDECAR_IMAGE,
+            "entrypoint": ["sh", "-c", "sleep 1; while true; do printf 'HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nready\n' | nc -l -p 8080; done"],
+            "health": {"cmd": "wget -q -O- http://127.0.0.1:8080/ready", "interval_ms": 200, "retries": 100},
+        }),
+    );
+    let sandbox = provider.create(&spec, None).await.expect("create");
+    let run = async {
+        sandbox.start().await.expect("already-running start");
+        sandbox.stop().await.expect("stop");
+        let recovered = provider.attach(sandbox.id(), None).await.expect("reattach");
+        recovered
+            .start()
+            .await
+            .expect("restart after services are healthy");
+        recovered
+            .exec()
+            .run(&ExecSpec::new("curl").args(["-fsS", "http://web:8080/ready"]))
+            .await
+            .expect("request ready service")
+    }
+    .await;
+    sandbox.delete().await.expect("delete");
+    assert!(
+        run.success(),
+        "service must answer as soon as start returns: {run:?}"
+    );
+    assert_eq!(run.stdout, b"ready\n");
 }

@@ -29,13 +29,15 @@ use bollard::container::{
     RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use bollard::models::{ContainerStateStatusEnum, EndpointSettings, HealthStatusEnum, HostConfig};
-use bollard::network::CreateNetworkOptions;
+use bollard::network::{CreateNetworkOptions, DisconnectNetworkOptions, InspectNetworkOptions};
 use futures_util::StreamExt;
 use sandbox_driver::{Error, ProviderError, Result};
 use tokio::time;
 
 use crate::config::{Sidecar, to_health_config};
-use crate::exec::{docker_error, docker_kind, is_not_found, tolerate_not_modified};
+use crate::exec::{
+    docker_error, docker_kind, is_not_found, is_not_modified, tolerate_not_modified,
+};
 use crate::{MANAGED_LABEL, image_present, non_empty, pull_image};
 
 /// The label every sidecar carries, naming its network.
@@ -75,7 +77,9 @@ pub(crate) async fn realize(docker: &Docker, network: &str, sidecars: &[Sidecar]
     match start_all(docker, network, sidecars, &labels).await {
         Ok(()) => Ok(()),
         Err(error) => {
-            sweep(docker, network).await;
+            if let Err(cleanup_error) = sweep(docker, network, None).await {
+                tracing::warn!(error = %cleanup_error, "failed sidecar cleanup failed");
+            }
             Err(error)
         }
     }
@@ -220,25 +224,64 @@ fn network_filter(network: &str) -> ListContainersOptions<String> {
     }
 }
 
-/// Removes every sidecar on the network, then the network. Best-effort:
-/// a missing container or network is not an error.
-pub(crate) async fn sweep(docker: &Docker, network: &str) {
-    if let Ok(containers) = docker.list_containers(Some(network_filter(network))).await {
-        for container in containers {
-            if let Some(id) = container.id {
-                let _ = docker
-                    .remove_container(
-                        &id,
-                        Some(RemoveContainerOptions {
-                            force: true,
-                            ..Default::default()
-                        }),
-                    )
-                    .await;
+/// Removes sidecars, disconnects the sandbox when present, then removes
+/// the network. Keep the sandbox until this succeeds: its network mode
+/// supplies the cleanup identity if any operation must be retried.
+pub(crate) async fn sweep(docker: &Docker, network: &str, sandbox: Option<&str>) -> Result<()> {
+    let containers = docker
+        .list_containers(Some(network_filter(network)))
+        .await
+        .map_err(|error| docker_error("listing sidecars", error))?;
+    for container in containers {
+        if let Some(id) = container.id {
+            match docker
+                .remove_container(
+                    &id,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(error) if is_not_found(&error) => {}
+                Err(error) => return Err(docker_error("removing sidecar", error)),
             }
         }
     }
-    let _ = docker.remove_network(network).await;
+    if let Some(sandbox) = sandbox {
+        let inspected = match docker
+            .inspect_network(network, None::<InspectNetworkOptions<String>>)
+            .await
+        {
+            Ok(inspected) => inspected,
+            Err(error) if is_not_found(&error) => return Ok(()),
+            Err(error) => return Err(docker_error("inspecting sidecar network", error)),
+        };
+        if inspected
+            .containers
+            .as_ref()
+            .is_some_and(|containers| containers.contains_key(sandbox))
+        {
+            match docker
+                .disconnect_network(network, DisconnectNetworkOptions {
+                    container: sandbox,
+                    force:     true,
+                })
+                .await
+            {
+                Ok(()) => {}
+                Err(error) if is_not_found(&error) => {}
+                Err(error) => return Err(docker_error("disconnecting sandbox network", error)),
+            }
+        }
+    }
+    match docker.remove_network(network).await {
+        Ok(()) => Ok(()),
+        Err(error) if is_not_found(&error) => Ok(()),
+        Err(error) => Err(docker_error("removing sidecar network", error)),
+    }
 }
 
 /// Stops or starts every sidecar on the network, alongside the main
@@ -248,24 +291,43 @@ pub(crate) async fn set_running(docker: &Docker, network: &str, running: bool) -
         .list_containers(Some(network_filter(network)))
         .await
         .map_err(|error| docker_error("listing sidecars", error))?;
-    for container in containers {
-        let Some(id) = container.id else { continue };
+    for container in &containers {
+        let Some(id) = &container.id else { continue };
         if running {
             match docker
-                .start_container(&id, None::<StartContainerOptions<String>>)
+                .start_container(id, None::<StartContainerOptions<String>>)
                 .await
             {
                 Ok(()) => {}
-                Err(error) if is_not_found(&error) => {}
+                Err(error) if is_not_modified(&error) => {}
                 Err(error) => return Err(docker_error("starting sidecar", error)),
             }
         } else {
             tolerate_not_modified(
                 docker
-                    .stop_container(&id, Some(StopContainerOptions { t: 1 }))
+                    .stop_container(id, Some(StopContainerOptions { t: 1 }))
                     .await,
                 "stopping sidecar",
             )?;
+        }
+    }
+    // Start every service before waiting: a health check may depend on
+    // another service on the same network.
+    if running {
+        for container in containers {
+            let Some(id) = container.id else { continue };
+            let inspect = docker
+                .inspect_container(&id, None)
+                .await
+                .map_err(|error| docker_error("inspecting sidecar health", error))?;
+            if inspect
+                .state
+                .as_ref()
+                .and_then(|state| state.health.as_ref())
+                .is_some()
+            {
+                await_health(docker, &id).await?;
+            }
         }
     }
     Ok(())

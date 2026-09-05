@@ -8,12 +8,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{io, process};
 
-use sandbox_driver::{Error, ResourceKind, Result, SandboxId, SandboxState, WorkspaceOwnership};
+use sandbox_driver::{
+    Error, ResourceKind, Result, SandboxId, SandboxState, SandboxStatus, WorkspaceOwnership,
+};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Record {
     pub(crate) version:    u32,
     pub(crate) id:         SandboxId,
@@ -24,6 +26,21 @@ pub(crate) struct Record {
     pub(crate) labels:     BTreeMap<String, String>,
     pub(crate) state:      SandboxState,
     pub(crate) created_at: SystemTime,
+}
+
+impl Record {
+    /// The reported view of a record. `state` is the live value when a
+    /// handle exists and the stored one when only the record does, so
+    /// `describe` and `list` report a sandbox identically.
+    pub(crate) fn status(&self, state: SandboxState) -> SandboxStatus {
+        let mut status = SandboxStatus::new(self.id.clone(), state);
+        status.name.clone_from(&self.name);
+        status.provider_state = format!("{state:?}").to_lowercase();
+        status.labels.clone_from(&self.labels);
+        status.workspace_ownership = Some(self.ownership);
+        status.created_at = Some(self.created_at);
+        status
+    }
 }
 
 pub(crate) fn fresh_id() -> String {

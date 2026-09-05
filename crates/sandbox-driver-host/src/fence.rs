@@ -203,64 +203,7 @@ impl ProcessGroups {
 
     async fn drain(&self, state: &mut GroupState) -> Result<()> {
         let deadline = time::Instant::now() + DRAIN;
-        // Mark all generations before observing any group. A concurrent old
-        // sentinel must either publish in time or see the marker before spawn.
-        let mut pgids = Vec::new();
-        let mut generation_paths = Vec::new();
-        let mut directories = match fs::read_dir(&self.root).await {
-            Ok(entries) => Some(entries),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(Error::io("reading process generations", e)),
-        };
-        if let Some(entries) = &mut directories {
-            while let Some(entry) = entries
-                .next_entry()
-                .await
-                .map_err(|e| Error::io("reading process generation", e))?
-            {
-                if !entry
-                    .file_type()
-                    .await
-                    .map_err(|e| Error::io("reading generation type", e))?
-                    .is_dir()
-                {
-                    continue;
-                }
-                let directory = entry.path();
-                fs::write(directory.join(FENCED), b"")
-                    .await
-                    .map_err(|e| Error::io("writing process fence", e))?;
-                generation_paths.push(directory.clone());
-                let mut records = fs::read_dir(&directory)
-                    .await
-                    .map_err(|e| Error::io("reading group records", e))?;
-                while let Some(record) = records
-                    .next_entry()
-                    .await
-                    .map_err(|e| Error::io("reading group record", e))?
-                {
-                    let path = record.path();
-                    if path.extension().is_none_or(|ext| ext != "group") {
-                        continue;
-                    }
-                    let text = fs::read_to_string(&path)
-                        .await
-                        .map_err(|e| Error::io("reading saved process group", e))?;
-                    let pgid = text
-                        .trim()
-                        .parse::<i32>()
-                        .ok()
-                        .filter(|id| *id > 0)
-                        .ok_or_else(|| {
-                            Error::io(
-                                "invalid saved process group",
-                                io::Error::other("expected a positive process-group id"),
-                            )
-                        })?;
-                    pgids.push(pgid);
-                }
-            }
-        }
+        let (generation_paths, mut pgids) = fence_saved_generations(&self.root).await?;
         if let Some(generation) = &mut state.generation {
             // Kill every owned group before waiting for any. Persisted ids are
             // never used here: each handle still owns its unreaped sentinel.
@@ -327,6 +270,75 @@ impl ProcessGroups {
             time::sleep(POLL).await;
         }
     }
+}
+
+/// Marks every saved generation fenced and returns their directories with
+/// the process-group ids they recorded. Marking precedes any observation, so
+/// a concurrent old sentinel either publishes in time or sees the marker
+/// before it spawns.
+async fn fence_saved_generations(root: &Path) -> Result<(Vec<PathBuf>, Vec<i32>)> {
+    let mut entries = match fs::read_dir(root).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
+        Err(e) => return Err(Error::io("reading process generations", e)),
+    };
+    let mut directories = Vec::new();
+    let mut pgids = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| Error::io("reading process generation", e))?
+    {
+        if !entry
+            .file_type()
+            .await
+            .map_err(|e| Error::io("reading generation type", e))?
+            .is_dir()
+        {
+            continue;
+        }
+        let directory = entry.path();
+        fs::write(directory.join(FENCED), b"")
+            .await
+            .map_err(|e| Error::io("writing process fence", e))?;
+        pgids.extend(saved_pgids(&directory).await?);
+        directories.push(directory);
+    }
+    Ok((directories, pgids))
+}
+
+/// The process-group ids one generation directory recorded.
+async fn saved_pgids(directory: &Path) -> Result<Vec<i32>> {
+    let mut records = fs::read_dir(directory)
+        .await
+        .map_err(|e| Error::io("reading group records", e))?;
+    let mut pgids = Vec::new();
+    while let Some(record) = records
+        .next_entry()
+        .await
+        .map_err(|e| Error::io("reading group record", e))?
+    {
+        let path = record.path();
+        if path.extension().is_none_or(|ext| ext != "group") {
+            continue;
+        }
+        let text = fs::read_to_string(&path)
+            .await
+            .map_err(|e| Error::io("reading saved process group", e))?;
+        let pgid = text
+            .trim()
+            .parse::<i32>()
+            .ok()
+            .filter(|id| *id > 0)
+            .ok_or_else(|| {
+                Error::io(
+                    "invalid saved process group",
+                    io::Error::other("expected a positive process-group id"),
+                )
+            })?;
+        pgids.push(pgid);
+    }
+    Ok(pgids)
 }
 
 impl Drop for ProcessGroups {

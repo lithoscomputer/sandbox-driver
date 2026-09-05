@@ -62,9 +62,10 @@ use bollard::container::{
 };
 use bollard::image::CreateImageOptions;
 use bollard::models::{
-    ContainerInspectResponse, ContainerStateStatusEnum, HostConfig, Mount, MountPointTypeEnum,
-    MountTypeEnum,
+    ContainerInspectResponse, ContainerStateStatusEnum, EndpointSettings, HostConfig, Mount,
+    MountPointTypeEnum, MountTypeEnum,
 };
+use bollard::network::{ConnectNetworkOptions, DisconnectNetworkOptions};
 use futures_util::StreamExt;
 use sandbox_driver::{
     Action, BASH_ENV_VAR, Capabilities, Error, EventContext, EventEmitter, EventSubject, Exec,
@@ -88,6 +89,7 @@ use crate::one_shot::DockerOneShot;
 use crate::pty::DockerPty;
 
 pub(crate) const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
+const SIDECAR_NETWORK_LABEL: &str = "sh.sandbox-driver.sidecar-network";
 const DEFAULT_WORKING_DIRECTORY: &str = "/workspace";
 const RUNTIME_DIRECTORY_PARENT: &str = "/tmp/sandbox-driver";
 pub(crate) const RUNTIME_DIRECTORY: &str = "/tmp/sandbox-driver/runtime";
@@ -402,15 +404,22 @@ fn is_managed(inspect: &ContainerInspectResponse) -> bool {
 }
 
 /// The managed sidecar network an inspected container joined, if any: a
-/// user-defined network named after the sandbox, recovered from the
-/// container's network mode so a rebuilt handle or a delete by id sweeps
-/// the sidecars too.
+/// user-defined network named after the sandbox. New containers record it
+/// before creating dependencies; older containers used their network mode.
 fn sidecar_network_of(inspect: &ContainerInspectResponse) -> Option<String> {
     inspect
-        .host_config
+        .config
         .as_ref()
-        .and_then(|host| host.network_mode.clone())
-        .filter(|mode| is_sidecar_network(mode))
+        .and_then(|config| config.labels.as_ref())
+        .and_then(|labels| labels.get(SIDECAR_NETWORK_LABEL))
+        .cloned()
+        .or_else(|| {
+            inspect
+                .host_config
+                .as_ref()
+                .and_then(|host| host.network_mode.clone())
+                .filter(|mode| is_sidecar_network(mode))
+        })
 }
 
 /// Where an inspected container's workspace lives: the volume or bind
@@ -439,7 +448,7 @@ fn workspace_of(inspect: &ContainerInspectResponse, working_dir: &str) -> Option
 
 /// Labels the provider writes for itself, never reported as the caller's.
 fn is_internal_label(key: &str) -> bool {
-    key == MANAGED_LABEL || key == one_shot::ONE_SHOT_LABEL
+    key == MANAGED_LABEL || key == one_shot::ONE_SHOT_LABEL || key == SIDECAR_NETWORK_LABEL
 }
 
 /// Whether a container's network mode names a managed sidecar network
@@ -591,12 +600,6 @@ impl SandboxProvider for DockerProvider {
                     )
                     .await?;
 
-                    // Sidecars come up healthy before the main container, so
-                    // a workload never races a service that is not ready.
-                    if let Some(network) = &sidecar_network {
-                        sidecars::realize(&self.docker, network, &config_options.sidecars).await?;
-                    }
-
                     let working_dir = spec
                         .working_directory
                         .clone()
@@ -607,9 +610,11 @@ impl SandboxProvider for DockerProvider {
                         .map(|(key, value)| (key.clone(), value.clone()))
                         .collect();
                     labels.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
+                    if let Some(network) = &sidecar_network {
+                        labels.insert(SIDECAR_NETWORK_LABEL.to_owned(), network.clone());
+                    }
 
-                    // The image and sidecars are up; the rest of the
-                    // options belong to the main container.
+                    // The primary image is ready; map its container options.
                     let DockerProviderConfig {
                         init,
                         privileged,
@@ -619,7 +624,15 @@ impl SandboxProvider for DockerProvider {
                         cap_add,
                         ..
                     } = config_options;
-                    let network_mode = sidecar_network.clone().or(base_network);
+                    // The labeled primary must exist before any dependent
+                    // resource. Keep it stopped and isolated while preparing
+                    // its network; the label records cleanup identity even
+                    // before the container joins that network.
+                    let network_mode = if sidecar_network.is_some() {
+                        Some("none".to_owned())
+                    } else {
+                        base_network
+                    };
                     // The workspace is the sandbox's own volume, unless the
                     // caller bound a host directory there.
                     let workspace_bound = binds.iter().any(|bind| {
@@ -698,10 +711,17 @@ impl SandboxProvider for DockerProvider {
                                 platform: config_options.platform.clone(),
                             }
                         });
-                    // From here a failure must sweep the sidecars it started.
+                    // A failure cleans dependencies before the primary so
+                    // unsuccessful cleanup remains discoverable by label.
                     let cleanup_network = &sidecar_network;
                     let sweep_on_error = |error: Error, container: Option<String>| async move {
                         if let Some(container) = container {
+                            if let Some(network) = cleanup_network {
+                                if let Err(cleanup_error) = sidecars::sweep(&self.docker, network, Some(&container)).await {
+                                    tracing::warn!(error = %cleanup_error, "failed sandbox sidecar cleanup failed; primary retained for retry");
+                                    return error;
+                                }
+                            }
                             if let Err(cleanup_error) = self.docker.remove_container(
                                 &container,
                                 Some(RemoveContainerOptions {
@@ -718,9 +738,6 @@ impl SandboxProvider for DockerProvider {
                                     );
                                 }
                             }
-                        }
-                        if let Some(network) = cleanup_network {
-                            sidecars::sweep(&self.docker, network).await;
                         }
                         error
                     };
@@ -746,6 +763,20 @@ impl SandboxProvider for DockerProvider {
                         ).await),
                     };
                     reporter.set_subject(EventSubject::sandbox(Some(event_id)));
+                    if let Some(network) = &sidecar_network {
+                        let prepare = async {
+                            sidecars::realize(&self.docker, network, &config_options.sidecars).await?;
+                            self.docker.disconnect_network("none", DisconnectNetworkOptions {
+                                container: created.id.as_str(), force: true,
+                            }).await.map_err(|error| docker_error("disconnecting initial sandbox network", error))?;
+                            self.docker.connect_network(network, ConnectNetworkOptions {
+                                container: created.id.as_str(), endpoint_config: EndpointSettings::default(),
+                            }).await.map_err(|error| docker_error("connecting sandbox to services", error))
+                        }.await;
+                        if let Err(error) = prepare {
+                            return Err(sweep_on_error(error, Some(created.id.clone())).await);
+                        }
+                    }
                     if let Err(error) = self
                         .docker
                         .start_container(&created.id, None::<StartContainerOptions<String>>)
@@ -878,13 +909,16 @@ impl SandboxProvider for DockerProvider {
                     let container_id = inspect.id.clone().unwrap_or_else(|| id.as_str().to_owned());
                     // One-shot containers hold the workspace volume too, so
                     // they go first and the volume goes with its last user.
-                    one_shot::sweep(&self.docker, &container_id).await;
+                    one_shot::sweep(&self.docker, &container_id).await?;
+                    if let Some(network) = &network {
+                        sidecars::sweep(&self.docker, network, Some(&container_id)).await?;
+                    }
                     let options = RemoveContainerOptions {
                         force: true,
                         v: true,
                         ..Default::default()
                     };
-                    let removed = match self
+                    match self
                         .docker
                         .remove_container(&container_id, Some(options))
                         .await
@@ -892,11 +926,7 @@ impl SandboxProvider for DockerProvider {
                         Ok(()) => Ok(()),
                         Err(error) if is_not_found(&error) => Ok(()),
                         Err(error) => Err(docker_error("removing container", error)),
-                    };
-                    if let Some(network) = &network {
-                        sidecars::sweep(&self.docker, network).await;
                     }
-                    removed
                 },
             )
             .await
@@ -1071,14 +1101,30 @@ impl Sandbox for DockerSandbox {
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Start,
                 |_| async {
-                    if let Some(network) = &self.network {
-                        sidecars::set_running(&self.docker, network, true).await?;
-                    }
                     let inspect = self
                         .docker
                         .inspect_container(self.id.as_str(), None::<InspectContainerOptions>)
                         .await
                         .map_err(|error| docker_error("inspecting container", error))?;
+                    if let Some(network) = &self.network {
+                        // A crash during create leaves the primary labeled
+                        // and stopped, but not connected until every service
+                        // is ready. Do not expose that incomplete allocation
+                        // as a working sandbox on recovery.
+                        let pending_connection = inspect.config.as_ref()
+                            .and_then(|config| config.labels.as_ref())
+                            .is_some_and(|labels| labels.contains_key(SIDECAR_NETWORK_LABEL))
+                            && !inspect.network_settings.as_ref()
+                                .and_then(|settings| settings.networks.as_ref())
+                                .is_some_and(|networks| networks.contains_key(network));
+                        if pending_connection {
+                            return Err(Error::Provider(ProviderError::new(
+                                docker_kind(),
+                                "sandbox creation did not finish connecting its services; delete the incomplete sandbox",
+                            )));
+                        }
+                        sidecars::set_running(&self.docker, network, true).await?;
+                    }
                     if inspect.state.as_ref().and_then(|state| state.paused) == Some(true) {
                         return self
                             .docker
@@ -1091,7 +1137,7 @@ impl Sandbox for DockerSandbox {
                     // resources before restarting it. Starting an already
                     // running sandbox must preserve its active one-shots.
                     if inspect.state.as_ref().and_then(|state| state.running) != Some(true) {
-                        one_shot::sweep(&self.docker, self.id.as_str()).await;
+                        one_shot::sweep(&self.docker, self.id.as_str()).await?;
                     }
                     // Already-running (304) is success; a vanished container is
                     // not — start's postcondition is a running sandbox, so 404
@@ -1129,7 +1175,7 @@ impl Sandbox for DockerSandbox {
                 |_| async {
                     // Whatever a one-shot was doing in the workspace ends
                     // with the sandbox's own processes.
-                    one_shot::sweep(&self.docker, self.id.as_str()).await;
+                    one_shot::sweep(&self.docker, self.id.as_str()).await?;
                     tolerate_not_modified(
                         self.docker
                             .stop_container(self.id.as_str(), Some(StopContainerOptions { t: 1 }))
@@ -1157,8 +1203,11 @@ impl Sandbox for DockerSandbox {
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Delete,
                 |_| async {
-                    one_shot::sweep(&self.docker, self.id.as_str()).await;
-                    let removed = match self
+                    one_shot::sweep(&self.docker, self.id.as_str()).await?;
+                    if let Some(network) = &self.network {
+                        sidecars::sweep(&self.docker, network, Some(self.id.as_str())).await?;
+                    }
+                    match self
                         .docker
                         .remove_container(self.id.as_str(), Some(options))
                         .await
@@ -1166,11 +1215,7 @@ impl Sandbox for DockerSandbox {
                         Ok(()) => Ok(()),
                         Err(error) if is_not_found(&error) => Ok(()),
                         Err(error) => Err(docker_error("removing container", error)),
-                    };
-                    if let Some(network) = &self.network {
-                        sidecars::sweep(&self.docker, network).await;
                     }
-                    removed
                 },
             )
             .await

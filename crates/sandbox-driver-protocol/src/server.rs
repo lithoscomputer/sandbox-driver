@@ -567,7 +567,15 @@ struct ExecRegistration<'a> {
 }
 
 impl<'a> ExecRegistration<'a> {
-    fn new(state: &'a ServerState, id: &'a str) -> Self {
+    /// Registers the stop tokens and only then opens the exec's data
+    /// channel. Acquiring a channel for a streaming exec *is* registering
+    /// it, so the ordering the client relies on cannot be inverted at a
+    /// call site, and `Drop` covers a failed channel by construction.
+    async fn open(
+        state: &'a ServerState,
+        id: &'a str,
+        request: &ChannelRequest,
+    ) -> Result<(Self, Channel)> {
         let term = CancellationToken::new();
         let kill = state.exec_shutdown.child_token();
         state
@@ -575,12 +583,14 @@ impl<'a> ExecRegistration<'a> {
             .lock()
             .expect("execs lock")
             .insert(id.to_owned(), (term.clone(), kill.clone()));
-        Self {
+        let registration = Self {
             state,
             id,
             term,
             kill,
-        }
+        };
+        let channel = state.open_channel(request).await?;
+        Ok((registration, channel))
     }
 }
 
@@ -880,8 +890,8 @@ async fn dispatch(
             let request: m::ExecStreamParams = parse(params)?;
             let handle = state.sandbox(&request.sandbox_id).await?;
             let mut spec = request.spec.into_spec();
-            let registration = ExecRegistration::new(state, &request.exec_id);
-            let mut channel = state.open_channel(&request.channel).await?;
+            let (registration, mut channel) =
+                ExecRegistration::open(state, &request.exec_id, &request.channel).await?;
             // A provider without streamed stdin takes the input as the
             // spec's fixed bytes, so the host's stream still reaches the
             // command; one without any stdin then rejects it honestly.
@@ -904,8 +914,8 @@ async fn dispatch(
             let one_shot = handle
                 .one_shot()
                 .ok_or_else(|| Error::unsupported(Capability::OneShot))?;
-            let registration = ExecRegistration::new(state, &request.exec_id);
-            let channel = state.open_channel(&request.channel).await?;
+            let (registration, channel) =
+                ExecRegistration::open(state, &request.exec_id, &request.channel).await?;
             let spec = request.spec;
             let streaming =
                 stream_through_channel(registration, channel, false, |controls| async move {

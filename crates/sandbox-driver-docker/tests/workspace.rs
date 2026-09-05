@@ -19,7 +19,6 @@ use bollard::container::{
     Config, CreateContainerOptions, InspectContainerOptions, KillContainerOptions,
     ListContainersOptions, StartContainerOptions,
 };
-use bollard::errors::Error as DockerError;
 use sandbox_driver::{
     Error, ExecControls, ExecSpec, OneShotSpec, OutputStream, SandboxFilter, SandboxProvider,
     SandboxSource, SandboxSpec, Termination,
@@ -69,25 +68,19 @@ async fn restarting_a_stopped_sandbox_sweeps_old_one_shots_but_live_start_preser
             )
             .await?;
         sandbox.start().await?;
-        let removed = docker
-            .inspect_container(&lingering.id, None::<InspectContainerOptions>)
-            .await;
-        Ok::<_, Box<dyn StdError>>((live, removed))
+        let swept = !one_shot_containers(sandbox.id().as_str())
+            .await
+            .contains(&lingering.id);
+        Ok::<_, Box<dyn StdError>>((live, swept))
     }
     .await;
     sandbox
         .delete()
         .await
         .expect("delete sandbox and one-shots after any error");
-    let (live, removed) = result.expect("restart through the provider");
+    let (live, swept) = result.expect("restart through the provider");
     assert_eq!(live.state.and_then(|state| state.running), Some(true));
-    assert!(matches!(
-        removed,
-        Err(DockerError::DockerResponseServerError {
-            status_code: 404,
-            ..
-        })
-    ));
+    assert!(swept, "restarting a stopped sandbox left an old one-shot");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -8,10 +8,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sandbox_driver::{
-    Capabilities, Capability, DirEntry, Error, Exec, ExecControls, ExecResult, ExecSpec,
-    ExecStreamingResult, FileMetadata, Filesystem, OneShot, OneShotSpec, PreviewUrls,
-    ProviderError, ProviderKind, Pty, PtyOptions, PtySession, Result, Sandbox, SandboxId,
-    SandboxProvider, SandboxSource, SandboxSpec, SpawnSpec, StdioProcess,
+    Capabilities, Capability, DirEntry, Error, Exec, ExecControls, ExecFailure, ExecResult,
+    ExecSpec, ExecStreamingResult, FileMetadata, Filesystem, OneShot, OneShotSpec, PreviewUrls,
+    Pty, PtyOptions, PtySession, Result, Sandbox, SandboxId, SandboxProvider, SandboxSource,
+    SandboxSpec, SpawnSpec, StdioProcess,
 };
 use sandbox_driver_daytona_config::{DockerExecutionTarget, NestedDockerConfig};
 use sandbox_driver_docker::{BindMount, DockerProvider, docker_capabilities};
@@ -54,8 +54,8 @@ impl NestedDocker {
         self.target == DockerExecutionTarget::Container
     }
 
-    pub(super) fn target_label(&self) -> &'static str {
-        target_label(self.target)
+    pub(super) fn target(&self) -> DockerExecutionTarget {
+        self.target
     }
 
     pub(super) fn capabilities(&self, caps: &mut Capabilities) {
@@ -101,13 +101,16 @@ impl NestedDocker {
                 .env_var("DOCKER_CERT_PATH", "");
             let result = self.vm_exec.run(&spec).await?;
             if !result.success() {
-                return Err(Error::Provider(ProviderError::new(
-                    ProviderKind::try_new("daytona").expect("constant provider kind"),
-                    format!(
-                        "nested Docker bootstrap failed running {} (exit {:?})",
-                        spec.program, result.exit_code
-                    ),
-                )));
+                return Err(Error::Exec(
+                    ExecFailure::new(
+                        format!("nested Docker bootstrap: {}", spec.program),
+                        result.termination,
+                        result.exit_code,
+                        result.stdout,
+                        result.stderr,
+                    )
+                    .with_duration(result.duration),
+                ));
             }
         }
         let preview = self.access.preview_url(DOCKER_PORT).await?;
@@ -163,6 +166,9 @@ impl NestedDocker {
     }
 }
 
+/// The stored Daytona label. It must stay the configuration enum's own
+/// serde encoding, so a label and a `provider_config` value can never
+/// disagree; the tests below pin the two together.
 pub(super) fn target_label(target: DockerExecutionTarget) -> &'static str {
     match target {
         DockerExecutionTarget::Container => "container",
@@ -327,6 +333,22 @@ impl Filesystem for NestedDocker {
 mod tests {
     use super::*;
     use crate::{DaytonaConfig, DaytonaProvider, daytona_capabilities};
+
+    #[test]
+    fn stored_labels_are_the_configuration_encoding_and_round_trip() {
+        for target in [
+            DockerExecutionTarget::Container,
+            DockerExecutionTarget::VirtualMachine,
+        ] {
+            let label = target_label(target);
+            assert_eq!(
+                serde_json::to_value(target).expect("plain enum"),
+                serde_json::Value::String(label.to_owned()),
+                "the Daytona label and provider_config encodings disagree"
+            );
+            assert_eq!(parse_target(label).expect("own label"), target);
+        }
+    }
 
     #[tokio::test]
     async fn previews_are_only_available_for_the_vm_execution_target() {
