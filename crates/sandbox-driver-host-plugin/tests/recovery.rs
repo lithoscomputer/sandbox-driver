@@ -62,7 +62,13 @@ async fn a_plugin_crash_preserves_identity_and_stop_fences_surviving_work() {
     let (provider, mut child) = connect(&root).await;
     let sandbox = provider
         .create(
-            &SandboxSpec::new(SandboxSource::HostDirectory).label("run", "recovery"),
+            &{
+                let mut spec = SandboxSpec::new(SandboxSource::HostDirectory)
+                    .label("run", "recovery")
+                    .working_directory(root.join("named-workspace").to_string_lossy());
+                spec.workspace_ownership = Some(sandbox_driver::WorkspaceOwnership::Managed);
+                spec
+            },
             None,
         )
         .await

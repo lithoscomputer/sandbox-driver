@@ -135,34 +135,36 @@ pub struct EventRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SandboxSpecDto {
     #[serde(default)]
-    pub name:              Option<String>,
-    pub source:            SandboxSourceDto,
+    pub name:                Option<String>,
+    pub source:              SandboxSourceDto,
     #[serde(default)]
-    pub resources:         Resources,
+    pub resources:           Resources,
     #[serde(default)]
-    pub sandbox_kind:      Option<SandboxKind>,
+    pub sandbox_kind:        Option<SandboxKind>,
     #[serde(default)]
-    pub env:               BTreeMap<String, String>,
+    pub env:                 BTreeMap<String, String>,
     #[serde(default)]
-    pub labels:            BTreeMap<String, String>,
+    pub labels:              BTreeMap<String, String>,
     #[serde(default)]
-    pub user:              Option<String>,
+    pub user:                Option<String>,
     #[serde(default)]
-    pub working_directory: Option<String>,
+    pub working_directory:   Option<String>,
     #[serde(default)]
-    pub network:           NetworkPolicy,
+    pub workspace_ownership: Option<sandbox_driver::WorkspaceOwnership>,
     #[serde(default)]
-    pub volumes:           Vec<VolumeMount>,
+    pub network:             NetworkPolicy,
     #[serde(default)]
-    pub timers:            LifecycleTimers,
+    pub volumes:             Vec<VolumeMount>,
     #[serde(default)]
-    pub ephemeral:         bool,
+    pub timers:              LifecycleTimers,
     #[serde(default)]
-    pub public:            Option<bool>,
+    pub ephemeral:           bool,
     #[serde(default)]
-    pub region:            Option<String>,
+    pub public:              Option<bool>,
     #[serde(default)]
-    pub provider_config:   serde_json::Value,
+    pub region:              Option<String>,
+    #[serde(default)]
+    pub provider_config:     serde_json::Value,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -200,6 +202,7 @@ impl TryFrom<&SandboxSpec> for SandboxSpecDto {
             labels: spec.labels.clone(),
             user: spec.user.clone(),
             working_directory: spec.working_directory.clone(),
+            workspace_ownership: spec.workspace_ownership,
             network: spec.network.clone(),
             volumes: spec.volumes.clone(),
             timers: spec.timers,
@@ -233,6 +236,7 @@ impl TryFrom<SandboxSpecDto> for SandboxSpec {
         result.labels = spec.labels;
         result.user = spec.user;
         result.working_directory = spec.working_directory;
+        result.workspace_ownership = spec.workspace_ownership;
         result.network = spec.network;
         result.volumes = spec.volumes;
         result.timers = spec.timers;
