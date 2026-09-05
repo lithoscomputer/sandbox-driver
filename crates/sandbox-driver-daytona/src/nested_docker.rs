@@ -4,11 +4,11 @@
 //! connection is created; the sandbox lifecycle owns all nested resources.
 
 use std::collections::BTreeMap;
-use std::future;
 use std::path::Path;
 use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::{future, io};
 
 use async_trait::async_trait;
 use sandbox_driver::{
@@ -40,6 +40,17 @@ const MANAGED_LABEL: &str = "sh.sandbox-driver.managed=true";
 const START_TIMEOUT: Duration = Duration::from_secs(120);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(300);
 const DRAIN_GRACE: Duration = Duration::from_secs(10);
+const CLEAN_STALE_PREPARATION: &str = r"
+import os, re, shutil, sys
+try:
+    entries = os.scandir(sys.argv[1])
+except FileNotFoundError:
+    sys.exit(0)
+with entries:
+    for entry in entries:
+        if re.fullmatch('(pull|build)-[0-9a-f]{16}', entry.name) and entry.is_dir(follow_symlinks=False):
+            shutil.rmtree(entry.path)
+";
 
 /// Shared native Daytona facets and Docker command construction. Environment
 /// hygiene applies to the CLI itself; user environment belongs inside Docker.
@@ -233,7 +244,14 @@ impl DockerCli {
     async fn await_health(&self, container: &str) -> Result<()> {
         let deadline = Instant::now() + HEALTH_TIMEOUT;
         loop {
-            let inspect = self.inspect(container).await?;
+            let inspect = time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                self.inspect(container),
+            )
+            .await
+            .map_err(|_| {
+                Error::invalid_spec("sidecar", format!("{container} health check timed out"))
+            })??;
             let state = &inspect["State"];
             let Some(health) = state["Health"]["Status"].as_str() else {
                 return Ok(());
@@ -341,6 +359,23 @@ impl NestedDocker {
         self.cli.run_spec(&spec).await.map(|_| ())
     }
 
+    async fn clean_stale_preparation(&self) -> Result<()> {
+        let spec = ExecSpec::new("python3")
+            .args(["-c", CLEAN_STALE_PREPARATION, RUNTIME_DIRECTORY])
+            .timeout(DRAIN_GRACE);
+        // Only a new generation sweeps. A ready handle can have active image
+        // preparation whose credentials and context still belong to its task.
+        time::timeout(DRAIN_GRACE * 2, self.cli.run_spec(&spec))
+            .await
+            .map_err(|_| {
+                Error::io(
+                    "recovering nested preparation",
+                    io::Error::other("cleanup timed out"),
+                )
+            })??;
+        Ok(())
+    }
+
     pub(super) async fn create(
         &self,
         config: &NestedDockerConfig,
@@ -351,6 +386,7 @@ impl NestedDocker {
         }
         let mut ready = self.ready.lock().await;
         self.bootstrap().await?;
+        self.clean_stale_preparation().await?;
         if config.options.auto_pull {
             self.cli
                 .pull(
@@ -413,6 +449,7 @@ impl NestedDocker {
             return Ok(());
         }
         self.bootstrap().await?;
+        self.clean_stale_preparation().await?;
         if !self.targets_container() {
             for action in self.cli.ids(ONE_SHOT_LABEL).await? {
                 self.cli.remove(&action).await?;
@@ -1141,6 +1178,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generation_recovery_sweeps_stale_preparation_but_preserves_active_work() {
+        use std::process::Command;
+        use std::{env, fs};
+
+        let dir = env::temp_dir().join(format!("nested-recovery-{:032x}", rand::random::<u128>()));
+        fs::create_dir(&dir).expect("private test runtime");
+        let stale = dir.join("pull-0123456789abcdef");
+        let active = dir.join("build-fedcba9876543210");
+        let unrelated = dir.join("pull-user-data");
+        fs::create_dir(&stale).expect("stale credential directory");
+        fs::create_dir(&unrelated).expect("unrelated directory");
+        let runtime = dir.clone();
+        let mut nested = fake_nested(move |spec| {
+            if spec.program == "python3" {
+                assert_eq!(spec.timeout, Some(DRAIN_GRACE));
+                let output = Command::new("python3")
+                    .args(["-c", CLEAN_STALE_PREPARATION])
+                    .arg(&runtime)
+                    .output()
+                    .expect("recovery cleanup command");
+                assert!(output.status.success(), "{:?}", output.stderr);
+            }
+            response(0, Vec::new())
+        })
+        .await;
+        nested.target = DockerExecutionTarget::VirtualMachine;
+        time::timeout(Duration::from_secs(10), async {
+            nested.ensure_ready().await.expect("first generation ready");
+            assert!(!stale.exists(), "old credentials are removed before reuse");
+            assert!(unrelated.exists(), "only private generated names are swept");
+            fs::create_dir(&active).expect("active preparation");
+            nested.ensure_ready().await.expect("already ready");
+            assert!(active.exists(), "ready handles preserve active preparation");
+            nested.stopped().await;
+            nested
+                .ensure_ready()
+                .await
+                .expect("restarted generation ready");
+            assert!(!active.exists(), "restart treats old preparation as stale");
+            assert!(unrelated.exists());
+        })
+        .await
+        .expect("bounded recovery");
+        fs::remove_dir_all(dir).expect("remove test runtime");
+    }
+
+    #[tokio::test]
     async fn failed_sidecar_creation_leaves_a_labeled_primary_for_outer_cleanup() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let primary = Arc::new(AtomicBool::new(false));
@@ -1251,5 +1335,78 @@ mod tests {
         };
         nested.create(&config, &BTreeMap::new()).await.unwrap();
         assert!(!*nested.ready.lock().await);
+    }
+
+    #[tokio::test]
+    async fn dropping_an_action_joins_a_late_create_before_removing_it() {
+        use tokio::sync::Notify;
+
+        struct DelayedCreate {
+            creating: Notify,
+            finish:   Notify,
+            removed:  Notify,
+        }
+
+        #[async_trait]
+        impl Exec for DelayedCreate {
+            async fn run(&self, spec: &ExecSpec) -> Result<ExecResult> {
+                match spec.args.first().map(String::as_str) {
+                    Some("image") => {}
+                    Some("create") => {
+                        self.creating.notify_one();
+                        self.finish.notified().await;
+                    }
+                    Some("rm") => self.removed.notify_one(),
+                    _ => panic!("a dropped action must never start: {}", spec.program),
+                }
+                Ok(response(0, Vec::new()))
+            }
+
+            async fn run_streaming(
+                &self,
+                spec: &ExecSpec,
+                _: ExecControls,
+            ) -> Result<ExecStreamingResult> {
+                self.run(spec).await.map(ExecStreamingResult::new)
+            }
+        }
+
+        let native = fake_nested(|_| unreachable!()).await;
+        let exec = Arc::new(DelayedCreate {
+            creating: Notify::new(),
+            finish:   Notify::new(),
+            removed:  Notify::new(),
+        });
+        let nested = NestedDocker::from_cli(
+            Arc::new(DockerCli {
+                exec:        exec.clone(),
+                fs:          Arc::clone(&native.cli.fs),
+                pty:         Arc::clone(&native.cli.pty),
+                working_dir: "/workspace".to_owned(),
+            }),
+            DockerExecutionTarget::VirtualMachine,
+        );
+        *nested.ready.lock().await = true;
+        let action = tokio::spawn(async move {
+            OneShot::run(
+                &nested,
+                &OneShotSpec::registry("alpine"),
+                ExecControls::default(),
+            )
+            .await
+        });
+        exec.creating.notified().await;
+        action.abort();
+        assert!(action.await.unwrap_err().is_cancelled());
+        assert!(
+            time::timeout(Duration::from_millis(20), exec.removed.notified())
+                .await
+                .is_err(),
+            "cleanup must wait until the accepted create has finished"
+        );
+        exec.finish.notify_one();
+        time::timeout(Duration::from_secs(1), exec.removed.notified())
+            .await
+            .expect("the abandoned action is removed after late creation");
     }
 }
