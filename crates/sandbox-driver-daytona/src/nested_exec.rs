@@ -1,22 +1,17 @@
-//! Execute Docker CLI commands through Daytona's native process APIs.
-//! Output is encoded by a command-local subprocess wrapper because the SDK's
-//! session log decoder otherwise replaces non-UTF-8 bytes.
+//! Execute Docker CLI commands through Daytona's byte-preserving exec facet.
 
 use std::fmt::Write as _;
 use std::future::pending;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use std::{io, iter, mem};
+use std::{io, mem};
 
 use async_trait::async_trait;
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use sandbox_driver::{
     BASH_ENV_VAR, Capability, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
-    OutputCaptureBuffer, OutputSanitization, OutputSanitizer, OutputSink, OutputStream, Pty,
-    PtyOptions, PtySession, PtySize, Result, SpawnSpec, StdioProcess, StdioProcessHandle,
-    StopLevel, Termination, stop_signal,
+    OutputSink, Pty, PtyOptions, PtySession, PtySize, Result, SpawnSpec, StdioProcess,
+    StdioProcessHandle, StopLevel, Termination, stop_signal,
 };
 use sandbox_driver_docker::DockerExec;
 use tokio::runtime::Handle;
@@ -30,180 +25,6 @@ use crate::{exec_line, shell_quote};
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const TERM_GRACE: Duration = Duration::from_secs(2);
 const DRAIN_GRACE: Duration = Duration::from_secs(10);
-const MAX_FRAME_BYTES: usize = 32 * 1024;
-
-// One process and its two pipes, with no socket or listener. Every record is
-// ASCII; the final process status remains the command's status. Selectors keep
-// both pipes drained without buffering an entire command in the VM.
-const ENCODE_OUTPUT: &str = r"
-import base64, json, os, selectors, subprocess, sys
-argv, has_stdin = json.loads(sys.argv[1])
-child = subprocess.Popen(argv, stdin=sys.stdin.buffer if has_stdin else subprocess.DEVNULL,
-                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-selector = selectors.DefaultSelector()
-selector.register(child.stdout, selectors.EVENT_READ, 'O')
-selector.register(child.stderr, selectors.EVENT_READ, 'E')
-while selector.get_map():
-    for key, _ in selector.select():
-        data = os.read(key.fileobj.fileno(), 16384)
-        if not data:
-            selector.unregister(key.fileobj)
-            key.fileobj.close()
-            continue
-        sys.stdout.write(key.data + base64.b64encode(data).decode('ascii') + '\n')
-        sys.stdout.flush()
-code = child.wait()
-sys.exit(code if code >= 0 else 128 - code)
-";
-
-fn encoded_spec(spec: &ExecSpec) -> Result<ExecSpec> {
-    let argv: Vec<_> = iter::once(&spec.program).chain(&spec.args).collect();
-    let payload = serde_json::to_string(&(argv, spec.stdin.is_some()))
-        .map_err(|error| Error::io("encoding Docker command", io::Error::other(error)))?;
-    let mut encoded = ExecSpec::new("python3").args(["-u", "-c", ENCODE_OUTPUT, &payload]);
-    encoded.timeout = spec.timeout;
-    encoded.working_dir.clone_from(&spec.working_dir);
-    encoded.env.clone_from(&spec.env);
-    encoded.stdin.clone_from(&spec.stdin);
-    Ok(encoded)
-}
-
-struct FramedOutput {
-    pending: Vec<u8>,
-    streams: [(OutputSanitizer, OutputCaptureBuffer); 2],
-    sink:    Option<OutputSink>,
-}
-
-impl FramedOutput {
-    fn new(policy: OutputSanitization, controls: &ExecControls) -> Self {
-        Self {
-            pending: Vec::new(),
-            streams: [0, 1].map(|_| {
-                (
-                    OutputSanitizer::new(policy),
-                    OutputCaptureBuffer::new(controls.retained_output_limit),
-                )
-            }),
-            sink:    controls.sink.clone(),
-        }
-    }
-
-    async fn emit(&mut self, index: usize, raw: &[u8]) -> Result<()> {
-        let (sanitizer, capture) = &mut self.streams[index];
-        let bytes = sanitizer.push(raw);
-        capture.push(&bytes);
-        if !bytes.is_empty() {
-            if let Some(sink) = &self.sink {
-                let stream = [OutputStream::Stdout, OutputStream::Stderr][index];
-                sink(stream, bytes).await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn push(&mut self, stream: OutputStream, mut bytes: &[u8]) -> Result<()> {
-        if stream == OutputStream::Stderr {
-            // Python startup failures remain ordinary stderr diagnostics.
-            return self.emit(1, bytes).await;
-        }
-        while !bytes.is_empty() {
-            let end = bytes.iter().position(|byte| *byte == b'\n');
-            let take = end.map_or(bytes.len(), |end| end + 1);
-            if self.pending.len() + take > MAX_FRAME_BYTES {
-                return Err(Error::io(
-                    "decoding Docker output",
-                    io::Error::new(io::ErrorKind::InvalidData, "output frame is too large"),
-                ));
-            }
-            self.pending.extend_from_slice(&bytes[..take]);
-            bytes = &bytes[take..];
-            if end.is_some() {
-                let index = match self.pending.first() {
-                    Some(b'O') => 0,
-                    Some(b'E') => 1,
-                    _ => {
-                        return Err(Error::io(
-                            "decoding Docker output",
-                            io::Error::new(io::ErrorKind::InvalidData, "invalid output frame"),
-                        ));
-                    }
-                };
-                let raw = STANDARD
-                    .decode(&self.pending[1..self.pending.len() - 1])
-                    .map_err(|error| {
-                        Error::io("decoding Docker output", io::Error::other(error))
-                    })?;
-                self.pending.clear();
-                self.emit(index, &raw).await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn finish(&mut self, mut result: ExecStreamingResult) -> Result<ExecStreamingResult> {
-        for (index, (sanitizer, capture)) in self.streams.iter_mut().enumerate() {
-            let final_bytes = sanitizer.finish();
-            capture.push(&final_bytes);
-            if !final_bytes.is_empty() {
-                if let Some(sink) = &self.sink {
-                    sink(
-                        [OutputStream::Stdout, OutputStream::Stderr][index],
-                        final_bytes,
-                    )
-                    .await?;
-                }
-            }
-        }
-        result.result.stdout = self.streams[0].1.to_bytes();
-        result.result.stderr = self.streams[1].1.to_bytes();
-        let truncated = result.stdout_capture.truncated
-            || result.stderr_capture.truncated
-            || !self.pending.is_empty();
-        result.stdout_capture = self.streams[0].1.stats();
-        result.stderr_capture = self.streams[1].1.stats();
-        result.stdout_capture.truncated |= truncated;
-        result.stderr_capture.truncated |= truncated;
-        result.streams_separated = true;
-        Ok(result)
-    }
-}
-
-/// Runs an arbitrary Docker CLI invocation while preserving exact output.
-/// The caller owns container-level stop handling; native stop tokens here
-/// control only the VM command that transports its output.
-pub(super) async fn run_cli(
-    cli: &DockerCli,
-    spec: &ExecSpec,
-    controls: ExecControls,
-) -> Result<ExecStreamingResult> {
-    if controls.stdin.is_some() {
-        return Err(Error::unsupported(Capability::ExecStdinStream));
-    }
-    let output = Arc::new(Mutex::new(FramedOutput::new(
-        spec.output_sanitization,
-        &controls,
-    )));
-    let sink: OutputSink = Arc::new({
-        let output = Arc::clone(&output);
-        move |stream, bytes| {
-            let output = Arc::clone(&output);
-            Box::pin(async move { output.lock().await.push(stream, &bytes).await })
-        }
-    });
-    let encoded = encoded_spec(spec)?;
-    let result = cli
-        .exec
-        .run_streaming(&encoded, ExecControls {
-            term: controls.term,
-            kill: controls.kill,
-            sink: Some(sink),
-            retained_output_limit: Some(0),
-            ..ExecControls::default()
-        })
-        .await?;
-    output.lock().await.finish(result).await
-}
-
 /// One inner process group. Native session deletion stops the Docker client;
 /// this second command tells the existing in-container watcher to stop the job.
 struct Job {
@@ -385,7 +206,7 @@ impl Exec for NestedExec {
             sink
         });
         let transport_kill = CancellationToken::new();
-        let run = run_cli(&self.cli, &command, ExecControls {
+        let run = self.cli.exec.run_streaming(&command, ExecControls {
             sink,
             kill: Some(transport_kill.clone()),
             retained_output_limit: controls.retained_output_limit,
@@ -713,11 +534,8 @@ impl Drop for NestedPtySession {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
+    use std::process::Command;
     use std::{env, fs};
-
-    use tokio::task::spawn_blocking;
 
     use super::*;
 
@@ -744,130 +562,5 @@ mod tests {
         );
         assert_eq!(fs::read_dir(&dir).expect("control files").count(), 1);
         fs::remove_dir_all(dir).expect("remove test control directory");
-    }
-
-    #[tokio::test]
-    async fn fragmented_native_frames_preserve_binary_streams_and_retention() {
-        let spec = ExecSpec::new("python3").args([
-            "-c",
-            "import os; os.write(1, bytes([0,255,128,10,65])); os.write(2, bytes([254,0,66]))",
-        ]);
-        let encoded = encoded_spec(&spec).expect("encoded command");
-        let output = spawn_blocking(move || {
-            Command::new(encoded.program)
-                .args(encoded.args)
-                .output()
-                .expect("Python command wrapper")
-        })
-        .await
-        .expect("command joined");
-        assert!(output.status.success(), "{:?}", output.stderr);
-        let observed = Arc::new(Mutex::new([Vec::new(), Vec::new()]));
-        let sink: OutputSink = Arc::new({
-            let observed = Arc::clone(&observed);
-            move |stream, bytes| {
-                let observed = Arc::clone(&observed);
-                Box::pin(async move {
-                    let index = usize::from(stream == OutputStream::Stderr);
-                    observed.lock().await[index].extend(bytes);
-                    Ok(())
-                })
-            }
-        });
-        let mut framed = FramedOutput::new(OutputSanitization::Raw, &ExecControls {
-            sink: Some(sink),
-            retained_output_limit: Some(2),
-            ..ExecControls::default()
-        });
-        for fragment in output.stdout.chunks(3) {
-            framed
-                .push(OutputStream::Stdout, fragment)
-                .await
-                .expect("fragment decoded");
-        }
-        let mut native = ExecStreamingResult::new(ExecResult::new(
-            Termination::Exited,
-            Some(0),
-            Duration::ZERO,
-        ));
-        // The transport retained no encoded bytes; all were delivered to the
-        // decoder. Deliberate transport omission is not decoded truncation.
-        native.stdout_capture.observed_bytes = output.stdout.len();
-        native.stdout_capture.omitted_bytes = output.stdout.len();
-        let result = framed.finish(native).await.expect("capture completed");
-        assert_eq!(*observed.lock().await, [vec![0, 255, 128, 10, 65], vec![
-            254, 0, 66
-        ]]);
-        assert_eq!(result.result.stdout, [0, 65]);
-        assert_eq!(result.result.stderr, [254, 66]);
-        assert_eq!(result.stdout_capture.observed_bytes, 5);
-        assert_eq!(result.stdout_capture.retained_bytes, 2);
-        assert_eq!(result.stdout_capture.omitted_bytes, 3);
-        assert!(!result.stdout_capture.truncated);
-        assert!(!result.stderr_capture.truncated);
-        assert!(result.streams_separated);
-    }
-
-    #[tokio::test]
-    async fn fixed_binary_stdin_reaches_the_command_and_closes_for_eof() {
-        let spec = ExecSpec::new("cat").stdin(vec![0, 255, 128, 10]);
-        let encoded = encoded_spec(&spec).expect("encoded command");
-        let output = spawn_blocking(move || {
-            let mut child = Command::new(encoded.program)
-                .args(encoded.args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("command wrapper");
-            child
-                .stdin
-                .take()
-                .expect("stdin pipe")
-                .write_all(encoded.stdin.as_deref().expect("fixed input"))
-                .expect("stdin delivered");
-            child.wait_with_output().expect("command observed EOF")
-        })
-        .await
-        .expect("command joined");
-        assert!(output.status.success());
-        let mut framed = FramedOutput::new(OutputSanitization::Raw, &ExecControls::default());
-        framed
-            .push(OutputStream::Stdout, &output.stdout)
-            .await
-            .expect("output decoded");
-        let result = framed
-            .finish(ExecStreamingResult::new(ExecResult::new(
-                Termination::Exited,
-                output.status.code(),
-                Duration::ZERO,
-            )))
-            .await
-            .expect("capture completed");
-        assert_eq!(result.result.stdout, spec.stdin.expect("fixed input"));
-    }
-
-    #[tokio::test]
-    async fn incomplete_frames_report_loss_and_oversized_frames_are_bounded() {
-        let mut framed = FramedOutput::new(OutputSanitization::Raw, &ExecControls::default());
-        framed
-            .push(OutputStream::Stdout, b"Ow")
-            .await
-            .expect("partial frame");
-        let result = framed
-            .finish(ExecStreamingResult::new(ExecResult::new(
-                Termination::Exited,
-                Some(0),
-                Duration::ZERO,
-            )))
-            .await
-            .expect("partial capture reports loss");
-        assert!(result.stdout_capture.truncated);
-        assert!(
-            framed
-                .push(OutputStream::Stdout, &vec![b'A'; MAX_FRAME_BYTES])
-                .await
-                .is_err()
-        );
     }
 }

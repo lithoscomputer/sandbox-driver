@@ -25,7 +25,7 @@ use tokio::sync::Mutex;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
-use crate::nested_exec::{NestedExec, run_cli};
+use crate::nested_exec::NestedExec;
 use crate::nested_fs::NestedFs;
 use crate::nested_operation::{run_command, run_owned};
 use crate::{DaytonaClient, DaytonaExec, DaytonaFs, DaytonaPty, RUNTIME_DIRECTORY};
@@ -40,6 +40,12 @@ const MANAGED_LABEL: &str = "sh.sandbox-driver.managed=true";
 const START_TIMEOUT: Duration = Duration::from_secs(120);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(300);
 const DRAIN_GRACE: Duration = Duration::from_secs(10);
+const INITIALIZE_RUNTIME_DIRECTORY: &str = r#"
+umask 077
+parent=${1%/*}
+test ! -L "$parent" && test ! -L "$1" &&
+    mkdir -p "$1" && chmod 0700 "$parent" "$1"
+"#;
 const CLEAN_STALE_PREPARATION: &str = r"
 import os, re, shutil, sys
 try:
@@ -435,6 +441,7 @@ impl NestedDocker {
                 .await?;
         }
         self.cli.run(words(["start", CONTAINER_NAME])).await?;
+        self.initialize_runtime_directory().await?;
         *ready = true;
         Ok(())
     }
@@ -480,7 +487,25 @@ impl NestedDocker {
             }
         }
         self.cli.run(words(["start", CONTAINER_NAME])).await?;
+        self.initialize_runtime_directory().await?;
         *ready = true;
+        Ok(())
+    }
+
+    async fn initialize_runtime_directory(&self) -> Result<()> {
+        // This is container-local scratch space. Binding the outer runtime
+        // would expose Docker credentials and preparation files to the job.
+        self.cli
+            .run(words([
+                "exec",
+                CONTAINER_NAME,
+                "/bin/sh",
+                "-c",
+                INITIALIZE_RUNTIME_DIRECTORY,
+                "sandbox-driver-runtime",
+                RUNTIME_DIRECTORY,
+            ]))
+            .await?;
         Ok(())
     }
 }
@@ -878,7 +903,7 @@ impl NestedDocker {
             let transport_kill = CancellationToken::new();
             let mut command = DockerCli::command(words(["start", "--attach", &name])).no_timeout();
             command.output_sanitization = spec.output_sanitization;
-            let mut run = pin!(run_cli(&cli, &command, ExecControls {
+            let mut run = pin!(cli.exec.run_streaming(&command, ExecControls {
                 sink,
                 kill: Some(transport_kill.clone()),
                 retained_output_limit: controls.retained_output_limit,
@@ -1175,6 +1200,75 @@ mod tests {
             reply: Box::new(reply),
         });
         NestedDocker::from_cli(Arc::new(cli), DockerExecutionTarget::Container)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn container_runtime_is_private_on_create_and_recovery_and_rejects_symlinks() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        use std::process::Command;
+        use std::{env, fs};
+
+        let dir = env::temp_dir().join(format!("nested runtime {:032x}", rand::random::<u128>()));
+        let parent = dir.join("sandbox-driver");
+        let runtime = parent.join("runtime");
+        let outside = dir.join("outside");
+        fs::create_dir_all(&outside).expect("test directory");
+        let test_runtime = runtime.clone();
+        let nested = fake_nested(move |spec| {
+            if spec.args.starts_with(&words(["inspect"])) {
+                return response(0, br#"[{"Id":"main","Config":{"Labels":{}}}]"#.to_vec());
+            }
+            if spec.args.starts_with(&words(["exec", CONTAINER_NAME])) {
+                let output = Command::new(&spec.args[2])
+                    .args(&spec.args[3..spec.args.len() - 1])
+                    .arg(&test_runtime)
+                    .output()
+                    .expect("container runtime command");
+                return response(output.status.code().expect("shell exited"), output.stdout);
+            }
+            response(0, Vec::new())
+        })
+        .await;
+        let config = NestedDockerConfig {
+            image:   "alpine:3.20".to_owned(),
+            target:  DockerExecutionTarget::Container,
+            user:    None,
+            options: DockerProviderConfig {
+                auto_pull: false,
+                ..Default::default()
+            },
+        };
+        nested
+            .create(&config, &BTreeMap::new())
+            .await
+            .expect("created");
+        for path in [&parent, &runtime] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        nested.stopped().await;
+        nested.ensure_ready().await.expect("recovered");
+        for path in [&parent, &runtime] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        fs::remove_dir(&runtime).unwrap();
+        symlink(&outside, &runtime).unwrap();
+        nested.stopped().await;
+        assert!(nested.ensure_ready().await.is_err());
+        assert!(!*nested.ready.lock().await);
+        fs::remove_file(&runtime).unwrap();
+        fs::remove_dir(&parent).unwrap();
+        symlink(&outside, &parent).unwrap();
+        assert!(nested.ensure_ready().await.is_err());
+        assert!(!outside.join("runtime").exists());
+        fs::remove_dir_all(dir).expect("remove test runtime");
     }
 
     #[tokio::test]

@@ -17,7 +17,9 @@ use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 use crate::session::{Session, dedup_capture, missing_suffix, wait_for_completion};
-use crate::{DaytonaClient, daytona_error, exec_line, is_server_timeout, shell_quote, stdio};
+use crate::{
+    DaytonaClient, daytona_error, encoded_exec, exec_line, is_server_timeout, shell_quote, stdio,
+};
 
 /// Bound on waiting for the log stream to close after the command has
 /// its outcome; a stream that will not end is abandoned.
@@ -127,6 +129,41 @@ impl Drop for StdinFile {
     }
 }
 
+/// Native command execution with byte-preserving output framing.
+pub struct DaytonaExec {
+    transport: DaytonaTransport,
+}
+
+impl DaytonaExec {
+    pub(crate) fn new(client: DaytonaClient, sandbox_id: String, working_dir: String) -> Self {
+        Self {
+            transport: DaytonaTransport::new(client, sandbox_id, working_dir),
+        }
+    }
+}
+
+#[async_trait]
+impl Exec for DaytonaExec {
+    async fn run(&self, spec: &ExecSpec) -> Result<ExecResult> {
+        Ok(self
+            .run_streaming(spec, ExecControls::default())
+            .await?
+            .result)
+    }
+
+    async fn run_streaming(
+        &self,
+        spec: &ExecSpec,
+        controls: ExecControls,
+    ) -> Result<ExecStreamingResult> {
+        encoded_exec::run(&self.transport, spec, controls).await
+    }
+
+    async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
+        self.transport.spawn_stdio(spec).await
+    }
+}
+
 /// Command execution through the Daytona toolbox, on two transports.
 ///
 /// A plain run uses the one-shot `execute` endpoint: combined output
@@ -142,14 +179,14 @@ impl Drop for StdinFile {
 /// that are not shell identifiers through. The environment crosses in the
 /// command because the API's `envs` field is not reliably applied.
 /// `BASH_ENV` is unset in the composing shell first.
-pub struct DaytonaExec {
+struct DaytonaTransport {
     client:      DaytonaClient,
     sandbox_id:  String,
     working_dir: String,
     process:     OnceCell<ProcessService>,
 }
 
-impl DaytonaExec {
+impl DaytonaTransport {
     pub(crate) fn new(client: DaytonaClient, sandbox_id: String, working_dir: String) -> Self {
         Self {
             client,
@@ -202,7 +239,7 @@ impl DaytonaExec {
 }
 
 #[async_trait]
-impl Exec for DaytonaExec {
+impl Exec for DaytonaTransport {
     async fn run(&self, spec: &ExecSpec) -> Result<ExecResult> {
         let streaming = self.run_streaming(spec, ExecControls::default()).await?;
         Ok(streaming.result)
@@ -254,7 +291,7 @@ impl Exec for DaytonaExec {
     }
 }
 
-impl DaytonaExec {
+impl DaytonaTransport {
     async fn run_buffered(
         &self,
         spec: &ExecSpec,
@@ -665,7 +702,7 @@ mod tests {
     #[test]
     fn compose_unsets_the_ambient_bash_env_before_the_spec_env() {
         let spec = ExecSpec::bash("true");
-        let program = DaytonaExec::compose(&spec, None);
+        let program = DaytonaTransport::compose(&spec, None);
         // The helper's blank travels like any other spec variable.
         assert_eq!(
             program,
@@ -678,7 +715,7 @@ mod tests {
         let spec = ExecSpec::new("true")
             .env_var("X;injected", "a b")
             .env_var("INPUT_INCLUDE-HIDDEN-FILES", "true");
-        let program = DaytonaExec::compose(&spec, None);
+        let program = DaytonaTransport::compose(&spec, None);
         // A metacharacter in a key corrupts nothing: the assignment is one
         // quoted word to `env`, which also admits names that are not shell
         // identifiers.
@@ -691,7 +728,7 @@ mod tests {
     #[test]
     fn compose_keeps_every_argument_literal() {
         let spec = ExecSpec::new("printf").args(["%s", "$HOME; rm -rf /", "it's"]);
-        let program = DaytonaExec::compose(&spec, None);
+        let program = DaytonaTransport::compose(&spec, None);
         assert!(
             program.ends_with("exec env 'printf' '%s' '$HOME; rm -rf /' 'it'\\''s'"),
             "{program}"
@@ -701,7 +738,7 @@ mod tests {
     #[test]
     fn compose_redirects_stdin_from_the_temp_file() {
         let spec = ExecSpec::new("wc").arg("-c");
-        let program = DaytonaExec::compose(&spec, Some("/tmp/.sandbox-driver-stdin-1-2"));
+        let program = DaytonaTransport::compose(&spec, Some("/tmp/.sandbox-driver-stdin-1-2"));
         assert!(
             program.ends_with("exec env 'wc' '-c' < '/tmp/.sandbox-driver-stdin-1-2'"),
             "{program}"

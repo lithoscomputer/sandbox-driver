@@ -823,15 +823,25 @@ async fn exec_argv_is_literal(ctx: &Conformance) -> CheckOutcome {
 }
 
 async fn exec_output_is_binary_safe(ctx: &Conformance) -> CheckOutcome {
+    use std::fmt::Write as _;
+
     let sandbox = ctx.ready().await?;
     let outcome = async {
-        let spec = ExecSpec::bash("printf 'a\\0b\\x01c'").timeout(Duration::from_secs(30));
+        // All byte values, repeated across transport chunk boundaries, with
+        // adjacent NULs and no final newline. No text conversion is lossless.
+        let mut octal = String::new();
+        for byte in 0..=255 {
+            write!(octal, "\\{byte:03o}").expect("writing to a String");
+        }
+        let command = format!("for i in {{1..8}}; do printf '{octal}'; done; printf '\\0\\0x'");
+        let expected: Vec<u8> = (0..=255).cycle().take(2048).chain([0, 0, b'x']).collect();
+        let spec = ExecSpec::bash(command).timeout(Duration::from_secs(30));
         let result = sandbox
             .exec()
             .run(&spec)
             .await
             .map_err(|error| format!("exec failed: {error}"))?;
-        if result.stdout != b"a\0b\x01c" {
+        if result.stdout != expected {
             return fail(format!("binary output mangled: {:?}", result.stdout));
         }
         PASS

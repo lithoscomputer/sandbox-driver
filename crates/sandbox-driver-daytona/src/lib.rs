@@ -23,6 +23,8 @@
 //! separated stdout/stderr, kills on stop/timeout by deleting the
 //! session, and preserves partial output on timeout. Stdin is delivered
 //! through a temp-file redirection inside the sandbox on both paths.
+//! Both exec paths encode output before it reaches the toolbox and decode
+//! it before delivery, preserving arbitrary bytes and separate streams.
 //! Git follows Fabro's hybrid path: clone uses the native toolbox API;
 //! worktree and remote operations use the shared exec-derived implementation.
 //! Daytona derives Search and background-service management through exec.
@@ -55,6 +57,7 @@
 //! changing the process environment.
 
 mod access;
+mod encoded_exec;
 mod exec;
 mod fs;
 mod git;
