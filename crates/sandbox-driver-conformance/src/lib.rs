@@ -147,6 +147,12 @@ impl Conformance {
 
     /// Runs the whole battery.
     pub async fn run(&self) -> Report {
+        self.run_matching(|_| true).await
+    }
+
+    /// Runs checks selected by name, for focused reruns against expensive
+    /// providers. The report contains only checks accepted by `include`.
+    pub async fn run_matching(&self, include: impl Fn(&str) -> bool) -> Report {
         let checks: &[(&'static str, CheckFn)] = &[
             ("provider_identity_and_list", |ctx| {
                 Box::pin(provider_identity_and_list(ctx))
@@ -287,6 +293,10 @@ impl Conformance {
 
         let mut results = Vec::new();
         for (name, check) in checks {
+            if !include(name) {
+                continue;
+            }
+            tracing::info!(check = name, "conformance check starting");
             let outcome = match time::timeout(self.check_timeout, check(self)).await {
                 Ok(Ok(None)) => Outcome::Passed,
                 Ok(Ok(Some(reason))) => Outcome::Skipped { reason },
@@ -295,6 +305,7 @@ impl Conformance {
                     reason: format!("check exceeded the {:?} budget", self.check_timeout),
                 },
             };
+            tracing::info!(check = name, ?outcome, "conformance check complete");
             results.push(CheckResult { name, outcome });
         }
         Report { results }
@@ -1170,6 +1181,11 @@ async fn exec_streams_stdin(ctx: &Conformance) -> CheckOutcome {
     }
     let sandbox = ctx.ready().await?;
     let outcome = async {
+        if !sandbox.capabilities().exec.stdin_stream {
+            return Ok(Some(
+                "exec.stdin_stream not declared for this sandbox".to_owned(),
+            ));
+        }
         let source = StdinSource::new(Cursor::new(b"streamed".to_vec()));
         let controls = ExecControls {
             stdin: Some(source),
@@ -2385,6 +2401,15 @@ async fn ssh_access_matches_capabilities(ctx: &Conformance) -> CheckOutcome {
     }
     let sandbox = ctx.ready().await?;
     let caps = sandbox.capabilities().access.clone();
+    if !caps.ssh {
+        let has_facet = sandbox.ssh().is_some();
+        cleanup(&sandbox).await;
+        return if has_facet {
+            fail("SSH facet is present but not declared for this sandbox")
+        } else {
+            Ok(Some("access.ssh not declared for this sandbox".to_owned()))
+        };
+    }
     let Some(ssh) = sandbox.ssh() else {
         cleanup(&sandbox).await;
         return fail("access.ssh is declared but the SSH facet is absent");
@@ -2869,11 +2894,17 @@ async fn one_shot_shares_the_sandbox_world(ctx: &Conformance) -> CheckOutcome {
     if ctx.caps().one_shot.is_none() {
         return Ok(Some("capability one_shot not declared".to_owned()));
     }
-    let Some(image) = ctx.specs.one_shot_image() else {
-        return fail("one_shot is declared but no one-shot image was configured");
-    };
     let sandbox = ctx.ready().await?;
     let outcome = async {
+        if sandbox.capabilities().one_shot.is_none() {
+            if sandbox.one_shot().is_some() {
+                return fail("one_shot facet is present but not declared for this sandbox");
+            }
+            return Ok(Some("one_shot not declared for this sandbox".to_owned()));
+        }
+        let Some(image) = ctx.specs.one_shot_image() else {
+            return fail("one_shot is declared but no one-shot image was configured");
+        };
         let Some(one_shot) = sandbox.one_shot() else {
             return fail("one_shot is declared but the facet is absent");
         };

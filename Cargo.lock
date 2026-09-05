@@ -1966,6 +1966,7 @@ dependencies = [
  "sandbox-driver",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]
