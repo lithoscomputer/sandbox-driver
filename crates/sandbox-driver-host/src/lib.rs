@@ -44,7 +44,7 @@ mod registry;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime};
 use std::{env, io};
 
@@ -65,6 +65,8 @@ use crate::fence::ProcessGroups;
 pub use crate::fs::HostFs;
 use crate::registry::Record;
 
+type HandleRegistry = Mutex<HashMap<SandboxId, Arc<HostSandbox>>>;
+
 /// A directory-backed provider. Use [`Self::with_registry`] to preserve
 /// sandbox identity across provider or plugin restarts.
 pub struct HostProvider {
@@ -72,7 +74,7 @@ pub struct HostProvider {
     capabilities:    Capabilities,
     root:            PathBuf,
     cleanup_on_drop: bool,
-    registry:        Mutex<HashMap<SandboxId, Arc<HostSandbox>>>,
+    registry:        Arc<HandleRegistry>,
 }
 
 impl HostProvider {
@@ -101,7 +103,7 @@ impl HostProvider {
             capabilities: host_capabilities(),
             root,
             cleanup_on_drop,
-            registry: Mutex::new(HashMap::new()),
+            registry: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -111,12 +113,16 @@ impl HostProvider {
             return Ok(sandbox.clone());
         }
         let record = registry::read(&self.root, id).await?;
+        if record.state == SandboxState::Deleted {
+            return Err(registry::missing(id));
+        }
         let sandbox = Arc::new(HostSandbox::new(
             record,
             self.root.clone(),
             self.capabilities.clone(),
             EventEmitter::new(self.kind.clone(), None),
             self.cleanup_on_drop,
+            Arc::downgrade(&self.registry),
         )?);
         registry.insert(id.clone(), sandbox.clone());
         Ok(sandbox)
@@ -326,6 +332,7 @@ impl SandboxProvider for HostProvider {
                     self.capabilities.clone(),
                     handle_emitter,
                     self.cleanup_on_drop,
+                    Arc::downgrade(&self.registry),
                 )?);
                 self.registry.lock().await.insert(id, sandbox.clone());
                 Ok(sandbox as Arc<dyn Sandbox>)
@@ -427,6 +434,7 @@ impl SandboxProvider for HostProvider {
 
 /// A directory-backed sandbox on the local machine.
 pub struct HostSandbox {
+    registry:          Weak<HandleRegistry>,
     root:              PathBuf,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     groups:            Arc<ProcessGroups>,
@@ -450,6 +458,7 @@ impl HostSandbox {
         capabilities: Capabilities,
         events: EventEmitter,
         cleanup_on_drop: bool,
+        registry: Weak<HandleRegistry>,
     ) -> Result<Self> {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let _ = cleanup_on_drop;
@@ -467,6 +476,7 @@ impl HostSandbox {
             groups.clone(),
         );
         Ok(Self {
+            registry,
             root,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             groups,
@@ -490,6 +500,7 @@ impl HostSandbox {
 
     fn with_emitter(&self, events: EventEmitter) -> Self {
         Self {
+            registry: self.registry.clone(),
             root: self.root.clone(),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             groups: self.groups.clone(),
@@ -506,6 +517,12 @@ impl HostSandbox {
     /// The workspace directory on the local filesystem.
     pub fn workspace(&self) -> &Path {
         &self.record.workspace
+    }
+
+    async fn remove_cached_handle(&self) {
+        if let Some(registry) = self.registry.upgrade() {
+            registry.lock().await.remove(&self.record.id);
+        }
     }
 
     async fn status(&self) -> SandboxStatus {
@@ -587,6 +604,8 @@ impl Sandbox for HostSandbox {
                 |_| async {
                     let mut state = self.state.lock().await;
                     if *state == SandboxState::Deleted {
+                        drop(state);
+                        self.remove_cached_handle().await;
                         return Ok(());
                     }
                     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -608,6 +627,8 @@ impl Sandbox for HostSandbox {
                 |_| async {
                     let mut state = self.state.lock().await;
                     if *state == SandboxState::Deleted {
+                        drop(state);
+                        self.remove_cached_handle().await;
                         return Ok(());
                     }
                     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -629,6 +650,10 @@ impl Sandbox for HostSandbox {
                     }
                     self.persist(SandboxState::Deleted).await?;
                     *state = SandboxState::Deleted;
+                    // Persisted tombstones remain available for recovery
+                    // policy, but deleted resources need no cached handle.
+                    drop(state);
+                    self.remove_cached_handle().await;
                     Ok(())
                 },
             )
@@ -641,5 +666,49 @@ impl Sandbox for HostSandbox {
 
     fn fs(&self) -> &dyn Filesystem {
         &self.fs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn deleted_handles_leave_the_cache_without_removing_tombstones() {
+        let provider = HostProvider::new();
+        for _ in 0..100 {
+            let sandbox = provider
+                .create(&SandboxSpec::new(SandboxSource::HostDirectory), None)
+                .await
+                .expect("create");
+            let attached = provider.attach(sandbox.id(), None).await.expect("attach");
+            let workspace = sandbox.working_directory().to_owned();
+            attached
+                .delete()
+                .await
+                .expect("delete through another handle");
+            assert!(provider.registry.lock().await.is_empty());
+            assert!(!Path::new(&workspace).exists());
+            assert_eq!(
+                sandbox.describe().await.expect("shared state").state,
+                SandboxState::Deleted
+            );
+            let record = registry::read(&provider.root, sandbox.id())
+                .await
+                .expect("durable tombstone");
+            assert_eq!(record.state, SandboxState::Deleted);
+            assert!(matches!(
+                provider.attach(sandbox.id(), None).await,
+                Err(Error::NotFound { .. })
+            ));
+            provider
+                .delete(sandbox.id(), None)
+                .await
+                .expect("idempotent provider delete");
+            assert!(provider.registry.lock().await.is_empty());
+        }
+        tokio_fs::remove_dir_all(&provider.root)
+            .await
+            .expect("test registry cleanup");
     }
 }

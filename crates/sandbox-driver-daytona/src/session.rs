@@ -20,7 +20,7 @@ use tokio::runtime::Handle;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
-use crate::daytona_error;
+use crate::{DaytonaClient, daytona_error, toolbox};
 
 /// Bound on session cleanup so a stalled REST call can never block a
 /// cancellation or timeout path indefinitely.
@@ -38,12 +38,14 @@ const MIN_DEDUP_BYTES: usize = 64 * 1024;
 /// Deleting the session is also the kill mechanism: Daytona terminates
 /// the session's processes and closes its log streams.
 pub(crate) struct Session {
+    logs:    Option<(DaytonaClient, String)>,
     process: Option<ProcessService>,
     id:      String,
 }
 
 impl Session {
-    pub(crate) async fn create(sandbox: &SdkSandbox) -> Result<Self> {
+    pub(crate) async fn create(client: &DaytonaClient, sandbox: &SdkSandbox) -> Result<Self> {
+        let endpoint = toolbox::endpoint(client, &sandbox.id).await?;
         let process = sandbox
             .process()
             .await
@@ -59,6 +61,7 @@ impl Session {
             .await
             .map_err(|error| daytona_error("creating command session", error))?;
         Ok(Self {
+            logs: Some((client.clone(), endpoint)),
             process: Some(process),
             id,
         })
@@ -96,37 +99,50 @@ impl Session {
     /// Best-effort final log fetch; `None` on any failure or after
     /// `close` — the caller falls back to what the stream delivered.
     pub(crate) async fn fetch_logs(&self, command_id: &str) -> Option<SessionCommandLogsResult> {
-        let outcome = self
-            .process
-            .as_ref()?
-            .get_session_command_logs(&self.id, command_id)
-            .await;
+        self.process.as_ref()?;
+        let (client, endpoint) = self.logs.as_ref()?;
+        let outcome = time::timeout(
+            CLEANUP_TIMEOUT,
+            toolbox::request(
+                client,
+                endpoint,
+                &[
+                    "process", "session", &self.id, "command", command_id, "logs",
+                ],
+                None,
+            ),
+        )
+        .await;
         match outcome {
-            Ok(logs) => Some(logs),
-            Err(error) => {
-                let error = daytona_error("fetching final command logs", error);
-                tracing::debug!(error = %error, "final command log fetch failed");
+            Ok(Ok((status, bytes))) if (200..300).contains(&status) => Some(parse_logs(&bytes)),
+            _ => {
+                tracing::debug!("bounded final command log fetch failed");
                 None
             }
         }
     }
 
-    /// Deletes the session — killing anything still running in it —
-    /// bounded and best-effort: cleanup can never fail a command that
-    /// already produced its outcome.
-    pub(crate) async fn close(&mut self) {
+    /// Deletes the session within a deadline. Only a successful response
+    /// confirms cleanup and termination of any command still running.
+    pub(crate) async fn close(&mut self) -> bool {
         let Some(process) = self.process.as_ref() else {
-            return;
+            return true;
         };
-        match time::timeout(CLEANUP_TIMEOUT, process.delete_session(&self.id)).await {
-            Ok(Ok(())) => {}
+        let confirmed = match time::timeout(CLEANUP_TIMEOUT, process.delete_session(&self.id)).await
+        {
+            Ok(Ok(())) => true,
             Ok(Err(error)) => {
                 let error = daytona_error("deleting command session", error);
                 tracing::warn!(error = %error, "command session cleanup failed");
+                false
             }
-            Err(_) => tracing::warn!("command session cleanup timed out"),
-        }
+            Err(_) => {
+                tracing::warn!("command session cleanup timed out");
+                false
+            }
+        };
         self.process.take();
+        confirmed
     }
 }
 
@@ -154,6 +170,60 @@ impl Drop for Session {
             tracing::warn!("command session cleanup skipped without a runtime");
         }
     }
+}
+
+/// Toolbox variants: separated JSON, a JSON string, or text with the
+/// toolbox's three-byte stdout/stderr markers. The HTTP body is bounded
+/// before decoding, so the decoded copies have a finite total size too.
+fn parse_logs(bytes: &[u8]) -> SessionCommandLogsResult {
+    let parsed = serde_json::from_slice::<serde_json::Value>(bytes).ok();
+    if let Some(value) = parsed.as_ref().filter(|value| value.is_object()) {
+        return SessionCommandLogsResult {
+            stdout:            value
+                .get("stdout")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+            stderr:            value
+                .get("stderr")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+            output:            value
+                .get("output")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+            streams_separated: true,
+        };
+    }
+    let bytes = parsed
+        .as_ref()
+        .and_then(|value| value.as_str())
+        .map_or(bytes, str::as_bytes);
+    let mut logs = SessionCommandLogsResult::default();
+    let mut remaining = bytes;
+    let mut stderr = false;
+    loop {
+        let marker = remaining
+            .windows(3)
+            .position(|window| window == [1, 1, 1] || window == [2, 2, 2]);
+        let end = marker.unwrap_or(remaining.len());
+        let text = String::from_utf8_lossy(&remaining[..end]);
+        logs.output.push_str(&text);
+        if stderr {
+            logs.stderr.push_str(&text);
+        } else {
+            logs.stdout.push_str(&text);
+        }
+        let Some(marker) = marker else {
+            break;
+        };
+        stderr = remaining[marker] == 2;
+        logs.streams_separated = true;
+        remaining = &remaining[marker + 3..];
+    }
+    logs
 }
 
 pub(crate) struct WaitOutcome {
@@ -229,10 +299,11 @@ pub(crate) async fn wait_for_completion(
 }
 
 /// Keeps enough raw output to compare live and final logs even when the
-/// caller retains little or no output. Larger limits and unbounded
-/// retention keep their existing behavior.
+/// caller retains little or no output. The window always has a finite bound.
 pub(crate) fn dedup_capture(retained_output_limit: Option<usize>) -> OutputCaptureBuffer {
-    OutputCaptureBuffer::new(retained_output_limit.map(|limit| limit.max(MIN_DEDUP_BYTES)))
+    OutputCaptureBuffer::new(Some(
+        retained_output_limit.unwrap_or(0).max(MIN_DEDUP_BYTES),
+    ))
 }
 
 /// Bytes of `final_bytes` the buffer has not yet seen. The live stream
@@ -298,6 +369,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn final_logs_accept_separated_json_and_toolbox_markers() {
+        let logs = parse_logs(br#"{"stdout":"out","stderr":"err","output":"outerr"}"#);
+        assert!(logs.streams_separated);
+        assert_eq!((logs.stdout.as_str(), logs.stderr.as_str()), ("out", "err"));
+        let logs = parse_logs(b"\x01\x01\x01out\x02\x02\x02err\x01\x01\x01tail");
+        assert!(logs.streams_separated);
+        assert_eq!(
+            (logs.stdout.as_str(), logs.stderr.as_str()),
+            ("outtail", "err")
+        );
+        let logs = parse_logs(br#""plain\ntext""#);
+        assert!(!logs.streams_separated);
+        assert_eq!(logs.stdout, "plain\ntext");
+    }
+
+    #[test]
     fn plain_suffix_offsets() {
         assert_eq!(plain_suffix_offset(b"abc", b"abcdef"), 3);
         assert_eq!(plain_suffix_offset(b"abc", b"abc"), 3);
@@ -311,7 +398,7 @@ mod tests {
 
     #[test]
     fn missing_suffix_is_empty_when_stream_is_ahead_of_snapshot() {
-        let mut seen = OutputCaptureBuffer::new(None);
+        let mut seen = OutputCaptureBuffer::new(Some(16 * 1024 * 1024));
         seen.push(b"A B C");
         assert!(missing_suffix(&mut seen, b"A B").is_empty());
     }
@@ -329,6 +416,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_logs_after_close_is_none() {
         let session = Session {
+            logs:    None,
             process: None,
             id:      "closed".to_owned(),
         };
@@ -338,7 +426,7 @@ mod tests {
 
     #[test]
     fn missing_suffix_appends_only_unseen_bytes() {
-        let mut seen = OutputCaptureBuffer::new(None);
+        let mut seen = OutputCaptureBuffer::new(Some(16 * 1024 * 1024));
         seen.push(b"hello ");
         assert_eq!(missing_suffix(&mut seen, b"hello world"), b"world");
         assert!(missing_suffix(&mut seen, b"hello ").is_empty());

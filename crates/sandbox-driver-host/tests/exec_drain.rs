@@ -41,7 +41,7 @@ async fn blocked_drain(leader_exits: bool, timeout: bool) {
             Box::pin(future::pending())
         })),
         retained_output_limit: Some(2),
-        ..ExecControls::default()
+        ..ExecControls::buffered()
     };
     let script = if leader_exits {
         "printf output"
@@ -103,7 +103,7 @@ async fn term_reaches_descendants_while_an_exited_leaders_output_drains() {
             sink_ready.notify_one();
             Box::pin(async { Ok(()) })
         })),
-        ..ExecControls::default()
+        ..ExecControls::buffered()
     };
     let spec = ExecSpec::bash(
         r#"
@@ -151,7 +151,7 @@ async fn a_failed_sink_stops_descendants_without_waiting_for_the_other_stream() 
                 Err(Error::invalid_spec("test_sink", "the consumer failed"))
             })
         })),
-        ..ExecControls::default()
+        ..ExecControls::buffered()
     };
     let spec = ExecSpec::bash("sleep 300 & printf output").no_timeout();
     let outcome = time::timeout(

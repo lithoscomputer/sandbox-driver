@@ -43,7 +43,7 @@ versa, minus the capability mask in §5.
 - Control messages are **newline-delimited JSON** (NDJSON): one complete
   JSON object per line, UTF-8, terminated by `\n`. A message must not
   contain a raw newline. Blank lines are ignored.
-- Either side may have any number of requests outstanding.
+- Each side must impose finite admission limits on outstanding requests.
   **Responses may arrive in any order**; the `id` correlates them. A
   plugin must not serialize request handling: a slow call must not
   block an unrelated fast call (see §9 and the conformance suite's
@@ -89,14 +89,109 @@ length, then the payload.
 accepts 65536. A receiver must reject a frame whose length exceeds the
 limit before it allocates the payload, and a sender must split larger
 chunks. An `eof` frame has an empty payload. Each side sends at most one
-`eof` and nothing after it; a closed connection is read as an `eof`. A
-frame kind the receiver does not expect on a given channel must be
-ignored or must end the channel; it must not be misread as data.
+`eof` and nothing after it. A connection closed before its `eof` is an
+incomplete transfer, even if the control response reports success. An
+unexpected frame kind must fail that operation; it must not become data.
 
 Backpressure is the socket's: a plugin that cannot write because the
 host is slow to read must stall the producing process, never drop or
 buffer output without bound, and the stall affects that one operation.
 Control responses, `exec/stop`, and every other channel keep flowing.
+
+An additive `data_transport.open_ack` boolean requests authentication
+acknowledgment. Its default is false for older peers. When true, the plugin
+adds `"acknowledge":true` to the open payload and waits for an empty `open`
+frame from the host before sending data. The host sends this acknowledgment
+only after peer identity, channel ID, and the one-use token pass validation.
+An open without `acknowledge` receives no acknowledgment. This prevents a
+tiny operation from closing before the host checks its peer credentials.
+
+### 2.2 Finite transport budgets
+
+Admission must precede provider work. Pending opens consume active I/O
+capacity. Overload is an application error with `report.kind:"overloaded"`
+and `detail:{"limit":"active_io","not_started":true}` (using the actual
+exhausted limit name). Only a rejection before work starts may make this
+claim. A transport failure or buffer limit error may follow provider effects;
+neither authorizes automatic replay.
+
+Both peers enforce local limits. The Rust implementation exposes
+`TransportLimits`, `connect_with_limits`, `spawn_with_limits`, and
+`serve_with_limits`. Each limit below applies to one connection on each side,
+except where the accounting boundary says otherwise. These are finite defaults,
+not measured capacity claims. See [transport validation](transport-validation.md)
+for measurements and the tested configuration.
+
+| Limit | Default | Accounting boundary |
+| --- | ---: | --- |
+| `active_io` | 1,024 | Pending and open data operations; permits remain with both channel halves |
+| `pending_opens` | 1,024 | Host channel expectations and plugin connection attempts before authentication |
+| `unauthenticated_handshakes` | 64 | Accepted host sockets before authentication |
+| `provider_requests` | 2,048 | Ordinary requests before dispatch through reply delivery |
+| `reserved_requests` | 64 | Stop, terminate, close, cancel, shutdown, delete, health, and diagnostics calls |
+| `control_message_bytes` | 1 MiB | Serialized JSON line including newline, before allocation beyond the cap |
+| `queued_control_bytes` | 8 MiB | Ordinary serialized control delivery, including the writer's current message |
+| `reserved_control_bytes` | 1 MiB | Reserved control delivery, including the current message |
+| `event_queue_bytes` | 1 MiB | Separate event delivery queue on each side, including the active callback |
+| `event_queue_messages` | 256 | Ordered event delivery queue |
+| `retained_output_bytes` | 16 MiB | Maximum requested capture per stdout/stderr stream |
+| `buffered_value_bytes` | 16 MiB | One buffered file, append payload, or fixed-input fallback; shipped provider fallbacks also impose their own 16 MiB cap |
+| `cached_handles` | 4,096 | Each local handle or event-route cache |
+| `output_progress_timeout` | 30 s | Pending output with no delivery progress; quiet commands do not start this timer |
+| `hard_cancel_drain_timeout` | 5 s | Local output waiting after the kill signal, independent of acknowledgment |
+| `open_timeout` | 10 s | Waiting for a channel or an unauthenticated open |
+| `shutdown_timeout` | 5 s | Server cleanup and writer shutdown phases |
+
+Reserved control messages precede ordinary messages. Events have their own
+queue and cannot consume response capacity. Admission does not queue provider
+work. The reader may wait within a deadline to deliver one overload response.
+The finite delivery queues are not a scheduler for new operations.
+
+Dropped log, PTY, and stdio handles retain their I/O permit while owned
+cleanup runs. A failed or timed-out cleanup retains that permit until the
+connection is dropped. `PluginProvider::cleanup_error()` exposes this state;
+unrelated channels stay open. Cleanup tasks and unresolved cleanup together
+cannot exceed `active_io`. A stop acknowledgment establishes receipt of the
+stop request. It does not establish remote termination or complete cleanup.
+
+Retained output is disabled by default. Explicit capture is finite, with a
+stable head and rolling tail. Deliberately omitted capture bytes increment
+`omitted_bytes`; failed delivery sets `truncated` or returns a transport error.
+Whole-value convenience APIs must fail when they cannot return the complete
+value. A failed file write can leave partial destination changes.
+
+Application RSS includes decoded messages, frame buffers, pipes, capture,
+requests, caches, and owned tasks. Socket buffers consume additional kernel
+memory. With explicit capture, the worst-case capture budget is twice
+`active_io * retained_output_bytes`; applications must choose an affordable
+configuration. Streaming without capture does not retain total stream output.
+
+### Transport diagnostics extension
+
+The optional `transport/diagnostics` request takes `{}` and returns the plugin's
+current ownership counters. Older peers may return method-not-found. The Rust
+client's `transport_diagnostics()` combines that response with its local counters.
+Diagnostics contain counts only, with no operation tokens or credentials. They
+use reserved request capacity.
+
+Server counters cover active I/O permits, pending channel opens, exec, stdio,
+PTY and log-stream registries, cached handles, and owned background tasks. Client
+counters cover active I/O permits, pending opens, unauthenticated handshakes,
+pending requests, cleanup tasks, unresolved cleanup, event routes and contexts.
+`runtime_tasks` counts all live tasks in each Tokio runtime, including application
+tasks and the diagnostic request itself. These snapshots are not atomic across
+processes and do not establish remote termination. Stop-delivery counters report
+logical requests, successful acknowledgments, and the longest acknowledged
+delivery in microseconds, including retries for reserved capacity. A stop can
+remain unacknowledged when its owning operation finishes first; provider
+termination and output completion remain separate facts.
+
+The listener also counts authenticated opens and transient accept backoffs.
+`take_channel_setup_samples_us()` drains at most 4,096 recent setup measurements.
+Each measurement starts before local admission and ends when the authenticated
+channel is made available. It excludes caller scheduling and first-byte delivery.
+The bounded buffer discards its oldest sample when full and increments
+`setup_samples_lost`. These measurements do not retain output or channel tokens.
 
 ## 3. Message envelope
 
@@ -292,7 +387,7 @@ method, `-32000` application failure. Application failures carry `data`:
 
 `report.kind` is the stable machine-readable classification:
 `not_found`, `unsupported`, `invalid_state`, `invalid_spec`, `timeout`,
-`auth`, `rate_limited`, `exec`, `provider`, `transport`, `io`.
+`auth`, `rate_limited`, `overloaded`, `limit_exceeded`, `exec`, `provider`, `transport`, `incomplete`, `io`.
 `report.causes` is a bounded rendered source chain. A receiver restores
 these rendered causes as an opaque remote source chain. `detail` carries
 kind-specific fields for faithful reconstruction:
@@ -306,6 +401,9 @@ kind-specific fields for faithful reconstruction:
 | `timeout` | `operation`, `elapsed` |
 | `auth` | `auth` object: `{provider, reason}` |
 | `rate_limited` | `retry_after` (optional) |
+| `overloaded` | `limit`, `not_started:true` |
+| `limit_exceeded` | `limit`, `max_bytes` |
+| `incomplete` | `operation`, `output_abandoned`, `stop_acknowledged`, `termination_confirmed`, `cleanup_confirmed` |
 | `provider` | `provider` object: `{provider, code, message, retryable, detail}` |
 | `exec` | `exec` object: `{label, termination, exit_code, stdout_b64, stderr_b64, duration_ms?}` (`duration_ms` is additive: senders may omit it, receivers must tolerate its absence) |
 | `transport` | `transport_context` |
@@ -686,7 +784,11 @@ Rules:
   Stops and the exec timeout remain active while output drains after the
   main process exits. A kill must not wait for a descendant's open pipe
   or a blocked output sink. Abandoned output sets the capture's
-  `truncated` flag.
+  `truncated` flag. The local hard-cancel drain deadline starts with the kill
+  signal, including before channel open. At expiry, `incomplete` reports
+  abandoned output, stop acknowledgment, confirmed termination, and cleanup
+  as separate facts. Unknown facts are false. Only that local operation ends;
+  an unconfirmed provider operation may still be running.
 - Every output frame for an exec must be sent **before** its `eof`, and
   the `eof` before the `exec/stream` response, in the order the output
   was observed.
@@ -696,7 +798,7 @@ Rules:
   stderr are genuinely distinct (combined-output backends must say
   false and use `stdout`). Results must never claim a flag the
   `initialize` capabilities did not declare.
-- **Retention.** The host keeps its own retained copy of the output
+- **Retention.** With an explicit finite `retained_output_limit`, the host keeps a copy of the output
   (a stable head plus rolling tail, bounded by `retained_output_limit`)
   from the frames it reads; the result's bytes are the host's. The
   plugin's `stdout_capture`/`stderr_capture` report its own accounting
@@ -797,16 +899,20 @@ Event `type` values are:
 For each accepted operation, the plugin must emit
 `operation_started` and exactly one `operation_completed` or
 `operation_failed`. They must have the same `operation_id`. The terminal
-event must enter the wire before the operation response. A create can
+event must enter ordered event delivery before the operation response. A create can
 start with a name-only subject. Its terminal event must include the
 provider-assigned resource ID when one was assigned.
 
-Delivery is ordered and lossless at the sandbox-driver handoff. A
-sender must await bounded transport capacity and must not silently drop
-events. The receiver must observe event notifications in wire order
-before it resolves the corresponding operation response. `route_id` is
-optional in a notification and echoes the request value when present;
-it is transport metadata, not event identity.
+Event callbacks do not block the shared control response reader. Notifications
+enter bounded, ordered event delivery; responses can arrive before callbacks
+finish. A slow callback or a full queue explicitly fails this connection's
+event subscription. The plugin signals queue failure with `host/event_failed`
+and null params. The Rust client exposes `event_delivery_error()` for this
+failure and for its own observer timeout or overflow. After failure, consumers
+must treat the event history as incomplete. Unrelated control calls continue.
+`route_id` echoes the request value when present; it is transport metadata,
+not event identity. Applications that need durable persistence must wait on
+their own observer's persistence boundary.
 
 The protocol has no event replay or persistence API. The host decides
 whether its observer persists events. `sandbox/describe`,

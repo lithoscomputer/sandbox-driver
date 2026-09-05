@@ -35,6 +35,10 @@
 //! assumed. A provider is inside the trust domain of every sandbox it
 //! drives.
 
+pub use error::IncompleteOperation;
+mod buffer;
+pub use buffer::{BoundedBuffer, DEFAULT_BUFFER_BYTES};
+
 mod access;
 mod capabilities;
 mod capture;

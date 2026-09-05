@@ -110,7 +110,7 @@ async fn one_shots_share_a_host_network_helpers_namespace_and_workspace() {
                 &OneShotSpec::registry(ALPINE)
                     .entrypoint("sh")
                     .args(["-c", "echo shared > marker; readlink /proc/self/ns/net"]),
-                ExecControls::default(),
+                ExecControls::buffered(),
             )
             .await?;
         let marker = sandbox.fs().read("marker").await?;
@@ -169,7 +169,7 @@ fn recording_controls() -> (ExecControls, Seen) {
                 Ok(())
             })
         })),
-        ..ExecControls::default()
+        ..ExecControls::buffered()
     };
     (controls, seen)
 }
@@ -353,7 +353,7 @@ async fn a_one_shot_shares_the_workspace_volume() {
     });
     let controls = ExecControls {
         term: Some(token),
-        ..ExecControls::default()
+        ..ExecControls::buffered()
     };
     let spec = OneShotSpec::registry(ALPINE)
         .entrypoint("sleep")
@@ -525,7 +525,7 @@ async fn a_one_shot_preserves_a_read_only_workspace_bind() {
     let outcome = sandbox
         .one_shot()
         .expect("facet")
-        .run(&spec, ExecControls::default())
+        .run(&spec, ExecControls::buffered())
         .await;
     sandbox.delete().await.expect("delete");
     let written = fs::read(directory.join("forbidden.txt")).await;
@@ -559,7 +559,7 @@ async fn blocked_output_sinks_do_not_block_kill() {
                 sink_kill.cancel();
                 Box::pin(future::pending())
             })),
-            ..ExecControls::default()
+            ..ExecControls::buffered()
         };
         let outcome = time::timeout(Duration::from_secs(25), async {
             if one_shot {

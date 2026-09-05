@@ -199,7 +199,7 @@ The protocol crate owns wire compatibility; domain types never absorb a wire bre
 
 ## Durable Host recovery
 
-`HostProvider::with_registry(directory)` stores private records in a caller-owned directory. The Host plugin reads that directory from `SANDBOX_DRIVER_HOST_REGISTRY`. One provider process owns the directory at a time. Records preserve resource identity, labels, environment, workspace ownership, and lifecycle state. Attach and list work after a plugin restart. Delete retains a tombstone and removes only managed workspaces.
+`HostProvider::with_registry(directory)` stores private records in a caller-owned directory. The Host plugin reads that directory from `SANDBOX_DRIVER_HOST_REGISTRY`. One provider process owns the directory at a time. Records preserve resource identity, labels, environment, workspace ownership, and lifecycle state. Attach and list work after a plugin restart. Delete retains a tombstone and removes only managed workspaces. Deleted sandboxes leave the in-memory handle cache. Dropping an unused or drained process-group handle does not start a cleanup task.
 
 On Linux and macOS, each exec runs under a sentinel in its own process group. The provider holds the unreaped sentinel until stop, so live signals cannot reach a recycled id. The sentinel publishes its group record before checking its generation's fence marker and starting the workload. An in-group watcher observes that marker and kills its own group even after the plugin dies. Recovery writes markers first and then observes process death through procfs or libproc. It never signals a saved id. A group that does not drain within five seconds reports provider code `fence_leaked`; stop and delete remain retryable after the operator ends it. Stream output and stdin use the same provider exec implementation.
 
@@ -323,6 +323,25 @@ Control contracts, normative: **stops are signals, not a policy.** `term` sends 
 
 `StdioProcess` keeps fabro's shape: `AsyncWrite` stdin, `AsyncRead` stdout, bounded stderr tail collector, and a handle with `terminate()`/`wait()`. This is the facet the JSON-RPC side-channel transport exists for.
 
+`ExecControls::default()` retains no output copy. `Some(n)` requests finite
+head/tail capture for each stream. `ExecControls::buffered()` requests up to
+16 MiB per stream. `Exec::run` returns a complete value or a limit error;
+`ExecStreamingResult::into_complete()` refuses omitted or abandoned output.
+Omitted capture and failed delivery remain separate accounting facts.
+
+Plugin transport limits and their accounting are specified in protocol §2.2.
+A local hard-cancel drain deadline does not prove remote termination or cleanup.
+`Error::Incomplete` reports abandoned output, stop acknowledgment, confirmed
+termination, and cleanup as separate facts. Dropped persistent handles use
+bounded owned cleanup. `PluginProvider::cleanup_error()` reports cleanup
+failures, which retain admission without closing unrelated channels.
+Daytona whole-response fallbacks stop collecting at 16 MiB; its file downloads
+stream. A failed final-log fetch cannot establish complete output.
+Old handles remain tied to a failed connection. `PluginSupervisor::current()`
+serializes replacement for new work under a fixed configuration and frozen
+credential environment. It never replays an uncertain call. Applications bound
+the number of supervisors and reconstruct handles for the new generation.
+
 ### Snapshots and volumes
 
 ```rust
@@ -404,7 +423,7 @@ The runner must provide `start-docker`, the Docker CLI, and Python 3. Nested Doc
 
 With the `container` target, execution, files, environment, git, PTY, services, and one-shot containers use the nested job container. With `virtual_machine`, ordinary operations stay in the outer sandbox; Docker starts only when a one-shot needs it. One-shots use the outer workspace and host network without a helper container. Sidecar containers require the `container` target. The provider owns workspace binds and network placement. The Docker provider separately supports `host_network: true` with unrestricted networking and no sidecars.
 
-The VM owns all nested resources. Stop fences the whole VM; delete removes it. Restart reattaches the existing named job container and preserves its workspace. It does not replace a missing job container. Docker start sweeps old one-shots when restarting a stopped sandbox and preserves active one-shots when already running. Only the execution target is stored in Daytona labels. Registry credentials and container configuration are not stored there. Nested containers retain VM lifecycle capabilities; VM desktop, SSH, and log facets are absent from a container execution target.
+The VM owns all nested resources. Stop fences the whole VM; delete removes it. Restart reattaches the existing named job container and preserves its workspace. It does not replace a missing job container. Docker start sweeps old one-shots only after this handle observes the generation ending. Fresh attachment preserves other handles’ active one-shots and preparation files. Only the execution target is stored in Daytona labels. Registry credentials and container configuration are not stored there. Nested containers retain VM lifecycle capabilities; VM desktop, SSH, and log facets are absent from a container execution target.
 
 Local tests cover Docker command construction, lifecycle behavior, and binary file transfers. The ignored live gate additionally requires `DAYTONA_API_KEY` and `SANDBOX_DRIVER_DAYTONA_DIND_SNAPSHOT`, a runner snapshot with at least 2 CPUs and 4 GiB of memory. That gate verifies the complete hosted nested Docker workflow.
 
@@ -453,7 +472,13 @@ The attachment is explicit. `create`, `attach`, and `undelete` take an optional 
 
 `EventEmitter::run` is the provider-side lifecycle boundary. Once an operation is accepted, it emits `OperationStarted` and exactly one `OperationCompleted` or `OperationFailed` with the same `OperationId`. The terminal event is observed before the method returns. Durations measure the real operation. A create operation starts with a name-only subject when necessary and updates the terminal subject after the provider assigns the resource ID. Long operations use structured `Progress` values with stable codes; display messages are not control data. Failures carry a bounded `ErrorReport { kind, message, retryable, causes }`, so the error taxonomy survives the event and wire boundary.
 
-Delivery is direct and ordered. `EventContext` assigns a monotonic sequence and awaits the async observer. It has no hidden queue, worker, detached task, overflow policy, or silent drop path. A slow observer therefore applies backpressure at the documented handoff boundary. The observer decides whether that handoff means an in-memory enqueue, durable persistence, or immediate processing.
+In-process delivery through `EventContext` is direct and ordered. The plugin
+client delivers events through a bounded ordered worker. It does not await an
+application observer in the shared control reader. Responses can precede the
+observer callback. `PluginProvider::event_delivery_error()` reports queue
+exhaustion, callback timeout, or an expired route. The application must treat
+that subscription as incomplete. Durable persistence requires an explicit
+application boundary; blocking an observer does not delay all control calls.
 
 sandbox-driver does not store or replay events. A consumer that needs a durable event log persists events in its observer. Re-attach starts a new live source. `describe()` and the snapshot and volume status methods remain authoritative for current durable resource state. This keeps operation telemetry separate from state reconciliation.
 

@@ -1980,6 +1980,7 @@ dependencies = [
  "daytona-sdk",
  "futures-util",
  "rand 0.10.2",
+ "reqwest",
  "sandbox-driver",
  "sandbox-driver-conformance",
  "sandbox-driver-daytona-config",
@@ -2056,6 +2057,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
+ "clap",
+ "nix",
  "rand 0.10.2",
  "sandbox-driver",
  "sandbox-driver-conformance",

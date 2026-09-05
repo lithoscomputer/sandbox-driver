@@ -343,7 +343,9 @@ async fn saved_pgids(directory: &Path) -> Result<Vec<i32>> {
 
 impl Drop for ProcessGroups {
     fn drop(&mut self) {
-        if !self.cleanup_on_drop {
+        // Explicit stop already reaped the children and removed generation
+        // records. Dropping a drained or unused handle needs no cleanup task.
+        if !self.cleanup_on_drop || self.state.get_mut().generation.is_none() {
             return;
         }
         if let Some(generation) = &self.state.get_mut().generation {

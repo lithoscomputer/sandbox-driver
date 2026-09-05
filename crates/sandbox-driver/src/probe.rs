@@ -44,7 +44,7 @@ pub async fn run_bash_probe(exec: &dyn Exec) -> Result<()> {
     let sink: OutputSink = Arc::new(|_stream, _chunk| Box::pin(async { Ok(()) }));
     let controls = ExecControls {
         sink: Some(sink),
-        ..ExecControls::default()
+        ..ExecControls::buffered()
     };
     let streaming = exec.run_streaming(&spec, controls).await?;
     check_probe_result("bash probe (streaming transport)", streaming.result)

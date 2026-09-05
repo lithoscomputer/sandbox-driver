@@ -43,7 +43,7 @@ pub(crate) async fn spawn(
         .await
         .map_err(|error| daytona_error("fetching sandbox", error))?;
 
-    let mut session = Session::create(&sandbox).await?;
+    let mut session = Session::create(client, &sandbox).await?;
     let command = exec_line(&spec.env, &spec.program, &spec.args);
     let program = wrap_session_script(&build_session_script(cwd, &command));
     let started = match session.execute(&program).await {

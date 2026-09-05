@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use sandbox_driver::{DirEntry, Error, FileKind, FileMetadata, Filesystem, ResourceKind, Result};
 use tokio::fs;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, BufReader, copy_buf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, BufReader, copy, copy_buf};
 
 const TRANSFER_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -72,7 +72,15 @@ impl Filesystem for HostFs {
     #[tracing::instrument(skip_all, fields(provider_kind = "host"), err)]
     async fn read(&self, path: &str) -> Result<Vec<u8>> {
         let full = self.resolve(path);
-        fs::read(&full).await.map_err(read_error(path, &full))
+        let mut file = fs::File::open(&full)
+            .await
+            .map_err(read_error(path, &full))?;
+        let mut bytes = sandbox_driver::BoundedBuffer::new(sandbox_driver::DEFAULT_BUFFER_BYTES);
+        let outcome = copy(&mut file, &mut bytes)
+            .await
+            .map(|_| ())
+            .map_err(read_error(path, &full));
+        bytes.finish(outcome)
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "host"), err)]
@@ -98,23 +106,18 @@ impl Filesystem for HostFs {
     async fn read_range(&self, path: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         let full = self.resolve(path);
-        let context = read_error(path, &full);
-        let outcome = async {
-            let mut file = fs::File::open(&full).await?;
-            file.seek(io::SeekFrom::Start(offset)).await?;
-            let mut content = Vec::new();
-            match length {
-                Some(length) => {
-                    file.take(length).read_to_end(&mut content).await?;
-                }
-                None => {
-                    file.read_to_end(&mut content).await?;
-                }
-            }
-            Ok::<_, io::Error>(content)
-        }
-        .await;
-        outcome.map_err(context)
+        let mut file = fs::File::open(&full)
+            .await
+            .map_err(read_error(path, &full))?;
+        file.seek(io::SeekFrom::Start(offset))
+            .await
+            .map_err(read_error(path, &full))?;
+        let mut bytes = sandbox_driver::BoundedBuffer::new(sandbox_driver::DEFAULT_BUFFER_BYTES);
+        let outcome = copy(&mut file.take(length.unwrap_or(u64::MAX)), &mut bytes)
+            .await
+            .map(|_| ())
+            .map_err(read_error(path, &full));
+        bytes.finish(outcome)
     }
 
     #[tracing::instrument(

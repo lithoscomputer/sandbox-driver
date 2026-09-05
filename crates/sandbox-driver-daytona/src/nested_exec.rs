@@ -148,10 +148,9 @@ impl NestedExec {
 #[async_trait]
 impl Exec for NestedExec {
     async fn run(&self, spec: &ExecSpec) -> Result<ExecResult> {
-        Ok(self
-            .run_streaming(spec, ExecControls::default())
+        self.run_streaming(spec, ExecControls::buffered())
             .await?
-            .result)
+            .into_complete()
     }
 
     async fn run_streaming(

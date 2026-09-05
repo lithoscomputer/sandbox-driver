@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sandbox_driver::{Error, ExecSpec, SandboxFilter, SandboxProvider, SandboxSource, SandboxSpec};
-use sandbox_driver_protocol::PluginProvider;
+use sandbox_driver_protocol::channel::TrustedPeer;
+use sandbox_driver_protocol::{PluginProvider, TransportLimits};
 use tokio::process::{Child, Command};
 use tokio::{fs, time};
 
@@ -34,9 +35,11 @@ async fn connect(root: &Path) -> (PluginProvider, Child) {
         .kill_on_drop(true)
         .spawn()
         .expect("spawn plugin");
-    let provider = PluginProvider::connect(
+    let provider = PluginProvider::connect_with_limits(
         child.stdout.take().expect("stdout"),
         child.stdin.take().expect("stdin"),
+        TransportLimits::default(),
+        TrustedPeer::Process(child.id().expect("plugin PID")),
     )
     .await
     .expect("connect");

@@ -454,8 +454,8 @@ impl DockerExec {
 #[async_trait]
 impl Exec for DockerExec {
     async fn run(&self, spec: &ExecSpec) -> Result<ExecResult> {
-        let streaming = self.run_streaming(spec, ExecControls::default()).await?;
-        Ok(streaming.result)
+        let streaming = self.run_streaming(spec, ExecControls::buffered()).await?;
+        streaming.into_complete()
     }
 
     #[tracing::instrument(

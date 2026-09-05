@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::pin::{Pin, pin};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use std::{future, io};
 
@@ -304,11 +305,12 @@ fn checked(result: ExecResult, operation: &str) -> Result<ExecResult> {
 }
 
 pub(super) struct NestedDocker {
-    target: DockerExecutionTarget,
-    cli:    Arc<DockerCli>,
-    exec:   Arc<NestedExec>,
-    fs:     NestedFs,
-    ready:  Mutex<bool>,
+    target:   DockerExecutionTarget,
+    cli:      Arc<DockerCli>,
+    exec:     Arc<NestedExec>,
+    fs:       NestedFs,
+    ready:    Mutex<bool>,
+    recovery: AtomicBool,
 }
 
 impl NestedDocker {
@@ -331,6 +333,7 @@ impl NestedDocker {
             exec,
             fs,
             ready: Mutex::new(false),
+            recovery: AtomicBool::new(false),
         }
     }
 
@@ -448,6 +451,7 @@ impl NestedDocker {
 
     pub(super) async fn stopped(&self) {
         *self.ready.lock().await = false;
+        self.recovery.store(true, Ordering::SeqCst);
     }
 
     pub(super) async fn ensure_ready(&self) -> Result<()> {
@@ -456,11 +460,17 @@ impl NestedDocker {
             return Ok(());
         }
         self.bootstrap().await?;
-        self.clean_stale_preparation().await?;
+        let recovery = self.recovery.load(Ordering::SeqCst);
+        if recovery {
+            self.clean_stale_preparation().await?;
+        }
         if !self.targets_container() {
-            for action in self.cli.ids(ONE_SHOT_LABEL).await? {
-                self.cli.remove(&action).await?;
+            if recovery {
+                for action in self.cli.ids(ONE_SHOT_LABEL).await? {
+                    self.cli.remove(&action).await?;
+                }
             }
+            self.recovery.store(false, Ordering::SeqCst);
             *ready = true;
             return Ok(());
         }
@@ -468,8 +478,10 @@ impl NestedDocker {
         let id = primary["Id"]
             .as_str()
             .ok_or_else(|| Error::invalid_spec("docker inspect", "container id missing"))?;
-        for action in self.cli.ids(&format!("{ONE_SHOT_LABEL}={id}")).await? {
-            self.cli.remove(&action).await?;
+        if recovery {
+            for action in self.cli.ids(&format!("{ONE_SHOT_LABEL}={id}")).await? {
+                self.cli.remove(&action).await?;
+            }
         }
         if let Some(network) = primary["Config"]["Labels"][SIDECAR_NETWORK_LABEL].as_str() {
             if primary["NetworkSettings"]["Networks"][network].is_null() {
@@ -488,6 +500,7 @@ impl NestedDocker {
         }
         self.cli.run(words(["start", CONTAINER_NAME])).await?;
         self.initialize_runtime_directory().await?;
+        self.recovery.store(false, Ordering::SeqCst);
         *ready = true;
         Ok(())
     }
@@ -1300,7 +1313,10 @@ mod tests {
         nested.target = DockerExecutionTarget::VirtualMachine;
         time::timeout(Duration::from_secs(10), async {
             nested.ensure_ready().await.expect("first generation ready");
-            assert!(!stale.exists(), "old credentials are removed before reuse");
+            assert!(
+                stale.exists(),
+                "fresh attachment preserves preparation owned by other handles"
+            );
             assert!(unrelated.exists(), "only private generated names are swept");
             fs::create_dir(&active).expect("active preparation");
             nested.ensure_ready().await.expect("already ready");
@@ -1398,6 +1414,7 @@ mod tests {
             }
             response(0, Vec::new())
         }).await;
+        nested.stopped().await;
         nested.ensure_ready().await.unwrap();
         assert!(removed.load(Ordering::SeqCst));
         assert_eq!(health.load(Ordering::SeqCst), 2);
@@ -1485,7 +1502,7 @@ mod tests {
             OneShot::run(
                 &nested,
                 &OneShotSpec::registry("alpine"),
-                ExecControls::default(),
+                ExecControls::buffered(),
             )
             .await
         });

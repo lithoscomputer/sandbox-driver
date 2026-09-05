@@ -13,49 +13,49 @@ use std::future::Future;
 use std::io;
 use std::path::Path;
 use std::pin::pin;
-use std::process::Stdio;
+use std::process::{self, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use sandbox_driver::{
     Capabilities, Capability, DirEntry, Error, EventContext, EventSubject, Exec, ExecControls,
     ExecResult, ExecSpec, ExecStreamingResult, FileMetadata, Filesystem, ForkOptions, HealthStatus,
-    LifecycleTimers, LogSink, LogSource, Logs, NetworkPolicy, OneShot, OneShotSpec,
-    OutputCaptureBuffer, OutputStream, PlatformInfo, PreviewUrl, PreviewUrls, ProviderHealth,
-    ProviderKind, Pty, PtyOptions, PtySession, PtySize, Resources, Result, Sandbox, SandboxFilter,
-    SandboxId, SandboxSnapshotOptions, SandboxSpec, SandboxStatus, SnapshotFilter, SnapshotId,
-    SnapshotProvider, SnapshotSpec, SnapshotStatus, SpawnSpec, SshAccess, SshAccessInfo,
-    StderrTail, StdinReader, StdioProcess, StdioProcessHandle, StopLevel, Termination,
-    TransportError, Vnc, VncConnection, VolumeId, VolumeProvider, VolumeSpec, VolumeStatus,
-    WebTerminal,
+    IncompleteOperation, LifecycleTimers, LogSink, LogSource, Logs, NetworkPolicy, OneShot,
+    OneShotSpec, OutputCaptureBuffer, OutputStream, PlatformInfo, PreviewUrl, PreviewUrls,
+    ProviderHealth, ProviderKind, Pty, PtyOptions, PtySession, PtySize, Resources, Result, Sandbox,
+    SandboxFilter, SandboxId, SandboxSnapshotOptions, SandboxSpec, SandboxStatus, SnapshotFilter,
+    SnapshotId, SnapshotProvider, SnapshotSpec, SnapshotStatus, SpawnSpec, SshAccess,
+    SshAccessInfo, StderrTail, StdinReader, StdioProcess, StdioProcessHandle, StopLevel,
+    Termination, TransportError, Vnc, VncConnection, VolumeId, VolumeProvider, VolumeSpec,
+    VolumeStatus, WebTerminal,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, duplex,
-};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, duplex};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::process::{Child, Command};
 use tokio::runtime::Handle as RuntimeHandle;
-use tokio::sync::{Mutex as AsyncMutex, OnceCell, mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::sync::{Mutex as AsyncMutex, OnceCell, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::{fs as tokio_fs, time};
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::field;
 
 use crate::channel::{
-    Channel, ChannelListener, ChannelReceiver, FrameKind, FrameReader, FrameWriter,
+    Channel, ChannelListener, ChannelReceiver, FrameKind, FrameReader, FrameWriter, TrustedPeer,
 };
-use crate::methods as m;
 use crate::wire::Message;
+use crate::{TransportDiagnostics, TransportLimits, control, limits, methods as m};
 
 /// How long the host waits, after a plugin has answered an operation,
 /// for the data channel that operation must already have opened.
 const LATE_CHANNEL_GRACE: Duration = Duration::from_secs(10);
 /// The entire shutdown exchange, including acknowledgment and process exit.
+#[cfg(test)]
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// A provider served by a JSON-RPC plugin over a byte stream.
@@ -80,9 +80,26 @@ impl PluginProvider {
         reader: impl AsyncRead + Unpin + Send + 'static,
         writer: impl AsyncWrite + Unpin + Send + 'static,
     ) -> Result<Self> {
-        let listener = ChannelListener::bind()?;
+        Self::connect_with_limits(
+            reader,
+            writer,
+            TransportLimits::default(),
+            TrustedPeer::Process(process::id()),
+        )
+        .await
+    }
+
+    /// Connects to an explicitly trusted data peer with finite transport
+    /// budgets.
+    pub async fn connect_with_limits(
+        reader: impl AsyncRead + Unpin + Send + 'static,
+        writer: impl AsyncWrite + Unpin + Send + 'static,
+        limits: TransportLimits,
+        peer: TrustedPeer,
+    ) -> Result<Self> {
+        let listener = ChannelListener::bind_with_limits(limits.clone(), peer)?;
         let transport = listener.transport();
-        let client = Client::start(reader, writer, listener);
+        let client = Client::start(reader, writer, listener, limits);
         let result: m::InitializeResult = client
             .call(m::INITIALIZE, &m::InitializeParams {
                 protocol_version: m::PROTOCOL_VERSION,
@@ -127,7 +144,12 @@ impl PluginProvider {
     /// [`PluginProvider::shutdown`] asks the plugin to exit and reaps it,
     /// killing after a grace period.
     #[tracing::instrument(skip_all, err)]
-    pub async fn spawn(mut command: Command) -> Result<Self> {
+    pub async fn spawn(command: Command) -> Result<Self> {
+        Self::spawn_with_limits(command, TransportLimits::default()).await
+    }
+
+    pub async fn spawn_with_limits(mut command: Command, limits: TransportLimits) -> Result<Self> {
+        limits.validate()?;
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
         command.kill_on_drop(true);
@@ -136,7 +158,11 @@ impl PluginProvider {
             .map_err(|error| Error::io("spawning plugin process", error))?;
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
-        let mut provider = Self::connect(stdout, stdin).await?;
+        let pid = child.id().ok_or_else(|| {
+            Error::Transport(TransportError::new("plugin exited before initialization"))
+        })?;
+        let mut provider =
+            Self::connect_with_limits(stdout, stdin, limits, TrustedPeer::Process(pid)).await?;
         provider.child = Some(Mutex::new(Some(child)));
         Ok(provider)
     }
@@ -145,6 +171,82 @@ impl PluginProvider {
     /// plugin exited or its stdio broke; every later call fails at once.
     pub fn is_closed(&self) -> bool {
         self.client.closed.load(Ordering::SeqCst)
+    }
+
+    /// Snapshot local ownership and plugin registries. Older peers may not
+    /// implement the optional `transport/diagnostics` method.
+    pub async fn transport_diagnostics(&self) -> Result<TransportDiagnostics> {
+        let server = self
+            .client
+            .call(m::TRANSPORT_DIAGNOSTICS, &m::Empty)
+            .await?;
+        let mut client = self.client.listener.diagnostics();
+        client.stop_requests = self.client.stop_requests.load(Ordering::Relaxed);
+        client.stop_acknowledgments = self.client.stop_acknowledgments.load(Ordering::Relaxed);
+        client.max_stop_acknowledgment_us = self
+            .client
+            .max_stop_acknowledgment_us
+            .load(Ordering::Relaxed);
+        client.pending_requests = self.client.pending.lock().expect("pending lock").len();
+        let mut cleanup = self.client.cleanup.lock().expect("cleanup tasks lock");
+        while cleanup.try_join_next().is_some() {}
+        client.cleanup_tasks = cleanup.len();
+        client.failed_cleanups = self
+            .client
+            .failed_cleanup
+            .lock()
+            .expect("failed cleanup lock")
+            .len();
+        client.event_routes = self
+            .client
+            .event_routes
+            .lock()
+            .expect("event routes lock")
+            .len();
+        client.event_contexts = self
+            .client
+            .event_contexts
+            .lock()
+            .expect("event contexts lock")
+            .len();
+        client.runtime_tasks = RuntimeHandle::current().metrics().num_alive_tasks();
+        Ok(TransportDiagnostics { client, server })
+    }
+
+    /// Takes the bounded recent channel-setup measurements, in microseconds.
+    pub fn take_channel_setup_samples_us(&self) -> Vec<u64> {
+        self.client.listener.take_setup_samples_us()
+    }
+
+    /// PID for process supervision and resource measurements, when spawned.
+    pub fn process_id(&self) -> Option<u32> {
+        self.child.as_ref().and_then(|slot| {
+            slot.lock()
+                .expect("child lock")
+                .as_ref()
+                .and_then(Child::id)
+        })
+    }
+
+    /// Failure of this connection's ordered event subscription. Control calls
+    /// continue, but applications must treat the event history as incomplete.
+    pub fn event_delivery_error(&self) -> Option<TransportError> {
+        self.client
+            .event_failure
+            .lock()
+            .expect("event failure lock")
+            .clone()
+    }
+
+    /// Last failed or timed-out local cleanup. Its I/O admission remains
+    /// occupied until this connection is dropped; other operations continue.
+    pub fn cleanup_error(&self) -> Option<TransportError> {
+        self.client
+            .failed_cleanup
+            .lock()
+            .expect("failed cleanup lock")
+            .last()
+            .map(|(_, error)| error.clone())
     }
 
     /// Asks the plugin to shut down cleanly and reaps a spawned child.
@@ -156,7 +258,7 @@ impl PluginProvider {
             .child
             .as_ref()
             .and_then(|slot| slot.lock().expect("child lock").take());
-        let outcome = time::timeout(SHUTDOWN_GRACE, async {
+        let outcome = time::timeout(self.client.limits.shutdown_timeout, async {
             let _: m::Empty = self.client.call(m::SHUTDOWN, &m::Empty).await?;
             if let Some(child) = &mut child {
                 child
@@ -192,11 +294,17 @@ impl PluginProvider {
         mask_wire_capabilities(&mut info.capabilities);
         let id = info.status.id.clone();
         if let Some(context) = &events {
-            self.client
+            let mut contexts = self
+                .client
                 .event_contexts
                 .lock()
-                .expect("event contexts lock")
-                .insert(id.as_str().to_owned(), context.clone());
+                .expect("event contexts lock");
+            if contexts.len() >= self.client.limits.cached_handles {
+                if let Some(old) = contexts.keys().next().cloned() {
+                    contexts.remove(&old);
+                }
+            }
+            contexts.insert(id.as_str().to_owned(), context.clone());
         }
         Arc::new(SandboxHandle::new(
             Arc::clone(&self.client),
@@ -232,7 +340,6 @@ impl sandbox_driver::SandboxProvider for PluginProvider {
                 events: event_request.clone(),
             })
             .await;
-        self.client.unregister_events(event_request.as_ref());
         Ok(self.wrap_handle(outcome?, events))
     }
 
@@ -249,7 +356,6 @@ impl sandbox_driver::SandboxProvider for PluginProvider {
                 events:     event_request.clone(),
             })
             .await;
-        self.client.unregister_events(event_request.as_ref());
         Ok(self.wrap_handle(outcome?, events))
     }
 
@@ -266,7 +372,6 @@ impl sandbox_driver::SandboxProvider for PluginProvider {
                 events:     event_request.clone(),
             })
             .await;
-        self.client.unregister_events(event_request.as_ref());
         Ok(self.wrap_handle(outcome?, events))
     }
 
@@ -279,7 +384,6 @@ impl sandbox_driver::SandboxProvider for PluginProvider {
                 events:     event_request.clone(),
             })
             .await;
-        self.client.unregister_events(event_request.as_ref());
         outcome.map(|_| ())
     }
 
@@ -342,7 +446,6 @@ impl SnapshotProvider for ProviderSnapshots {
                 events: event_request.clone(),
             })
             .await;
-        self.client.unregister_events(event_request.as_ref());
         let result = outcome?;
         SnapshotId::try_new(result.snapshot_id)
             .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))
@@ -378,14 +481,13 @@ impl SnapshotProvider for ProviderSnapshots {
                 events:      event_request.clone(),
             })
             .await;
-        self.client.unregister_events(event_request.as_ref());
         outcome?;
         Ok(())
     }
 
     async fn build_logs(&self, id: &SnapshotId, follow: bool, sink: LogSink) -> Result<()> {
         let stream_id = self.client.next_stream_id("snapshot");
-        let (channel, receiver) = self.client.listener.expect();
+        let (channel, receiver) = self.client.listener.expect()?;
         follow_log_stream(
             &self.client,
             m::SNAPSHOT_BUILD_LOGS,
@@ -411,7 +513,6 @@ impl SnapshotProvider for ProviderSnapshots {
                 events:      event_request.clone(),
             })
             .await;
-        self.client.unregister_events(event_request.as_ref());
         outcome?;
         Ok(())
     }
@@ -425,7 +526,6 @@ impl SnapshotProvider for ProviderSnapshots {
                 events:      event_request.clone(),
             })
             .await;
-        self.client.unregister_events(event_request.as_ref());
         outcome?;
         Ok(())
     }
@@ -447,7 +547,6 @@ impl VolumeProvider for ProviderVolumes {
                 events: event_request.clone(),
             })
             .await;
-        self.client.unregister_events(event_request.as_ref());
         let result = outcome?;
         VolumeId::try_new(result.volume_id)
             .map_err(|error| Error::invalid_spec("volume_id", error.to_string()))
@@ -478,7 +577,6 @@ impl VolumeProvider for ProviderVolumes {
                 events:    event_request.clone(),
             })
             .await;
-        self.client.unregister_events(event_request.as_ref());
         outcome?;
         Ok(())
     }
@@ -584,22 +682,40 @@ fn mask_wire_capabilities(capabilities: &mut Capabilities) {
 /// calls and forwards events. Every byte stream has a connection of its
 /// own, pumped by the operation that asked for it.
 struct Client {
-    outbound:       mpsc::Sender<Message>,
-    listener:       ChannelListener,
-    next_id:        AtomicU64,
-    next_exec:      AtomicU64,
-    next_stream:    AtomicU64,
+    outbound: control::ControlSender,
+    limits: TransportLimits,
+    requests: Arc<Semaphore>,
+    reserved: Arc<Semaphore>,
+    events: mpsc::Sender<DeliveredEvent>,
+    event_bytes: Arc<Semaphore>,
+    event_failure: Mutex<Option<TransportError>>,
+    listener: ChannelListener,
+    next_id: AtomicU64,
+    next_exec: AtomicU64,
+    next_stream: AtomicU64,
     next_operation: AtomicU64,
+    stop_requests: AtomicU64,
+    stop_acknowledgments: AtomicU64,
+    max_stop_acknowledgment_us: AtomicU64,
     /// Set when either transport task ends; every pending and future call
     /// fails fast instead of waiting on a dead pipe.
-    closed:         AtomicBool,
-    closed_error:   Mutex<Option<TransportError>>,
-    pending:        Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>,
+    closed: AtomicBool,
+    closed_signal: CancellationToken,
+    cleanup: Mutex<JoinSet<()>>,
+    failed_cleanup: Mutex<Vec<(Arc<OwnedSemaphorePermit>, TransportError)>>,
+    closed_error: Mutex<Option<TransportError>>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>,
     event_contexts: Mutex<HashMap<String, EventContext>>,
     /// Contexts for in-flight resource operations, keyed by a wire-only
     /// route id so events can arrive before a resource id exists.
-    event_routes:   Mutex<HashMap<String, EventContext>>,
-    tasks:          OnceLock<[AbortOnDropHandle<()>; 2]>,
+    event_routes: Mutex<HashMap<String, EventContext>>,
+    tasks: OnceLock<[AbortOnDropHandle<()>; 3]>,
+}
+
+struct DeliveredEvent {
+    context: EventContext,
+    event:   sandbox_driver::Event,
+    _bytes:  OwnedSemaphorePermit,
 }
 
 struct PendingCall<'a> {
@@ -618,16 +734,33 @@ impl Client {
         reader: impl AsyncRead + Unpin + Send + 'static,
         writer: impl AsyncWrite + Unpin + Send + 'static,
         listener: ChannelListener,
+        limits: TransportLimits,
     ) -> Arc<Self> {
-        let (outbound, mut outbound_rx) = mpsc::channel::<Message>(256);
+        let (outbound, mut outbound_rx) = control::queue(&limits);
+        let (events, mut event_rx) = mpsc::channel::<DeliveredEvent>(limits.event_queue_messages);
+        let progress_timeout = limits.output_progress_timeout;
+        let max_message = limits.control_message_bytes;
+        let listener_failed = listener.failure_signal();
         let client = Arc::new(Self {
             outbound,
+            events,
+            event_bytes: Arc::new(Semaphore::new(limits.event_queue_bytes)),
+            event_failure: Mutex::new(None),
+            requests: Arc::new(Semaphore::new(limits.provider_requests)),
+            reserved: Arc::new(Semaphore::new(limits.reserved_requests)),
+            limits,
             listener,
             next_id: AtomicU64::new(1),
             next_exec: AtomicU64::new(1),
             next_stream: AtomicU64::new(1),
             next_operation: AtomicU64::new(1),
+            stop_requests: AtomicU64::new(0),
+            stop_acknowledgments: AtomicU64::new(0),
+            max_stop_acknowledgment_us: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            closed_signal: CancellationToken::new(),
+            cleanup: Mutex::new(JoinSet::new()),
+            failed_cleanup: Mutex::new(Vec::new()),
             closed_error: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             event_contexts: Mutex::new(HashMap::new()),
@@ -640,13 +773,12 @@ impl Client {
             let mut writer = writer;
             let outcome: Result<(), TransportError> = async {
                 while let Some(message) = outbound_rx.recv().await {
-                    let mut line = serde_json::to_string(&message).map_err(|error| {
-                        TransportError::with_source("serializing plugin request", error)
-                    })?;
-                    line.push('\n');
-                    writer.write_all(line.as_bytes()).await.map_err(|error| {
-                        TransportError::with_source("writing plugin request", error)
-                    })?;
+                    time::timeout(progress_timeout, writer.write_all(&message.bytes))
+                        .await
+                        .map_err(|_| TransportError::new("plugin control writer made no progress"))?
+                        .map_err(|error| {
+                            TransportError::with_source("writing plugin request", error)
+                        })?;
                 }
                 writer.shutdown().await.map_err(|error| {
                     TransportError::with_source("shutting down plugin writer", error)
@@ -664,39 +796,76 @@ impl Client {
         });
 
         let reader_client = Arc::downgrade(&client);
-        let reader_task =
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(reader).lines();
-                let outcome: Result<(), TransportError> = async {
-                    loop {
-                        let Some(line) = lines.next_line().await.map_err(|error| {
+        let reader_task = tokio::spawn(async move {
+            let mut reader = BufReader::new(reader);
+            let mut partial = Vec::new();
+            let outcome: Result<(), TransportError> = async {
+                loop {
+                    let line = tokio::select! {
+                        line = control::read_line(&mut reader, &mut partial, max_message) => line,
+                        () = listener_failed.cancelled() => return Err(TransportError::new("data listener failed")),
+                    };
+                    let Some(line) = line.map_err(|error| {
                             TransportError::with_source("reading plugin response", error)
                         })?
-                        else {
-                            return Ok(());
-                        };
-                        if line.trim().is_empty() {
-                            continue;
-                        }
-                        let message = serde_json::from_str::<Message>(&line).map_err(|error| {
-                            TransportError::with_source("decoding plugin response", error)
-                        })?;
-                        let Some(client) = reader_client.upgrade() else {
-                            return Ok(());
-                        };
-                        client.route(message).await?;
+                    else {
+                        return Ok(());
+                    };
+                    if line.iter().all(u8::is_ascii_whitespace) {
+                        continue;
                     }
+                    let message = serde_json::from_slice::<Message>(&line).map_err(|error| {
+                        TransportError::with_source("decoding plugin response", error)
+                    })?;
+                    let Some(client) = reader_client.upgrade() else {
+                        return Ok(());
+                    };
+                    client.route(message, line.len())?;
                 }
-                .await;
-                if let Some(client) = reader_client.upgrade() {
-                    client.mark_closed(outcome.err().unwrap_or_else(|| {
-                        TransportError::new("plugin response transport closed")
-                    }));
+            }
+            .await;
+            if let Some(client) = reader_client.upgrade() {
+                client.mark_closed(
+                    outcome
+                        .err()
+                        .unwrap_or_else(|| TransportError::new("plugin response transport closed")),
+                );
+            }
+        });
+        let event_client = Arc::downgrade(&client);
+        let event_task = tokio::spawn(async move {
+            while let Some(delivery) = event_rx.recv().await {
+                let Some(client) = event_client.upgrade() else {
+                    return;
+                };
+                if client
+                    .event_failure
+                    .lock()
+                    .expect("event failure lock")
+                    .is_some()
+                {
+                    return;
                 }
-            });
+                let timeout = client.limits.output_progress_timeout;
+                drop(client);
+                if time::timeout(timeout, delivery.context.forward(delivery.event))
+                    .await
+                    .is_err()
+                {
+                    if let Some(client) = event_client.upgrade() {
+                        *client.event_failure.lock().expect("event failure lock") =
+                            Some(TransportError::new(
+                                "event observer timed out; event subscription is incomplete",
+                            ));
+                    }
+                    return;
+                }
+            }
+        });
         let _ = client.tasks.set([
             AbortOnDropHandle::new(writer_task),
             AbortOnDropHandle::new(reader_task),
+            AbortOnDropHandle::new(event_task),
         ]);
 
         client
@@ -706,6 +875,7 @@ impl Client {
     /// both transport tasks; also re-checked by `call` after registering,
     /// closing the race where a call lands just after the drain.
     fn mark_closed(&self, error: TransportError) {
+        self.closed_signal.cancel();
         let first_failure = !self.closed.swap(true, Ordering::SeqCst);
         let error = {
             let mut closed_error = self.closed_error.lock().expect("closed error lock");
@@ -738,6 +908,80 @@ impl Client {
         Error::Transport(error)
     }
 
+    async fn pump<R, T>(
+        &self,
+        call: impl Future<Output = Result<R>>,
+        pump: impl Future<Output = Result<T>>,
+        accepted: &AtomicBool,
+        method: &str,
+    ) -> Result<(R, T)> {
+        let responded = AtomicBool::new(false);
+        let call = async {
+            let result = call.await?;
+            responded.store(true, Ordering::SeqCst);
+            Ok(result)
+        };
+        let mut operation = pin!(call_with_pump(call, pump, accepted, method));
+        tokio::select! {
+            biased;
+            result = &mut operation => result,
+            () = self.closed_signal.cancelled() => {
+                // Graceful shutdown may close control after a response while
+                // its final data frames still await scheduling on this side.
+                if responded.load(Ordering::SeqCst) {
+                    time::timeout(self.limits.hard_cancel_drain_timeout, operation).await
+                        .unwrap_or_else(|_| Err(self.closed_error()))
+                } else { Err(self.closed_error()) }
+            }
+        }
+    }
+
+    async fn cleanup_call<P: Serialize>(&self, method: &str, params: &P) -> Result<()> {
+        loop {
+            match self.call::<_, m::Empty>(method, params).await {
+                Err(Error::Overloaded { .. }) => time::sleep(Duration::from_millis(1)).await,
+                outcome => return outcome.map(|_| ()),
+            }
+        }
+    }
+
+    fn own_cleanup(
+        self: &Arc<Self>,
+        permit: Arc<OwnedSemaphorePermit>,
+        future: impl Future<Output = Result<()>> + Send + 'static,
+    ) {
+        if RuntimeHandle::try_current().is_err() {
+            self.failed_cleanup
+                .lock()
+                .expect("failed cleanup lock")
+                .push((
+                    permit,
+                    TransportError::new("cleanup could not run without a runtime"),
+                ));
+            return;
+        }
+        let mut tasks = self.cleanup.lock().expect("cleanup tasks lock");
+        while tasks.try_join_next().is_some() {}
+        // Each task retains the original operation's I/O permit. The number
+        // of running or failed cleanups therefore cannot exceed active_io.
+        let weak = Arc::downgrade(self);
+        let deadline = self.limits.shutdown_timeout;
+        tasks.spawn(async move {
+            let error = match time::timeout(deadline, future).await {
+                Ok(Ok(())) => return,
+                Ok(Err(_)) => TransportError::new("resource cleanup failed"),
+                Err(_) => TransportError::new("resource cleanup timed out"),
+            };
+            if let Some(client) = weak.upgrade() {
+                client
+                    .failed_cleanup
+                    .lock()
+                    .expect("failed cleanup lock")
+                    .push((permit, error));
+            }
+        });
+    }
+
     fn next_stream_id(&self, prefix: &str) -> String {
         format!(
             "{prefix}-{}",
@@ -759,10 +1003,16 @@ impl Client {
                 "event-{}",
                 self.next_operation.fetch_add(1, Ordering::Relaxed)
             );
-            self.event_routes
-                .lock()
-                .expect("event routes lock")
-                .insert(route_id.clone(), context.clone());
+            let mut routes = self.event_routes.lock().expect("event routes lock");
+            // Responses can overtake asynchronous events. Keep completed routes
+            // in a bounded cache; a late event for an evicted route explicitly
+            // fails the event subscription instead of disappearing silently.
+            if routes.len() >= self.limits.cached_handles {
+                if let Some(old) = routes.keys().next().cloned() {
+                    routes.remove(&old);
+                }
+            }
+            routes.insert(route_id.clone(), context.clone());
             m::EventRequest {
                 route_id,
                 correlation_id: context.correlation_id_ref().cloned(),
@@ -770,16 +1020,7 @@ impl Client {
         })
     }
 
-    fn unregister_events(&self, request: Option<&m::EventRequest>) {
-        if let Some(request) = request {
-            self.event_routes
-                .lock()
-                .expect("event routes lock")
-                .remove(&request.route_id);
-        }
-    }
-
-    async fn route(&self, message: Message) -> Result<(), TransportError> {
+    fn route(&self, message: Message, bytes: usize) -> Result<(), TransportError> {
         if let Some(id) = message.id {
             let sender = self.pending.lock().expect("pending lock").remove(&id);
             if let Some(sender) = sender {
@@ -796,6 +1037,11 @@ impl Client {
             return Ok(());
         };
         let params = message.params.unwrap_or(Value::Null);
+        if method == "host/event_failed" {
+            *self.event_failure.lock().expect("event failure lock") = Some(TransportError::new(
+                "plugin event subscription exceeded its delivery capacity",
+            ));
+        }
         if method == m::HOST_EVENT {
             let notification =
                 serde_json::from_value::<m::HostEventNotification>(params).map_err(|error| {
@@ -827,8 +1073,31 @@ impl Client {
                             .cloned()
                     })
                 });
+            if context.is_none() {
+                *self.event_failure.lock().expect("event failure lock") = Some(
+                    TransportError::new("event route expired; event subscription is incomplete"),
+                );
+            }
             if let Some(context) = context {
-                context.forward(notification.event).await;
+                let mut failure = self.event_failure.lock().expect("event failure lock");
+                if failure.is_none() {
+                    let permit = Arc::clone(&self.event_bytes)
+                        .try_acquire_many_owned(u32::try_from(bytes).expect("bounded message"));
+                    let delivered = permit.ok().is_some_and(|permit| {
+                        self.events
+                            .try_send(DeliveredEvent {
+                                context,
+                                event: notification.event,
+                                _bytes: permit,
+                            })
+                            .is_ok()
+                    });
+                    if !delivered {
+                        *failure = Some(TransportError::new(
+                            "event delivery capacity exceeded; event subscription is incomplete",
+                        ));
+                    }
+                }
             }
         }
         Ok(())
@@ -840,6 +1109,19 @@ impl Client {
         err
     )]
     async fn call<P: Serialize, R: DeserializeOwned>(&self, method: &str, params: &P) -> Result<R> {
+        let priority = limits::reserved(method);
+        let _admission = limits::acquire(
+            if priority {
+                &self.reserved
+            } else {
+                &self.requests
+            },
+            if priority {
+                "reserved_requests"
+            } else {
+                "provider_requests"
+            },
+        )?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         tracing::Span::current().record("request_id", id);
         let params = serde_json::to_value(params).map_err(|error| {
@@ -862,16 +1144,8 @@ impl Client {
             // registration. The guard removes this call on return.
             return Err(self.closed_error());
         }
-        if let Err(send_error) = self
-            .outbound
-            .send(Message::request(id, method, params))
-            .await
-        {
-            return Err(Error::Transport(TransportError::with_source(
-                "sending plugin request",
-                send_error,
-            )));
-        }
+        self.outbound
+            .send(&Message::request(id, method, params), priority)?;
         let value = receiver.await.map_err(|error| {
             Error::Transport(TransportError::with_source(
                 "receiving plugin response",
@@ -892,6 +1166,7 @@ impl Client {
         self: &Arc<Self>,
         exec_id: &str,
         controls: &ExecControls,
+        acknowledged: Arc<AtomicBool>,
     ) -> Option<JoinHandle<()>> {
         (controls.term.is_some() || controls.kill.is_some()).then(|| {
             let client = Arc::clone(self);
@@ -907,9 +1182,16 @@ impl Client {
                         () = &mut termed, if !term_sent => StopLevel::Term,
                         () = &mut killed => StopLevel::Kill,
                     };
-                    client.send_stop(&exec_id, level).await;
                     if level == StopLevel::Kill {
+                        acknowledged.store(client.send_stop(&exec_id, level).await, Ordering::SeqCst);
                         break;
+                    }
+                    tokio::select! {
+                        _ = client.send_stop(&exec_id, level) => {},
+                        () = &mut killed => {
+                            acknowledged.store(client.send_stop(&exec_id, StopLevel::Kill).await, Ordering::SeqCst);
+                            break;
+                        }
                     }
                     term_sent = true;
                 }
@@ -917,15 +1199,34 @@ impl Client {
         })
     }
 
-    async fn send_stop(&self, exec_id: &str, level: StopLevel) {
-        let outcome: Result<m::Empty> = self
-            .call(m::EXEC_STOP, &m::ExecStopParams {
-                exec_id: exec_id.to_owned(),
-                level,
-            })
-            .await;
-        if let Err(error) = outcome {
-            tracing::warn!(error = %error, ?level, "plugin exec stop failed");
+    async fn send_stop(&self, exec_id: &str, level: StopLevel) -> bool {
+        self.stop_requests.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+        loop {
+            let outcome: Result<m::Empty> = self
+                .call(m::EXEC_STOP, &m::ExecStopParams {
+                    exec_id: exec_id.to_owned(),
+                    level,
+                })
+                .await;
+            match outcome {
+                Ok(_) => {
+                    self.stop_acknowledgments.fetch_add(1, Ordering::Relaxed);
+                    self.max_stop_acknowledgment_us.fetch_max(
+                        u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                        Ordering::Relaxed,
+                    );
+                    return true;
+                }
+                // Admitted operations already bound the number of stop tasks.
+                // Retry delivery inside the local drain deadline; do not lose
+                // an already-fired kill token when the reserve is briefly full.
+                Err(Error::Overloaded { .. }) => time::sleep(Duration::from_millis(1)).await,
+                Err(error) => {
+                    tracing::warn!(error = %error, ?level, "plugin exec stop failed");
+                    return false;
+                }
+            }
         }
     }
 }
@@ -980,16 +1281,28 @@ async fn pump_exec_channel(
     accepted: Arc<AtomicBool>,
     stdin: Option<StdinReader>,
     controls: ExecControls,
+    acknowledged: Arc<AtomicBool>,
 ) -> Result<PumpedOutput> {
     let Channel { mut reader, writer } = receiver.accept().await?;
     accepted.store(true, Ordering::SeqCst);
     // The server registers stop tokens before opening this channel. Waiting
     // for acceptance prevents an already-cancelled token overtaking exec.
     let _stop_task = client
-        .forward_stops(&exec_id, &controls)
+        .forward_stops(&exec_id, &controls, acknowledged)
         .map(AbortOnDropHandle::new);
-    let _stdin_task =
-        stdin.map(|reader| AbortOnDropHandle::new(tokio::spawn(feed_stdin_frames(reader, writer))));
+    let input_error = Arc::new(Mutex::new(None));
+    let _stdin_task = stdin.map(|reader| {
+        let input_error = Arc::clone(&input_error);
+        let kill = controls.kill.clone();
+        AbortOnDropHandle::new(tokio::spawn(async move {
+            if let Err(error) = feed_stdin_frames(reader, writer).await {
+                *input_error.lock().expect("input error lock") = Some(error);
+                if let Some(kill) = kill {
+                    kill.cancel();
+                }
+            }
+        }))
+    });
     let mut output = PumpedOutput {
         stdout:     OutputCaptureBuffer::new(controls.retained_output_limit),
         stderr:     OutputCaptureBuffer::new(controls.retained_output_limit),
@@ -1004,8 +1317,10 @@ async fn pump_exec_channel(
             (FrameKind::Stderr, payload) => (OutputStream::Stderr, payload),
             (FrameKind::Eof, _) => break,
             (kind, _) => {
-                tracing::warn!(?kind, "unexpected frame on an exec channel");
-                continue;
+                return Err(Error::invalid_spec(
+                    "frame",
+                    format!("unexpected {kind:?} frame on exec output"),
+                ));
             }
         };
         match stream {
@@ -1016,13 +1331,26 @@ async fn pump_exec_channel(
             continue;
         }
         if let Some(sink) = &controls.sink {
-            if let Err(error) = sink(stream, payload).await {
+            let delivered =
+                time::timeout(client.limits.output_progress_timeout, sink(stream, payload))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(Error::Transport(TransportError::new(
+                            "output sink made no progress",
+                        )))
+                    });
+            if let Err(error) = delivered {
                 // A failing sink is a hard stop on every provider; the
                 // rest of the stream is drained and dropped.
-                client.send_stop(&exec_id, StopLevel::Kill).await;
+                if let Some(kill) = &controls.kill {
+                    kill.cancel();
+                }
                 output.sink_error = Some(error);
             }
         }
+    }
+    if let Some(error) = input_error.lock().expect("input error lock").take() {
+        return Err(error);
     }
     Ok(output)
 }
@@ -1030,27 +1358,31 @@ async fn pump_exec_channel(
 /// Copies `reader` into the channel as `Stdin` frames, then sends the
 /// host's `Eof`. A channel the plugin closed is the command declining
 /// its input, which is not an error.
-async fn feed_stdin_frames(mut reader: StdinReader, mut writer: FrameWriter<OwnedWriteHalf>) {
+async fn feed_stdin_frames(
+    mut reader: StdinReader,
+    mut writer: FrameWriter<OwnedWriteHalf>,
+) -> Result<()> {
     let mut buffer = vec![0; 32 * 1024];
     loop {
-        match reader.read(&mut buffer).await {
-            Ok(0) => break,
-            Err(error) => {
-                tracing::debug!(error = %error, "exec stdin source failed");
-                break;
-            }
-            Ok(read) => {
-                if writer
-                    .write(FrameKind::Stdin, &buffer[..read])
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
+        let read = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|error| Error::io("reading exec stdin source", error))?;
+        if read == 0 {
+            break;
+        }
+        // A process may close stdin without consuming all input. A source
+        // read error, unlike that normal refusal, must fail the operation.
+        if writer
+            .write(FrameKind::Stdin, &buffer[..read])
+            .await
+            .is_err()
+        {
+            return Ok(());
         }
     }
     let _ = writer.finish().await;
+    Ok(())
 }
 
 /// Runs a channel-backed command to its result: sends the request, pumps
@@ -1065,7 +1397,27 @@ async fn run_channel_exec<P: Serialize>(
     stdin: Option<StdinReader>,
     controls: &ExecControls,
 ) -> Result<ExecStreamingResult> {
+    if controls
+        .retained_output_limit
+        .is_some_and(|limit| limit > client.limits.retained_output_bytes)
+    {
+        return Err(Error::LimitExceeded {
+            limit:     "retained_output_bytes".into(),
+            max_bytes: client.limits.retained_output_bytes,
+        });
+    }
+    let mut controls = controls.clone();
+    let kill = controls
+        .kill
+        .get_or_insert_with(CancellationToken::new)
+        .clone();
+    let drain_deadline = async {
+        kill.cancelled().await;
+        time::sleep(client.limits.hard_cancel_drain_timeout).await;
+    };
     let accepted = Arc::new(AtomicBool::new(false));
+    let acknowledged = Arc::new(AtomicBool::new(false));
+    let terminated = AtomicBool::new(false);
     let pump = pump_exec_channel(
         Arc::clone(client),
         exec_id.to_owned(),
@@ -1073,18 +1425,39 @@ async fn run_channel_exec<P: Serialize>(
         Arc::clone(&accepted),
         stdin,
         controls.clone(),
+        Arc::clone(&acknowledged),
     );
-    let (result, pumped) = call_with_pump(
-        client.call::<_, m::ExecStreamResult>(method, params),
+    let execution = client.pump(
+        async {
+            let result = client
+                .call::<_, m::ExecStreamResult>(method, params)
+                .await?;
+            terminated.store(
+                matches!(
+                    result.result.termination,
+                    Termination::Exited | Termination::Killed
+                ),
+                Ordering::SeqCst,
+            );
+            Ok(result)
+        },
         pump,
         &accepted,
         method,
-    )
-    .await?;
+    );
+    let (result, pumped) = tokio::select! {
+        result = execution => result?,
+        () = drain_deadline => {
+            let mut outcome = IncompleteOperation::new("hard cancellation drain");
+            outcome.stop_acknowledged = acknowledged.load(Ordering::SeqCst);
+            outcome.termination_confirmed = terminated.load(Ordering::SeqCst);
+            return Err(Error::Incomplete(outcome));
+        },
+    };
     let (stdout, mut stdout_stats) = pumped.stdout.into_parts();
     let (stderr, mut stderr_stats) = pumped.stderr.into_parts();
-    stdout_stats.truncated = result.stdout_capture.truncated;
-    stderr_stats.truncated = result.stderr_capture.truncated;
+    stdout_stats.truncated = result.stdout_capture.truncated || pumped.sink_error.is_some();
+    stderr_stats.truncated = result.stderr_capture.truncated || pumped.sink_error.is_some();
     let mut exec_result = result.result.into_result(stdout, stderr);
     if pumped.sink_error.is_some() {
         exec_result.termination = Termination::Cancelled;
@@ -1098,6 +1471,7 @@ async fn run_channel_exec<P: Serialize>(
 }
 
 struct StreamCancelGuard {
+    permit:    Option<Arc<OwnedSemaphorePermit>>,
     client:    Arc<Client>,
     stream_id: String,
     armed:     bool,
@@ -1110,21 +1484,20 @@ impl Drop for StreamCancelGuard {
         }
         let client = Arc::clone(&self.client);
         let stream_id = self.stream_id.clone();
-        // The follow future is normally dropped inside the runtime, but a
-        // teardown-time drop must not panic; without a runtime the plugin
-        // connection is going away with the stream anyway.
-        if let Ok(handle) = RuntimeHandle::try_current() {
-            handle.spawn(async move {
-                let outcome: Result<m::Empty> = client
-                    .call(m::STREAM_CANCEL, &m::StreamIdParams { stream_id })
-                    .await;
-                if let Err(error) = outcome {
-                    tracing::warn!(error = %error, "plugin log stream cancellation failed");
+        let permit = self.permit.take().expect("armed stream retains admission");
+        self.client.own_cleanup(permit, async move {
+            loop {
+                match client
+                    .call::<_, m::Empty>(m::STREAM_CANCEL, &m::StreamIdParams {
+                        stream_id: stream_id.clone(),
+                    })
+                    .await
+                {
+                    Err(Error::Overloaded { .. }) => time::sleep(Duration::from_millis(1)).await,
+                    outcome => return outcome.map(|_| ()),
                 }
-            });
-        } else {
-            tracing::debug!("plugin log stream cancellation skipped without a runtime");
-        }
+            }
+        });
     }
 }
 
@@ -1134,14 +1507,24 @@ async fn pump_log_channel(
     receiver: ChannelReceiver,
     accepted: Arc<AtomicBool>,
     sink: LogSink,
+    timeout: Duration,
 ) -> Result<()> {
     let Channel { mut reader, .. } = receiver.accept().await?;
     accepted.store(true, Ordering::SeqCst);
     loop {
         match reader.read().await? {
-            Some((FrameKind::Stdout | FrameKind::Stderr, payload)) => sink(payload).await?,
+            Some((FrameKind::Stdout | FrameKind::Stderr, payload)) => {
+                time::timeout(timeout, sink(payload)).await.map_err(|_| {
+                    Error::Transport(TransportError::new("log sink made no progress"))
+                })??;
+            }
             Some((FrameKind::Eof, _)) | None => return Ok(()),
-            Some((kind, _)) => tracing::warn!(?kind, "unexpected frame on a log channel"),
+            Some((kind, _)) => {
+                return Err(Error::invalid_spec(
+                    "frame",
+                    format!("unexpected {kind:?} on a log channel"),
+                ));
+            }
         }
     }
 }
@@ -1155,6 +1538,7 @@ async fn follow_log_stream<P: Serialize>(
     sink: LogSink,
 ) -> Result<()> {
     let mut guard = StreamCancelGuard {
+        permit:    Some(receiver.io_permit()),
         client:    Arc::clone(client),
         stream_id: stream_id.to_owned(),
         armed:     true,
@@ -1165,13 +1549,19 @@ async fn follow_log_stream<P: Serialize>(
         guard.armed = false;
         outcome
     };
-    call_with_pump(
-        call,
-        pump_log_channel(receiver, Arc::clone(&accepted), sink),
-        &accepted,
-        method,
-    )
-    .await?;
+    client
+        .pump(
+            call,
+            pump_log_channel(
+                receiver,
+                Arc::clone(&accepted),
+                sink,
+                client.limits.output_progress_timeout,
+            ),
+            &accepted,
+            method,
+        )
+        .await?;
     Ok(())
 }
 
@@ -1472,7 +1862,8 @@ struct SandboxPty {
 impl Pty for SandboxPty {
     async fn open(&self, options: &PtyOptions) -> Result<Box<dyn PtySession>> {
         let pty_id = self.client.next_stream_id("pty");
-        let (channel, receiver) = self.client.listener.expect();
+        let (channel, receiver) = self.client.listener.expect()?;
+        let permit = receiver.io_permit();
         let _: m::Empty = self
             .client
             .call(m::PTY_OPEN, &m::PtyOpenParams {
@@ -1485,18 +1876,43 @@ impl Pty for SandboxPty {
         let Channel { reader, writer } = receiver.accept_soon().await?;
         Ok(Box::new(RemotePtySession {
             client: Arc::clone(&self.client),
+            permit: Mutex::new(Some(permit)),
+            closed: AtomicBool::new(false),
             pty_id,
-            reader: AsyncMutex::new(reader),
-            writer: AsyncMutex::new(writer),
+            reader: AsyncMutex::new(Some(reader)),
+            writer: AsyncMutex::new(Some(writer)),
         }))
     }
 }
 
 struct RemotePtySession {
+    permit: Mutex<Option<Arc<OwnedSemaphorePermit>>>,
+    closed: AtomicBool,
     client: Arc<Client>,
     pty_id: String,
-    reader: AsyncMutex<FrameReader<OwnedReadHalf>>,
-    writer: AsyncMutex<FrameWriter<OwnedWriteHalf>>,
+    reader: AsyncMutex<Option<FrameReader<OwnedReadHalf>>>,
+    writer: AsyncMutex<Option<FrameWriter<OwnedWriteHalf>>>,
+}
+
+impl Drop for RemotePtySession {
+    fn drop(&mut self) {
+        if self.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        let permit = self
+            .permit
+            .get_mut()
+            .expect("PTY permit lock")
+            .take()
+            .expect("PTY retains admission");
+        let client = Arc::clone(&self.client);
+        let pty_id = self.pty_id.clone();
+        self.client.own_cleanup(permit, async move {
+            client
+                .cleanup_call(m::PTY_CLOSE, &m::PtyIdParams { pty_id })
+                .await
+        });
+    }
 }
 
 #[async_trait]
@@ -1505,19 +1921,24 @@ impl PtySession for RemotePtySession {
         self.writer
             .lock()
             .await
+            .as_mut()
+            .ok_or_else(|| Error::invalid_spec("pty", "session is closed"))?
             .write(FrameKind::Stdin, bytes)
             .await
     }
 
     async fn read_output(&self) -> Result<Option<Vec<u8>>> {
-        loop {
-            match self.reader.lock().await.read().await? {
-                Some((FrameKind::Stdout | FrameKind::Stderr, payload)) => {
-                    return Ok(Some(payload));
-                }
-                Some((FrameKind::Eof, _)) | None => return Ok(None),
-                Some(_) => {}
-            }
+        let mut reader = self.reader.lock().await;
+        let Some(reader) = reader.as_mut() else {
+            return Ok(None);
+        };
+        match reader.read().await? {
+            Some((FrameKind::Stdout | FrameKind::Stderr, payload)) => Ok(Some(payload)),
+            Some((FrameKind::Eof, _)) | None => Ok(None),
+            Some((kind, _)) => Err(Error::invalid_spec(
+                "frame",
+                format!("unexpected {kind:?} on PTY output"),
+            )),
         }
     }
 
@@ -1533,14 +1954,20 @@ impl PtySession for RemotePtySession {
     }
 
     async fn close(&self) -> Result<()> {
-        let _: m::Empty = self
-            .client
-            .call(m::PTY_CLOSE, &m::PtyIdParams {
-                pty_id: self.pty_id.clone(),
-            })
-            .await?;
-        let _ = self.writer.lock().await.finish().await;
-        Ok(())
+        time::timeout(self.client.limits.hard_cancel_drain_timeout, async {
+            self.client
+                .cleanup_call(m::PTY_CLOSE, &m::PtyIdParams {
+                    pty_id: self.pty_id.clone(),
+                })
+                .await?;
+            self.reader.lock().await.take();
+            self.writer.lock().await.take();
+            self.permit.lock().expect("PTY permit lock").take();
+            self.closed.store(true, Ordering::SeqCst);
+            Ok::<_, Error>(())
+        })
+        .await
+        .map_err(|_| Error::Incomplete(IncompleteOperation::new("PTY close")))?
     }
 }
 
@@ -1553,7 +1980,7 @@ struct SandboxLogs {
 impl Logs for SandboxLogs {
     async fn follow(&self, source: LogSource, sink: LogSink) -> Result<()> {
         let stream_id = self.client.next_stream_id("logs");
-        let (channel, receiver) = self.client.listener.expect();
+        let (channel, receiver) = self.client.listener.expect()?;
         follow_log_stream(
             &self.client,
             m::LOGS_FOLLOW,
@@ -1579,8 +2006,13 @@ struct SandboxExec {
 #[async_trait]
 impl Exec for SandboxExec {
     async fn run(&self, spec: &ExecSpec) -> Result<ExecResult> {
-        let streaming = self.run_streaming(spec, ExecControls::default()).await?;
-        Ok(streaming.result)
+        let streaming = self
+            .run_streaming(spec, ExecControls {
+                retained_output_limit: Some(self.client.limits.retained_output_bytes),
+                ..ExecControls::default()
+            })
+            .await?;
+        streaming.into_complete()
     }
 
     async fn run_streaming(
@@ -1590,7 +2022,7 @@ impl Exec for SandboxExec {
     ) -> Result<ExecStreamingResult> {
         let exec_id = self.client.next_exec_id(&self.sandbox_id);
         let stdin = controls.stdin_reader(spec);
-        let (channel, receiver) = self.client.listener.expect();
+        let (channel, receiver) = self.client.listener.expect()?;
         let params = m::ExecStreamParams {
             sandbox_id: self.sandbox_id.as_str().to_owned(),
             exec_id: exec_id.clone(),
@@ -1613,7 +2045,8 @@ impl Exec for SandboxExec {
 
     async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
         let process_id = self.client.next_stream_id("stdio");
-        let (channel, receiver) = self.client.listener.expect();
+        let (channel, receiver) = self.client.listener.expect()?;
+        let permit = receiver.io_permit();
         let _: m::Empty = self
             .client
             .call(m::EXEC_STDIO_OPEN, &m::StdioOpenParams {
@@ -1631,42 +2064,72 @@ impl Exec for SandboxExec {
         let (mut stdout_writer, stdout_reader) = duplex(64 * 1024);
         let stderr_tail = StderrTail::default();
         let output_tail = stderr_tail.clone();
+        let stopped = CancellationToken::new();
+        let output_stopped = stopped.clone();
         let output_id = process_id.clone();
+        let output_client = Arc::clone(&self.client);
         let output_task = tokio::spawn(async move {
-            loop {
-                match reader.read().await {
-                    Ok(Some((FrameKind::Stdout, payload))) => {
-                        if stdout_writer.write_all(&payload).await.is_err() {
-                            tracing::debug!(
-                                process_id = %output_id,
-                                "plugin stdio output reader closed"
-                            );
-                            break;
+            let outcome = async {
+                loop {
+                    match reader.read().await? {
+                        Some((FrameKind::Stdout, payload)) => {
+                            let mut bytes = payload.as_slice();
+                            while !bytes.is_empty() {
+                                let count = time::timeout(
+                                    output_client.limits.output_progress_timeout,
+                                    stdout_writer.write(bytes),
+                                )
+                                .await
+                                .map_err(|_| {
+                                    Error::Incomplete(IncompleteOperation::new(
+                                        "stdio output progress",
+                                    ))
+                                })?
+                                .map_err(|error| Error::io("writing stdio output", error))?;
+                                if count == 0 {
+                                    return Err(Error::io(
+                                        "writing stdio output",
+                                        io::ErrorKind::WriteZero.into(),
+                                    ));
+                                }
+                                bytes = &bytes[count..];
+                            }
                         }
-                    }
-                    Ok(Some((FrameKind::Stderr, payload))) => output_tail.push(&payload),
-                    Ok(Some((FrameKind::Eof, _)) | None) => break,
-                    Ok(Some(_)) => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            process_id = %output_id,
-                            error = %error,
-                            "plugin stdio output channel failed"
-                        );
-                        break;
+                        Some((FrameKind::Stderr, payload)) => output_tail.push(&payload),
+                        Some((FrameKind::Eof, _)) | None => return Ok(()),
+                        Some((kind, _)) => {
+                            return Err(Error::invalid_spec(
+                                "frame",
+                                format!("unexpected {kind:?} on stdio output"),
+                            ));
+                        }
                     }
                 }
             }
+            .await;
+            if outcome.is_err() {
+                output_stopped.cancel();
+                let _ = time::timeout(
+                    output_client.limits.hard_cancel_drain_timeout,
+                    output_client.cleanup_call(m::EXEC_STDIO_TERMINATE, &m::StdioIdParams {
+                        process_id: output_id,
+                    }),
+                )
+                .await;
+            }
             let _ = stdout_writer.shutdown().await;
+            outcome
         });
 
         let handle = RemoteStdioHandle {
             client: Arc::clone(&self.client),
+            permit: Mutex::new(Some(permit)),
+            stopped,
             process_id,
             stderr_tail: stderr_tail.clone(),
             outcome: OnceCell::new(),
-            input_task: AsyncMutex::new(Some(input_task)),
-            output_task: AsyncMutex::new(Some(output_task)),
+            input_task: AsyncMutex::new(Some(AbortOnDropHandle::new(input_task))),
+            output_task: AsyncMutex::new(Some(AbortOnDropHandle::new(output_task))),
         };
         Ok(StdioProcess {
             stdin: Box::pin(stdin_writer),
@@ -1686,7 +2149,7 @@ struct SandboxOneShot {
 impl OneShot for SandboxOneShot {
     async fn run(&self, spec: &OneShotSpec, controls: ExecControls) -> Result<ExecStreamingResult> {
         let exec_id = self.client.next_exec_id(&self.sandbox_id);
-        let (channel, receiver) = self.client.listener.expect();
+        let (channel, receiver) = self.client.listener.expect()?;
         let params = m::OneShotRunParams {
             sandbox_id: self.sandbox_id.as_str().to_owned(),
             exec_id: exec_id.clone(),
@@ -1708,26 +2171,56 @@ impl OneShot for SandboxOneShot {
 }
 
 struct RemoteStdioHandle {
+    permit:      Mutex<Option<Arc<OwnedSemaphorePermit>>>,
+    stopped:     CancellationToken,
     client:      Arc<Client>,
     process_id:  String,
     stderr_tail: StderrTail,
     outcome:     OnceCell<(Termination, Option<i32>)>,
-    input_task:  AsyncMutex<Option<JoinHandle<()>>>,
-    output_task: AsyncMutex<Option<JoinHandle<()>>>,
+    input_task:  AsyncMutex<Option<AbortOnDropHandle<Result<()>>>>,
+    output_task: AsyncMutex<Option<AbortOnDropHandle<Result<()>>>>,
+}
+
+impl Drop for RemoteStdioHandle {
+    fn drop(&mut self) {
+        let Some(permit) = self.permit.get_mut().expect("stdio permit lock").take() else {
+            return;
+        };
+        let client = Arc::clone(&self.client);
+        let process_id = self.process_id.clone();
+        self.client.own_cleanup(permit, async move {
+            let params = m::StdioIdParams { process_id };
+            client
+                .cleanup_call(m::EXEC_STDIO_TERMINATE, &params)
+                .await?;
+            loop {
+                match client
+                    .call::<_, m::StdioWaitResult>(m::EXEC_STDIO_WAIT, &params)
+                    .await
+                {
+                    Err(Error::Overloaded { .. }) => time::sleep(Duration::from_millis(1)).await,
+                    outcome => return outcome.map(|_| ()),
+                }
+            }
+        });
+    }
 }
 
 #[async_trait]
 impl StdioProcessHandle for RemoteStdioHandle {
     #[tracing::instrument(skip_all, fields(process_id = %self.process_id))]
     async fn terminate(&self) {
-        let outcome: Result<m::Empty> = self
-            .client
-            .call(m::EXEC_STDIO_TERMINATE, &m::StdioIdParams {
-                process_id: self.process_id.clone(),
-            })
-            .await;
-        if let Err(error) = outcome {
-            tracing::warn!(error = %error, "plugin stdio termination failed");
+        self.stopped.cancel();
+        let outcome = time::timeout(
+            self.client.limits.hard_cancel_drain_timeout,
+            self.client
+                .cleanup_call(m::EXEC_STDIO_TERMINATE, &m::StdioIdParams {
+                    process_id: self.process_id.clone(),
+                }),
+        )
+        .await;
+        if !matches!(outcome, Ok(Ok(()))) {
+            tracing::warn!("plugin stdio termination is unconfirmed");
         }
     }
 
@@ -1736,12 +2229,15 @@ impl StdioProcessHandle for RemoteStdioHandle {
         *self
             .outcome
             .get_or_init(|| async {
-                let result: Result<m::StdioWaitResult> = self
-                    .client
-                    .call(m::EXEC_STDIO_WAIT, &m::StdioIdParams {
-                        process_id: self.process_id.clone(),
-                    })
-                    .await;
+                let params = m::StdioIdParams { process_id: self.process_id.clone() };
+                let result: Result<m::StdioWaitResult> = tokio::select! {
+                    result = self.client.call(m::EXEC_STDIO_WAIT, &params) => result,
+                    () = async { self.stopped.cancelled().await; time::sleep(self.client.limits.hard_cancel_drain_timeout).await; } => {
+                        self.output_task.lock().await.take();
+                        self.input_task.lock().await.take();
+                        return (Termination::Unknown, None);
+                    }
+                };
                 let result = match result {
                     Ok(result) => result,
                     Err(error) => {
@@ -1749,9 +2245,13 @@ impl StdioProcessHandle for RemoteStdioHandle {
                         return (Termination::Unknown, None);
                     }
                 };
+                // The provider wait completed. Cleanup no longer needs to
+                // retain separate admission, even if local output later fails.
+                self.permit.lock().expect("stdio permit lock").take();
                 if let Some(task) = self.output_task.lock().await.take() {
-                    if let Err(error) = task.await {
-                        tracing::error!(error = ?error, "plugin stdio output task failed");
+                    if !matches!(time::timeout(self.client.limits.hard_cancel_drain_timeout, task).await, Ok(Ok(Ok(())))) {
+                        self.input_task.lock().await.take();
+                        return (Termination::Unknown, None);
                     }
                 }
                 if !result.stderr_tail.is_empty() {
@@ -1786,7 +2286,7 @@ impl SandboxFs {
         length: Option<u64>,
         output: &mut (dyn AsyncWrite + Unpin + Send),
     ) -> Result<()> {
-        let (channel, receiver) = self.client.listener.expect();
+        let (channel, receiver) = self.client.listener.expect()?;
         let accepted = Arc::new(AtomicBool::new(false));
         let collect_accepted = Arc::clone(&accepted);
         let collect = async move {
@@ -1794,12 +2294,36 @@ impl SandboxFs {
             collect_accepted.store(true, Ordering::SeqCst);
             loop {
                 match reader.read().await? {
-                    Some((FrameKind::Stdout, payload)) => output
-                        .write_all(&payload)
-                        .await
-                        .map_err(|error| Error::io("writing downloaded file", error))?,
+                    Some((FrameKind::Stdout, payload)) => {
+                        let mut bytes = payload.as_slice();
+                        while !bytes.is_empty() {
+                            let written = time::timeout(
+                                self.client.limits.output_progress_timeout,
+                                output.write(bytes),
+                            )
+                            .await
+                            .map_err(|_| {
+                                Error::Transport(TransportError::new(
+                                    "file output made no progress",
+                                ))
+                            })?
+                            .map_err(|error| Error::io("writing downloaded file", error))?;
+                            if written == 0 {
+                                return Err(Error::io(
+                                    "writing downloaded file",
+                                    io::ErrorKind::WriteZero.into(),
+                                ));
+                            }
+                            bytes = &bytes[written..];
+                        }
+                    }
                     Some((FrameKind::Eof, _)) | None => return Ok(()),
-                    Some(_) => {}
+                    Some(_) => {
+                        return Err(Error::invalid_spec(
+                            "frame",
+                            "unexpected frame on file output",
+                        ));
+                    }
                 }
             }
         };
@@ -1810,13 +2334,14 @@ impl SandboxFs {
             offset,
             length,
         };
-        call_with_pump(
-            self.client.call::<_, m::Empty>(m::FS_READ, &params),
-            collect,
-            &accepted,
-            m::FS_READ,
-        )
-        .await?;
+        self.client
+            .pump(
+                self.client.call::<_, m::Empty>(m::FS_READ, &params),
+                collect,
+                &accepted,
+                m::FS_READ,
+            )
+            .await?;
         Ok(())
     }
 
@@ -1827,7 +2352,7 @@ impl SandboxFs {
         length: u64,
         append: bool,
     ) -> Result<()> {
-        let (channel, receiver) = self.client.listener.expect();
+        let (channel, receiver) = self.client.listener.expect()?;
         let accepted = Arc::new(AtomicBool::new(false));
         let send_accepted = Arc::clone(&accepted);
         let send = async move {
@@ -1863,13 +2388,14 @@ impl SandboxFs {
             append,
             content_length: Some(length),
         };
-        call_with_pump(
-            self.client.call::<_, m::Empty>(m::FS_WRITE, &params),
-            send,
-            &accepted,
-            m::FS_WRITE,
-        )
-        .await?;
+        self.client
+            .pump(
+                self.client.call::<_, m::Empty>(m::FS_WRITE, &params),
+                send,
+                &accepted,
+                m::FS_WRITE,
+            )
+            .await?;
         Ok(())
     }
 }
@@ -1877,16 +2403,19 @@ impl SandboxFs {
 #[async_trait]
 impl Filesystem for SandboxFs {
     async fn read(&self, path: &str) -> Result<Vec<u8>> {
-        let mut content = Vec::new();
-        self.read_to(path, &mut content).await?;
-        Ok(content)
+        let mut content =
+            sandbox_driver::BoundedBuffer::new(self.client.limits.buffered_value_bytes);
+        let outcome = self.read_to(path, &mut content).await;
+        content.finish(outcome)
     }
 
     async fn read_range(&self, path: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
-        let mut content = Vec::new();
-        self.read_through_channel(path, Some(offset), length, &mut content)
-            .await?;
-        Ok(content)
+        let mut content =
+            sandbox_driver::BoundedBuffer::new(self.client.limits.buffered_value_bytes);
+        let outcome = self
+            .read_through_channel(path, Some(offset), length, &mut content)
+            .await;
+        content.finish(outcome)
     }
 
     async fn write(&self, path: &str, mut content: &[u8]) -> Result<()> {
@@ -2027,6 +2556,248 @@ mod tests {
     use tokio::task::yield_now;
 
     use super::*;
+    use crate::channel;
+
+    #[tokio::test]
+    async fn cancellation_before_open_releases_local_admission() {
+        let limits = TransportLimits {
+            active_io: 1,
+            hard_cancel_drain_timeout: Duration::from_millis(50),
+            ..TransportLimits::default()
+        };
+        let (reader, _peer_writer) = duplex(4096);
+        let (writer, _peer_reader) = duplex(4096);
+        let listener =
+            ChannelListener::bind_with_limits(limits.clone(), TrustedPeer::Process(process::id()))
+                .expect("listener");
+        let client = Client::start(reader, writer, listener, limits);
+        let (_, receiver) = client.listener.expect().expect("admission");
+        let kill = CancellationToken::new();
+        kill.cancel();
+        let result = time::timeout(
+            Duration::from_secs(1),
+            run_channel_exec(
+                &client,
+                m::EXEC_STREAM,
+                &m::Empty,
+                "before-open",
+                receiver,
+                None,
+                &ExecControls {
+                    kill: Some(kill),
+                    ..ExecControls::default()
+                },
+            ),
+        )
+        .await
+        .expect("deadline");
+        assert!(matches!(result, Err(Error::Incomplete(_))));
+        assert_eq!(client.listener.diagnostics().active_io, 0);
+        assert!(client.listener.expect().is_ok());
+        assert!(!client.closed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_result_bounds_output_and_partial_eof_delivery() {
+        use tokio::io::split;
+        use tokio::net::UnixStream;
+        for partial_eof in [false, true] {
+            let limits = TransportLimits {
+                hard_cancel_drain_timeout: Duration::from_millis(100),
+                ..TransportLimits::default()
+            };
+            let (host, peer_control) = duplex(4096);
+            let (reader, writer) = split(host);
+            let (peer_reader, mut peer_writer) = split(peer_control);
+            let listener = ChannelListener::bind_with_limits(
+                limits.clone(),
+                TrustedPeer::Process(process::id()),
+            )
+            .expect("listener");
+            let transport = listener.transport();
+            let client = Client::start(reader, writer, listener, limits);
+            let (request, receiver) = client.listener.expect().expect("admitted");
+            let mut peer = UnixStream::connect(&transport.socket_path)
+                .await
+                .expect("socket");
+            FrameWriter::new(&mut peer, transport.max_frame_bytes)
+                .write(
+                    FrameKind::Open,
+                    &serde_json::to_vec(&request).expect("open"),
+                )
+                .await
+                .expect("authenticate");
+            if partial_eof {
+                // A valid EOF kind with an incomplete length must never mean
+                // complete output, even after a successful control response.
+                peer.write_all(&[4, 0]).await.expect("partial EOF header");
+            } else {
+                FrameWriter::new(&mut peer, transport.max_frame_bytes)
+                    .write(FrameKind::Stdout, b"pending output")
+                    .await
+                    .expect("output");
+            }
+            let kill = CancellationToken::new();
+            let remote_kill = kill.clone();
+            let response_task = AbortOnDropHandle::new(tokio::spawn(async move {
+                let mut reader = BufReader::new(peer_reader);
+                let mut partial = Vec::new();
+                while let Some(line) = control::read_line(&mut reader, &mut partial, 4096)
+                    .await
+                    .expect("request")
+                {
+                    let request: Message = serde_json::from_slice(&line).expect("message");
+                    let id = request.id.expect("id");
+                    let response = if request.method.as_deref() == Some(m::EXEC_STREAM) {
+                        let result = ExecStreamingResult::new(ExecResult::from_shell_status(
+                            Termination::Exited,
+                            Some(0),
+                            Duration::ZERO,
+                        ));
+                        Message::response(
+                            id,
+                            serde_json::to_value(m::ExecStreamResult {
+                                result:            m::ExecResultDto::from_result(&result.result),
+                                live_streaming:    true,
+                                streams_separated: true,
+                                stdout_capture:    result.stdout_capture,
+                                stderr_capture:    result.stderr_capture,
+                            })
+                            .expect("response"),
+                        )
+                    } else {
+                        Message::response(id, Value::Null)
+                    };
+                    peer_writer
+                        .write_all(
+                            format!("{}\n", serde_json::to_string(&response).expect("encode"))
+                                .as_bytes(),
+                        )
+                        .await
+                        .expect("reply");
+                    if request.method.as_deref() == Some(m::EXEC_STREAM) {
+                        remote_kill.cancel();
+                    }
+                }
+            }));
+            let outcome = time::timeout(
+                Duration::from_secs(2),
+                run_channel_exec(
+                    &client,
+                    m::EXEC_STREAM,
+                    &m::Empty,
+                    "after-result",
+                    receiver,
+                    None,
+                    &ExecControls {
+                        kill: Some(kill),
+                        sink: Some(Arc::new(|_, _| Box::pin(future::pending()))),
+                        ..ExecControls::default()
+                    },
+                ),
+            )
+            .await
+            .expect("local completion bounded");
+            let Err(Error::Incomplete(outcome)) = outcome else {
+                panic!("must report incomplete delivery");
+            };
+            assert!(outcome.output_abandoned);
+            assert!(outcome.stop_acknowledged);
+            assert!(outcome.termination_confirmed);
+            assert!(!outcome.cleanup_confirmed);
+            let _: m::Empty = client
+                .call(m::PROVIDER_HEALTH, &m::Empty)
+                .await
+                .expect("unrelated response remains available");
+            assert_eq!(client.listener.diagnostics().active_io, 0);
+            drop(peer);
+            drop(response_task);
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_retains_admission_without_closing_other_calls() {
+        let limits = TransportLimits {
+            active_io: 1,
+            ..TransportLimits::default()
+        };
+        let (reader, _plugin_writer) = duplex(1024);
+        let (writer, _plugin_reader) = duplex(1024);
+        let listener =
+            ChannelListener::bind_with_limits(limits.clone(), TrustedPeer::Process(process::id()))
+                .expect("listener");
+        let client = Client::start(reader, writer, listener, limits);
+        let (_, receiver) = client.listener.expect().expect("admitted");
+        client.own_cleanup(receiver.io_permit(), async {
+            Err(Error::invalid_spec("cleanup", "failed"))
+        });
+        drop(receiver);
+        time::timeout(Duration::from_secs(1), async {
+            while client
+                .failed_cleanup
+                .lock()
+                .expect("failed cleanup lock")
+                .is_empty()
+            {
+                yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup failure recorded");
+        assert!(!client.closed.load(Ordering::SeqCst));
+        assert!(matches!(
+            client.listener.expect(),
+            Err(Error::Overloaded { .. })
+        ));
+        assert!(limits::acquire(&client.reserved, "reserved_requests").is_ok());
+    }
+
+    #[tokio::test]
+    async fn hard_cancel_drain_does_not_wait_for_stop_acknowledgment() {
+        let limits = TransportLimits {
+            hard_cancel_drain_timeout: Duration::from_millis(50),
+            ..TransportLimits::default()
+        };
+        let (reader, _plugin_writer) = duplex(1024);
+        let (writer, _plugin_reader) = duplex(1024);
+        let listener =
+            ChannelListener::bind_with_limits(limits.clone(), TrustedPeer::Process(process::id()))
+                .expect("listener");
+        let transport = listener.transport();
+        let client = Client::start(reader, writer, listener, limits);
+        let (request, receiver) = client.listener.expect().expect("admitted");
+        let peer = channel::open(&transport, &request)
+            .await
+            .expect("authenticated peer");
+        let kill = CancellationToken::new();
+        kill.cancel();
+        let outcome = time::timeout(
+            Duration::from_secs(1),
+            run_channel_exec(
+                &client,
+                m::EXEC_STREAM,
+                &m::Empty,
+                "cancelled",
+                receiver,
+                None,
+                &ExecControls {
+                    kill: Some(kill),
+                    ..ExecControls::default()
+                },
+            ),
+        )
+        .await
+        .expect("local drain deadline");
+        let Err(Error::Incomplete(outcome)) = outcome else {
+            panic!("must report incomplete drain");
+        };
+        assert!(outcome.output_abandoned);
+        assert!(!outcome.stop_acknowledged);
+        assert!(!outcome.termination_confirmed);
+        assert!(!outcome.cleanup_confirmed);
+        assert!(!client.closed.load(Ordering::SeqCst));
+        drop(peer);
+    }
 
     #[tokio::test]
     async fn shutdown_kills_a_plugin_that_never_acknowledges() {
@@ -2040,7 +2811,12 @@ mod tests {
         let reader = child.stdout.take().expect("stdout");
         let writer = child.stdin.take().expect("stdin");
         let provider = PluginProvider {
-            client:       Client::start(reader, writer, ChannelListener::bind().expect("bind")),
+            client:       Client::start(
+                reader,
+                writer,
+                ChannelListener::bind().expect("bind"),
+                TransportLimits::default(),
+            ),
             kind:         ProviderKind::try_new("host").expect("kind"),
             capabilities: Capabilities::minimal(sandbox_driver::Isolation::None),
             snapshots:    None,
@@ -2090,7 +2866,12 @@ mod tests {
     async fn cancelling_a_call_removes_its_pending_response() {
         let (reader, _plugin_writer) = duplex(1024);
         let (writer, _plugin_reader) = duplex(1024);
-        let client = Client::start(reader, writer, ChannelListener::bind().expect("bind"));
+        let client = Client::start(
+            reader,
+            writer,
+            ChannelListener::bind().expect("bind"),
+            TransportLimits::default(),
+        );
         let mut call = Box::pin(client.call::<_, m::Empty>("test", &m::Empty));
         tokio::select! {
             biased;
@@ -2106,7 +2887,12 @@ mod tests {
     async fn dropping_the_client_releases_its_transport() {
         let (reader, _plugin_writer) = duplex(1024);
         let (writer, mut plugin_reader) = duplex(1024);
-        let client = Client::start(reader, writer, ChannelListener::bind().expect("bind"));
+        let client = Client::start(
+            reader,
+            writer,
+            ChannelListener::bind().expect("bind"),
+            TransportLimits::default(),
+        );
         let socket = client.listener.transport().socket_path;
         let weak = Arc::downgrade(&client);
         drop(client);

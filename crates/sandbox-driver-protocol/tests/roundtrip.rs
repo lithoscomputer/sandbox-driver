@@ -7,19 +7,25 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use std::{io, mem};
+use std::{future, io, mem, process};
 
 use async_trait::async_trait;
 use sandbox_driver::{
-    Action, Capability, CorrelationId, Error, Event, EventBody, EventContext, EventObserver,
-    ExecControls, ExecSpec, Git, GitCommitOptions, OutputStream, SandboxProvider, SandboxSource,
-    SandboxSpec, Termination, WaitOptions, activate,
+    Action, Capabilities, Capability, CorrelationId, Error, Event, EventBody, EventContext,
+    EventEmitter, EventObserver, EventSubject, ExecControls, ExecSpec, Git, GitCommitOptions,
+    OutputStream, ProviderKind, Result, Sandbox, SandboxFilter, SandboxId, SandboxProvider,
+    SandboxSource, SandboxSpec, SandboxStatus, SpawnSpec, StdinSource, Termination, WaitOptions,
+    activate,
 };
 use sandbox_driver_host::HostProvider;
+use sandbox_driver_protocol::channel::TrustedPeer;
 use sandbox_driver_protocol::{PluginProvider, serve};
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter, copy, duplex, repeat, split};
+use tokio::io::{
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter, ReadBuf, copy, duplex, repeat,
+    split,
+};
 use tokio::sync::Notify;
-use tokio::{fs, time};
+use tokio::{fs, task, time};
 use tokio_util::sync::CancellationToken;
 
 type SeenChunks = Arc<Mutex<Vec<(OutputStream, Vec<u8>)>>>;
@@ -90,7 +96,7 @@ async fn shutdown_cancels_an_active_exec_before_the_server_returns() {
                         ready.notify_one();
                         Box::pin(async { Ok(()) })
                     })),
-                    ..ExecControls::default()
+                    ..ExecControls::buffered()
                 },
             )
             .await
@@ -141,7 +147,7 @@ async fn shutdown_cancels_an_exec_queued_before_registration() {
         serde_json::from_str(&responses.next_line().await.unwrap().unwrap()).unwrap();
     assert!(initialized.error.is_none());
 
-    let (channel, receiver) = listener.expect();
+    let (channel, receiver) = listener.expect().expect("admitted");
     let exec = Message::request(
         2,
         m::EXEC_STREAM,
@@ -506,7 +512,7 @@ async fn streaming_exec_delivers_output_notifications_and_stops() {
                 Ok(())
             })
         })),
-        ..ExecControls::default()
+        ..ExecControls::buffered()
     };
     let spec = ExecSpec::bash("echo one; echo two >&2").timeout(Duration::from_secs(10));
     let streaming = sandbox
@@ -533,7 +539,7 @@ async fn streaming_exec_delivers_output_notifications_and_stops() {
     });
     let controls = ExecControls {
         term: Some(token),
-        ..ExecControls::default()
+        ..ExecControls::buffered()
     };
     let started = Instant::now();
     let streaming = sandbox
@@ -582,7 +588,7 @@ async fn attach_and_list_work_over_the_wire() {
     assert_eq!(attached.id(), sandbox.id());
     assert_eq!(attached.working_directory(), sandbox.working_directory());
 
-    let mut filter = sandbox_driver::SandboxFilter::default();
+    let mut filter = SandboxFilter::default();
     filter.labels.insert("wire".into(), "yes".into());
     let listed = provider.list(&filter).await.expect("list");
     assert_eq!(listed.len(), 1);
@@ -752,7 +758,7 @@ async fn cancellation_before_exec_registration_is_delivered_after_channel_accept
         let controls = ExecControls {
             term: (!kill).then(|| token.clone()),
             kill: kill.then_some(token),
-            ..ExecControls::default()
+            ..ExecControls::buffered()
         };
         let result = time::timeout(
             Duration::from_secs(5),
@@ -779,6 +785,475 @@ async fn cancellation_before_exec_registration_is_delivered_after_channel_accept
         );
         sandbox.start().await.expect("restart");
     }
+    sandbox.delete().await.expect("delete");
+    provider.shutdown().await.expect("shutdown");
+}
+
+async fn connect_limited(limits: sandbox_driver_protocol::TransportLimits) -> PluginProvider {
+    connect_separate_limits(limits.clone(), limits).await
+}
+
+async fn connect_separate_limits(
+    client_limits: sandbox_driver_protocol::TransportLimits,
+    server_limits: sandbox_driver_protocol::TransportLimits,
+) -> PluginProvider {
+    let (host, plugin) = duplex(1024 * 1024);
+    let (read, write) = split(host);
+    let (plugin_read, plugin_write) = split(plugin);
+    tokio::spawn(sandbox_driver_protocol::serve_with_limits(
+        Arc::new(HostProvider::new()),
+        plugin_read,
+        plugin_write,
+        server_limits,
+    ));
+    PluginProvider::connect_with_limits(
+        read,
+        write,
+        client_limits,
+        TrustedPeer::Process(process::id()),
+    )
+    .await
+    .expect("limited connection")
+}
+
+#[tokio::test]
+async fn streaming_defaults_to_no_copy_and_buffered_files_enforce_the_limit() {
+    let mut limits = sandbox_driver_protocol::TransportLimits::default();
+    limits.buffered_value_bytes = 4;
+    let provider = connect_limited(limits).await;
+    let sandbox = provider.create(&host_spec(), None).await.expect("sandbox");
+    let result = sandbox
+        .exec()
+        .run_streaming(&ExecSpec::bash("printf hello"), ExecControls::default())
+        .await
+        .expect("stream");
+    assert!(result.result.stdout.is_empty());
+    assert_eq!(result.stdout_capture.observed_bytes, 5);
+    assert_eq!(result.stdout_capture.omitted_bytes, 5);
+    assert!(!result.stdout_capture.truncated);
+    sandbox.fs().write("large", b"hello").await.expect("write");
+    assert!(matches!(
+        sandbox.fs().read("large").await,
+        Err(Error::LimitExceeded { max_bytes: 4, .. })
+    ));
+    let mut output = Vec::new();
+    sandbox
+        .fs()
+        .read_to("large", &mut output)
+        .await
+        .expect("stream file");
+    assert_eq!(output, b"hello");
+    sandbox.delete().await.expect("delete");
+    provider.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn io_overload_rejects_before_command_effects_and_reserved_controls_work() {
+    assert_io_overload(true).await;
+}
+
+#[tokio::test]
+async fn server_rejects_ten_thousand_excess_operations_before_effects() {
+    assert_io_overload(false).await;
+}
+
+async fn assert_io_overload(client_limited: bool) {
+    let mut limits = sandbox_driver_protocol::TransportLimits::default();
+    limits.active_io = 1;
+    let client_limits = if client_limited {
+        limits.clone()
+    } else {
+        sandbox_driver_protocol::TransportLimits::default()
+    };
+    let provider = connect_separate_limits(client_limits, limits).await;
+    let sandbox = provider.create(&host_spec(), None).await.expect("sandbox");
+    let active = Arc::clone(&sandbox);
+    let ready = Arc::new(Notify::new());
+    let started = Arc::clone(&ready);
+    let kill = CancellationToken::new();
+    let token = kill.clone();
+    let task = tokio::spawn(async move {
+        active
+            .exec()
+            .run_streaming(
+                &ExecSpec::bash("echo ready; exec sleep 300"),
+                ExecControls {
+                    kill: Some(token),
+                    sink: Some(Arc::new(move |_, _| {
+                        started.notify_one();
+                        Box::pin(async { Ok(()) })
+                    })),
+                    ..ExecControls::default()
+                },
+            )
+            .await
+    });
+    time::timeout(Duration::from_secs(5), ready.notified())
+        .await
+        .expect("active command");
+    for _ in 0..10_000 {
+        let error = sandbox
+            .exec()
+            .run(&ExecSpec::bash("touch should-not-exist"))
+            .await
+            .expect_err("rejected");
+        assert!(matches!(error, Error::Overloaded { limit } if limit == "active_io"));
+    }
+    time::timeout(Duration::from_secs(1), provider.health())
+        .await
+        .expect("reserved health")
+        .expect("healthy");
+    kill.cancel();
+    let result = time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("stop available")
+        .expect("task")
+        .expect("kill result");
+    assert_eq!(result.result.termination, Termination::Killed);
+    assert!(!sandbox.fs().exists("should-not-exist").await.expect("stat"));
+    assert!(
+        sandbox
+            .exec()
+            .run(&ExecSpec::new("true"))
+            .await
+            .expect("resumed")
+            .success()
+    );
+    sandbox.delete().await.expect("delete");
+    provider.shutdown().await.expect("shutdown");
+}
+
+struct BlockedObserver;
+#[async_trait]
+impl EventObserver for BlockedObserver {
+    async fn observe(&self, _: Event) {
+        future::pending::<()>().await;
+    }
+}
+
+#[tokio::test]
+async fn blocked_observer_does_not_block_responses_and_reports_subscription_failure() {
+    let mut limits = sandbox_driver_protocol::TransportLimits::default();
+    limits.output_progress_timeout = Duration::from_millis(50);
+    let provider = connect_limited(limits).await;
+    let sandbox = time::timeout(
+        Duration::from_secs(2),
+        provider.create(
+            &host_spec(),
+            Some(EventContext::new(Arc::new(BlockedObserver))),
+        ),
+    )
+    .await
+    .expect("observer does not block create")
+    .expect("sandbox");
+    time::timeout(Duration::from_secs(2), async {
+        while provider.event_delivery_error().is_none() {
+            task::yield_now().await;
+        }
+    })
+    .await
+    .expect("explicit observer failure");
+    provider.health().await.expect("healthy control transport");
+    sandbox.delete().await.expect("delete");
+    provider.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn blocked_output_cancels_but_a_quiet_command_has_no_progress_deadline() {
+    let mut limits = sandbox_driver_protocol::TransportLimits::default();
+    limits.output_progress_timeout = Duration::from_millis(50);
+    limits.hard_cancel_drain_timeout = Duration::from_millis(100);
+    let provider = connect_limited(limits).await;
+    let sandbox = provider.create(&host_spec(), None).await.expect("sandbox");
+    let quiet = sandbox
+        .exec()
+        .run(&ExecSpec::bash("sleep 0.2"))
+        .await
+        .expect("quiet command");
+    assert!(quiet.success());
+    let outcome = time::timeout(
+        Duration::from_secs(2),
+        sandbox.exec().run_streaming(
+            &ExecSpec::bash("echo ready; exec sleep 300"),
+            ExecControls {
+                sink: Some(Arc::new(|_, _| Box::pin(future::pending()))),
+                ..ExecControls::default()
+            },
+        ),
+    )
+    .await
+    .expect("blocked output waiting is bounded");
+    match outcome {
+        Ok(result) => assert!(!result.result.success()),
+        Err(error) => assert!(matches!(error, Error::Transport(_) | Error::Incomplete(_))),
+    }
+    assert!(
+        sandbox
+            .exec()
+            .run(&ExecSpec::new("true"))
+            .await
+            .expect("unrelated channel")
+            .success()
+    );
+    sandbox.delete().await.expect("delete");
+    provider.shutdown().await.expect("shutdown");
+}
+
+struct FailedInput;
+impl AsyncRead for FailedInput {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(Err(io::Error::other("source failed")))
+    }
+}
+
+#[tokio::test]
+async fn failed_input_cannot_be_reported_as_complete() {
+    let provider = connect().await;
+    let sandbox = provider.create(&host_spec(), None).await.expect("sandbox");
+    let result = time::timeout(
+        Duration::from_secs(5),
+        sandbox
+            .exec()
+            .run_streaming(&ExecSpec::bash("cat >/dev/null"), ExecControls {
+                stdin: Some(StdinSource::new(FailedInput)),
+                ..ExecControls::default()
+            }),
+    )
+    .await
+    .expect("failed input ends local waiting");
+    assert!(
+        result.is_err(),
+        "source failure must not become a successful EOF"
+    );
+    provider
+        .health()
+        .await
+        .expect("unrelated controls remain usable");
+    sandbox.delete().await.expect("delete");
+    provider.shutdown().await.expect("shutdown");
+}
+
+struct FloodProvider {
+    host:    HostProvider,
+    notices: usize,
+}
+
+#[async_trait]
+impl SandboxProvider for FloodProvider {
+    fn kind(&self) -> &ProviderKind {
+        self.host.kind()
+    }
+    fn capabilities(&self) -> &Capabilities {
+        self.host.capabilities()
+    }
+    async fn create(
+        &self,
+        spec: &SandboxSpec,
+        events: Option<EventContext>,
+    ) -> Result<Arc<dyn Sandbox>> {
+        let emitter = EventEmitter::new(self.kind().clone(), events.clone());
+        for _ in 0..self.notices {
+            emitter
+                .notice(EventSubject::pending_sandbox(None), "flood", "notice")
+                .await;
+        }
+        self.host.create(spec, events).await
+    }
+    async fn attach(
+        &self,
+        id: &SandboxId,
+        events: Option<EventContext>,
+    ) -> Result<Arc<dyn Sandbox>> {
+        self.host.attach(id, events).await
+    }
+    async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>> {
+        self.host.list(filter).await
+    }
+}
+
+#[tokio::test]
+async fn event_flood_reports_failure_and_keeps_control_responses_available() {
+    for server_limited in [false, true] {
+        let mut client_limits = sandbox_driver_protocol::TransportLimits::default();
+        let mut server_limits = client_limits.clone();
+        if server_limited {
+            server_limits.event_queue_messages = 2;
+        } else {
+            client_limits.event_queue_messages = 2;
+        }
+        let (host, plugin) = duplex(4096);
+        let (read, write) = split(host);
+        let (plugin_read, plugin_write) = split(plugin);
+        let server = task::spawn(sandbox_driver_protocol::serve_with_limits(
+            Arc::new(FloodProvider {
+                host:    HostProvider::new(),
+                notices: 10000,
+            }),
+            plugin_read,
+            plugin_write,
+            server_limits,
+        ));
+        let provider = PluginProvider::connect_with_limits(
+            read,
+            write,
+            client_limits,
+            TrustedPeer::Process(process::id()),
+        )
+        .await
+        .expect("connect");
+        let sandbox = time::timeout(
+            Duration::from_secs(5),
+            provider.create(
+                &host_spec(),
+                Some(EventContext::new(Arc::new(BlockedObserver))),
+            ),
+        )
+        .await
+        .expect("flood does not stall response")
+        .expect("sandbox");
+        time::timeout(Duration::from_secs(1), async {
+            while provider.event_delivery_error().is_none() {
+                task::yield_now().await;
+            }
+        })
+        .await
+        .expect("explicit subscription failure");
+        time::timeout(
+            Duration::from_secs(1),
+            provider.list(&SandboxFilter::default()),
+        )
+        .await
+        .expect("control available after flood")
+        .expect("list");
+        assert!(!provider.is_closed());
+        sandbox.delete().await.expect("delete");
+        provider.shutdown().await.expect("shutdown");
+        server.await.expect("join server").expect("server result");
+    }
+}
+
+#[tokio::test]
+async fn stdio_wait_and_dropped_handles_return_admission_and_owned_tasks() {
+    let mut limits = sandbox_driver_protocol::TransportLimits::default();
+    limits.active_io = 1;
+    let provider = connect_limited(limits).await;
+    let sandbox = provider.create(&host_spec(), None).await.expect("sandbox");
+    for _ in 0..50 {
+        let mut process = sandbox
+            .exec()
+            .spawn_stdio(&SpawnSpec::new("cat"))
+            .await
+            .expect("stdio");
+        process.stdin.write_all(b"hello\n").await.expect("input");
+        process.stdin.shutdown().await.expect("EOF");
+        let mut output = Vec::new();
+        time::timeout(
+            Duration::from_secs(3),
+            process.stdout.read_to_end(&mut output),
+        )
+        .await
+        .expect("output deadline")
+        .expect("output");
+        assert_eq!(output, b"hello\n");
+        let (termination, code) = time::timeout(Duration::from_secs(3), process.handle.wait())
+            .await
+            .expect("wait deadline");
+        assert_eq!((termination, code), (Termination::Exited, Some(0)));
+        // Keep the completed handle alive while reusing its released admission.
+        sandbox
+            .exec()
+            .run(&ExecSpec::new("true"))
+            .await
+            .expect("admission after wait");
+        drop(process);
+        let process = sandbox
+            .exec()
+            .spawn_stdio(&SpawnSpec::new("cat"))
+            .await
+            .expect("second stdio");
+        drop(process);
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                let stats = provider.transport_diagnostics().await.expect("diagnostics");
+                if stats.client.active_io == 0
+                    && stats.client.cleanup_tasks == 0
+                    && stats.server.active_io == 0
+                    && stats.server.stdios == 0
+                    && stats.server.background_tasks == 0
+                {
+                    break;
+                }
+                assert_eq!(stats.client.failed_cleanups, 0);
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dropped stdio is cleaned up");
+    }
+    sandbox.delete().await.expect("delete");
+    provider.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn cancellation_during_streamed_input_drops_the_source_and_preserves_other_channels() {
+    let provider = connect().await;
+    let sandbox = provider.create(&host_spec(), None).await.expect("sandbox");
+    let (mut source, stdin) = duplex(64);
+    let kill = CancellationToken::new();
+    let token = kill.clone();
+    let running = Arc::clone(&sandbox);
+    let ready = Arc::new(Notify::new());
+    let sent = Arc::clone(&ready);
+    let task = task::spawn(async move {
+        running
+            .exec()
+            .run_streaming(
+                &ExecSpec::bash("echo ready; cat >/dev/null"),
+                ExecControls {
+                    stdin: Some(StdinSource::new(stdin)),
+                    kill: Some(token),
+                    sink: Some(Arc::new(move |_, _| {
+                        sent.notify_one();
+                        Box::pin(async { Ok(()) })
+                    })),
+                    ..ExecControls::default()
+                },
+            )
+            .await
+    });
+    time::timeout(Duration::from_secs(3), ready.notified())
+        .await
+        .expect("command running");
+    source
+        .write_all(b"partial input")
+        .await
+        .expect("input before kill");
+    kill.cancel();
+    let result = time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("drain deadline")
+        .expect("join")
+        .expect("outcome");
+    assert_eq!(result.result.termination, Termination::Killed);
+    assert!(
+        time::timeout(Duration::from_secs(1), source.write_all(&[0; 128]))
+            .await
+            .expect("input pump closes")
+            .is_err(),
+        "the local input pump must be dropped"
+    );
+    assert!(
+        sandbox
+            .exec()
+            .run(&ExecSpec::new("true"))
+            .await
+            .expect("unrelated operation")
+            .success()
+    );
     sandbox.delete().await.expect("delete");
     provider.shutdown().await.expect("shutdown");
 }

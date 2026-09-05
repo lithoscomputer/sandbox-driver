@@ -21,15 +21,16 @@ pub struct OutputCaptureBuffer {
 }
 
 impl OutputCaptureBuffer {
-    /// `cap = None` retains everything.
+    /// `cap = None` disables retention. Explicit capture always has a finite
+    /// cap.
     pub fn new(cap: Option<usize>) -> Self {
         Self {
-            cap,
+            cap:      Some(cap.unwrap_or(0)),
             head_cap: cap.map_or(0, |c| c / 2),
-            head: Vec::new(),
-            tail: VecDeque::new(),
+            head:     Vec::new(),
+            tail:     VecDeque::new(),
             observed: 0,
-            omitted: 0,
+            omitted:  0,
         }
     }
 
@@ -103,14 +104,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn retains_everything_without_a_cap() {
+    fn retains_nothing_without_a_cap() {
         let mut buffer = OutputCaptureBuffer::new(None);
         buffer.push(b"hello ");
         buffer.push(b"world");
         let (bytes, stats) = buffer.into_parts();
-        assert_eq!(bytes, b"hello world");
+        assert!(bytes.is_empty());
         assert_eq!(stats.observed_bytes, 11);
-        assert_eq!(stats.omitted_bytes, 0);
+        assert_eq!(stats.omitted_bytes, 11);
     }
 
     #[test]

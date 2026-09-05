@@ -260,11 +260,19 @@ pub struct ExecControls {
     pub stdin:                 Option<StdinSource>,
     pub sink:                  Option<OutputSink>,
     /// Retention cap for the buffered copy in the result (head + tail);
-    /// output beyond it is drained and counted, not kept.
+    /// output beyond it is drained and counted, not kept. `None` keeps no copy.
     pub retained_output_limit: Option<usize>,
 }
 
 impl ExecControls {
+    /// Explicit bounded capture for whole-value convenience methods.
+    pub fn buffered() -> Self {
+        Self {
+            retained_output_limit: Some(crate::DEFAULT_BUFFER_BYTES),
+            ..Self::default()
+        }
+    }
+
     /// The standard input the command should be fed, if any: the streamed
     /// source when set, else the fixed [`ExecSpec::stdin`] bytes. The two
     /// never coexist (the control-plane contract), so a stream wins when
@@ -540,6 +548,26 @@ pub struct ExecStreamingResult {
 }
 
 impl ExecStreamingResult {
+    /// Converts an explicitly captured result only when every byte is retained
+    /// and delivered. Execution may have had effects even when this fails.
+    pub fn into_complete(self) -> Result<ExecResult> {
+        if self.stdout_capture.truncated || self.stderr_capture.truncated {
+            return Err(Error::Transport(crate::TransportError::new(
+                "command output delivery was incomplete",
+            )));
+        }
+        if self.stdout_capture.omitted_bytes != 0 || self.stderr_capture.omitted_bytes != 0 {
+            return Err(Error::LimitExceeded {
+                limit:     "retained_output_bytes".into(),
+                max_bytes: self
+                    .stdout_capture
+                    .retained_bytes
+                    .max(self.stderr_capture.retained_bytes),
+            });
+        }
+        Ok(self.result)
+    }
+
     /// Wraps a buffered result with the honesty flags at their degraded
     /// defaults (`streams_separated: false`, `live_streaming: false`);
     /// providers set the flags they actually deliver. Capture stats

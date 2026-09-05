@@ -21,7 +21,7 @@ use serde_json::Value;
 pub(crate) const JSONRPC_VERSION: &str = "2.0";
 
 /// One incoming or outgoing JSON-RPC message.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Message {
     pub jsonrpc: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -34,6 +34,16 @@ pub struct Message {
     pub result:  Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error:   Option<WireError>,
+}
+
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Message")
+            .field("id", &self.id)
+            .field("method", &self.method)
+            .field("body", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Message {
@@ -121,6 +131,14 @@ pub(crate) fn decode_bytes(text: &str) -> Result<Vec<u8>, Error> {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Detail {
     #[serde(skip_serializing_if = "Option::is_none")]
+    limit:             Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    incomplete:        Option<sandbox_driver::IncompleteOperation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_bytes:         Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    not_started:       Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     capability:        Option<Capability>,
     #[serde(skip_serializing_if = "Option::is_none")]
     resource:          Option<ResourceKind>,
@@ -206,6 +224,15 @@ impl WireError {
         let report = ErrorReport::from(error);
         let mut detail = Detail::default();
         match error {
+            Error::Incomplete(outcome) => detail.incomplete = Some(outcome.clone()),
+            Error::Overloaded { limit } => {
+                detail.limit = Some(limit.clone());
+                detail.not_started = Some(true);
+            }
+            Error::LimitExceeded { limit, max_bytes } => {
+                detail.limit = Some(limit.clone());
+                detail.max_bytes = Some(*max_bytes);
+            }
             Error::Unsupported { capability } => detail.capability = Some(*capability),
             Error::NotFound { resource, id } => {
                 detail.resource = Some(*resource);
@@ -279,6 +306,21 @@ impl WireError {
         };
         let detail: Detail = serde_json::from_value(data.detail).unwrap_or_default();
         match data.report.kind.as_str() {
+            "incomplete" => {
+                if let Some(outcome) = detail.incomplete {
+                    return Error::Incomplete(outcome);
+                }
+            }
+            "overloaded" if detail.not_started == Some(true) => {
+                if let Some(limit) = detail.limit {
+                    return Error::Overloaded { limit };
+                }
+            }
+            "limit_exceeded" => {
+                if let (Some(limit), Some(max_bytes)) = (detail.limit, detail.max_bytes) {
+                    return Error::LimitExceeded { limit, max_bytes };
+                }
+            }
             "unsupported" => {
                 if let Some(capability) = detail.capability {
                     return Error::Unsupported { capability };
@@ -388,6 +430,32 @@ mod tests {
     use std::error::Error as _;
 
     use super::*;
+
+    #[test]
+    fn admission_rejection_and_incomplete_outcome_remain_distinct() {
+        let overloaded = Error::Overloaded {
+            limit: "active_io".into(),
+        };
+        assert!(
+            matches!(WireError::from_error(&overloaded).into_error(), Error::Overloaded { limit } if limit == "active_io")
+        );
+        let incomplete = sandbox_driver::IncompleteOperation::new("hard cancellation drain");
+        let Error::Incomplete(back) =
+            WireError::from_error(&Error::Incomplete(incomplete)).into_error()
+        else {
+            panic!("incomplete outcome must survive the wire");
+        };
+        assert!(back.output_abandoned);
+        assert!(!back.stop_acknowledged && !back.termination_confirmed && !back.cleanup_confirmed);
+        let limit = Error::LimitExceeded {
+            limit:     "buffered_value_bytes".into(),
+            max_bytes: 4,
+        };
+        assert!(matches!(
+            WireError::from_error(&limit).into_error(),
+            Error::LimitExceeded { max_bytes: 4, .. }
+        ));
+    }
 
     #[test]
     fn typed_errors_round_trip_the_wire() {

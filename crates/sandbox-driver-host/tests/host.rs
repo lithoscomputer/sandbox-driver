@@ -330,7 +330,12 @@ async fn exec_timeout_kills_the_process_tree() {
         .arg("30")
         .timeout(Duration::from_millis(300));
     let started = Instant::now();
-    let result = sandbox.exec().run(&spec).await.expect("exec resolves");
+    let result = sandbox
+        .exec()
+        .run_streaming(&spec, ExecControls::buffered())
+        .await
+        .expect("exec resolves")
+        .result;
     assert_eq!(result.termination, Termination::TimedOut);
     assert!(started.elapsed() < Duration::from_secs(10));
 
@@ -351,7 +356,12 @@ async fn exec_timeout_kills_a_command_that_left_its_process_group() {
     )
     .timeout(Duration::from_millis(300));
     let started = Instant::now();
-    let result = sandbox.exec().run(&spec).await.expect("exec resolves");
+    let result = sandbox
+        .exec()
+        .run_streaming(&spec, ExecControls::buffered())
+        .await
+        .expect("exec resolves")
+        .result;
     assert_eq!(result.termination, Termination::TimedOut);
     assert!(started.elapsed() < Duration::from_secs(10));
 
@@ -374,7 +384,7 @@ async fn exec_term_lets_the_process_run_its_term_trap() {
     });
     let controls = ExecControls {
         term: Some(term),
-        ..ExecControls::default()
+        ..ExecControls::buffered()
     };
     let spec = ExecSpec::bash("trap 'echo cleaned >&2; exit 0' TERM; sleep 30 & wait");
     let result = sandbox
@@ -403,7 +413,12 @@ async fn exec_timeout_fires_after_output_streams_close() {
     // any daemonizing command. The timeout must still fire.
     let spec = ExecSpec::bash("exec >/dev/null 2>&1; sleep 30").timeout(Duration::from_millis(300));
     let started = Instant::now();
-    let result = sandbox.exec().run(&spec).await.expect("exec resolves");
+    let result = sandbox
+        .exec()
+        .run_streaming(&spec, ExecControls::buffered())
+        .await
+        .expect("exec resolves")
+        .result;
     assert_eq!(result.termination, Termination::TimedOut);
     assert!(started.elapsed() < Duration::from_secs(10));
 
@@ -418,7 +433,7 @@ async fn exec_term_resolves_with_cancelled() {
     let token = CancellationToken::new();
     let controls = ExecControls {
         term: Some(token.clone()),
-        ..ExecControls::default()
+        ..ExecControls::buffered()
     };
     let cancel_after = token.clone();
     tokio::spawn(async move {
@@ -452,7 +467,7 @@ async fn streaming_separates_streams_and_caps_retention() {
             })
         })),
         retained_output_limit: Some(1000),
-        ..ExecControls::default()
+        ..ExecControls::buffered()
     };
     let spec =
         ExecSpec::bash("echo err-line >&2; for i in $(seq 1 2000); do echo payload-$i; done")

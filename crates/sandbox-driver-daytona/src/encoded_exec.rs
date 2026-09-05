@@ -270,7 +270,7 @@ pub(super) async fn run(
             .await?
     } else {
         let result = transport
-            .run_streaming(&encoded, ExecControls::default())
+            .run_streaming(&encoded, ExecControls::buffered())
             .await?;
         let mut output = output.lock().await;
         output
@@ -327,7 +327,7 @@ sys.exit(7)
         .expect("command joined");
         assert_eq!(output.status.code(), Some(7), "{:?}", output.stderr);
         assert!(output.stderr.is_empty(), "stderr must also be encoded");
-        let mut framed = FramedOutput::new(OutputSanitization::Raw, &ExecControls::default());
+        let mut framed = FramedOutput::new(OutputSanitization::Raw, &ExecControls::buffered());
         for fragment in output.stdout.chunks(79) {
             framed
                 .push(OutputStream::Stdout, fragment)
@@ -388,7 +388,7 @@ sys.exit(7)
         let mut framed = FramedOutput::new(OutputSanitization::Raw, &ExecControls {
             sink: Some(sink),
             retained_output_limit: Some(2),
-            ..ExecControls::default()
+            ..ExecControls::buffered()
         });
         for fragment in output.stdout.chunks(3) {
             framed
@@ -442,7 +442,7 @@ sys.exit(7)
         .await
         .expect("command joined");
         assert!(output.status.success());
-        let mut framed = FramedOutput::new(OutputSanitization::Raw, &ExecControls::default());
+        let mut framed = FramedOutput::new(OutputSanitization::Raw, &ExecControls::buffered());
         framed
             .push(OutputStream::Stdout, &output.stdout)
             .await
@@ -460,7 +460,7 @@ sys.exit(7)
 
     #[tokio::test]
     async fn incomplete_frames_report_loss_and_oversized_frames_are_bounded() {
-        let mut framed = FramedOutput::new(OutputSanitization::Raw, &ExecControls::default());
+        let mut framed = FramedOutput::new(OutputSanitization::Raw, &ExecControls::buffered());
         framed
             .push(OutputStream::Stdout, b"Ow")
             .await

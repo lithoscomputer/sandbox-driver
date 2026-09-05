@@ -1,10 +1,16 @@
+use std::io;
 use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use daytona_api_client::apis::sandbox_api;
 use daytona_sdk::{FileSystemService, SetFilePermissionsOptions};
-use sandbox_driver::{DirEntry, Error, FileKind, FileMetadata, Filesystem, ResourceKind, Result};
+use sandbox_driver::{
+    BoundedBuffer, DEFAULT_BUFFER_BYTES, DirEntry, Error, FileKind, FileMetadata, Filesystem,
+    Result,
+};
 use tokio::fs as tokio_fs;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::OnceCell;
 
 use crate::{DaytonaClient, daytona_error, is_not_found};
@@ -13,10 +19,11 @@ use crate::{DaytonaClient, daytona_error, is_not_found};
 ///
 /// Relative paths resolve against the sandbox working directory.
 pub struct DaytonaFs {
-    client:      DaytonaClient,
-    sandbox_id:  String,
-    working_dir: String,
-    service:     OnceCell<FileSystemService>,
+    client:            DaytonaClient,
+    sandbox_id:        String,
+    working_dir:       String,
+    service:           OnceCell<FileSystemService>,
+    download_endpoint: OnceCell<String>,
 }
 
 impl DaytonaFs {
@@ -26,6 +33,7 @@ impl DaytonaFs {
             sandbox_id,
             working_dir,
             service: OnceCell::new(),
+            download_endpoint: OnceCell::new(),
         }
     }
 
@@ -80,20 +88,74 @@ impl Filesystem for DaytonaFs {
         err
     )]
     async fn read(&self, path: &str) -> Result<Vec<u8>> {
-        self.service()
-            .await?
-            .download_file(&self.resolve(path))
-            .await
-            .map_err(|error| {
-                if is_not_found(&error) {
-                    Error::NotFound {
-                        resource: ResourceKind::File,
-                        id:       path.to_owned(),
-                    }
-                } else {
-                    daytona_error("reading file", error)
-                }
+        let mut buffer = BoundedBuffer::new(DEFAULT_BUFFER_BYTES);
+        let outcome = self.read_to(path, &mut buffer).await;
+        buffer.finish(outcome)
+    }
+
+    async fn read_to(
+        &self,
+        path: &str,
+        output: &mut (dyn AsyncWrite + Unpin + Send),
+    ) -> Result<()> {
+        let config = self.client.api_configuration();
+        let endpoint = self
+            .download_endpoint
+            .get_or_try_init(|| async {
+                let proxy = sandbox_api::get_toolbox_proxy_url(
+                    config,
+                    &self.sandbox_id,
+                    self.client.organization_id(),
+                )
+                .await
+                .map_err(|error| {
+                    Error::io("resolving file download endpoint", io::Error::other(error))
+                })?;
+                Ok::<_, Error>(format!(
+                    "{}/{}/files/download",
+                    proxy.url.trim_end_matches('/'),
+                    self.sandbox_id
+                ))
             })
+            .await?;
+        let mut request = config
+            .client
+            .get(endpoint)
+            .query(&[("path", self.resolve(path))]);
+        if let Some(token) = &config.bearer_access_token {
+            request = request.bearer_auth(token);
+        }
+        if let Some(org) = self.client.organization_id() {
+            request = request.header("X-Daytona-Organization-ID", org);
+        }
+        let mut response = request
+            .send()
+            .await
+            .map_err(|error| Error::io("requesting file download", io::Error::other(error)))?;
+        if !response.status().is_success() {
+            // The metadata API preserves the SDK's missing-file classification,
+            // including older toolboxes that return 400 or 500 for missing files.
+            self.metadata(path).await?;
+            return Err(Error::io(
+                "downloading file",
+                io::Error::other(format!("HTTP {}", response.status())),
+            ));
+        }
+        while let Some(bytes) = response.chunk().await.map_err(|error| {
+            Error::io(
+                "reading file download",
+                io::Error::other(error.without_url()),
+            )
+        })? {
+            output
+                .write_all(&bytes)
+                .await
+                .map_err(|error| Error::io("writing file output", error))?;
+        }
+        output
+            .flush()
+            .await
+            .map_err(|error| Error::io("flushing file output", error))
     }
 
     #[tracing::instrument(
@@ -106,6 +168,12 @@ impl Filesystem for DaytonaFs {
         err
     )]
     async fn write(&self, path: &str, content: &[u8]) -> Result<()> {
+        if content.len() > DEFAULT_BUFFER_BYTES {
+            return Err(Error::LimitExceeded {
+                limit:     "buffered_value_bytes".into(),
+                max_bytes: DEFAULT_BUFFER_BYTES,
+            });
+        }
         let full = self.resolve(path);
         let service = self.service().await?;
         // Upload first: the common case has an existing parent, and
@@ -255,23 +323,28 @@ impl Filesystem for DaytonaFs {
 
     #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id), err)]
     async fn upload(&self, local: &Path, remote: &str) -> Result<()> {
-        let content = tokio_fs::read(local)
+        let mut input = tokio_fs::File::open(local)
             .await
-            .map_err(|error| Error::io(format!("reading {}", local.display()), error))?;
-        self.write(remote, &content).await
+            .map_err(|error| Error::io("opening upload", error))?;
+        let length = input
+            .metadata()
+            .await
+            .map_err(|error| Error::io("reading upload length", error))?
+            .len();
+        self.write_from(remote, &mut input, length).await
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id), err)]
     async fn download(&self, remote: &str, local: &Path) -> Result<()> {
-        let content = self.read(remote).await?;
         if let Some(parent) = local.parent() {
-            tokio_fs::create_dir_all(parent).await.map_err(|error| {
-                Error::io(format!("creating parent of {}", local.display()), error)
-            })?;
+            tokio_fs::create_dir_all(parent)
+                .await
+                .map_err(|error| Error::io("creating download directory", error))?;
         }
-        tokio_fs::write(local, content)
+        let mut output = tokio_fs::File::create(local)
             .await
-            .map_err(|error| Error::io(format!("writing {}", local.display()), error))
+            .map_err(|error| Error::io("creating download destination", error))?;
+        self.read_to(remote, &mut output).await
     }
 }
 

@@ -322,8 +322,8 @@ async fn pump_stream(
 impl Exec for HostExec {
     #[tracing::instrument(skip_all, fields(provider_kind = "host"), err)]
     async fn run(&self, spec: &ExecSpec) -> Result<ExecResult> {
-        let streaming = self.run_streaming(spec, ExecControls::default()).await?;
-        Ok(streaming.result)
+        let streaming = self.run_streaming(spec, ExecControls::buffered()).await?;
+        streaming.into_complete()
     }
 
     #[tracing::instrument(

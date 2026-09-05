@@ -2,24 +2,31 @@ use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use std::{mem, process};
+use std::{io, mem, process};
 
 use async_trait::async_trait;
-use daytona_sdk::{DaytonaError, ExecuteCommandOptions, FileSystemService, ProcessService};
+use daytona_sdk::{DaytonaError, FileSystemService};
 use sandbox_driver::{
     Capability, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
     OutputCaptureBuffer, OutputSanitizer, OutputSink, OutputStream, Result, SpawnSpec,
     StdioProcess, Termination,
 };
+use serde::Deserialize;
+use serde_json::json;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, OnceCell};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 use crate::session::{Session, dedup_capture, missing_suffix, wait_for_completion};
-use crate::{
-    DaytonaClient, daytona_error, encoded_exec, exec_line, is_server_timeout, shell_quote, stdio,
-};
+use crate::{DaytonaClient, daytona_error, encoded_exec, exec_line, shell_quote, stdio, toolbox};
+
+#[derive(Deserialize)]
+struct BufferedResponse {
+    #[serde(rename = "exitCode", default)]
+    exit_code: Option<i32>,
+    result:    String,
+}
 
 /// Bound on waiting for the log stream to close after the command has
 /// its outcome; a stream that will not end is abandoned.
@@ -67,6 +74,12 @@ struct StdinFile {
 
 impl StdinFile {
     async fn create(client: &DaytonaClient, sandbox_id: &str, bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > sandbox_driver::DEFAULT_BUFFER_BYTES {
+            return Err(Error::LimitExceeded {
+                limit:     "buffered_value_bytes".into(),
+                max_bytes: sandbox_driver::DEFAULT_BUFFER_BYTES,
+            });
+        }
         let sandbox = client
             .get(sandbox_id)
             .await
@@ -145,10 +158,9 @@ impl DaytonaExec {
 #[async_trait]
 impl Exec for DaytonaExec {
     async fn run(&self, spec: &ExecSpec) -> Result<ExecResult> {
-        Ok(self
-            .run_streaming(spec, ExecControls::default())
+        self.run_streaming(spec, ExecControls::buffered())
             .await?
-            .result)
+            .into_complete()
     }
 
     async fn run_streaming(
@@ -183,7 +195,7 @@ struct DaytonaTransport {
     client:      DaytonaClient,
     sandbox_id:  String,
     working_dir: String,
-    process:     OnceCell<ProcessService>,
+    endpoint:    OnceCell<String>,
 }
 
 impl DaytonaTransport {
@@ -192,23 +204,13 @@ impl DaytonaTransport {
             client,
             sandbox_id,
             working_dir,
-            process: OnceCell::new(),
+            endpoint: OnceCell::new(),
         }
     }
 
-    async fn process(&self) -> Result<&ProcessService> {
-        self.process
-            .get_or_try_init(|| async {
-                let sandbox = self
-                    .client
-                    .get(&self.sandbox_id)
-                    .await
-                    .map_err(|error| daytona_error("fetching sandbox", error))?;
-                sandbox
-                    .process()
-                    .await
-                    .map_err(|error| daytona_error("connecting to the toolbox", error))
-            })
+    async fn endpoint(&self) -> Result<&String> {
+        self.endpoint
+            .get_or_try_init(|| toolbox::endpoint(&self.client, &self.sandbox_id))
             .await
     }
 
@@ -241,8 +243,8 @@ impl DaytonaTransport {
 #[async_trait]
 impl Exec for DaytonaTransport {
     async fn run(&self, spec: &ExecSpec) -> Result<ExecResult> {
-        let streaming = self.run_streaming(spec, ExecControls::default()).await?;
-        Ok(streaming.result)
+        let streaming = self.run_streaming(spec, ExecControls::buffered()).await?;
+        streaming.into_complete()
     }
 
     #[tracing::instrument(
@@ -298,36 +300,46 @@ impl DaytonaTransport {
         controls: &ExecControls,
     ) -> Result<ExecStreamingResult> {
         let started = Instant::now();
-        let process = self.process().await?;
+        let endpoint = self.endpoint().await?;
         let mut stdin_file = match &spec.stdin {
             Some(bytes) => Some(StdinFile::create(&self.client, &self.sandbox_id, bytes).await?),
             None => None,
         };
-        let options = ExecuteCommandOptions {
-            cwd:     Some(self.resolve_dir(spec.working_dir.as_deref())),
-            env:     None,
-            timeout: Some(wire_timeout(spec.timeout)),
-        };
         let program = Self::compose(spec, stdin_file.as_ref().map(|file| file.path.as_str()));
-        let call = process.execute_command(&program, options);
-
-        // A server-side timeout comes back as a 408 error rather than a
-        // response, and a client-side deadline elapses as None; both mean
-        // the command was killed for exceeding its timeout.
+        let call = async {
+            let (status, bytes) = toolbox::request(
+                &self.client,
+                endpoint,
+                &["process", "execute"],
+                Some(json!({
+                    "command": program,
+                    "cwd": self.resolve_dir(spec.working_dir.as_deref()),
+                    "timeout": wire_timeout(spec.timeout).as_secs(),
+                })),
+            )
+            .await?;
+            if status == 408 {
+                return Ok(None);
+            }
+            if !(200..300).contains(&status) {
+                return Err(Error::io(
+                    "executing command",
+                    io::Error::other(format!("HTTP {status}")),
+                ));
+            }
+            let response: BufferedResponse = serde_json::from_slice(&bytes)
+                .map_err(|error| Error::io("decoding command response", io::Error::other(error)))?;
+            Ok::<_, Error>(Some(response))
+        };
         let response = match spec.timeout {
-            Some(timeout) => match time::timeout(timeout + TIMEOUT_GRACE, call).await {
-                Ok(Ok(response)) => Ok(Some(response)),
-                Ok(Err(error)) if is_server_timeout(&error) => Ok(None),
-                Ok(Err(error)) => Err(daytona_error("executing command", error)),
-                Err(_) => Ok(None),
-            },
-            None => match call.await {
-                Ok(response) => Ok(Some(response)),
-                // The unbounded stand-in is still finite server-side, so
-                // its expiry is a timeout kill, not a provider failure.
-                Err(error) if is_server_timeout(&error) => Ok(None),
-                Err(error) => Err(daytona_error("executing command", error)),
-            },
+            Some(timeout) => time::timeout(timeout + TIMEOUT_GRACE, call)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Error::Incomplete(sandbox_driver::IncompleteOperation::new(
+                        "Daytona command timeout",
+                    )))
+                }),
+            None => call.await,
         };
         // Clean up before propagating any failure, so an errored command
         // does not strand its stdin file.
@@ -345,7 +357,7 @@ impl DaytonaTransport {
             None => (Termination::TimedOut, None, Vec::new()),
             Some(response) => (
                 Termination::Exited,
-                Some(response.exit_code),
+                Some(response.exit_code.unwrap_or(0)),
                 spec.output_sanitization
                     .sanitize(response.result.as_bytes()),
             ),
@@ -406,7 +418,7 @@ impl DaytonaTransport {
         let cwd = self.resolve_dir(spec.working_dir.as_deref());
         let program = wrap_session_script(&build_session_script(&cwd, &command));
 
-        let mut session = match Session::create(&sandbox).await {
+        let mut session = match Session::create(&self.client, &sandbox).await {
             Ok(session) => session,
             Err(error) => {
                 close_stdin(&mut stdin_file).await;
@@ -504,8 +516,12 @@ impl DaytonaTransport {
 
         // A non-natural end must actively kill the command: deleting
         // the session terminates it and closes the log stream.
-        if outcome.termination != Termination::Exited {
-            session.close().await;
+        if outcome.termination != Termination::Exited && !session.close().await {
+            stream_task.abort();
+            close_stdin(&mut stdin_file).await;
+            return Err(Error::Incomplete(sandbox_driver::IncompleteOperation::new(
+                "Daytona session termination",
+            )));
         }
 
         let stream_clean = match time::timeout(STREAM_DRAIN_GRACE, &mut stream_task).await {
@@ -526,10 +542,18 @@ impl DaytonaTransport {
 
         let final_logs = match outcome.final_logs {
             Some(logs) => Some(logs),
-            None => session.fetch_logs(&command_id).await,
+            None if !stream_clean => session.fetch_logs(&command_id).await,
+            None => None,
         };
-        session.close().await;
+        let cleanup_confirmed = session.close().await;
         close_stdin(&mut stdin_file).await;
+        if !cleanup_confirmed {
+            let mut incomplete =
+                sandbox_driver::IncompleteOperation::new("Daytona session cleanup");
+            incomplete.termination_confirmed = outcome.termination == Termination::Exited;
+            incomplete.output_abandoned = !stream_clean;
+            return Err(Error::Incomplete(incomplete));
+        }
 
         // The stream and the final fetch overlap arbitrarily; append
         // only what the stream missed, to the buffers and the sink.
@@ -613,6 +637,10 @@ impl DaytonaTransport {
         streaming.streams_separated = stream_clean || logs_separated;
         streaming.stdout_capture = stdout_stats;
         streaming.stderr_capture = stderr_stats;
+        if (!stream_clean && final_logs.is_none()) || sink_failed.is_cancelled() {
+            streaming.stdout_capture.truncated = true;
+            streaming.stderr_capture.truncated = true;
+        }
         Ok(streaming)
     }
 }

@@ -29,13 +29,20 @@
 
 pub mod channel;
 mod client;
+mod control;
+mod diagnostics;
 pub mod discovery;
+mod limits;
 mod server;
+mod supervisor;
 mod wire;
 
 pub mod methods;
 
 pub use client::PluginProvider;
+pub use diagnostics::{ClientDiagnostics, ServerDiagnostics, TransportDiagnostics};
 pub use discovery::{PluginConfig, PluginLaunch, file_sha256, launch_plugin};
-pub use server::{serve, serve_stdio};
+pub use limits::TransportLimits;
+pub use server::{serve, serve_stdio, serve_with_limits};
+pub use supervisor::PluginSupervisor;
 pub use wire::{Message, WireError, WireErrorData};

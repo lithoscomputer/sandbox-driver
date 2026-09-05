@@ -30,7 +30,7 @@ pub(super) async fn run_command(
         .run_streaming(spec, ExecControls {
             kill: Some(cancel.clone()),
             retained_output_limit: Some(256 * 1024),
-            ..ExecControls::default()
+            ..ExecControls::buffered()
         })
         .await?
         .result)

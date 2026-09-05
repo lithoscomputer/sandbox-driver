@@ -20,6 +20,7 @@ base64.workspace = true
 daytona-api-client.workspace = true
 daytona-sdk.workspace = true
 rand.workspace = true
+reqwest.workspace = true
 sandbox-driver.workspace = true
 sandbox-driver-protocol = { path = "../sandbox-driver-protocol" }
 sandbox-driver-daytona-config.workspace = true

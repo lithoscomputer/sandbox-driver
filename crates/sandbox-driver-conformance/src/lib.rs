@@ -37,6 +37,7 @@ use sandbox_driver::{
     WaitOptions, activate, wait_for_state,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Notify;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
@@ -44,13 +45,27 @@ type SeenChunks = Arc<Mutex<Vec<(OutputStream, Vec<u8>)>>>;
 
 #[derive(Default)]
 struct RecordingEventObserver {
-    events: Mutex<Vec<Event>>,
+    events:  Mutex<Vec<Event>>,
+    changed: Notify,
 }
 
 #[async_trait]
 impl EventObserver for RecordingEventObserver {
     async fn observe(&self, event: Event) {
         self.events.lock().expect("events lock").push(event);
+        self.changed.notify_one();
+    }
+}
+
+impl RecordingEventObserver {
+    async fn completed(&self, action: Action) -> Result<(), String> {
+        time::timeout(Duration::from_secs(30), async {
+            loop {
+                let notified = self.changed.notified();
+                if self.events.lock().expect("events lock").iter().any(|event| matches!(event.body, EventBody::OperationCompleted { action: seen, .. } if seen == action)) { return; }
+                notified.await;
+            }
+        }).await.map_err(|_| "event completion was not delivered".to_owned())
     }
 }
 
@@ -887,7 +902,7 @@ async fn exec_output_sanitization_is_consistent(ctx: &Conformance) -> CheckOutco
                     Ok(())
                 })
             })),
-            ..ExecControls::default()
+            ..ExecControls::buffered()
         };
         let spec =
             ExecSpec::bash("printf '\\033'; sleep 0.05; printf '[31mred\\033[0m\\007\\001\\n'")
@@ -965,11 +980,14 @@ async fn exec_timeout_terminates(ctx: &Conformance) -> CheckOutcome {
             .timeout(Duration::from_secs(2));
         let result = sandbox
             .exec()
-            .run(&spec)
+            .run_streaming(&spec, ExecControls::buffered())
             .await
             .map_err(|error| format!("exec failed: {error}"))?;
-        if result.termination != Termination::TimedOut {
-            return fail(format!("expected TimedOut, got {:?}", result.termination));
+        if result.result.termination != Termination::TimedOut {
+            return fail(format!(
+                "expected TimedOut, got {:?}",
+                result.result.termination
+            ));
         }
         if started.elapsed() > Duration::from_secs(60) {
             return fail("timeout enforcement took over a minute");
@@ -977,11 +995,11 @@ async fn exec_timeout_terminates(ctx: &Conformance) -> CheckOutcome {
         // A timeout is the provider's own stop, with no caller present to
         // escalate, so it kills. A provider that observes the ending
         // signal must say so.
-        if let Some(signal) = result.signal {
+        if let Some(signal) = result.result.signal {
             if signal != SIGKILL {
                 return fail(format!(
                     "expected signal {SIGKILL} on timeout, got {signal} (code {:?})",
-                    result.exit_code
+                    result.result.exit_code
                 ));
             }
         }
@@ -1001,7 +1019,7 @@ async fn exec_term_terminates(ctx: &Conformance) -> CheckOutcome {
         ctx,
         |token| ExecControls {
             term: Some(token),
-            ..ExecControls::default()
+            ..ExecControls::buffered()
         },
         Termination::Cancelled,
         SIGTERM,
@@ -1014,7 +1032,7 @@ async fn exec_kill_terminates(ctx: &Conformance) -> CheckOutcome {
         ctx,
         |token| ExecControls {
             kill: Some(token),
-            ..ExecControls::default()
+            ..ExecControls::buffered()
         },
         Termination::Killed,
         SIGKILL,
@@ -1045,7 +1063,7 @@ async fn exec_term_does_not_escalate(ctx: &Conformance) -> CheckOutcome {
         let controls = ExecControls {
             term: Some(term),
             kill: Some(kill),
-            ..ExecControls::default()
+            ..ExecControls::buffered()
         };
         let started = Instant::now();
         let streaming = sandbox
@@ -1199,7 +1217,7 @@ async fn exec_streams_stdin(ctx: &Conformance) -> CheckOutcome {
         let source = StdinSource::new(Cursor::new(b"streamed".to_vec()));
         let controls = ExecControls {
             stdin: Some(source),
-            ..ExecControls::default()
+            ..ExecControls::buffered()
         };
         let spec = ExecSpec::new("cat").timeout(Duration::from_secs(30));
         let streaming = sandbox
@@ -1233,7 +1251,7 @@ async fn exec_streaming_is_honest(ctx: &Conformance) -> CheckOutcome {
                     Ok(())
                 })
             })),
-            ..ExecControls::default()
+            ..ExecControls::buffered()
         };
         let spec =
             ExecSpec::bash("echo to-stdout; echo to-stderr >&2").timeout(Duration::from_secs(30));
@@ -1285,7 +1303,7 @@ async fn exec_retention_accounting_is_consistent(ctx: &Conformance) -> CheckOutc
     let outcome = async {
         let controls = ExecControls {
             retained_output_limit: Some(512),
-            ..ExecControls::default()
+            ..ExecControls::buffered()
         };
         let spec = ExecSpec::bash("for i in $(seq 1 500); do echo payload-line-$i; done")
             .timeout(Duration::from_secs(60));
@@ -1338,7 +1356,7 @@ async fn concurrent_streams_do_not_starve_each_other(ctx: &Conformance) -> Check
                     Ok(())
                 })
             })),
-            ..ExecControls::default()
+            ..ExecControls::buffered()
         };
         let slow_spec = ExecSpec::bash("for i in $(seq 1 20); do echo slow-$i; sleep 0.05; done")
             .timeout(Duration::from_secs(60));
@@ -1368,7 +1386,7 @@ async fn concurrent_streams_do_not_starve_each_other(ctx: &Conformance) -> Check
                     Ok(())
                 })
             })),
-            ..ExecControls::default()
+            ..ExecControls::buffered()
         };
         let fast_spec = ExecSpec::new("echo")
             .arg("fast-done")
@@ -2589,7 +2607,7 @@ async fn exec_rejects_undeclared_stdin_and_stop(ctx: &Conformance) -> CheckOutco
                 .timeout(Duration::from_secs(30));
             match sandbox
                 .exec()
-                .run_streaming(&spec, ExecControls::default())
+                .run_streaming(&spec, ExecControls::buffered())
                 .await
             {
                 Err(Error::Unsupported {
@@ -2604,7 +2622,7 @@ async fn exec_rejects_undeclared_stdin_and_stop(ctx: &Conformance) -> CheckOutco
         if !caps.exec.stop {
             let controls = ExecControls {
                 term: Some(CancellationToken::new()),
-                ..ExecControls::default()
+                ..ExecControls::buffered()
             };
             let spec = ExecSpec::new("true").timeout(Duration::from_secs(30));
             match sandbox.exec().run_streaming(&spec, controls).await {
@@ -2794,13 +2812,13 @@ async fn create_emits_terminal_events(ctx: &Conformance) -> CheckOutcome {
         .create(&ctx.specs.spec(), Some(context))
         .await
         .map_err(|error| format!("create failed: {error}"))?;
-    // The terminal event must already be visible when create returns.
+    observer.completed(Action::Create).await?;
     let seen = observer.events.lock().expect("events lock").clone();
     sandbox
         .delete()
         .await
         .map_err(|error| format!("delete failed: {error}"))?;
-    // Delete has the same terminal-before-return contract.
+    observer.completed(Action::Delete).await?;
     let all_seen = observer.events.lock().expect("events lock").clone();
 
     let Some(first) = seen.first() else {
@@ -2933,7 +2951,7 @@ async fn one_shot_shares_the_sandbox_world(ctx: &Conformance) -> CheckOutcome {
                     Ok(())
                 })
             })),
-            ..ExecControls::default()
+            ..ExecControls::buffered()
         };
         let spec = OneShotSpec::registry(image)
             .entrypoint("sh")
@@ -2987,7 +3005,7 @@ async fn one_shot_shares_the_sandbox_world(ctx: &Conformance) -> CheckOutcome {
         });
         let controls = ExecControls {
             term: Some(token),
-            ..ExecControls::default()
+            ..ExecControls::buffered()
         };
         let spec = OneShotSpec::registry(image)
             .entrypoint("sleep")

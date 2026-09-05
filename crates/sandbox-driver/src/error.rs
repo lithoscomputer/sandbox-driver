@@ -72,6 +72,15 @@ pub enum Error {
     #[error("rate limited{}", retry_after.map(|d| format!(", retry after {d:?}")).unwrap_or_default())]
     RateLimited { retry_after: Option<Duration> },
 
+    /// Admission failed before provider work started. The caller may retry.
+    #[error("transport capacity exhausted: {limit}; operation did not start")]
+    Overloaded { limit: String },
+
+    /// A complete buffered value could not be provided. This does not imply
+    /// that a command or write had no effects.
+    #[error("{limit} exceeds the {max_bytes} byte buffer limit")]
+    LimitExceeded { limit: String, max_bytes: usize },
+
     /// A command inside the sandbox failed in a way the caller did not run
     /// it to observe (probe failures, derived-operation failures).
     #[error(transparent)]
@@ -84,6 +93,10 @@ pub enum Error {
     #[error(transparent)]
     Transport(#[from] TransportError),
 
+    /// Local waiting ended without establishing a complete operation outcome.
+    #[error(transparent)]
+    Incomplete(#[from] IncompleteOperation),
+
     /// Local I/O failure (uploads, downloads, spawning).
     #[error("{context}")]
     Io {
@@ -91,6 +104,32 @@ pub enum Error {
         #[source]
         source:  io::Error,
     },
+}
+
+/// Facts established when local operation waiting ends. A stop acknowledgment
+/// confirms receipt of a control request, not termination or resource cleanup.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, thiserror::Error)]
+#[error(
+    "{operation} is incomplete; output abandoned: {output_abandoned}, stop acknowledged: {stop_acknowledged}, termination confirmed: {termination_confirmed}, cleanup confirmed: {cleanup_confirmed}"
+)]
+#[non_exhaustive]
+pub struct IncompleteOperation {
+    pub operation:             String,
+    pub output_abandoned:      bool,
+    pub stop_acknowledged:     bool,
+    pub termination_confirmed: bool,
+    pub cleanup_confirmed:     bool,
+}
+impl IncompleteOperation {
+    pub fn new(operation: impl Into<String>) -> Self {
+        Self {
+            operation:             operation.into(),
+            output_abandoned:      true,
+            stop_acknowledged:     false,
+            termination_confirmed: false,
+            cleanup_confirmed:     false,
+        }
+    }
 }
 
 impl Error {

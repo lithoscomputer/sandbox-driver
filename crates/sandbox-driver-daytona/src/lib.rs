@@ -69,6 +69,7 @@ mod nested_operation;
 mod pty;
 mod session;
 mod stdio;
+mod toolbox;
 
 use std::collections::{BTreeMap, HashMap};
 use std::env;
@@ -240,15 +241,6 @@ pub(crate) fn exec_line(env: &BTreeMap<String, String>, program: &str, args: &[S
 
 pub(crate) fn is_not_found(error: &DaytonaError) -> bool {
     matches!(error, DaytonaError::NotFound { .. })
-}
-
-/// The toolbox reports a command that exceeded its server-side timeout as
-/// a 408.
-pub(crate) fn is_server_timeout(error: &DaytonaError) -> bool {
-    matches!(error, DaytonaError::Api {
-        status_code: 408,
-        ..
-    })
 }
 
 /// A lifecycle action racing an in-flight state change: Daytona rejects

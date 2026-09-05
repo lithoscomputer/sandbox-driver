@@ -79,6 +79,7 @@ pub const SNAPSHOT_DELETE: &str = "snapshot/delete";
 pub const SNAPSHOT_ACTIVATE: &str = "snapshot/activate";
 pub const SNAPSHOT_DEACTIVATE: &str = "snapshot/deactivate";
 pub const SNAPSHOT_BUILD_LOGS: &str = "snapshot/build_logs";
+pub const TRANSPORT_DIAGNOSTICS: &str = "transport/diagnostics";
 pub const PROVIDER_HEALTH: &str = "provider/health";
 pub const VOLUME_CREATE: &str = "volume/create";
 pub const VOLUME_GET: &str = "volume/get";

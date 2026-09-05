@@ -80,6 +80,12 @@ pub trait Filesystem: Send + Sync {
         input: &mut (dyn AsyncRead + Unpin + Send),
         length: u64,
     ) -> Result<()> {
+        if length > crate::DEFAULT_BUFFER_BYTES as u64 {
+            return Err(Error::LimitExceeded {
+                limit:     "buffered_value_bytes".into(),
+                max_bytes: crate::DEFAULT_BUFFER_BYTES,
+            });
+        }
         let mut content = Vec::new();
         input
             .take(length)
@@ -110,6 +116,12 @@ pub trait Filesystem: Send + Sync {
         } else {
             Vec::new()
         };
+        if content.len() > crate::DEFAULT_BUFFER_BYTES.saturating_sub(combined.len()) {
+            return Err(Error::LimitExceeded {
+                limit:     "buffered_value_bytes".into(),
+                max_bytes: crate::DEFAULT_BUFFER_BYTES,
+            });
+        }
         combined.extend_from_slice(content);
         self.write(path, &combined).await
     }

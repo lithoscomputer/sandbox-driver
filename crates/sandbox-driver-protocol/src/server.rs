@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::future::Future;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -24,20 +25,21 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, duplex, stdin,
-    stdout,
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, duplex, stdin, stdout,
 };
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
-use tokio::task::JoinHandle;
+use tokio::runtime::Handle as RuntimeHandle;
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::channel::{
     self, Channel, ChannelRequest, DataTransport, FrameKind, FrameReader, FrameWriter,
 };
-use crate::methods as m;
 use crate::wire::{CODE_INVALID_REQUEST, CODE_METHOD_NOT_FOUND, Message, WireError};
+use crate::{ServerDiagnostics, TransportLimits, control, limits, methods as m};
 
 /// Serves `provider` over this process's stdin and stdout until EOF or
 /// `shutdown` — the main loop of a plugin binary:
@@ -66,44 +68,51 @@ pub async fn serve(
     reader: impl AsyncRead + Unpin + Send + 'static,
     writer: impl AsyncWrite + Unpin + Send + 'static,
 ) -> Result<()> {
-    let (outbound, mut outbound_rx) = mpsc::channel::<Message>(256);
-    let mut writer_task = tokio::spawn(async move {
+    serve_with_limits(provider, reader, writer, TransportLimits::default()).await
+}
+
+/// Serves a plugin with finite local admission and delivery budgets.
+pub async fn serve_with_limits(
+    provider: Arc<dyn SandboxProvider>,
+    reader: impl AsyncRead + Unpin + Send + 'static,
+    writer: impl AsyncWrite + Unpin + Send + 'static,
+    limits: TransportLimits,
+) -> Result<()> {
+    limits.validate()?;
+    let (outbound, mut outbound_rx) = control::queue(&limits);
+    let progress_timeout = limits.output_progress_timeout;
+    let mut writer_task = AbortOnDropHandle::new(tokio::spawn(async move {
         let mut writer = writer;
         while let Some(message) = outbound_rx.recv().await {
-            let mut line = serde_json::to_string(&message).map_err(|error| {
-                Error::Transport(TransportError::with_source(
-                    "encoding plugin response",
-                    error,
-                ))
-            })?;
-            line.push('\n');
-            writer.write_all(line.as_bytes()).await.map_err(|error| {
+            time::timeout(progress_timeout, async {
+                writer.write_all(&message.bytes).await?;
+                writer.flush().await
+            })
+            .await
+            .map_err(|_| {
+                Error::Transport(TransportError::new("control response delivery timed out"))
+            })?
+            .map_err(|error| {
                 Error::Transport(TransportError::with_source(
                     "writing plugin response",
                     error,
                 ))
             })?;
-            // Tokio stdout queues a blocking write. Flush before considering
-            // the response delivered, especially the final shutdown reply:
-            // runtime teardown can otherwise cancel that queued write.
-            writer.flush().await.map_err(|error| {
-                Error::Transport(TransportError::with_source(
-                    "flushing plugin response",
-                    error,
-                ))
-            })?;
         }
-        writer.shutdown().await.map_err(|error| {
-            Error::Transport(TransportError::with_source(
-                "closing plugin response transport",
-                error,
-            ))
-        })
-    });
-
+        writer
+            .shutdown()
+            .await
+            .map_err(|error| Error::io("closing plugin response transport", error))
+    }));
+    let request_budget = Arc::new(Semaphore::new(limits.provider_requests));
+    let reserved_budget = Arc::new(Semaphore::new(limits.reserved_requests));
+    let io_budget = Arc::new(Semaphore::new(limits.active_io));
+    let mut requests = JoinSet::new();
     let state = Arc::new(ServerState {
         provider,
         transport: OnceLock::new(),
+        open_budget: Arc::new(Semaphore::new(limits.pending_opens)),
+        io_budget: Arc::clone(&io_budget),
         handles: Mutex::new(HashMap::new()),
         execs: Mutex::new(HashMap::new()),
         exec_shutdown: CancellationToken::new(),
@@ -111,13 +120,26 @@ pub async fn serve(
         ptys: Mutex::new(HashMap::new()),
         streams: Mutex::new(HashMap::new()),
         outbound: outbound.clone(),
+        limits: limits.clone(),
+        delivery_failed: CancellationToken::new(),
+        events_failed: Arc::new(AtomicBool::new(false)),
+        background: Mutex::new(Vec::new()),
     });
 
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
+    let mut partial = Vec::new();
     let mut writer_finished = false;
     let outcome = loop {
         let line = tokio::select! {
-            line = lines.next_line() => line,
+            biased;
+            () = state.delivery_failed.cancelled() => break Err(Error::Transport(TransportError::new("control delivery failed; provider effects may be uncertain"))),
+            result = requests.join_next(), if !requests.is_empty() => {
+                if result.is_some_and(|result| result.is_err()) {
+                    break Err(Error::Transport(TransportError::new("plugin request task failed")));
+                }
+                continue;
+            }
+            line = control::read_line(&mut reader, &mut partial, limits.control_message_bytes) => line,
             writer_result = &mut writer_task => {
                 writer_finished = true;
                 break match writer_result {
@@ -139,19 +161,29 @@ pub async fn serve(
                 )));
             }
         };
-        if line.trim().is_empty() {
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let message: Message = match serde_json::from_str(&line) {
+        let message: Message = match serde_json::from_slice(&line) {
             Ok(message) => message,
             Err(error) => {
-                let _ = outbound
-                    .send(Message::error_response(0, WireError {
-                        code:    CODE_INVALID_REQUEST,
-                        message: format!("malformed message: {error}"),
-                        data:    None,
-                    }))
-                    .await;
+                if outbound
+                    .send(
+                        &Message::error_response(0, WireError {
+                            code:    CODE_INVALID_REQUEST,
+                            message: format!(
+                                "malformed message at line {} column {}",
+                                error.line(),
+                                error.column()
+                            ),
+                            data:    None,
+                        }),
+                        true,
+                    )
+                    .is_err()
+                {
+                    state.delivery_failed.cancel();
+                }
                 continue;
             }
         };
@@ -160,7 +192,14 @@ pub async fn serve(
             continue;
         };
         if method == m::SHUTDOWN {
-            if let Err(error) = outbound.send(Message::response(id, Value::Null)).await {
+            if let Err(error) = outbound
+                .deliver(
+                    &Message::response(id, Value::Null),
+                    true,
+                    limits.output_progress_timeout,
+                )
+                .await
+            {
                 break Err(Error::Transport(TransportError::with_source(
                     "sending plugin shutdown response",
                     error,
@@ -170,10 +209,81 @@ pub async fn serve(
             // that cancellation cannot stop, keeping the process alive.
             break Ok(());
         }
+        let priority = limits::reserved(&method);
+        let admission = (|| {
+            let request = limits::acquire(
+                if priority {
+                    &reserved_budget
+                } else {
+                    &request_budget
+                },
+                if priority {
+                    "reserved_requests"
+                } else {
+                    "provider_requests"
+                },
+            )?;
+            let io = if limits::uses_io(&method) {
+                Some(Arc::new(limits::acquire(&io_budget, "active_io")?))
+            } else {
+                None
+            };
+            Ok::<_, Error>((request, io))
+        })();
+        let (request_permit, io_permit) = match admission {
+            Ok(permits) => permits,
+            Err(error) => {
+                if outbound
+                    .deliver(
+                        &Message::error_response(id, WireError::from_error(&error)),
+                        true,
+                        limits.output_progress_timeout,
+                    )
+                    .await
+                    .is_err()
+                {
+                    state.delivery_failed.cancel();
+                }
+                continue;
+            }
+        };
+        let stream_id = if matches!(method.as_str(), m::LOGS_FOLLOW | m::SNAPSHOT_BUILD_LOGS) {
+            message
+                .params
+                .as_ref()
+                .and_then(|params| params.get("stream_id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        } else {
+            None
+        };
+        if let Some(stream) = &stream_id {
+            let mut streams = state.streams.lock().expect("streams lock");
+            if streams.contains_key(stream) {
+                if outbound
+                    .send(
+                        &Message::error_response(
+                            id,
+                            WireError::from_error(&Error::invalid_spec(
+                                "stream_id",
+                                "duplicate stream id",
+                            )),
+                        ),
+                        true,
+                    )
+                    .is_err()
+                {
+                    state.delivery_failed.cancel();
+                }
+                continue;
+            }
+            streams.insert(stream.clone(), state.exec_shutdown.child_token());
+        }
         let state = Arc::clone(&state);
-        tokio::spawn(async move {
+        requests.spawn(async move {
+            let _request_permit = request_permit;
             let params = message.params.unwrap_or(Value::Null);
-            let reply = match dispatch(&state, &method, params).await {
+            let reply = match dispatch(&state, &method, params, io_permit).await {
                 Ok(result) => Message::response(id, result),
                 Err(DispatchError::UnknownMethod) => Message::error_response(id, WireError {
                     code:    CODE_METHOD_NOT_FOUND,
@@ -182,51 +292,105 @@ pub async fn serve(
                 }),
                 Err(DispatchError::BadParams(error)) => Message::error_response(id, WireError {
                     code:    CODE_INVALID_REQUEST,
-                    message: format!("invalid params for {method}: {error}"),
+                    message: format!(
+                        "invalid params for {method} at line {} column {}",
+                        error.line(),
+                        error.column()
+                    ),
                     data:    None,
                 }),
                 Err(DispatchError::App(error)) => {
                     Message::error_response(id, WireError::from_error(&error))
                 }
             };
-            if state.outbound.send(reply).await.is_err() {
-                tracing::warn!(request_id = id, method = %method, "plugin response queue closed");
+            if let Some(stream) = stream_id {
+                state.streams.lock().expect("streams lock").remove(&stream);
+            }
+            let delivery = state
+                .outbound
+                .deliver(&reply, priority, state.limits.output_progress_timeout)
+                .await;
+            let delivery = match delivery {
+                Err(error @ Error::LimitExceeded { .. }) => {
+                    let reply = Message::error_response(id, WireError::from_error(&error));
+                    state
+                        .outbound
+                        .deliver(&reply, true, state.limits.output_progress_timeout)
+                        .await
+                }
+                outcome => outcome,
+            };
+            if delivery.is_err() {
+                state.delivery_failed.cancel();
             }
         });
     };
 
-    state.close_sessions().await;
+    let cleanup = time::timeout(limits.shutdown_timeout, async {
+        state.close_sessions().await;
+        while requests.join_next().await.is_some() {}
+    })
+    .await;
+    requests.abort_all();
+    while requests.join_next().await.is_some() {}
+    state
+        .background
+        .lock()
+        .expect("background tasks lock")
+        .clear();
     drop(outbound);
     drop(state);
     let writer_outcome = if writer_finished {
         Ok(())
     } else {
-        writer_task.await.map_err(|error| {
-            Error::Transport(TransportError::with_source(
-                "joining plugin response writer",
-                error,
-            ))
-        })?
+        time::timeout(limits.shutdown_timeout, &mut writer_task)
+            .await
+            .map_err(|_| {
+                Error::Transport(TransportError::new("plugin response shutdown timed out"))
+            })?
+            .map_err(|error| {
+                Error::Transport(TransportError::with_source(
+                    "joining plugin response writer",
+                    error,
+                ))
+            })?
     };
     outcome?;
+    cleanup.map_err(|_| {
+        Error::Transport(TransportError::new(
+            "plugin cleanup incomplete at shutdown deadline",
+        ))
+    })?;
     writer_outcome
 }
 
 struct ServerState {
-    provider:      Arc<dyn SandboxProvider>,
+    provider:        Arc<dyn SandboxProvider>,
     /// Set by `initialize`; every data channel opens against it.
-    transport:     OnceLock<DataTransport>,
-    handles:       Mutex<HashMap<String, Arc<dyn Sandbox>>>,
+    transport:       OnceLock<DataTransport>,
+    open_budget:     Arc<Semaphore>,
+    io_budget:       Arc<Semaphore>,
+    handles:         Mutex<HashMap<String, Arc<dyn Sandbox>>>,
     /// Per in-flight exec: its `term` and `kill` tokens, in that order.
-    execs:         Mutex<HashMap<String, (CancellationToken, CancellationToken)>>,
-    exec_shutdown: CancellationToken,
-    stdios:        Mutex<HashMap<String, Arc<ServerStdio>>>,
-    ptys:          Mutex<HashMap<String, Arc<dyn sandbox_driver::PtySession>>>,
-    streams:       Mutex<HashMap<String, CancellationToken>>,
-    outbound:      mpsc::Sender<Message>,
+    execs:           Mutex<HashMap<String, (CancellationToken, CancellationToken)>>,
+    exec_shutdown:   CancellationToken,
+    stdios:          Mutex<HashMap<String, Arc<ServerStdio>>>,
+    ptys:            Mutex<HashMap<String, Arc<ServerPty>>>,
+    streams:         Mutex<HashMap<String, CancellationToken>>,
+    outbound:        control::ControlSender,
+    limits:          TransportLimits,
+    delivery_failed: CancellationToken,
+    events_failed:   Arc<AtomicBool>,
+    background:      Mutex<Vec<AbortOnDropHandle<()>>>,
 }
 
 impl ServerState {
+    fn own(&self, future: impl Future<Output = ()> + Send + 'static) {
+        let mut tasks = self.background.lock().expect("background tasks lock");
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(AbortOnDropHandle::new(tokio::spawn(future)));
+    }
+
     async fn close_sessions(&self) {
         // A closing connection has no caller left to escalate, so every
         // in-flight exec is killed outright.
@@ -263,7 +427,7 @@ impl ServerState {
             .map(|(_, session)| session)
             .collect::<Vec<_>>();
         for session in ptys {
-            if let Err(error) = session.close().await {
+            if let Err(error) = session.session.close().await {
                 tracing::warn!(error = %error, "plugin PTY cleanup failed");
             }
         }
@@ -276,25 +440,28 @@ impl ServerState {
         let sandbox_id = SandboxId::try_new(id)
             .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
         let handle = self.provider.attach(&sandbox_id, None).await?;
-        self.handles
-            .lock()
-            .expect("handles lock")
-            .insert(id.to_owned(), Arc::clone(&handle));
+        self.remember(&handle);
         Ok(handle)
     }
 
     fn remember(&self, handle: &Arc<dyn Sandbox>) {
-        self.handles
-            .lock()
-            .expect("handles lock")
-            .insert(handle.id().as_str().to_owned(), Arc::clone(handle));
+        let mut handles = self.handles.lock().expect("handles lock");
+        let id = handle.id().as_str();
+        if !handles.contains_key(id) && handles.len() >= self.limits.cached_handles {
+            if let Some(oldest) = handles.keys().next().cloned() {
+                handles.remove(&oldest);
+            }
+        }
+        handles.insert(id.to_owned(), Arc::clone(handle));
     }
 
     fn event_context(&self, request: Option<m::EventRequest>) -> Option<EventContext> {
         request.map(|request| {
             let mut context = EventContext::new(Arc::new(ProtocolEventObserver {
-                outbound: self.outbound.clone(),
-                route_id: request.route_id,
+                outbound:      self.outbound.clone(),
+                route_id:      request.route_id,
+                failed:        self.delivery_failed.clone(),
+                events_failed: Arc::clone(&self.events_failed),
             }));
             if let Some(correlation_id) = request.correlation_id {
                 context = context.correlation_id(correlation_id);
@@ -305,13 +472,28 @@ impl ServerState {
 
     /// Opens the data channel a request named. Before `initialize` there
     /// is no transport to open it against, which is a protocol violation.
-    async fn open_channel(&self, request: &ChannelRequest) -> Result<Channel> {
+    async fn open_channel(
+        &self,
+        request: &ChannelRequest,
+        permit: Option<Arc<OwnedSemaphorePermit>>,
+    ) -> Result<Channel> {
+        let _open = limits::acquire(&self.open_budget, "pending_opens")?;
         let transport = self.transport.get().ok_or_else(|| {
             Error::Transport(TransportError::new(
                 "a data channel was requested before initialize",
             ))
         })?;
-        channel::open(transport, request).await
+        let mut channel =
+            time::timeout(self.limits.open_timeout, channel::open(transport, request))
+                .await
+                .map_err(|_| {
+                    Error::Transport(TransportError::new("opening data channel timed out"))
+                })??;
+        channel.progress_timeout(self.limits.output_progress_timeout);
+        if let Some(permit) = permit {
+            channel.hold(permit);
+        }
+        Ok(channel)
     }
 }
 
@@ -320,16 +502,27 @@ impl ServerState {
 struct ServerStdio {
     handle:      Arc<dyn StdioProcessHandle>,
     stderr_tail: StderrTail,
+    _permit:     Option<Arc<OwnedSemaphorePermit>>,
+}
+
+struct ServerPty {
+    session: Arc<dyn sandbox_driver::PtySession>,
+    _permit: Option<Arc<OwnedSemaphorePermit>>,
 }
 
 struct ProtocolEventObserver {
-    outbound: mpsc::Sender<Message>,
-    route_id: String,
+    outbound:      control::ControlSender,
+    failed:        CancellationToken,
+    events_failed: Arc<AtomicBool>,
+    route_id:      String,
 }
 
 #[async_trait]
 impl EventObserver for ProtocolEventObserver {
     async fn observe(&self, event: Event) {
+        if self.events_failed.load(Ordering::SeqCst) {
+            return;
+        }
         let notification = Message::notification(
             m::HOST_EVENT,
             serde_json::to_value(m::HostEventNotification {
@@ -338,8 +531,13 @@ impl EventObserver for ProtocolEventObserver {
             })
             .expect("host event notification contains serializable values"),
         );
-        if self.outbound.send(notification).await.is_err() {
-            tracing::debug!("host event notification transport closed");
+        if self.outbound.send(&notification, false).is_err()
+            && !self.events_failed.swap(true, Ordering::SeqCst)
+        {
+            let failure = Message::notification("host/event_failed", Value::Null);
+            if self.outbound.send(&failure, true).is_err() {
+                self.failed.cancel();
+            }
         }
     }
 }
@@ -381,7 +579,7 @@ fn pty(state: &ServerState, id: &str) -> Result<Arc<dyn sandbox_driver::PtySessi
         .lock()
         .expect("ptys lock")
         .get(id)
-        .cloned()
+        .map(|entry| Arc::clone(&entry.session))
         .ok_or_else(|| Error::invalid_spec("pty_id", "unknown PTY id"))
 }
 
@@ -414,15 +612,17 @@ fn log_frame_sink(writer: &SharedWriter) -> LogSink {
 
 /// Ends the plugin's side of a channel; a failure here means the host is
 /// gone, which the response will report too.
-async fn finish_channel(writer: &SharedWriter) {
-    if let Err(error) = writer.lock().await.finish().await {
-        tracing::debug!(error = %error, "data channel eof was not delivered");
-    }
+async fn finish_channel(writer: &SharedWriter) -> Result<()> {
+    writer.lock().await.finish().await
 }
 
 /// Pumps the host's `Stdin` frames into `sink` until its `Eof`. The
 /// duplex's writer half closing is the command's end-of-file.
-fn pump_stdin_frames(mut reader: FrameReader<OwnedReadHalf>) -> (StdinSource, JoinHandle<()>) {
+fn pump_stdin_frames(
+    mut reader: FrameReader<OwnedReadHalf>,
+    kill: CancellationToken,
+    input_error: Arc<Mutex<Option<Error>>>,
+) -> (StdinSource, JoinHandle<()>) {
     let (mut writer, pipe) = duplex(64 * 1024);
     let task = tokio::spawn(async move {
         loop {
@@ -436,11 +636,16 @@ fn pump_stdin_frames(mut reader: FrameReader<OwnedReadHalf>) -> (StdinSource, Jo
                 }
                 Ok(Some((FrameKind::Eof, _)) | None) => break,
                 Ok(Some((kind, _))) => {
-                    tracing::warn!(?kind, "unexpected frame on an input channel");
+                    *input_error.lock().expect("input error lock") = Some(Error::invalid_spec(
+                        "frame",
+                        format!("unexpected {kind:?} on exec input"),
+                    ));
+                    kill.cancel();
                     break;
                 }
                 Err(error) => {
-                    tracing::debug!(error = %error, "input channel read failed");
+                    *input_error.lock().expect("input error lock") = Some(error);
+                    kill.cancel();
                     break;
                 }
             }
@@ -451,11 +656,22 @@ fn pump_stdin_frames(mut reader: FrameReader<OwnedReadHalf>) -> (StdinSource, Jo
 }
 
 /// Reads the host's `Stdin` frames to `Eof` and returns the bytes.
-async fn collect_stdin_frames(reader: &mut FrameReader<OwnedReadHalf>) -> Result<Vec<u8>> {
+async fn collect_stdin_frames(
+    reader: &mut FrameReader<OwnedReadHalf>,
+    max: usize,
+) -> Result<Vec<u8>> {
     let mut content = Vec::new();
     loop {
         match reader.read().await? {
-            Some((FrameKind::Stdin, payload)) => content.extend(payload),
+            Some((FrameKind::Stdin, payload)) => {
+                if payload.len() > max.saturating_sub(content.len()) {
+                    return Err(Error::LimitExceeded {
+                        limit:     "buffered_value_bytes".into(),
+                        max_bytes: max,
+                    });
+                }
+                content.extend(payload);
+            }
             Some((FrameKind::Eof, _)) | None => return Ok(content),
             Some((kind, _)) => {
                 return Err(Error::invalid_spec(
@@ -575,21 +791,28 @@ impl<'a> ExecRegistration<'a> {
         state: &'a ServerState,
         id: &'a str,
         request: &ChannelRequest,
+        permit: Option<Arc<OwnedSemaphorePermit>>,
     ) -> Result<(Self, Channel)> {
         let term = CancellationToken::new();
         let kill = state.exec_shutdown.child_token();
-        state
-            .execs
-            .lock()
-            .expect("execs lock")
-            .insert(id.to_owned(), (term.clone(), kill.clone()));
+        {
+            let mut execs = state.execs.lock().expect("execs lock");
+            match execs.entry(id.to_owned()) {
+                Entry::Vacant(entry) => {
+                    entry.insert((term.clone(), kill.clone()));
+                }
+                Entry::Occupied(_) => {
+                    return Err(Error::invalid_spec("exec_id", "duplicate execution id"));
+                }
+            }
+        }
         let registration = Self {
             state,
             id,
             term,
             kill,
         };
-        let channel = state.open_channel(request).await?;
+        let channel = state.open_channel(request, permit).await?;
         Ok((registration, channel))
     }
 }
@@ -615,8 +838,10 @@ where
 {
     let Channel { reader, writer } = channel;
     let writer: SharedWriter = Arc::new(AsyncMutex::new(writer));
+    let input_error = Arc::new(Mutex::new(None));
     let (stdin_source, stdin_task) = if stdin {
-        let (source, task) = pump_stdin_frames(reader);
+        let (source, task) =
+            pump_stdin_frames(reader, registration.kill.clone(), Arc::clone(&input_error));
         (Some(source), Some(AbortOnDropHandle::new(task)))
     } else {
         (None, None)
@@ -634,7 +859,10 @@ where
     if let Some(task) = stdin_task {
         task.abort();
     }
-    finish_channel(&writer).await;
+    finish_channel(&writer).await?;
+    if let Some(error) = input_error.lock().expect("input error lock").take() {
+        return Err(error);
+    }
     outcome
 }
 
@@ -691,6 +919,7 @@ async fn dispatch(
     state: &Arc<ServerState>,
     method: &str,
     params: Value,
+    io_permit: Option<Arc<OwnedSemaphorePermit>>,
 ) -> Result<Value, DispatchError> {
     match method {
         m::INITIALIZE => {
@@ -711,10 +940,10 @@ async fn dispatch(
                 )));
             }
             let request: m::InitializeParams = parse(params)?;
-            if request.data_transport.max_frame_bytes == 0 {
+            if request.data_transport.max_frame_bytes != channel::MAX_FRAME_BYTES {
                 return Err(DispatchError::App(Error::invalid_spec(
                     "data_transport.max_frame_bytes",
-                    "must be positive",
+                    "must be 65536",
                 )));
             }
             // A second initialize keeps the first transport: channels the
@@ -797,6 +1026,11 @@ async fn dispatch(
                 let events = state.event_context(request.events);
                 state.provider.delete(&sandbox_id, events).await?;
             }
+            state
+                .handles
+                .lock()
+                .expect("handles lock")
+                .remove(&request.sandbox_id);
             to_value(&m::Empty)
         }
         m::SANDBOX_START
@@ -891,13 +1125,17 @@ async fn dispatch(
             let handle = state.sandbox(&request.sandbox_id).await?;
             let mut spec = request.spec.into_spec();
             let (registration, mut channel) =
-                ExecRegistration::open(state, &request.exec_id, &request.channel).await?;
+                ExecRegistration::open(state, &request.exec_id, &request.channel, io_permit)
+                    .await?;
             // A provider without streamed stdin takes the input as the
             // spec's fixed bytes, so the host's stream still reaches the
             // command; one without any stdin then rejects it honestly.
             let stream_stdin = request.stdin && handle.capabilities().exec.stdin_stream;
             if request.stdin && !stream_stdin {
-                spec.stdin = Some(collect_stdin_frames(&mut channel.reader).await?);
+                spec.stdin = Some(
+                    collect_stdin_frames(&mut channel.reader, state.limits.buffered_value_bytes)
+                        .await?,
+                );
             }
             let streaming = stream_through_channel(
                 registration,
@@ -915,7 +1153,8 @@ async fn dispatch(
                 .one_shot()
                 .ok_or_else(|| Error::unsupported(Capability::OneShot))?;
             let (registration, channel) =
-                ExecRegistration::open(state, &request.exec_id, &request.channel).await?;
+                ExecRegistration::open(state, &request.exec_id, &request.channel, io_permit)
+                    .await?;
             let spec = request.spec;
             let streaming =
                 stream_through_channel(registration, channel, false, |controls| async move {
@@ -942,6 +1181,9 @@ async fn dispatch(
         }
         m::EXEC_STDIO_OPEN => {
             let request: m::StdioOpenParams = parse(params)?;
+            let channel = state
+                .open_channel(&request.channel, io_permit.clone())
+                .await?;
             let process = state
                 .sandbox(&request.sandbox_id)
                 .await?
@@ -952,6 +1194,7 @@ async fn dispatch(
             let entry_value = Arc::new(ServerStdio {
                 handle:      Arc::clone(&handle),
                 stderr_tail: process.stderr_tail,
+                _permit:     io_permit.clone(),
             });
             let inserted = {
                 let mut stdios = state.stdios.lock().expect("stdios lock");
@@ -967,21 +1210,9 @@ async fn dispatch(
                 handle.terminate().await;
                 return Err(Error::invalid_spec("process_id", "duplicate stdio process id").into());
             }
-            let channel = match state.open_channel(&request.channel).await {
-                Ok(channel) => channel,
-                Err(error) => {
-                    state
-                        .stdios
-                        .lock()
-                        .expect("stdios lock")
-                        .remove(&request.process_id);
-                    handle.terminate().await;
-                    return Err(error.into());
-                }
-            };
             let Channel { mut reader, writer } = channel;
             let mut stdin = process.stdin;
-            tokio::spawn(async move {
+            state.own(async move {
                 // Anything but an input frame — the host's eof, a closed
                 // connection, a stray kind — ends the process's stdin.
                 while let Ok(Some((FrameKind::Stdin, payload))) = reader.read().await {
@@ -992,12 +1223,13 @@ async fn dispatch(
                 let _ = stdin.shutdown().await;
             });
             let mut stdout = process.stdout;
-            tokio::spawn(async move {
+            state.own(async move {
                 let mut writer = writer;
                 let mut buffer = vec![0; 32 * 1024];
                 loop {
                     match stdout.read(&mut buffer).await {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) => break,
+                        Err(_) => return,
                         Ok(read) => {
                             if writer
                                 .write(FrameKind::Stdout, &buffer[..read])
@@ -1035,6 +1267,9 @@ async fn dispatch(
         }
         m::PTY_OPEN => {
             let request: m::PtyOpenParams = parse(params)?;
+            let channel = state
+                .open_channel(&request.channel, io_permit.clone())
+                .await?;
             let handle = state.sandbox(&request.sandbox_id).await?;
             let pty = handle
                 .pty()
@@ -1046,7 +1281,10 @@ async fn dispatch(
                 let mut ptys = state.ptys.lock().expect("ptys lock");
                 match ptys.entry(request.pty_id.clone()) {
                     Entry::Vacant(entry) => {
-                        entry.insert(Arc::clone(&pty));
+                        entry.insert(Arc::new(ServerPty {
+                            session: Arc::clone(&pty),
+                            _permit: io_permit.clone(),
+                        }));
                         true
                     }
                     Entry::Occupied(_) => false,
@@ -1058,21 +1296,9 @@ async fn dispatch(
                 }
                 return Err(Error::invalid_spec("pty_id", "duplicate PTY id").into());
             }
-            let channel = match state.open_channel(&request.channel).await {
-                Ok(channel) => channel,
-                Err(error) => {
-                    state
-                        .ptys
-                        .lock()
-                        .expect("ptys lock")
-                        .remove(&request.pty_id);
-                    let _ = pty.close().await;
-                    return Err(error.into());
-                }
-            };
             let Channel { mut reader, writer } = channel;
             let input_pty = Arc::clone(&pty);
-            tokio::spawn(async move {
+            state.own(async move {
                 while let Ok(Some((FrameKind::Stdin, payload))) = reader.read().await {
                     if input_pty.write_input(&payload).await.is_err() {
                         break;
@@ -1080,11 +1306,17 @@ async fn dispatch(
                 }
             });
             let output_pty = Arc::clone(&pty);
-            tokio::spawn(async move {
+            state.own(async move {
                 let mut writer = writer;
-                while let Ok(Some(chunk)) = output_pty.read_output().await {
-                    if writer.write(FrameKind::Stdout, &chunk).await.is_err() {
-                        return;
+                loop {
+                    match output_pty.read_output().await {
+                        Ok(Some(chunk)) => {
+                            if writer.write(FrameKind::Stdout, &chunk).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(_) => return,
                     }
                 }
                 let _ = writer.finish().await;
@@ -1104,7 +1336,14 @@ async fn dispatch(
                 .expect("ptys lock")
                 .remove(&request.pty_id);
             if let Some(session) = session {
-                session.close().await?;
+                if let Err(error) = session.session.close().await {
+                    state
+                        .ptys
+                        .lock()
+                        .expect("ptys lock")
+                        .insert(request.pty_id, session);
+                    return Err(error.into());
+                }
             }
             to_value(&m::Empty)
         }
@@ -1114,7 +1353,7 @@ async fn dispatch(
             let logs = handle
                 .logs()
                 .ok_or_else(|| Error::unsupported(Capability::Logs))?;
-            let channel = state.open_channel(&request.channel).await?;
+            let channel = state.open_channel(&request.channel, io_permit).await?;
             let writer: SharedWriter = Arc::new(AsyncMutex::new(channel.writer));
             let outcome = follow_logs(
                 state,
@@ -1122,7 +1361,7 @@ async fn dispatch(
                 logs.follow(request.source, log_frame_sink(&writer)),
             )
             .await;
-            finish_channel(&writer).await;
+            finish_channel(&writer).await?;
             outcome?;
             to_value(&m::Empty)
         }
@@ -1132,11 +1371,7 @@ async fn dispatch(
                 let mut streams = state.streams.lock().expect("streams lock");
                 match streams.entry(request.stream_id) {
                     Entry::Occupied(entry) => entry.get().clone(),
-                    Entry::Vacant(entry) => {
-                        let cancel = CancellationToken::new();
-                        entry.insert(cancel.clone());
-                        cancel
-                    }
+                    Entry::Vacant(_) => return to_value(&m::Empty),
                 }
             };
             cancel.cancel();
@@ -1145,16 +1380,19 @@ async fn dispatch(
         m::FS_READ => {
             let request: m::FsReadParams = parse(params)?;
             let handle = state.sandbox(&request.sandbox_id).await?;
-            let mut channel = state.open_channel(&request.channel).await?;
-            let outcome = if request.offset.is_some() || request.length.is_some() {
-                let content = handle
-                    .fs()
-                    .read_range(&request.path, request.offset.unwrap_or(0), request.length)
-                    .await?;
-                channel.writer.write(FrameKind::Stdout, &content).await
-            } else {
-                send_file(handle.fs(), &request.path, &mut channel.writer).await
-            };
+            let mut channel = state.open_channel(&request.channel, io_permit).await?;
+            let outcome = async {
+                if request.offset.is_some() || request.length.is_some() {
+                    let content = handle
+                        .fs()
+                        .read_range(&request.path, request.offset.unwrap_or(0), request.length)
+                        .await?;
+                    channel.writer.write(FrameKind::Stdout, &content).await
+                } else {
+                    send_file(handle.fs(), &request.path, &mut channel.writer).await
+                }
+            }
+            .await;
             let finished = channel.writer.finish().await;
             outcome?;
             finished?;
@@ -1163,16 +1401,24 @@ async fn dispatch(
         m::FS_WRITE => {
             let request: m::FsWriteParams = parse(params)?;
             let handle = state.sandbox(&request.sandbox_id).await?;
-            let mut channel = state.open_channel(&request.channel).await?;
+            let mut channel = state.open_channel(&request.channel, io_permit).await?;
             let outcome = if let Some(length) = request.content_length.filter(|_| !request.append) {
                 write_file(handle.fs(), &request.path, &mut channel.reader, length).await
             } else {
                 let content = if let Some(length) = request.content_length {
+                    if length > state.limits.buffered_value_bytes as u64 {
+                        return Err(Error::LimitExceeded {
+                            limit:     "buffered_value_bytes".into(),
+                            max_bytes: state.limits.buffered_value_bytes,
+                        }
+                        .into());
+                    }
                     let mut content = Vec::new();
                     receive_file(&mut channel.reader, &mut content, length).await?;
                     content
                 } else {
-                    collect_stdin_frames(&mut channel.reader).await?
+                    collect_stdin_frames(&mut channel.reader, state.limits.buffered_value_bytes)
+                        .await?
                 };
                 if request.append {
                     handle.fs().write_append(&request.path, &content).await
@@ -1304,7 +1550,7 @@ async fn dispatch(
                 .ok_or_else(|| Error::unsupported(Capability::Snapshots))?;
             let id = SnapshotId::try_new(&request.snapshot_id)
                 .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))?;
-            let channel = state.open_channel(&request.channel).await?;
+            let channel = state.open_channel(&request.channel, io_permit).await?;
             let writer: SharedWriter = Arc::new(AsyncMutex::new(channel.writer));
             let outcome = follow_logs(
                 state,
@@ -1312,7 +1558,7 @@ async fn dispatch(
                 service.build_logs(&id, request.follow, log_frame_sink(&writer)),
             )
             .await;
-            finish_channel(&writer).await;
+            finish_channel(&writer).await?;
             outcome?;
             to_value(&m::Empty)
         }
@@ -1334,6 +1580,22 @@ async fn dispatch(
                 _ => service.delete(&id, events).await?,
             }
             to_value(&m::Empty)
+        }
+        m::TRANSPORT_DIAGNOSTICS => {
+            let mut background = state.background.lock().expect("background tasks lock");
+            background.retain(|task| !task.is_finished());
+            to_value(&ServerDiagnostics {
+                active_io:        state.limits.active_io - state.io_budget.available_permits(),
+                pending_opens:    state.limits.pending_opens
+                    - state.open_budget.available_permits(),
+                execs:            state.execs.lock().expect("execs lock").len(),
+                stdios:           state.stdios.lock().expect("stdios lock").len(),
+                ptys:             state.ptys.lock().expect("ptys lock").len(),
+                streams:          state.streams.lock().expect("streams lock").len(),
+                cached_handles:   state.handles.lock().expect("handles lock").len(),
+                background_tasks: background.len(),
+                runtime_tasks:    RuntimeHandle::current().metrics().num_alive_tasks(),
+            })
         }
         m::PROVIDER_HEALTH => {
             let health = state.provider.health().await?;

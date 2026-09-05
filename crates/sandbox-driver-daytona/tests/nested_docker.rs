@@ -130,7 +130,7 @@ async fn nested_job_sidecars_one_shots_and_restart_share_the_sandbox_lifecycle()
                         "-c",
                         "wget -qO- http://service:8080; cat /etc/alpine-release",
                     ]),
-                    ExecControls::default(),
+                    ExecControls::buffered(),
                 )
                 .await?;
             assert_eq!(result.result.exit_code, Some(0));
@@ -194,7 +194,7 @@ async fn nested_job_sidecars_one_shots_and_restart_share_the_sandbox_lifecycle()
                         "-c",
                         "wget -qO- http://service:8080; printf kept > one-shot",
                     ]),
-                    ExecControls::default(),
+                    ExecControls::buffered(),
                 )
                 .await?;
             assert_eq!(result.result.exit_code, Some(0));
@@ -222,7 +222,7 @@ async fn nested_job_sidecars_one_shots_and_restart_share_the_sandbox_lifecycle()
                         tag:        "sandbox-driver-live-build".to_owned(),
                         reuse:      false,
                     }),
-                    ExecControls::default(),
+                    ExecControls::buffered(),
                 )
                 .await?;
             assert_eq!(built.result.exit_code, Some(0));

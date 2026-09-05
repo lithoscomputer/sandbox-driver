@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Run explicit transport workloads and record process, socket, and ownership time series."""
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import platform
+import re
+import resource
+import shutil
+import subprocess
+import time
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--operations", type=int, nargs="+", default=[1, 100, 1000])
+parser.add_argument("--modes", nargs="+", choices=["rate", "bulk", "tiny", "cycles", "burst"], default=["rate"])
+parser.add_argument("--seconds", type=int, default=30)
+parser.add_argument("--cycles", type=int, default=10000)
+parser.add_argument("--repetitions", type=int, default=3)
+parser.add_argument("--sample-seconds", type=float, default=1)
+parser.add_argument("--binary", type=pathlib.Path)
+parser.add_argument("--output", type=pathlib.Path, required=True)
+parser.add_argument("--max-control-p99-ms", type=float)
+parser.add_argument("--environment-note", default="")
+args = parser.parse_args()
+if args.repetitions < 1 or args.sample_seconds <= 0:
+    parser.error("repetitions and sample interval must be positive")
+root = pathlib.Path(__file__).resolve().parent.parent
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (16384 if hard == resource.RLIM_INFINITY else min(16384, hard), hard))
+tool_prefix = ["mise", "exec", "--"] if shutil.which("mise") else []
+if args.binary is None:
+    subprocess.run(tool_prefix + ["cargo", "build", "--locked", "--release", "-p",
+                   "sandbox-driver-protocol", "--example", "transport_bench"], cwd=root, check=True)
+    args.binary = pathlib.Path(os.environ.get("CARGO_TARGET_DIR", root / "target")) / "release/examples/transport_bench"
+args.binary = args.binary.resolve()
+args.output = args.output.resolve()
+source_hash = hashlib.sha256()
+for path in sorted(root.joinpath("crates").rglob("*.rs")):
+    source_hash.update(str(path.relative_to(root)).encode())
+    source_hash.update(path.read_bytes())
+for path in [root / "Cargo.lock", root / "Cargo.toml", pathlib.Path(__file__)]:
+    source_hash.update(path.read_bytes())
+metadata = {
+    "platform": platform.platform(), "architecture": platform.machine(),
+    "logical_cpus": os.cpu_count(), "affinity": sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
+    "descriptor_limits": resource.getrlimit(resource.RLIMIT_NOFILE),
+    "toolchain": subprocess.check_output(tool_prefix + ["rustc", "--version"], cwd=root, text=True).strip(),
+    "build_profile": "release", "source_sha256": source_hash.hexdigest(),
+    "binary_sha256": hashlib.sha256(args.binary.read_bytes()).hexdigest(),
+    "workload": {key: str(value) if isinstance(value, pathlib.Path) else value for key, value in vars(args).items()},
+    "reference_capacity_validated": False,
+    "socket_memory_accounting": "ss skmem fields are recorded separately; rb/tb are limits, not allocated memory; fields must not be added without accounting for overlap.",
+}
+if pathlib.Path("/proc/cpuinfo").exists():
+    cpuinfo = pathlib.Path("/proc/cpuinfo").read_text()
+    metadata["cpu_info"] = cpuinfo
+    metadata["memory"] = pathlib.Path("/proc/meminfo").read_text().splitlines()[0]
+    for name in ["cpu.max", "memory.max", "cpuset.cpus.effective"]:
+        path = pathlib.Path("/sys/fs/cgroup") / name
+        metadata[name] = path.read_text().strip() if path.exists() else None
+else:
+    metadata["cpu_model"] = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip()
+    metadata["memory_bytes"] = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True))
+
+
+def process_ids(pid):
+    pids = {pid}
+    try:
+        for thread in (pathlib.Path("/proc") / str(pid) / "task").iterdir():
+            pids.update(int(value) for value in (thread / "children").read_text().split())
+    except FileNotFoundError:
+        pass
+    return pids
+
+
+def sample(pid):
+    """Measure the client and its directly owned plugin; sample tools are excluded."""
+    if not (pathlib.Path("/proc") / str(pid)).exists():
+        return None
+    pids = process_ids(pid)
+    measured = {"rss_bytes": 0, "descriptors": 0, "os_threads": 0, "processes": {}, "socket_memory": None}
+    for child in pids:
+        directory = pathlib.Path("/proc") / str(child)
+        try:
+            status = directory.joinpath("status").read_text().splitlines()
+            values = {
+                "rss_bytes": next((int(line.split()[1]) * 1024 for line in status if line.startswith("VmRSS:")), 0),
+                "descriptors": len(list(directory.joinpath("fd").iterdir())),
+                "os_threads": len(list(directory.joinpath("task").iterdir())),
+            }
+            stat = directory.joinpath("stat").read_text().rsplit(") ", 1)[1].split()
+            values["cpu_seconds"] = (int(stat[11]) + int(stat[12])) / os.sysconf("SC_CLK_TCK")
+            measured["processes"][str(child)] = values
+            for key in ["rss_bytes", "descriptors", "os_threads"]:
+                measured[key] += values[key]
+        except FileNotFoundError:
+            pass
+    measured["socket_directories"] = sum(len(list(pathlib.Path("/tmp").glob(f"sandbox-driver-{child}-*"))) for child in pids)
+    if shutil.which("ss"):
+        result = subprocess.run(["ss", "-x", "-m", "-n", "-p"], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            fields, sockets, selected = {}, 0, False
+            for line in result.stdout.splitlines():
+                if not line.startswith((" ", "\t")):
+                    selected = bool(pids.intersection(int(value) for value in re.findall(r"pid=(\d+)", line)))
+                    sockets += int(selected)
+                if selected:
+                    for key, value in re.findall(r"([a-z]+)(\d+)", line.split("skmem:(", 1)[1] if "skmem:(" in line else ""):
+                        fields[key] = fields.get(key, 0) + int(value)
+            measured["socket_memory"] = {"sockets": sockets, "skmem": fields}
+    return measured
+
+
+args.output.parent.mkdir(parents=True, exist_ok=True)
+failed_gate = False
+with args.output.open("w") as output:
+    output.write(json.dumps({"environment": metadata}) + "\n")
+    output.flush()
+    for mode in args.modes:
+        for operations in args.operations:
+            for repetition in range(args.repetitions):
+                stem = f"{args.output.stem}-{mode}-{operations}-{repetition + 1}"
+                telemetry = args.output.with_name(stem + ".transport.jsonl")
+                resources = args.output.with_name(stem + ".resources.jsonl")
+                before = resource.getrusage(resource.RUSAGE_CHILDREN)
+                command = [str(args.binary), "--operations", str(operations), "--seconds", str(args.seconds),
+                           "--mode", mode, "--cycles", str(args.cycles), "--telemetry", str(telemetry)]
+                started = time.monotonic()
+                process = subprocess.Popen(command, stdout=subprocess.PIPE, text=True)
+                peak, last, cpu_by_pid = {}, None, {}
+                with resources.open("w") as samples:
+                    while process.poll() is None:
+                        current = sample(process.pid)
+                        if current:
+                            current["elapsed_seconds"] = time.monotonic() - started
+                            samples.write(json.dumps(current) + "\n")
+                            samples.flush()
+                            for key in ["rss_bytes", "descriptors", "os_threads", "socket_directories"]:
+                                peak[key] = max(current[key], peak.get(key, 0))
+                            if len(current["processes"]) >= 2:
+                                last = current
+                            for pid, values in current["processes"].items():
+                                cpu_by_pid[pid] = max(values["cpu_seconds"], cpu_by_pid.get(pid, 0))
+                        time.sleep(args.sample_seconds)
+                stdout, _ = process.communicate()
+                remaining_socket_directories = sum(len(list(pathlib.Path("/tmp").glob(f"sandbox-driver-{pid}-*"))) for pid in cpu_by_pid)
+                after = resource.getrusage(resource.RUSAGE_CHILDREN)
+                cpu = after.ru_utime + after.ru_stime - before.ru_utime - before.ru_stime
+                # /proc counters exclude the ss sampler and include all threads.
+                # The final quiet window captures work before process shutdown.
+                record = {"command": command, "repetition": repetition + 1, "exit_code": process.returncode,
+                          "peak_client_and_plugin": peak, "last_process_sample": last,
+                          "remaining_socket_directories": remaining_socket_directories,
+                          "cpu_seconds_with_sampler_children": cpu, "cpu_seconds": sum(cpu_by_pid.values()) if cpu_by_pid else None, "telemetry": str(telemetry), "resources": str(resources)}
+                if process.returncode == 0:
+                    measurement = record["measurement"] = json.loads(stdout)
+                    count = measurement["bytes"]
+                    record["cpu_seconds_per_gib"] = sum(cpu_by_pid.values()) / (count / 2**30) if count and cpu_by_pid else None
+                    p99 = measurement["control"].get("p99_us")
+                    passed = args.max_control_p99_ms is None or (p99 is not None and p99 < args.max_control_p99_ms * 1000)
+                    record["control_latency_gate_passed"] = passed
+                    failed_gate |= not passed or remaining_socket_directories != 0
+                output.write(json.dumps(record) + "\n")
+                output.flush()
+                if process.returncode:
+                    raise SystemExit(process.returncode)
+if failed_gate:
+    raise SystemExit("control p99 or socket cleanup failed; see recorded measurements")

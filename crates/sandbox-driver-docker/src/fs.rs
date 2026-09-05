@@ -507,9 +507,9 @@ impl Filesystem for DockerFs {
         err
     )]
     async fn read_range(&self, path: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        self.read_range_to(path, offset, length, &mut bytes).await?;
-        Ok(bytes)
+        let mut bytes = sandbox_driver::BoundedBuffer::new(sandbox_driver::DEFAULT_BUFFER_BYTES);
+        let outcome = self.read_range_to(path, offset, length, &mut bytes).await;
+        bytes.finish(outcome)
     }
 
     async fn read_to(

@@ -87,9 +87,12 @@ impl From<&Error> for ErrorReport {
             Error::Timeout { .. } => "timeout",
             Error::Auth(_) => "auth",
             Error::RateLimited { .. } => "rate_limited",
+            Error::Overloaded { .. } => "overloaded",
+            Error::LimitExceeded { .. } => "limit_exceeded",
             Error::Exec(_) => "exec",
             Error::Provider(_) => "provider",
             Error::Transport(_) => "transport",
+            Error::Incomplete(_) => "incomplete",
             Error::Io { .. } => "io",
         };
         let retryable = match error {
