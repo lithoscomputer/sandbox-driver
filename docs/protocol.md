@@ -615,10 +615,15 @@ are reserved for failures of the check itself. Hosts must treat a
 
 ### 8.9 Shutdown
 
-`shutdown` (params `{}`) asks the plugin to exit. The plugin must answer
-the request, then stop reading and exit promptly. A plugin must also
-exit when its stdin reaches EOF. Hosts should reap the process and may
-kill it after a grace period.
+`shutdown` (params `{}`) asks the plugin to exit. The plugin must stop
+reading new requests, flush its reply, cancel active commands, and exit
+promptly. A plugin must also exit when its stdin reaches EOF.
+
+The Rust client gives the acknowledgment and process exit one shared
+five-second deadline. If either fails or the deadline expires, the
+client kills a child it spawned and returns an error. A client connected
+to an externally owned process returns the error without killing that
+process. Reaping a killed child must not extend the shutdown deadline.
 
 ## 9. Streaming exec
 

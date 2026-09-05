@@ -54,6 +54,8 @@ use crate::wire::Message;
 /// How long the host waits, after a plugin has answered an operation,
 /// for the data channel that operation must already have opened.
 const LATE_CHANNEL_GRACE: Duration = Duration::from_secs(10);
+/// The entire shutdown exchange, including acknowledgment and process exit.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// A provider served by a JSON-RPC plugin over a byte stream.
 ///
@@ -144,35 +146,41 @@ impl PluginProvider {
         self.client.closed.load(Ordering::SeqCst)
     }
 
-    /// Asks the plugin to shut down cleanly and, for a spawned plugin,
-    /// reaps the child — killing it after a grace period if it lingers.
+    /// Asks the plugin to shut down cleanly and reaps a spawned child.
+    /// Acknowledgment and process exit share a five-second deadline;
+    /// failure or timeout kills the child and returns an error.
     #[tracing::instrument(skip_all, fields(provider_kind = %self.kind), err)]
     pub async fn shutdown(&self) -> Result<()> {
-        let _: m::Empty = self.client.call(m::SHUTDOWN, &m::Empty).await?;
-        let child = self
+        let mut child = self
             .child
             .as_ref()
             .and_then(|slot| slot.lock().expect("child lock").take());
-        if let Some(mut child) = child {
-            if time::timeout(Duration::from_secs(5), child.wait())
-                .await
-                .is_err()
-            {
-                tracing::warn!(provider_kind = %self.kind, "plugin did not exit after shutdown");
-                if let Err(error) = child.kill().await {
-                    tracing::warn!(
-                        provider_kind = %self.kind,
-                        error = ?error,
-                        "plugin process kill failed"
-                    );
-                }
+        let outcome = time::timeout(SHUTDOWN_GRACE, async {
+            let _: m::Empty = self.client.call(m::SHUTDOWN, &m::Empty).await?;
+            if let Some(child) = &mut child {
                 child
                     .wait()
                     .await
                     .map_err(|error| Error::io("reaping plugin process", error))?;
             }
+            Ok(())
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::Transport(TransportError::new(
+                "plugin shutdown timed out before acknowledgment or process exit",
+            )))
+        });
+        if outcome.is_err() {
+            if let Some(child) = &mut child {
+                if let Err(error) = child.start_kill() {
+                    tracing::warn!(provider_kind = %self.kind, error = ?error, "plugin process kill failed");
+                }
+                // Do not add an unbounded wait after the deadline. Tokio's
+                // child drop transfers any remaining reap to its reaper.
+            }
         }
-        Ok(())
+        outcome
     }
 
     fn wrap_handle(
@@ -1950,10 +1958,53 @@ impl Filesystem for SandboxFs {
 #[cfg(test)]
 mod tests {
     use std::future;
+    use std::process::Stdio;
 
+    use sandbox_driver::SandboxProvider;
     use tokio::task::yield_now;
 
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_kills_a_plugin_that_never_acknowledges() {
+        let mut child = Command::new("sh")
+            .args(["-c", "read request; exec sleep 300"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("unresponsive plugin");
+        let reader = child.stdout.take().expect("stdout");
+        let writer = child.stdin.take().expect("stdin");
+        let provider = PluginProvider {
+            client:       Client::start(reader, writer, ChannelListener::bind().expect("bind")),
+            kind:         ProviderKind::try_new("host").expect("kind"),
+            capabilities: Capabilities::minimal(sandbox_driver::Isolation::None),
+            snapshots:    None,
+            volumes:      None,
+            child:        Some(Mutex::new(Some(child))),
+        };
+        let error = time::timeout(SHUTDOWN_GRACE + Duration::from_secs(1), provider.shutdown())
+            .await
+            .expect("the missing acknowledgment is bounded")
+            .expect_err("the plugin never acknowledged shutdown");
+        assert!(matches!(error, Error::Transport(_)), "{error:?}");
+        let result = time::timeout(
+            Duration::from_secs(1),
+            provider.list(&SandboxFilter::default()),
+        )
+        .await
+        .expect("the terminated plugin closes its transport");
+        assert!(result.is_err());
+        assert!(
+            provider
+                .client
+                .pending
+                .lock()
+                .expect("pending lock")
+                .is_empty()
+        );
+    }
 
     #[tokio::test]
     async fn a_failed_pump_does_not_wait_for_the_control_response() {

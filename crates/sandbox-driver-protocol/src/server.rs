@@ -82,6 +82,15 @@ pub async fn serve(
                     error,
                 ))
             })?;
+            // Tokio stdout queues a blocking write. Flush before considering
+            // the response delivered, especially the final shutdown reply:
+            // runtime teardown can otherwise cancel that queued write.
+            writer.flush().await.map_err(|error| {
+                Error::Transport(TransportError::with_source(
+                    "flushing plugin response",
+                    error,
+                ))
+            })?;
         }
         writer.shutdown().await.map_err(|error| {
             Error::Transport(TransportError::with_source(
@@ -102,7 +111,6 @@ pub async fn serve(
         outbound: outbound.clone(),
     });
 
-    let shutdown = CancellationToken::new();
     let mut lines = BufReader::new(reader).lines();
     let mut writer_finished = false;
     let outcome = loop {
@@ -118,7 +126,6 @@ pub async fn serve(
                     ))),
                 };
             }
-            () = shutdown.cancelled() => break Ok(()),
         };
         let line = match line {
             Ok(Some(line)) => line,
@@ -157,8 +164,9 @@ pub async fn serve(
                     error,
                 )));
             }
-            shutdown.cancel();
-            continue;
+            // Do not poll stdin again: Tokio stdin can start a blocking read
+            // that cancellation cannot stop, keeping the process alive.
+            break Ok(());
         }
         let state = Arc::clone(&state);
         tokio::spawn(async move {

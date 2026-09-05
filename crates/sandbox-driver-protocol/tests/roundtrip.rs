@@ -2,12 +2,12 @@
 //! JSON-RPC must behave like the Host provider in-process. Also proves
 //! the interleaving requirement — a slow call must not block a fast one.
 
-use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use std::{io, mem};
 
 use async_trait::async_trait;
 use sandbox_driver::{
@@ -18,6 +18,7 @@ use sandbox_driver::{
 use sandbox_driver_host::HostProvider;
 use sandbox_driver_protocol::{PluginProvider, serve};
 use tokio::io::{AsyncWrite, AsyncWriteExt, duplex, split};
+use tokio::sync::Notify;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
@@ -60,6 +61,53 @@ async fn handshake_negotiates_capabilities() {
     assert!(provider.capabilities().exec.live_streaming);
     assert!(provider.capabilities().fs.native);
     provider.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn shutdown_cancels_an_active_exec_before_the_server_returns() {
+    let host = Arc::new(HostProvider::new());
+    let local = host
+        .create(&host_spec(), None)
+        .await
+        .expect("local sandbox");
+    let (host_side, plugin_side) = duplex(4096);
+    let (host_read, host_write) = split(host_side);
+    let (plugin_read, plugin_write) = split(plugin_side);
+    let server = tokio::spawn(serve(host, plugin_read, plugin_write));
+    let provider = PluginProvider::connect(host_read, host_write)
+        .await
+        .expect("handshake");
+    let sandbox = provider.attach(local.id(), None).await.expect("attach");
+    let started = Arc::new(Notify::new());
+    let ready = Arc::clone(&started);
+    let exec = tokio::spawn(async move {
+        sandbox
+            .exec()
+            .run_streaming(
+                &ExecSpec::bash("echo ready; exec sleep 300").no_timeout(),
+                ExecControls {
+                    sink: Some(Arc::new(move |_, _| {
+                        ready.notify_one();
+                        Box::pin(async { Ok(()) })
+                    })),
+                    ..ExecControls::default()
+                },
+            )
+            .await
+    });
+    let outcome = time::timeout(Duration::from_secs(5), async {
+        started.notified().await;
+        provider.shutdown().await.expect("shutdown");
+        let result = exec.await.expect("join exec").expect("exec result");
+        server.await.expect("join server").expect("server shutdown");
+        result.result.termination
+    })
+    .await;
+    local.delete().await.expect("clean up local sandbox");
+    assert_eq!(
+        outcome.expect("shutdown ends the active exec and server"),
+        Termination::Killed
+    );
 }
 
 #[tokio::test]
@@ -330,7 +378,8 @@ async fn malformed_plugin_response_is_classified() {
 
 #[tokio::test]
 async fn plugin_response_write_failure_is_returned() {
-    const SHUTDOWN_REQUEST: &[u8] = b"{\"id\":1,\"method\":\"shutdown\",\"params\":{}}\n";
+    const SHUTDOWN_REQUEST: &[u8] =
+        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"shutdown\",\"params\":{}}\n";
 
     let error = serve(
         Arc::new(HostProvider::new()),
@@ -343,6 +392,57 @@ async fn plugin_response_write_failure_is_returned() {
         panic!("expected transport failure");
     };
     assert_eq!(transport.context, "writing plugin response");
+}
+
+#[tokio::test]
+async fn shutdown_response_is_flushed_before_the_server_returns() {
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let writer = FlushWriter {
+        buffered:  Vec::new(),
+        delivered: delivered.clone(),
+    };
+    serve(
+        Arc::new(HostProvider::new()),
+        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"shutdown\",\"params\":{}}\n".as_slice(),
+        writer,
+    )
+    .await
+    .expect("server shutdown");
+    let response: sandbox_driver_protocol::Message =
+        serde_json::from_slice(&delivered.lock().expect("delivered bytes"))
+            .expect("the shutdown reply reached the client");
+    assert_eq!(response.id, Some(1));
+    assert!(response.error.is_none());
+}
+
+/// Like Tokio stdout, shutdown alone does not finish a pending write.
+struct FlushWriter {
+    buffered:  Vec<u8>,
+    delivered: Arc<Mutex<Vec<u8>>>,
+}
+
+impl AsyncWrite for FlushWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.buffered.extend_from_slice(bytes);
+        Poll::Ready(Ok(bytes.len()))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let bytes = mem::take(&mut self.buffered);
+        self.delivered
+            .lock()
+            .expect("delivered bytes")
+            .extend(bytes);
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
 }
 
 struct FailingWriter;
