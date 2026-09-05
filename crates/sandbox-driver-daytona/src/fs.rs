@@ -7,7 +7,7 @@ use daytona_api_client::apis::sandbox_api;
 use daytona_sdk::{FileSystemService, SetFilePermissionsOptions};
 use sandbox_driver::{
     BoundedBuffer, DEFAULT_BUFFER_BYTES, DirEntry, Error, FileKind, FileMetadata, Filesystem,
-    Result,
+    ResourceKind, Result,
 };
 use tokio::fs as tokio_fs;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -240,7 +240,19 @@ impl Filesystem for DaytonaFs {
             .await?
             .get_file_info(&self.resolve(path))
             .await
-            .map_err(|error| daytona_error("reading file metadata", error))?;
+            .map_err(|error| {
+                if is_not_found(&error)
+                    || (matches!(error.status_code(), Some(400 | 500))
+                        && error.message().contains("no such file"))
+                {
+                    Error::NotFound {
+                        resource: ResourceKind::File,
+                        id:       path.to_owned(),
+                    }
+                } else {
+                    daytona_error("reading file metadata", error)
+                }
+            })?;
         let kind = if info.is_dir {
             FileKind::Directory
         } else {

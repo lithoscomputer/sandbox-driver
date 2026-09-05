@@ -238,7 +238,7 @@ async fn nested_job_sidecars_one_shots_and_restart_share_the_sandbox_lifecycle()
             ExecControls { term: Some(term), sink: Some(Arc::new(move |_, _| {
                 cancel.cancel();
                 Box::pin(async { Ok(()) })
-            })), ..Default::default() },
+            })), ..ExecControls::buffered() },
         ).await?;
             assert_eq!(stopped.result.termination, Termination::Cancelled);
             assert!(stopped.result.stdout_lossy().contains("term"));

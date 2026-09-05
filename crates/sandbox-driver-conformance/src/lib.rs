@@ -34,7 +34,7 @@ use sandbox_driver::{
     LogSink, LogSource, NetworkPolicy, OneShotSpec, OutputSanitization, OutputStream, PtyOptions,
     PtySize, Resources, Sandbox, SandboxFilter, SandboxId, SandboxProvider, SandboxSpec,
     SandboxState, Search, ServiceSpec, Services, SnapshotMode, SpawnSpec, StdinSource, Termination,
-    WaitOptions, activate, wait_for_state,
+    VolumeId, VolumeMount, WaitOptions, activate, wait_for_state,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
@@ -2547,46 +2547,117 @@ async fn volume_round_trip(ctx: &Conformance) -> CheckOutcome {
         Err(error) => return fail(format!("volume create failed: {error}")),
     };
 
-    // Poll briefly for a settled state; elastic backends are quick.
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        let status = volumes
-            .get(&id)
-            .await
-            .map_err(|error| format!("volume get failed: {error}"))?;
-        match status.state {
-            sandbox_driver::VolumeState::Ready => break,
-            sandbox_driver::VolumeState::Error => {
-                let _ = volumes.delete(&id, None).await;
-                return fail(format!(
-                    "volume entered error state: {:?}",
-                    status.error_reason
-                ));
+    let outcome = async {
+        // Poll briefly for a settled state; elastic backends are quick.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let status = volumes
+                .get(&id)
+                .await
+                .map_err(|error| format!("volume get failed: {error}"))?;
+            match status.state {
+                sandbox_driver::VolumeState::Ready => break,
+                sandbox_driver::VolumeState::Error => {
+                    return fail(format!(
+                        "volume entered error state: {:?}",
+                        status.error_reason
+                    ));
+                }
+                _ if Instant::now() >= deadline => {
+                    return fail("volume never became ready");
+                }
+                _ => time::sleep(Duration::from_secs(2)).await,
             }
-            _ if Instant::now() >= deadline => {
-                let _ = volumes.delete(&id, None).await;
-                return fail("volume never became ready".to_owned());
-            }
-            _ => time::sleep(Duration::from_secs(2)).await,
         }
-    }
 
-    let listed = volumes
-        .list()
-        .await
-        .map_err(|error| format!("volume list failed: {error}"))?;
-    if !listed.iter().any(|status| status.id == id) {
-        let _ = volumes.delete(&id, None).await;
-        return fail("created volume missing from list".to_owned());
+        let listed = volumes
+            .list()
+            .await
+            .map_err(|error| format!("volume list failed: {error}"))?;
+        if !listed.iter().any(|status| status.id == id) {
+            return fail("created volume missing from list");
+        }
+        if ctx
+            .caps()
+            .volumes
+            .as_ref()
+            .is_some_and(|caps| caps.create_time_attach)
+        {
+            mounted_volume_survives_sandbox_deletion(ctx, &id).await?;
+        }
+        PASS
     }
-    volumes
+    .await;
+    let deleted = volumes
         .delete(&id, None)
         .await
-        .map_err(|error| format!("volume delete failed: {error}"))?;
+        .map_err(|error| format!("volume delete failed: {error}"));
+    outcome?;
+    deleted?;
     volumes
         .delete(&id, None)
         .await
         .map_err(|error| format!("second volume delete failed: {error}"))?;
+    PASS
+}
+
+async fn mounted_volume_survives_sandbox_deletion(
+    ctx: &Conformance,
+    volume: &VolumeId,
+) -> CheckOutcome {
+    const MOUNT_PATH: &str = "/mnt/sandbox-driver-conformance-volume";
+    const FILE_PATH: &str = "/mnt/sandbox-driver-conformance-volume/persisted.bin";
+    let payload = [0, 1, 2, 255, 254, b'\n', b'\r', 0];
+    let spec = ctx
+        .specs
+        .spec()
+        .volume(VolumeMount::new(volume.as_str(), MOUNT_PATH));
+
+    let first = ctx.ready_from_spec(&spec).await?;
+    tracing::info!(%volume, sandbox_id = %first.id(), "writing mounted volume");
+    let written = first
+        .fs()
+        .write(FILE_PATH, &payload)
+        .await
+        .map_err(|error| format!("write mounted volume failed: {error}"));
+    let deleted = first
+        .delete()
+        .await
+        .map_err(|error| format!("delete first volume sandbox failed: {error}"));
+    written?;
+    deleted?;
+    wait_for_state(first.as_ref(), SandboxState::Deleted, &ctx.wait)
+        .await
+        .map_err(|error| format!("wait for first volume sandbox deletion failed: {error}"))?;
+
+    let second = ctx.ready_from_spec(&spec).await?;
+    tracing::info!(%volume, sandbox_id = %second.id(), "reading volume in replacement sandbox");
+    let outcome = async {
+        if first.id() == second.id() {
+            return fail("volume persistence reused the deleted sandbox");
+        }
+        let read = second
+            .fs()
+            .read(FILE_PATH)
+            .await
+            .map_err(|error| format!("read remounted volume failed: {error}"))?;
+        if read != payload {
+            return fail(format!(
+                "remounted volume returned different bytes: {read:?}"
+            ));
+        }
+        PASS
+    }
+    .await;
+    let deleted = second
+        .delete()
+        .await
+        .map_err(|error| format!("delete second volume sandbox failed: {error}"));
+    outcome?;
+    deleted?;
+    wait_for_state(second.as_ref(), SandboxState::Deleted, &ctx.wait)
+        .await
+        .map_err(|error| format!("wait for second volume sandbox deletion failed: {error}"))?;
     PASS
 }
 
