@@ -8,8 +8,8 @@ use std::time::Duration;
 use daytona_sdk::Client;
 use futures_util::FutureExt;
 use sandbox_driver::{
-    ExecControls, ExecSpec, OneShotImage, OneShotSpec, SandboxKind, SandboxProvider, SandboxSource,
-    SandboxSpec, SnapshotId, Termination,
+    ExecControls, ExecSpec, OneShotImage, OneShotSpec, PtyOptions, PtySize, SandboxKind,
+    SandboxProvider, SandboxSource, SandboxSpec, SnapshotId, SpawnSpec, Termination,
 };
 use sandbox_driver_daytona::{
     DaytonaProvider, DaytonaProviderConfig, DockerExecutionTarget, NestedDockerConfig,
@@ -17,6 +17,8 @@ use sandbox_driver_daytona::{
 use sandbox_driver_docker::{Health, Sidecar};
 use support::init_diagnostics;
 use tokio::fs;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 mod support;
@@ -133,6 +135,56 @@ async fn nested_job_sidecars_one_shots_and_restart_share_the_sandbox_lifecycle()
                 .await?;
             assert_eq!(result.result.exit_code, Some(0));
             assert!(result.result.stdout_lossy().contains("ready"));
+            tracing::info!("nested live gate: fixed binary stdin");
+            let echoed = sandbox
+                .exec()
+                .run(
+                    &ExecSpec::new("cat")
+                        .stdin(vec![0, 255, 128, 10])
+                        .timeout(Duration::from_secs(20)),
+                )
+                .await?;
+            assert_eq!(echoed.exit_code, Some(0));
+            assert_eq!(echoed.stdout, [0, 255, 128, 10]);
+            tracing::info!("nested live gate: ACP stdio exchange");
+            let mut process = sandbox
+                .exec()
+                .spawn_stdio(&SpawnSpec::new("/bin/sh").args([
+                    "-c",
+                    "while IFS= read -r line; do printf '%s\\n' \"$line\"; done",
+                ]))
+                .await?;
+            process.stdin.write_all(b"{\"request\":1}\n").await.unwrap();
+            process.stdin.flush().await.unwrap();
+            let mut reader = BufReader::new(process.stdout);
+            let mut line = String::new();
+            timeout(Duration::from_secs(20), reader.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(line, "{\"request\":1}\n");
+            timeout(Duration::from_secs(20), process.handle.terminate())
+                .await
+                .unwrap();
+            tracing::info!("nested live gate: PTY resize and close");
+            let terminal = sandbox.pty().unwrap().open(&PtyOptions::default()).await?;
+            terminal.resize(PtySize { rows: 31, cols: 91 }).await?;
+            terminal.write_input(b"stty size\n").await?;
+            timeout(Duration::from_secs(20), async {
+                let mut output = Vec::new();
+                loop {
+                    let chunk = terminal.read_output().await?.expect("open nested terminal");
+                    output.extend_from_slice(&chunk);
+                    assert!(output.len() < 32768, "bounded terminal output");
+                    if String::from_utf8_lossy(&output).contains("31 91") {
+                        break;
+                    }
+                }
+                Ok::<_, sandbox_driver::Error>(())
+            })
+            .await
+            .unwrap()?;
+            terminal.close().await?;
             tracing::info!("nested live gate: one-shot");
             let result = sandbox
                 .one_shot()

@@ -4,11 +4,11 @@
 //! connection is created; the sandbox lifecycle owns all nested resources.
 
 use std::collections::BTreeMap;
+use std::future;
 use std::path::Path;
 use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{future, io};
 
 use async_trait::async_trait;
 use sandbox_driver::{
@@ -22,12 +22,12 @@ use sandbox_driver_docker_config::{RegistryAuth, Sidecar};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 use crate::nested_exec::{NestedExec, run_cli};
 use crate::nested_fs::NestedFs;
+use crate::nested_operation::{run_command, run_owned};
 use crate::{DaytonaClient, DaytonaExec, DaytonaFs, DaytonaPty, RUNTIME_DIRECTORY};
 
 pub(super) const TARGET_LABEL: &str = "sh.sandbox-driver.docker-target";
@@ -140,35 +140,57 @@ impl DockerCli {
             return Ok(());
         }
         let config = format!("{RUNTIME_DIRECTORY}/pull-{:016x}", rand::random::<u64>());
-        let outcome = async {
-            if let Some(auth) = auth {
-                let mut args = words(["login", "--username", &auth.username, "--password-stdin"]);
-                if let Some(server) = &auth.server {
-                    args.push(server.clone());
+        let cleanup_config = config.clone();
+        let has_auth = auth.is_some();
+        let auth = auth.cloned();
+        let image = image.to_owned();
+        let platform = platform.map(str::to_owned);
+        let exec = Arc::clone(&self.exec);
+        let fs = Arc::clone(&self.fs);
+        run_owned(
+            move |cancel| async move {
+                if let Some(auth) = &auth {
+                    let mut args =
+                        words(["login", "--username", &auth.username, "--password-stdin"]);
+                    if let Some(server) = &auth.server {
+                        args.push(server.clone());
+                    }
+                    checked(
+                        run_command(
+                            &*exec,
+                            &Self::command(args)
+                                .env_var("DOCKER_CONFIG", &config)
+                                .stdin(auth.password.as_bytes().to_vec()),
+                            &cancel,
+                        )
+                        .await?,
+                        "logging into nested Docker registry",
+                    )?;
                 }
-                self.run_spec(
-                    &Self::command(args)
-                        .env_var("DOCKER_CONFIG", &config)
-                        .stdin(auth.password.as_bytes().to_vec()),
-                )
-                .await?;
-            }
-            let mut args = words(["pull"]);
-            if let Some(platform) = platform {
-                args.extend(words(["--platform", platform]));
-            }
-            args.push(image.to_owned());
-            self.run_spec(&Self::command(args).env_var("DOCKER_CONFIG", &config))
-                .await?;
-            Ok(())
-        }
-        .await;
-        if auth.is_some() {
-            if let Err(error) = self.fs.delete(&config, true).await {
-                tracing::warn!(error = %error, "nested Docker registry credential cleanup failed");
-            }
-        }
-        outcome
+                let mut args = words(["pull"]);
+                if let Some(platform) = &platform {
+                    args.extend(words(["--platform", platform]));
+                }
+                args.push(image);
+                checked(
+                    run_command(
+                        &*exec,
+                        &Self::command(args).env_var("DOCKER_CONFIG", &config),
+                        &cancel,
+                    )
+                    .await?,
+                    "pulling nested Docker image",
+                )?;
+                Ok(())
+            },
+            move || async move {
+                if has_auth {
+                    fs.delete(&cleanup_config, true).await?;
+                }
+                Ok(())
+            },
+        )
+        .await
     }
 
     async fn ids(&self, label: &str) -> Result<Vec<String>> {
@@ -593,47 +615,66 @@ impl NestedDocker {
                     return Ok(tag.clone());
                 }
                 let context = self.cli.resolve(context);
-                if !self.targets_container() {
-                    let mut args = words(["build", "--tag", tag]);
-                    if let Some(dockerfile) = dockerfile {
-                        args.extend(words(["--file", &format!("{context}/{dockerfile}")]));
-                    }
-                    args.push(context);
-                    self.cli.run(args).await?;
-                    return Ok(tag.clone());
+                if dockerfile
+                    .as_ref()
+                    .is_some_and(|path| path.starts_with('/'))
+                {
+                    return Err(Error::invalid_spec(
+                        "dockerfile",
+                        "expected a path within the build context",
+                    ));
                 }
-                let stage = format!("{RUNTIME_DIRECTORY}/build-{:016x}", rand::random::<u64>());
-                self.cli.fs.create_dir(&stage).await?;
-                let outcome = async {
-                    // Docker resolves the context in the job container. It may
-                    // be outside the workspace bind or behind a container symlink.
-                    self.cli
-                        .run(words([
-                            "cp",
-                            "--",
-                            &format!("{CONTAINER_NAME}:{context}/."),
-                            &stage,
-                        ]))
-                        .await?;
-                    let mut args = words(["build", "--tag", tag]);
-                    if let Some(dockerfile) = dockerfile {
-                        if dockerfile.starts_with('/') {
-                            return Err(Error::invalid_spec(
-                                "dockerfile",
-                                "expected a path within the build context",
-                            ));
+                let stage = self
+                    .targets_container()
+                    .then(|| format!("{RUNTIME_DIRECTORY}/build-{:016x}", rand::random::<u64>()));
+                let cleanup_stage = stage.clone();
+                let cli = Arc::clone(&self.cli);
+                let cleanup_fs = Arc::clone(&self.cli.fs);
+                let tag = tag.clone();
+                let dockerfile = dockerfile.clone();
+                run_owned(
+                    move |cancel| async move {
+                        let context = if let Some(stage) = stage {
+                            cli.fs.create_dir(&stage).await?;
+                            // Docker resolves the context in the job container. It may
+                            // be outside the workspace bind or behind a container symlink.
+                            checked(
+                                run_command(
+                                    &*cli.exec,
+                                    &DockerCli::command(words([
+                                        "cp",
+                                        "--",
+                                        &format!("{CONTAINER_NAME}:{context}/."),
+                                        &stage,
+                                    ])),
+                                    &cancel,
+                                )
+                                .await?,
+                                "copying nested Docker build context",
+                            )?;
+                            stage
+                        } else {
+                            context
+                        };
+                        let mut args = words(["build", "--tag", &tag]);
+                        if let Some(dockerfile) = &dockerfile {
+                            args.extend(words(["--file", &format!("{context}/{dockerfile}")]));
                         }
-                        args.extend(words(["--file", &format!("{stage}/{dockerfile}")]));
-                    }
-                    args.push(stage.clone());
-                    self.cli.run(args).await?;
-                    Ok(tag.clone())
-                }
-                .await;
-                if let Err(error) = self.cli.fs.delete(&stage, true).await {
-                    tracing::warn!(error = %error, "nested Docker build context cleanup failed");
-                }
-                outcome
+                        args.push(context);
+                        checked(
+                            run_command(&*cli.exec, &DockerCli::command(args), &cancel).await?,
+                            "building nested Docker action image",
+                        )?;
+                        Ok(tag)
+                    },
+                    move || async move {
+                        if let Some(stage) = cleanup_stage {
+                            cleanup_fs.delete(&stage, true).await?;
+                        }
+                        Ok(())
+                    },
+                )
+                .await
             }
             _ => Err(Error::invalid_spec("image", "unsupported one-shot image")),
         }
@@ -725,33 +766,15 @@ impl OneShot for NestedDocker {
         }
         args.push(image);
         args.extend(spec.args.clone());
-        let abandoned = CancellationToken::new();
         let cli = Arc::clone(&self.cli);
+        let cleanup_cli = Arc::clone(&cli);
+        let cleanup_name = name.clone();
         let spec = spec.clone();
-        let controls = controls.clone();
-        let stopped = abandoned.clone();
-        let mut action = OwnedAction {
-            task: tokio::spawn(Self::run_action(
-                cli, name, args, spec, controls, started, stopped,
-            )),
-            abandoned,
-        };
-        (&mut action.task)
-            .await
-            .map_err(|error| Error::io("running nested Docker action", io::Error::other(error)))?
-    }
-}
-
-struct OwnedAction {
-    task:      JoinHandle<Result<ExecStreamingResult>>,
-    abandoned: CancellationToken,
-}
-
-impl Drop for OwnedAction {
-    fn drop(&mut self) {
-        // Do not abort: an accepted create/start must finish before its
-        // cleanup can reliably remove the named container.
-        self.abandoned.cancel();
+        run_owned(
+            move |abandoned| Self::run_action(cli, name, args, spec, controls, started, abandoned),
+            move || async move { cleanup_cli.remove(&cleanup_name).await },
+        )
+        .await
     }
 }
 
@@ -772,8 +795,34 @@ impl NestedDocker {
             }
         };
         let mut deadline = pin!(deadline);
-        cli.run(args).await?;
-        let outcome = async {
+        cli.run_spec(&DockerCli::command(args).timeout(START_TIMEOUT))
+            .await?;
+        let stopped = if abandoned.is_cancelled()
+            || controls
+                .kill
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+        {
+            Some(Termination::Killed)
+        } else if controls
+            .term
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            Some(Termination::Cancelled)
+        } else if spec.timeout.is_some_and(|limit| started.elapsed() >= limit) {
+            Some(Termination::TimedOut)
+        } else {
+            None
+        };
+        if let Some(reason) = stopped {
+            return Ok(ExecStreamingResult::new(ExecResult::from_shell_status(
+                reason,
+                None,
+                started.elapsed(),
+            )));
+        }
+        async {
             let sink_failed = CancellationToken::new();
             let sink = controls.sink.clone().map(|sink| {
                 let failed = sink_failed.clone();
@@ -853,19 +902,7 @@ impl NestedDocker {
                 }
             }
         }
-        .await;
-        // Keep the primary error if both execution and cleanup failed.
-        let cleanup = cli.remove(&name).await;
-        match (outcome, cleanup) {
-            (Ok(result), Ok(())) => Ok(result),
-            (Err(error), cleanup) => {
-                if let Err(cleanup) = cleanup {
-                    tracing::warn!(error = %cleanup, "nested Docker action cleanup failed");
-                }
-                Err(error)
-            }
-            (Ok(_), Err(error)) => Err(error),
-        }
+        .await
     }
 }
 

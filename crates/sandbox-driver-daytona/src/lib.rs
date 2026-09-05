@@ -62,6 +62,7 @@ mod logs;
 mod nested_docker;
 mod nested_exec;
 mod nested_fs;
+mod nested_operation;
 mod pty;
 mod session;
 mod stdio;
