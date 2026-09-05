@@ -106,6 +106,7 @@ pub async fn serve(
         transport: OnceLock::new(),
         handles: Mutex::new(HashMap::new()),
         execs: Mutex::new(HashMap::new()),
+        exec_shutdown: CancellationToken::new(),
         stdios: Mutex::new(HashMap::new()),
         ptys: Mutex::new(HashMap::new()),
         streams: Mutex::new(HashMap::new()),
@@ -212,29 +213,26 @@ pub async fn serve(
 }
 
 struct ServerState {
-    provider:  Arc<dyn SandboxProvider>,
+    provider:      Arc<dyn SandboxProvider>,
     /// Set by `initialize`; every data channel opens against it.
-    transport: OnceLock<DataTransport>,
-    handles:   Mutex<HashMap<String, Arc<dyn Sandbox>>>,
+    transport:     OnceLock<DataTransport>,
+    handles:       Mutex<HashMap<String, Arc<dyn Sandbox>>>,
     /// Per in-flight exec: its `term` and `kill` tokens, in that order.
-    execs:     Mutex<HashMap<String, (CancellationToken, CancellationToken)>>,
-    stdios:    Mutex<HashMap<String, Arc<ServerStdio>>>,
-    ptys:      Mutex<HashMap<String, Arc<dyn sandbox_driver::PtySession>>>,
-    streams:   Mutex<HashMap<String, CancellationToken>>,
-    outbound:  mpsc::Sender<Message>,
+    execs:         Mutex<HashMap<String, (CancellationToken, CancellationToken)>>,
+    exec_shutdown: CancellationToken,
+    stdios:        Mutex<HashMap<String, Arc<ServerStdio>>>,
+    ptys:          Mutex<HashMap<String, Arc<dyn sandbox_driver::PtySession>>>,
+    streams:       Mutex<HashMap<String, CancellationToken>>,
+    outbound:      mpsc::Sender<Message>,
 }
 
 impl ServerState {
     async fn close_sessions(&self) {
         // A closing connection has no caller left to escalate, so every
         // in-flight exec is killed outright.
-        let execs = self
-            .execs
-            .lock()
-            .expect("execs lock")
-            .drain()
-            .map(|(_, (_, kill))| kill)
-            .collect::<Vec<_>>();
+        // Child tokens also cancel requests that have not yet registered.
+        self.exec_shutdown.cancel();
+        self.execs.lock().expect("execs lock").clear();
         let streams = self
             .streams
             .lock()
@@ -242,7 +240,7 @@ impl ServerState {
             .drain()
             .map(|(_, token)| token)
             .collect::<Vec<_>>();
-        for token in execs.into_iter().chain(streams) {
+        for token in streams {
             token.cancel();
         }
 
@@ -571,7 +569,7 @@ struct ExecRegistration<'a> {
 impl<'a> ExecRegistration<'a> {
     fn new(state: &'a ServerState, id: &'a str) -> Self {
         let term = CancellationToken::new();
-        let kill = CancellationToken::new();
+        let kill = state.exec_shutdown.child_token();
         state
             .execs
             .lock()

@@ -111,6 +111,93 @@ async fn shutdown_cancels_an_active_exec_before_the_server_returns() {
 }
 
 #[tokio::test]
+async fn shutdown_cancels_an_exec_queued_before_registration() {
+    use sandbox_driver_protocol::channel::ChannelListener;
+    use sandbox_driver_protocol::{Message, methods as m};
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let host = Arc::new(HostProvider::new());
+    let sandbox = host.create(&host_spec(), None).await.expect("sandbox");
+    let listener = ChannelListener::bind().expect("data listener");
+    let (host_side, plugin_side) = duplex(16384);
+    let (host_read, mut host_write) = split(host_side);
+    let (plugin_read, plugin_write) = split(plugin_side);
+    let mut server = tokio::spawn(serve(host, plugin_read, plugin_write));
+    let initialize = Message::request(
+        1,
+        m::INITIALIZE,
+        serde_json::to_value(m::InitializeParams {
+            protocol_version: 2,
+            data_transport:   listener.transport(),
+        })
+        .unwrap(),
+    );
+    host_write
+        .write_all(format!("{}\n", serde_json::to_string(&initialize).unwrap()).as_bytes())
+        .await
+        .unwrap();
+    let mut responses = BufReader::new(host_read).lines();
+    let initialized: Message =
+        serde_json::from_str(&responses.next_line().await.unwrap().unwrap()).unwrap();
+    assert!(initialized.error.is_none());
+
+    let (channel, receiver) = listener.expect();
+    let exec = Message::request(
+        2,
+        m::EXEC_STREAM,
+        serde_json::to_value(m::ExecStreamParams {
+            sandbox_id: sandbox.id().as_str().to_owned(),
+            exec_id: "queued-exec".to_owned(),
+            channel,
+            spec: m::ExecSpecDto::from_spec(&ExecSpec::new("sleep").arg("300").no_timeout()),
+            stdin: false,
+            retained_output_limit: Some(0),
+        })
+        .unwrap(),
+    );
+    let shutdown = Message::request(3, m::SHUTDOWN, serde_json::Value::Null);
+    // Both lines arrive in one write on this current-thread runtime. The
+    // server reads shutdown before the spawned exec task can register.
+    host_write
+        .write_all(
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&exec).unwrap(),
+                serde_json::to_string(&shutdown).unwrap()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let outcome = time::timeout(Duration::from_secs(3), async {
+        let _channel = receiver.accept().await.expect("exec data channel");
+        let mut termination = None;
+        while let Some(line) = responses.next_line().await.unwrap() {
+            let response: Message = serde_json::from_str(&line).unwrap();
+            if response.id == Some(2) {
+                let result: m::ExecStreamResult =
+                    serde_json::from_value(response.result.expect("exec result")).unwrap();
+                termination = Some(result.result.termination);
+            }
+        }
+        (&mut server).await.unwrap().unwrap();
+        termination
+    })
+    .await;
+    sandbox
+        .delete()
+        .await
+        .expect("cleanup even if shutdown fails");
+    if outcome.is_err() {
+        server.abort();
+    }
+    assert_eq!(
+        outcome.expect("queued exec cannot keep shutdown alive"),
+        Some(Termination::Killed)
+    );
+}
+
+#[tokio::test]
 async fn create_exec_fs_delete_round_trip() {
     let provider = connect().await;
     let sandbox = provider.create(&host_spec(), None).await.expect("create");

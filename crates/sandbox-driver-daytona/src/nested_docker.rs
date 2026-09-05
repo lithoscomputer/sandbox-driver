@@ -15,6 +15,7 @@ use sandbox_driver::{
 };
 use sandbox_driver_daytona_config::{DockerExecutionTarget, NestedDockerConfig};
 use sandbox_driver_docker::{BindMount, DockerProvider, docker_capabilities};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 
 use crate::{DaytonaAccess, DaytonaClient, DaytonaExec, RUNTIME_DIRECTORY, docker_transport};
@@ -68,6 +69,8 @@ impl NestedDocker {
             // VM logs and remote desktop access do not describe the job
             // container. VM lifecycle and network policy still apply.
             caps.logs = None;
+            caps.access.preview_urls = false;
+            caps.access.signed_preview_urls = false;
             caps.access.ssh = false;
             caps.access.ssh_ttl = false;
             caps.access.ssh_revoke = false;
@@ -259,6 +262,13 @@ impl Filesystem for NestedDocker {
     async fn read(&self, path: &str) -> Result<Vec<u8>> {
         self.sandbox().await?.fs().read(path).await
     }
+    async fn read_to(
+        &self,
+        path: &str,
+        output: &mut (dyn AsyncWrite + Unpin + Send),
+    ) -> Result<()> {
+        self.sandbox().await?.fs().read_to(path, output).await
+    }
     async fn read_range(&self, path: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
         self.sandbox()
             .await?
@@ -268,6 +278,18 @@ impl Filesystem for NestedDocker {
     }
     async fn write(&self, path: &str, content: &[u8]) -> Result<()> {
         self.sandbox().await?.fs().write(path, content).await
+    }
+    async fn write_from(
+        &self,
+        path: &str,
+        input: &mut (dyn AsyncRead + Unpin + Send),
+        length: u64,
+    ) -> Result<()> {
+        self.sandbox()
+            .await?
+            .fs()
+            .write_from(path, input, length)
+            .await
     }
     async fn write_append(&self, path: &str, content: &[u8]) -> Result<()> {
         self.sandbox().await?.fs().write_append(path, content).await
@@ -298,5 +320,33 @@ impl Filesystem for NestedDocker {
     }
     async fn download(&self, remote: &str, local: &Path) -> Result<()> {
         self.sandbox().await?.fs().download(remote, local).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DaytonaConfig, DaytonaProvider, daytona_capabilities};
+
+    #[tokio::test]
+    async fn previews_are_only_available_for_the_vm_execution_target() {
+        let provider = DaytonaProvider::connect_with_config(DaytonaConfig {
+            api_key: Some("test-key".to_owned()),
+            api_url: Some("https://daytona.example/api".to_owned()),
+            ..DaytonaConfig::default()
+        })
+        .await
+        .unwrap();
+        for target in [
+            DockerExecutionTarget::Container,
+            DockerExecutionTarget::VirtualMachine,
+        ] {
+            let nested = NestedDocker::new(&provider.client, "test-vm", "/workspace", target);
+            let mut caps = daytona_capabilities();
+            nested.capabilities(&mut caps);
+            let vm = target == DockerExecutionTarget::VirtualMachine;
+            assert_eq!(caps.supports(Capability::PreviewUrls), vm);
+            assert_eq!(caps.supports(Capability::SignedPreviewUrls), vm);
+        }
     }
 }

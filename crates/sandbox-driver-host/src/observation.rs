@@ -21,7 +21,7 @@ use nix::libc;
 /// the group is alive without enumerating it. Only a dead or zombie sentinel —
 /// our KILL, or a hostile workload's — makes the full listing necessary.
 pub(super) fn group_is_live(pgid: i32) -> bool {
-    sentinel_is_live(pgid) || live_group_members(pgid) > 0
+    sentinel_is_live(pgid) || has_live_group_members(pgid)
 }
 
 /// One `/proc/<pgid>/stat` read: the sentinel, live and still leading the
@@ -38,13 +38,13 @@ fn sentinel_is_live(pgid: i32) -> bool {
     is_live(pgid)
 }
 
-/// How many *live* processes remain in the group. Non-signalling, and zombies
+/// Whether any live processes remain in the group. Non-signalling, and zombies
 /// do not count: they cannot run, and the unreaped sentinel is deliberately
 /// one.
 #[cfg(target_os = "linux")]
-fn live_group_members(pgid: i32) -> usize {
+fn has_live_group_members(pgid: i32) -> bool {
     let Ok(entries) = fs::read_dir("/proc") else {
-        return 0;
+        return false;
     };
     entries
         .flatten()
@@ -54,8 +54,7 @@ fn live_group_members(pgid: i32) -> usize {
                 .to_str()
                 .is_some_and(|name| name.bytes().all(|b| b.is_ascii_digit()))
         })
-        .filter(|entry| entry_is_live_member(entry, pgid))
-        .count()
+        .any(|entry| entry_is_live_member(&entry, pgid))
 }
 
 /// One `/proc/<pid>/stat` read for a numbered `/proc` entry: whether that
@@ -85,7 +84,7 @@ fn stat_is_live_in_group(stat: &str, pgid: i32) -> bool {
 
 /// libproc's process listing by group, each member checked for zombie state.
 #[cfg(target_os = "macos")]
-fn live_group_members(pgid: i32) -> usize {
+fn has_live_group_members(pgid: i32) -> bool {
     const PROC_PGRP_ONLY: u32 = 2;
     let group = u32::try_from(pgid).unwrap_or(0);
 
@@ -96,14 +95,14 @@ fn live_group_members(pgid: i32) -> usize {
     // count, or a non-positive value the code below treats as an empty group.
     let sized = unsafe { libc::proc_listpids(PROC_PGRP_ONLY, group, ptr::null_mut(), 0) };
     if sized <= 0 {
-        return 0;
+        return false;
     }
     // Headroom above the reported size: the group can gain members between the
     // two calls, and a full buffer is indistinguishable from a truncated one.
     let capacity = usize::try_from(sized).unwrap_or(0) / size_of::<i32>() + 8;
     let mut pids = vec![0i32; capacity];
     let Ok(byte_capacity) = i32::try_from(capacity * size_of::<i32>()) else {
-        return 0;
+        return false;
     };
 
     // SAFETY: `pids.as_mut_ptr()` points to `capacity` initialized `i32`s in a
@@ -121,13 +120,11 @@ fn live_group_members(pgid: i32) -> usize {
         )
     };
     if filled <= 0 {
-        return 0;
+        return false;
     }
 
     pids.truncate(usize::try_from(filled).unwrap_or(0) / size_of::<i32>());
-    pids.into_iter()
-        .filter(|&pid| pid > 0 && is_live(pid))
-        .count()
+    pids.into_iter().any(|pid| pid > 0 && is_live(pid))
 }
 
 /// One libproc query: is this pid a process that still runs? A caller may pass

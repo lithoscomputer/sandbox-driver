@@ -107,6 +107,9 @@ pub(crate) fn effective_env(base_env: &BTreeMap<String, String>) -> BTreeMap<Str
 /// their own process group so cancellation and timeouts kill the whole
 /// tree. On Linux and macOS, a sandbox-owned sentinel keeps the group id
 /// pinned until stop, including after the workload exits.
+/// Standalone executors release their groups on drop after any spawned stdio
+/// process ends. Process-record removal is best effort while Tokio is
+/// available.
 pub struct HostExec {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     groups:                     Arc<ProcessGroups>,
@@ -125,14 +128,30 @@ impl HostExec {
         base_env: BTreeMap<String, String>,
         recreate_missing_workspace: bool,
     ) -> Self {
-        Self {
+        Self::with_groups(
+            working_dir,
+            base_env,
+            recreate_missing_workspace,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
-            groups: Arc::new(ProcessGroups::new(
+            Arc::new(ProcessGroups::new(
                 env::temp_dir()
                     .join("sandbox-driver-host-groups")
                     .join(registry::fresh_id()),
                 true,
+                true,
             )),
+        )
+    }
+
+    pub(crate) fn with_groups(
+        working_dir: PathBuf,
+        base_env: BTreeMap<String, String>,
+        recreate_missing_workspace: bool,
+        #[cfg(any(target_os = "linux", target_os = "macos"))] groups: Arc<ProcessGroups>,
+    ) -> Self {
+        Self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            groups,
             working_dir,
             base_env,
             recreate_missing_workspace,
@@ -151,12 +170,6 @@ impl HostExec {
                 }
             }
         }
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    pub(crate) fn with_groups(mut self, groups: Arc<ProcessGroups>) -> Self {
-        self.groups = groups;
-        self
     }
 
     async fn spawn_command(
@@ -522,8 +535,11 @@ impl Exec for HostExec {
             stdout_stats.truncated = true;
             stderr_stats.truncated = true;
         }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let mut result = ExecResult::from_shell_status(termination, exit_code, started.elapsed());
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let mut result = ExecResult::new(termination, exit_code, started.elapsed());
-        result.signal = exit_signal;
+        result.signal = exit_signal.or(result.signal);
         result.stdout = stdout_bytes;
         result.stderr = stderr_bytes;
 
@@ -668,5 +684,100 @@ impl StdioProcessHandle for HostStdioHandle {
     #[tracing::instrument(skip_all, fields(provider_kind = "host"))]
     async fn wait(&self) -> (Termination, Option<i32>) {
         self.outcome().await
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+    use sandbox_driver::{SandboxProvider, SandboxSource, SandboxSpec};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::task::spawn_blocking;
+
+    use super::*;
+    use crate::HostProvider;
+    use crate::observation::group_is_live;
+
+    async fn wait_for_group_exit(pgid: i32) {
+        time::timeout(Duration::from_secs(3), async {
+            while spawn_blocking(move || group_is_live(pgid))
+                .await
+                .expect("observe process group")
+            {
+                time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the final temporary owner releases its sentinel");
+    }
+
+    #[tokio::test]
+    async fn standalone_exec_releases_completed_process_groups_on_drop() {
+        let exec = HostExec::new(env::temp_dir(), BTreeMap::new(), false);
+        let result = exec.run(&ExecSpec::bash("echo $PPID")).await.unwrap();
+        let pgid = result.stdout_lossy().trim().parse().unwrap();
+        drop(exec);
+        wait_for_group_exit(pgid).await;
+    }
+
+    #[tokio::test]
+    async fn standalone_stdio_owns_its_process_after_the_executor_drops() {
+        let exec = HostExec::new(env::temp_dir(), BTreeMap::new(), false);
+        let mut process = exec
+            .spawn_stdio(&SpawnSpec::new("sh").args(["-c", "echo $PPID; exec cat"]))
+            .await
+            .unwrap();
+        drop(exec);
+        let mut output = BufReader::new(process.stdout);
+        let mut line = String::new();
+        output.read_line(&mut line).await.unwrap();
+        let pgid = line.trim().parse().unwrap();
+        process.stdin.write_all(b"still alive\n").await.unwrap();
+        line.clear();
+        time::timeout(Duration::from_secs(3), output.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(line, "still alive\n");
+        process.handle.terminate().await;
+        wait_for_group_exit(pgid).await;
+    }
+
+    #[tokio::test]
+    async fn only_durable_providers_keep_groups_after_the_last_handle_drops() {
+        for durable in [false, true] {
+            let root = env::temp_dir().join(registry::fresh_id());
+            let provider = if durable {
+                HostProvider::with_registry(&root).await.unwrap()
+            } else {
+                HostProvider::new()
+            };
+            let sandbox = provider
+                .create(&SandboxSpec::new(SandboxSource::HostDirectory), None)
+                .await
+                .unwrap();
+            let id = sandbox.id().clone();
+            let workspace = sandbox.working_directory().to_owned();
+            let result = sandbox
+                .exec()
+                .run(&ExecSpec::bash("echo $PPID"))
+                .await
+                .unwrap();
+            let pgid = result.stdout_lossy().trim().parse().unwrap();
+            drop(sandbox);
+            drop(provider);
+            if durable {
+                assert!(spawn_blocking(move || group_is_live(pgid)).await.unwrap());
+                HostProvider::with_registry(&root)
+                    .await
+                    .unwrap()
+                    .delete(&id, None)
+                    .await
+                    .unwrap();
+                fs::remove_dir_all(root).await.unwrap();
+            } else {
+                fs::remove_dir_all(workspace).await.unwrap();
+            }
+            wait_for_group_exit(pgid).await;
+        }
     }
 }

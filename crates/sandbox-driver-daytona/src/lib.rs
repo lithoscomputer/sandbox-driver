@@ -1957,7 +1957,10 @@ impl Sandbox for DaytonaSandbox {
     }
 
     fn preview_urls(&self) -> Option<&dyn PreviewUrls> {
-        Some(&self.access)
+        self.capabilities
+            .access
+            .preview_urls
+            .then_some(&self.access)
     }
 
     fn ssh(&self) -> Option<&dyn SshAccess> {

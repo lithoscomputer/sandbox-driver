@@ -27,6 +27,8 @@
 //! fence writes markers and observes process death without signalling saved
 //! ids. Other platforms retain direct process execution and do not offer this
 //! crash fence.
+//! Temporary providers end owned process groups when their last owner drops.
+//! Caller-owned registries retain groups for explicit stop or recovery.
 
 mod exec;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -62,10 +64,11 @@ use crate::registry::Record;
 /// A directory-backed provider. Use [`Self::with_registry`] to preserve
 /// sandbox identity across provider or plugin restarts.
 pub struct HostProvider {
-    kind:         ProviderKind,
-    capabilities: Capabilities,
-    root:         PathBuf,
-    registry:     Mutex<HashMap<SandboxId, Arc<HostSandbox>>>,
+    kind:            ProviderKind,
+    capabilities:    Capabilities,
+    root:            PathBuf,
+    cleanup_on_drop: bool,
+    registry:        Mutex<HashMap<SandboxId, Arc<HostSandbox>>>,
 }
 
 impl HostProvider {
@@ -74,6 +77,7 @@ impl HostProvider {
             env::temp_dir()
                 .join("sandbox-driver-host")
                 .join(registry::fresh_id()),
+            true,
         )
     }
 
@@ -84,14 +88,15 @@ impl HostProvider {
         let root = tokio_fs::canonicalize(root.as_ref())
             .await
             .map_err(|e| Error::io("resolving host registry", e))?;
-        Ok(Self::at(root))
+        Ok(Self::at(root, false))
     }
 
-    fn at(root: PathBuf) -> Self {
+    fn at(root: PathBuf, cleanup_on_drop: bool) -> Self {
         Self {
             kind: ProviderKind::try_new("host").expect("static kind is valid"),
             capabilities: host_capabilities(),
             root,
+            cleanup_on_drop,
             registry: Mutex::new(HashMap::new()),
         }
     }
@@ -107,6 +112,7 @@ impl HostProvider {
             self.root.clone(),
             self.capabilities.clone(),
             EventEmitter::new(self.kind.clone(), None),
+            self.cleanup_on_drop,
         )?);
         registry.insert(id.clone(), sandbox.clone());
         Ok(sandbox)
@@ -249,6 +255,10 @@ impl SandboxProvider for HostProvider {
                 reporter
                     .progress(Progress::new(ProgressCode::SANDBOX_PROVISION))
                     .await;
+                registry::private_directory(&self.root).await?;
+                let root = tokio_fs::canonicalize(&self.root)
+                    .await
+                    .map_err(|e| Error::io("resolving host registry", e))?;
                 let (workspace, ownership) = if let Some(path) = &spec.working_directory {
                     let path = PathBuf::from(path.as_str());
                     let ownership = spec
@@ -279,10 +289,6 @@ impl SandboxProvider for HostProvider {
                     })?;
                     (path, ownership)
                 } else {
-                    registry::private_directory(&self.root).await?;
-                    let root = tokio_fs::canonicalize(&self.root)
-                        .await
-                        .map_err(|e| Error::io("resolving host registry", e))?;
                     let path = registry::resource_dir(&root, &id)?.join("workspace");
                     tokio_fs::create_dir_all(&path).await.map_err(|error| {
                         Error::io(
@@ -298,10 +304,6 @@ impl SandboxProvider for HostProvider {
                     })?;
                     (path, WorkspaceOwnership::Managed)
                 };
-                registry::private_directory(&self.root).await?;
-                let root = tokio_fs::canonicalize(&self.root)
-                    .await
-                    .map_err(|e| Error::io("resolving host registry", e))?;
                 let record = Record {
                     version: 1,
                     id: id.clone(),
@@ -319,6 +321,7 @@ impl SandboxProvider for HostProvider {
                     root,
                     self.capabilities.clone(),
                     handle_emitter,
+                    self.cleanup_on_drop,
                 )?);
                 self.registry.lock().await.insert(id, sandbox.clone());
                 Ok(sandbox as Arc<dyn Sandbox>)
@@ -443,19 +446,23 @@ impl HostSandbox {
         root: PathBuf,
         capabilities: Capabilities,
         events: EventEmitter,
+        cleanup_on_drop: bool,
     ) -> Result<Self> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let _ = cleanup_on_drop;
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let groups = Arc::new(ProcessGroups::new(
             registry::resource_dir(&root, &record.id)?.join("groups"),
             record.state == SandboxState::Running,
+            cleanup_on_drop,
         ));
-        let exec = HostExec::new(
+        let exec = HostExec::with_groups(
             record.workspace.clone(),
             record.env.clone(),
             record.ownership == WorkspaceOwnership::Managed,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            groups.clone(),
         );
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let exec = exec.with_groups(groups.clone());
         Ok(Self {
             root,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -584,7 +591,7 @@ impl Sandbox for HostSandbox {
                         return Err(registry::missing(&self.id));
                     }
                     #[cfg(any(target_os = "linux", target_os = "macos"))]
-                    self.groups.start().await;
+                    self.groups.start().await?;
                     self.persist(SandboxState::Running).await?;
                     *state = SandboxState::Running;
                     Ok(())

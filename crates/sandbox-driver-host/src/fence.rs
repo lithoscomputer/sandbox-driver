@@ -3,18 +3,19 @@
 //! The sentinel publishes its record before checking the marker and spawning
 //! work. Its in-group watcher handles a fence even after the plugin dies.
 
-use std::io;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
+use std::{fs as sync_fs, io};
 
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use sandbox_driver::{Error, ProviderError, ProviderKind, Result};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::runtime::Handle;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::spawn_blocking;
 use tokio::{fs, time};
@@ -82,9 +83,6 @@ impl PinnedGroup {
 
     fn take_for_reap(&self) -> Option<Child> {
         let mut child = self.child.lock().unwrap_or_else(PoisonError::into_inner);
-        if child.is_some() {
-            let _ = killpg(Pid::from_raw(self.pgid), Signal::SIGKILL);
-        }
         // No other handle can signal after this removes its proof of ownership.
         child.take()
     }
@@ -101,14 +99,16 @@ struct GroupState {
 }
 
 pub(crate) struct ProcessGroups {
-    root:  PathBuf,
-    state: AsyncMutex<GroupState>,
+    root:            PathBuf,
+    state:           AsyncMutex<GroupState>,
+    cleanup_on_drop: bool,
 }
 
 impl ProcessGroups {
-    pub(crate) fn new(root: PathBuf, running: bool) -> Self {
+    pub(crate) fn new(root: PathBuf, running: bool, cleanup_on_drop: bool) -> Self {
         Self {
             root,
+            cleanup_on_drop,
             state: AsyncMutex::new(GroupState {
                 running,
                 generation: None,
@@ -116,12 +116,17 @@ impl ProcessGroups {
         }
     }
 
-    pub(crate) async fn start(&self) {
-        self.state.lock().await.running = true;
+    pub(crate) async fn start(&self) -> Result<()> {
+        let mut state = self.state.lock().await;
+        if !state.running {
+            self.drain(&mut state).await?;
+        }
+        state.running = true;
+        Ok(())
     }
 
     pub(crate) async fn spawn(
-        &self,
+        self: &Arc<Self>,
         program: &str,
         args: &[String],
         configure: impl FnOnce(&mut Command),
@@ -185,6 +190,7 @@ impl ProcessGroups {
             stdout,
             stderr,
             group,
+            _groups: self.clone(),
             status_file,
         })
     }
@@ -192,6 +198,11 @@ impl ProcessGroups {
     pub(crate) async fn stop(&self) -> Result<()> {
         let mut state = self.state.lock().await;
         state.running = false;
+        self.drain(&mut state).await
+    }
+
+    async fn drain(&self, state: &mut GroupState) -> Result<()> {
+        let deadline = time::Instant::now() + DRAIN;
         // Mark all generations before observing any group. A concurrent old
         // sentinel must either publish in time or see the marker before spawn.
         let mut pgids = Vec::new();
@@ -253,21 +264,43 @@ impl ProcessGroups {
         if let Some(generation) = &mut state.generation {
             // Kill every owned group before waiting for any. Persisted ids are
             // never used here: each handle still owns its unreaped sentinel.
-            let children: Vec<_> = generation
-                .groups
-                .iter()
-                .filter_map(|group| {
-                    pgids.push(group.pgid);
-                    group.take_for_reap()
-                })
-                .collect();
-            for mut child in children {
-                let _ = child.wait().await;
+            for group in &generation.groups {
+                pgids.push(group.pgid);
+                if let Err(error) = group.signal(Signal::SIGKILL) {
+                    // Some platforms reject a signal to an already-dead
+                    // group. Only a live group still needs a successful kill.
+                    let pgid = group.pgid;
+                    let live =
+                        spawn_blocking(move || group_is_live(pgid))
+                            .await
+                            .map_err(|error| {
+                                Error::io("observing process group", io::Error::other(error))
+                            })?;
+                    if live {
+                        return Err(Error::io("killing host process group", error));
+                    }
+                }
+            }
+            for group in &generation.groups {
+                let Some(mut child) = group.take_for_reap() else {
+                    continue;
+                };
+                let outcome = match time::timeout_at(deadline, child.wait()).await {
+                    Ok(result) => {
+                        result.map_err(|error| Error::io("reaping host process group", error))
+                    }
+                    Err(_) => Err(fence_leaked(&pgids)),
+                };
+                if let Err(error) = outcome {
+                    // The unreaped child still pins this id. Keep it so a
+                    // later stop can safely retry both signalling and reaping.
+                    *group.child.lock().unwrap_or_else(PoisonError::into_inner) = Some(child);
+                    return Err(error);
+                }
             }
         }
         pgids.sort_unstable();
         pgids.dedup();
-        let deadline = time::Instant::now() + DRAIN;
         loop {
             pgids = spawn_blocking(move || {
                 pgids.retain(|id| group_is_live(*id));
@@ -289,18 +322,42 @@ impl ProcessGroups {
                 return Ok(());
             }
             if time::Instant::now() >= deadline {
-                let mut error = ProviderError::new(
-                    ProviderKind::try_new("host").expect("static kind"),
-                    format!(
-                        "process groups {pgids:?} did not drain; no signal was sent to saved ids"
-                    ),
-                );
-                error.code = Some("fence_leaked".to_owned());
-                return Err(error.into());
+                return Err(fence_leaked(&pgids));
             }
             time::sleep(POLL).await;
         }
     }
+}
+
+impl Drop for ProcessGroups {
+    fn drop(&mut self) {
+        if !self.cleanup_on_drop {
+            return;
+        }
+        if let Some(generation) = &self.state.get_mut().generation {
+            for group in &generation.groups {
+                // Signal only ids still pinned by our child handles. Tokio
+                // takes responsibility for reaping each dropped child.
+                let _ = group.signal(Signal::SIGKILL);
+                drop(group.take_for_reap());
+            }
+        }
+        // Disposable process records have no recovery caller. Their removal
+        // is best effort and must not block the thread dropping the owner.
+        if let Ok(runtime) = Handle::try_current() {
+            let root = self.root.clone();
+            runtime.spawn_blocking(move || sync_fs::remove_dir_all(root));
+        }
+    }
+}
+
+fn fence_leaked(pgids: &[i32]) -> Error {
+    let mut error = ProviderError::new(
+        ProviderKind::try_new("host").expect("static kind"),
+        format!("process groups {pgids:?} did not drain; no signal was sent to saved ids"),
+    );
+    error.code = Some("fence_leaked".to_owned());
+    error.into()
 }
 
 /// A workload's status and pipes. The sandbox, not this handle, owns the
@@ -310,6 +367,8 @@ pub(crate) struct HostChild {
     pub(crate) stdout: Option<ChildStdout>,
     pub(crate) stderr: Option<ChildStderr>,
     group:             Arc<PinnedGroup>,
+    // A standalone stdio process can outlive the HostExec that spawned it.
+    _groups:           Arc<ProcessGroups>,
     status_file:       PathBuf,
 }
 
@@ -356,13 +415,8 @@ impl HostChild {
             .await
             .ok()?
             .trim()
-            .parse::<i32>()
+            .parse::<u8>()
             .ok()?;
-        let raw = if (129..=192).contains(&code) {
-            code - 128
-        } else {
-            code << 8
-        };
-        Some(ExitStatus::from_raw(raw))
+        Some(ExitStatus::from_raw(i32::from(code) << 8))
     }
 }

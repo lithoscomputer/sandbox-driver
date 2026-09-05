@@ -191,8 +191,18 @@ async fn a_saved_innocent_group_is_observed_but_never_signalled() {
     .await
     .expect("saved id");
     let outcome = sandbox.stop().await;
+    let restart = sandbox.start().await;
     let still_alive = innocent.try_wait().expect("observe owned child").is_none();
     innocent.kill().await.expect("test owner cleans its child");
+    sandbox
+        .start()
+        .await
+        .expect("restart finishes the old fence");
+    let resumed = sandbox
+        .exec()
+        .run(&ExecSpec::bash("exit 7"))
+        .await
+        .expect("new generation");
     sandbox.delete().await.expect("retry after group ended");
     provider.shutdown().await.expect("shutdown");
     child
@@ -201,6 +211,11 @@ async fn a_saved_innocent_group_is_observed_but_never_signalled() {
         .expect("reap the externally owned plugin child");
     fs::remove_dir_all(root).await.expect("registry cleanup");
     assert!(still_alive, "the fencer signalled an unrelated group");
+    assert!(
+        matches!(restart, Err(Error::Provider(ref error)) if error.code.as_deref() == Some("fence_leaked")),
+        "{restart:?}"
+    );
+    assert_eq!(resumed.exit_code, Some(7));
     assert!(
         matches!(outcome, Err(Error::Provider(ref error)) if error.code.as_deref() == Some("fence_leaked")),
         "{outcome:?}"

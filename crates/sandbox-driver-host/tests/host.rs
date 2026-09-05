@@ -804,3 +804,28 @@ async fn explicitly_managed_named_workspace_is_owned_across_registry_restarts() 
         .await
         .expect("registry cleanup");
 }
+
+#[tokio::test]
+async fn exec_and_stdio_preserve_high_exit_codes() {
+    let provider = HostProvider::new();
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+    for code in [129, 130, 143, 255] {
+        let script = format!("exit {code}");
+        let result = sandbox
+            .exec()
+            .run(&ExecSpec::bash(&script))
+            .await
+            .expect("exec");
+        let process = sandbox
+            .exec()
+            .spawn_stdio(&SpawnSpec::new("sh").args(["-c", &script]))
+            .await
+            .expect("stdio");
+        assert_eq!(result.exit_code, Some(code));
+        assert_eq!(
+            process.handle.wait().await,
+            (Termination::Exited, Some(code))
+        );
+    }
+    sandbox.delete().await.expect("cleanup");
+}

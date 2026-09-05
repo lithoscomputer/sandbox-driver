@@ -72,8 +72,13 @@ async fn nested_job_sidecars_one_shots_and_restart_share_the_vm_lifecycle() {
     .into_value();
     let sandbox = provider.create(&spec, None).await.unwrap();
     let outcome = AssertUnwindSafe(async {
-        sandbox.fs().write("binary", &[0, 255, 128, 10]).await?;
-        assert_eq!(sandbox.fs().read("binary").await?, [0, 255, 128, 10]);
+        sandbox
+            .fs()
+            .write_from("binary", &mut [0, 255, 128, 10].as_slice(), 4)
+            .await?;
+        let mut binary = Vec::new();
+        sandbox.fs().read_to("binary", &mut binary).await?;
+        assert_eq!(binary, [0, 255, 128, 10]);
         let result = sandbox
             .exec()
             .run_streaming(
