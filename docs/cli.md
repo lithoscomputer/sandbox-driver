@@ -1,8 +1,40 @@
 # lithos-sandbox CLI
 
 The `sandbox-driver-cli` crate builds the `lithos-sandbox` executable. The CLI
-is a thin application over the provider traits. It does not add resources or
-operations to the core library.
+uses JSON-RPC for every provider, including Host, Docker, and Daytona. It
+does not link provider implementations or add resources to the core contract.
+
+## Provider executables
+
+Build the CLI and all provider executables with `mise run dev`. Each provider
+package builds its same-named executable: `sandbox-driver-host`,
+`sandbox-driver-docker`, and `sandbox-driver-daytona`.
+
+For the default profiles, the CLI resolves the executable in this order:
+
+1. `SANDBOX_DRIVER_<KIND>_PLUGIN`, with the kind in uppercase.
+2. The same directory as `lithos-sandbox`.
+3. `PATH`.
+
+Set `SANDBOX_DRIVER_<KIND>_SHA256` to the expected binary checksum. A missing
+checksum is rejected unless `SANDBOX_DRIVER_PLUGIN_DEV=1` explicitly allows
+local development. A checksum mismatch is always rejected.
+
+```sh
+mise run dev
+SANDBOX_DRIVER_PLUGIN_DEV=1 target/debug/lithos-sandbox --provider host provider health
+```
+
+Default profiles forward `PATH`, `HOME`, `TMPDIR`, `RUST_LOG`, and
+`LLVM_PROFILE_FILE` when set. Docker also receives `DOCKER_HOST`,
+`DOCKER_TLS_VERIFY`, `DOCKER_CERT_PATH`, and `DOCKER_CONFIG`. Daytona receives its standard
+API key, JWT token, organization ID, API/server URL, and target variables.
+All other ambient variables are removed. Plugin diagnostics default to
+`warn` when the CLI has no `RUST_LOG` setting.
+
+The default Host profile uses a temporary in-memory registry. To configure a
+durable registry or a different environment, use an explicit plugin profile.
+The current CLI still limits Host sandbox operations to `sandbox run`.
 
 ## Command structure
 
@@ -66,7 +98,7 @@ lithos-sandbox --provider docker sandbox run --image ubuntu:24.04 -- \
 Use `--keep` with a persistent provider to preserve the sandbox. The CLI
 writes its ID to stderr so command stdout stays unchanged.
 
-The Host provider stores its handles in process memory. Therefore, Host
+The default Host profile stores its handles in plugin process memory. Its
 handles cannot be used by a later CLI invocation. Use Host only with
 `sandbox run`. `--workspace PATH` designates a caller-owned directory. Host
 cleanup releases the handle and does not delete that directory.
@@ -134,12 +166,13 @@ api-url = "https://app.daytona.io/api"
 target = "us"
 ```
 
-An unconfigured built-in Daytona profile reads the standard Daytona
-environment variables. A configured profile can name different environment
-variables. The configuration stores environment variable names, not secret
-values.
+An unconfigured built-in Daytona profile forwards the standard Daytona
+environment variables to the plugin. A configured profile can name different environment
+variables. Named settings override the standard values; unspecified settings
+keep the SDK environment defaults. The configuration stores environment
+variable names, not secret values.
 
-Configure an external JSON-RPC plugin as follows:
+Configure an explicit plugin profile for a bundled or third-party provider as follows:
 
 ```toml
 [providers.e2b]
@@ -151,7 +184,9 @@ inherit-env = ["PATH", "E2B_API_KEY"]
 ```
 
 The CLI verifies the checksum before it starts the plugin. Set `dev = true`
-only for local plugin development when no checksum is available. Plugin
+only for local plugin development when no checksum is available. Explicit
+plugin profiles use their own `dev` and `sha256` fields; the default-profile
+environment overrides above do not change them. Plugin
 processes receive only configured `env` values and variables named by
 `inherit-env`.
 

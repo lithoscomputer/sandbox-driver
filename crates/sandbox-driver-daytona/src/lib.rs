@@ -1,5 +1,9 @@
 //! Daytona cloud sandbox provider.
 //!
+//! Internal provider implementation, shared by the plugin executable and tests.
+//! Applications use this provider through JSON-RPC, via
+//! `sandbox-driver-protocol`.
+//!
 //! VM-backed sandboxes (`Isolation::Vm`) through the Daytona control
 //! plane and per-sandbox toolbox daemon, with snapshots and volumes as
 //! first-class services and preview-URL/SSH access facets.
@@ -51,17 +55,19 @@
 //! changing the process environment.
 
 mod access;
-mod docker_transport;
 mod exec;
 mod fs;
 mod git;
 mod logs;
 mod nested_docker;
+mod nested_exec;
+mod nested_fs;
 mod pty;
 mod session;
 mod stdio;
 
 use std::collections::{BTreeMap, HashMap};
+use std::env;
 use std::fmt::Debug;
 use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex};
@@ -580,6 +586,7 @@ pub struct DaytonaProvider {
     kind:         ProviderKind,
     capabilities: Capabilities,
     client:       DaytonaClient,
+    uses_api_key: bool,
     snapshots:    DaytonaSnapshots,
     volumes:      DaytonaVolumes,
 }
@@ -588,10 +595,7 @@ impl DaytonaProvider {
     /// Connects using the SDK's environment configuration.
     #[tracing::instrument(skip_all, fields(provider_kind = "daytona"), err)]
     pub async fn connect() -> Result<Self> {
-        let client = Client::new()
-            .await
-            .map_err(|error| daytona_error("connecting to daytona", error))?;
-        Ok(Self::from_client(client))
+        Self::connect_with_config(DaytonaConfig::default()).await
     }
 
     /// Connects using explicit SDK configuration.
@@ -604,14 +608,22 @@ impl DaytonaProvider {
     /// Returns an error when the configuration is invalid or the SDK client
     /// cannot be initialized.
     #[tracing::instrument(skip_all, fields(provider_kind = "daytona"), err)]
-    pub async fn connect_with_config(config: DaytonaConfig) -> Result<Self> {
+    pub async fn connect_with_config(mut config: DaytonaConfig) -> Result<Self> {
+        // Resolve the SDK's API-key fallback once, before it consumes config.
+        // An explicitly empty key disables that fallback and selects JWT.
+        config.api_key = Some(
+            config
+                .api_key
+                .unwrap_or_else(|| env::var("DAYTONA_API_KEY").unwrap_or_default()),
+        );
+        let uses_api_key = config.api_key.as_ref().is_some_and(|key| !key.is_empty());
         let client = Client::new_with_config(config)
             .await
             .map_err(|error| daytona_error("connecting to daytona", error))?;
-        Ok(Self::from_client(client))
+        Ok(Self::from_client(client, uses_api_key))
     }
 
-    fn from_client(client: Client) -> Self {
+    fn from_client(client: Client, uses_api_key: bool) -> Self {
         let client = Arc::new(client);
         let kind = ProviderKind::try_new("daytona").expect("static kind is valid");
         Self {
@@ -626,7 +638,19 @@ impl DaytonaProvider {
                 kind,
             },
             client,
+            uses_api_key,
         }
+    }
+
+    fn jwt_health_identity(&self) -> Option<String> {
+        // An API key ignores the organization header. Only JWT authentication
+        // can use that header as its effective resource namespace.
+        if self.uses_api_key {
+            return None;
+        }
+        self.client
+            .organization_id()
+            .map(|id| format!("organization:{id}"))
     }
 
     /// Creates the sandbox and waits for it to start under `budget`,
@@ -862,7 +886,7 @@ fn daytona_capabilities() -> Capabilities {
     caps.exec.stdio_process = true;
     caps.exec.environment = true;
     caps.exec.stdin_stream = true;
-    caps.one_shot = sandbox_driver_docker::docker_capabilities().one_shot;
+    caps.one_shot = Some(nested_docker::one_shot_capabilities());
     caps.fs.native = true;
     caps.fs.upload = true;
     caps.fs.download = true;
@@ -990,11 +1014,7 @@ fn base_params(spec: &SandboxSpec) -> Result<SandboxBaseParams> {
             env
         }),
         labels: Some(labels),
-        public: if config.docker.is_some() {
-            Some(false)
-        } else {
-            spec.public
-        },
+        public: spec.public,
         target: spec.region.clone(),
         auto_stop_interval: spec.timers.auto_stop_after_idle.map(minutes),
         auto_pause_interval: spec.timers.auto_pause_after_idle.map(minutes),
@@ -1271,10 +1291,7 @@ impl SandboxProvider for DaytonaProvider {
         let mut health = ProviderHealth::new(HealthStatus::Ok);
         // JWT authentication requires an explicit organization. A successful
         // authenticated list above verifies access to that namespace.
-        health.identity = self
-            .client
-            .organization_id()
-            .map(|id| format!("organization:{id}"));
+        health.identity = self.jwt_health_identity();
         // Scope enumeration works only for API-key credentials; a JWT
         // credential proved itself above and skips it, as does a control
         // plane without key introspection.
@@ -1288,10 +1305,12 @@ impl SandboxProvider for DaytonaProvider {
         if let Some(organization) = self.client.organization_id() {
             request = request.header("X-Daytona-Organization-ID", organization);
         }
-        if let Ok(response) = request.send().await
-            && let Ok(response) = response.error_for_status()
-            && let Ok(key) = response.json::<CurrentApiKey>().await
-        {
+        let key = async {
+            let response = request.send().await.ok()?.error_for_status().ok()?;
+            response.json::<CurrentApiKey>().await.ok()
+        }
+        .await;
+        if let Some(key) = key {
             // API keys select their organization even when configuration
             // supplies no organization header. The server's value wins.
             if let Some(organization) = key.organization_id.filter(|id| !id.is_empty()) {
@@ -1384,10 +1403,8 @@ impl DaytonaSandbox {
             .filter(|nested| nested.targets_container())
     }
 
-    /// The nested Docker client holds a preview token scoped to one
-    /// running VM generation, so every verb that ends that generation
-    /// clears it here. Keeping the contract in one place is why `pause`
-    /// and `archive` cannot forget it.
+    /// A new sandbox generation must restart Docker and its services
+    /// before nested operations resume.
     async fn vm_generation_ended(&self) {
         if let Some(nested) = &self.nested {
             nested.stopped().await;
@@ -1397,8 +1414,8 @@ impl DaytonaSandbox {
     async fn start_with_docker(&self) -> Result<()> {
         self.start_inner().await?;
         self.vm_generation_ended().await;
-        if let Some(nested) = &self.nested {
-            nested.sandbox().await?;
+        if let Some(nested) = self.container() {
+            nested.ensure_ready().await?;
         }
         Ok(())
     }
@@ -1599,14 +1616,11 @@ impl Sandbox for DaytonaSandbox {
     }
 
     async fn environment(&self) -> Result<BTreeMap<String, String>> {
-        if let Some(container) = self.container() {
-            return container.sandbox().await?.environment().await;
-        }
-        let result = self.exec.run(&ExecSpec::new("env").arg("-0")).await?;
+        let result = self.exec().run(&ExecSpec::new("env").arg("-0")).await?;
         if !result.success() {
             return Err(Error::Exec(
                 ExecFailure::new(
-                    "reading VM environment",
+                    "reading sandbox environment",
                     result.termination,
                     result.exit_code,
                     result.stdout,
@@ -1616,7 +1630,7 @@ impl Sandbox for DaytonaSandbox {
             ));
         }
         let output = String::from_utf8(result.stdout)
-            .map_err(|error| docker_transport::transport_error("decoding VM environment", error))?;
+            .map_err(|error| Error::invalid_spec("environment", error.to_string()))?;
         output
             .split_terminator('\0')
             .map(|entry| {
@@ -1630,13 +1644,10 @@ impl Sandbox for DaytonaSandbox {
 
     #[tracing::instrument(skip_all, fields(provider_kind = "daytona", sandbox_id = %self.id), err)]
     async fn platform_info(&self) -> Result<PlatformInfo> {
-        if let Some(container) = self.container() {
-            return container.sandbox().await?.platform_info().await;
-        }
         // uname prints its fields in canonical order — sysname, release,
         // machine — regardless of flag order.
         let result = self
-            .exec
+            .exec()
             .run(
                 &ExecSpec::new("uname")
                     .args(["-s", "-r", "-m"])
@@ -2644,6 +2655,36 @@ mod tests {
         );
         assert_eq!(sdk_config.base_path, "https://daytona.example/api");
         assert_eq!(provider.client.organization_id(), Some("org-1"));
+        assert_eq!(
+            provider.jwt_health_identity(),
+            None,
+            "an API key's effective organization must come from the server"
+        );
+    }
+
+    #[tokio::test]
+    async fn jwt_credentials_use_the_configured_organization_as_health_identity() {
+        let provider = DaytonaProvider::connect_with_config(DaytonaConfig {
+            api_key: Some(String::new()),
+            jwt_token: Some("jwt-vault-resolved".to_owned()),
+            organization_id: Some("org-1".to_owned()),
+            api_url: Some("https://daytona.example/api".to_owned()),
+            ..DaytonaConfig::default()
+        })
+        .await
+        .expect("explicit JWT configuration initializes the SDK client");
+        assert_eq!(
+            provider.jwt_health_identity().as_deref(),
+            Some("organization:org-1")
+        );
+        assert_eq!(
+            provider
+                .client
+                .api_configuration()
+                .bearer_access_token
+                .as_deref(),
+            Some("jwt-vault-resolved")
+        );
     }
 
     #[test]
@@ -2733,7 +2774,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_docker_keeps_private_preview_and_only_nonsecret_target_metadata() {
+    fn nested_docker_preserves_visibility_and_only_nonsecret_target_metadata() {
         let mut spec = SandboxSpec::new(SandboxSource::Image {
             reference: "runner:dind".to_owned(),
         });
@@ -2758,12 +2799,12 @@ mod tests {
         }
         .into_value();
         let base = base_params(&spec).unwrap();
-        assert_eq!(base.public, Some(false));
+        assert_eq!(base.public, None);
         let labels = base.labels.unwrap();
         assert_eq!(labels[nested_docker::TARGET_LABEL], "container");
         assert!(!format!("{labels:?}").contains("private-"));
         spec.public = Some(true);
-        assert!(matches!(base_params(&spec), Err(Error::InvalidSpec { .. })));
+        assert_eq!(base_params(&spec).unwrap().public, Some(true));
     }
 
     #[test]

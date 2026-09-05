@@ -322,14 +322,14 @@ impl DockerExec {
     /// An in-container watcher polls for the stop file, so a stop that
     /// lands before the pid file exists — or before the command starts
     /// at all — still takes effect. The stop file carries a rendered
-    /// [`StopMode`]: for `term` the watcher SIGTERMs the process group
+    /// mode: for `term` the watcher SIGTERMs the process group
     /// once and keeps watching, so a later `kill` still lands; for
     /// `kill` it SIGKILLs. There is no escalation in here: the caller
     /// owns that. Control files are cleared before the command starts
     /// and removed on exit. The `wait` runs with stderr closed: dash
     /// reports a signalled background job as `Terminated` on stderr,
     /// which would otherwise land in the command's output.
-    fn wrapped(stop_file: &str, pid_file: &str, forward_stdin: bool) -> String {
+    pub fn command_wrapper(stop_file: &str, pid_file: &str, forward_stdin: bool) -> String {
         let stop_file = shell_quote(stop_file);
         let pid_file = shell_quote(pid_file);
         let (save_stdin, stdin_redirect, close_stdin) = if forward_stdin {
@@ -475,7 +475,7 @@ impl Exec for DockerExec {
         let started = Instant::now();
         let (stop_file, pid_file) = self.control_paths();
         let stdin_reader = controls.stdin_reader(spec);
-        let wrapper = Self::wrapped(&stop_file, &pid_file, stdin_reader.is_some());
+        let wrapper = Self::command_wrapper(&stop_file, &pid_file, stdin_reader.is_some());
 
         let working_dir = self.resolve_dir(spec.working_dir.as_deref());
         let options = CreateExecOptions {
@@ -599,7 +599,7 @@ impl Exec for DockerExec {
     )]
     async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
         let (stop_file, pid_file) = self.control_paths();
-        let wrapper = Self::wrapped(&stop_file, &pid_file, true);
+        let wrapper = Self::command_wrapper(&stop_file, &pid_file, true);
         let working_dir = self.resolve_dir(spec.working_dir.as_deref());
         let options = CreateExecOptions {
             attach_stdin: Some(true),

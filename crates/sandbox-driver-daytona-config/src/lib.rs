@@ -26,7 +26,9 @@ impl DaytonaProviderConfig {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NestedDockerConfig {
-    /// Job image, or a small helper image when execution stays in the VM.
+    /// Job image for container execution. Process execution does not create
+    /// a helper container and ignores this image.
+    #[serde(default)]
     pub image:   String,
     #[serde(default)]
     pub target:  DockerExecutionTarget,
@@ -44,7 +46,7 @@ pub enum DockerExecutionTarget {
     /// Ordinary operations and one-shot containers share the job container.
     #[default]
     Container,
-    /// Ordinary operations stay in the VM. A helper container gives
-    /// one-shots access to its workspace and host network namespace.
+    /// Ordinary operations stay in the VM. One-shots use the VM workspace
+    /// and host network namespace; Docker starts only when an action needs it.
     VirtualMachine,
 }

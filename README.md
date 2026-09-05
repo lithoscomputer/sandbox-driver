@@ -1,20 +1,26 @@
 # sandbox-driver
 
-A Rust library for driving sandboxes across providers: manage sandboxes,
-snapshots, and volumes behind one capability-discoverable interface.
+Sandbox providers for managing sandboxes, snapshots, and volumes through a
+JSON-RPC protocol. Petri is the primary consumer. Applications use the
+protocol client and shared types; provider libraries are internal
+implementations for the executables and tests.
 
 | Crate | Purpose |
 | --- | --- |
 | `sandbox-driver` | Core traits, types, exec-derived facets, wait/probe helpers |
-| `sandbox-driver-host` | Host (local) provider — directories, no isolation |
-| `sandbox-driver-docker` | Docker provider — containers with a workspace volume, one-shot containers, sidecars, image pulls |
+| `sandbox-driver-host` | Host executable and internal implementation — directories, no isolation |
+| `sandbox-driver-docker` | Docker executable and internal implementation — containers with a workspace volume, one-shot containers, sidecars, image pulls |
 | `sandbox-driver-docker-config` | The Docker provider's `provider_config` as plain Serde types, for hosts on the wire |
-| `sandbox-driver-daytona` | Daytona provider — cloud VMs, nested Docker, snapshots, volumes |
+| `sandbox-driver-daytona` | Daytona executable and internal implementation — cloud VMs, nested Docker, snapshots, volumes |
 | `sandbox-driver-daytona-config` | Typed Daytona and nested Docker configuration for plugin clients |
 | `sandbox-driver-protocol` | JSON-RPC plugin protocol (version 2, with per-operation data channels): serve any provider, adapt any plugin |
 | `sandbox-driver-conformance` | Black-box conformance suite every provider must pass |
-| `sandbox-driver-{host,docker,daytona}-plugin` | The three providers as plugin executables: `sandbox-driver-host`, `sandbox-driver-docker`, `sandbox-driver-daytona` |
 | `sandbox-driver-cli` | `lithos-sandbox` command for provider diagnostics and sandbox operations |
+
+Each provider package builds an executable with the same name as the package.
+The Docker library is also reused inside Daytona for nested Docker. These
+libraries are not supported application APIs. All applications, including
+`lithos-sandbox`, reach providers through JSON-RPC.
 
 Host and Docker pass conformance locally (Docker needs a daemon), in
 process and served over the plugin wire; the Daytona suite runs live with
@@ -27,12 +33,13 @@ and `docs/protocol.md` for the normative plugin wire protocol.
 
 Daytona can own a nested job container, sidecars, and one-shot action containers.
 Use `DaytonaProviderConfig` from `sandbox-driver-daytona-config`. The runner
-snapshot must include `start-docker` and Python 3. Container traffic crosses a
-private authenticated preview. VM stop and delete own the full resource fence.
+snapshot must include `start-docker`, the Docker CLI, and Python 3. Nested
+operations use Daytona's native process and file APIs. The outer sandbox
+owns the lifecycle of all nested resources.
 See [the design](docs/design.md#nested-docker-on-daytona) for configuration and
 restart behavior.
 
-The transport has deterministic local tests. The hosted integration remains an
+Docker command construction and binary file transfers have local tests. The hosted integration remains an
 explicit live gate:
 
 ```sh
@@ -45,16 +52,22 @@ cargo nextest run --locked -p sandbox-driver-daytona --test nested_docker --run-
 Build the `lithos-sandbox` command and inspect the available operations:
 
 ```sh
-cargo build --locked -p sandbox-driver-cli
+mise run dev
+export SANDBOX_DRIVER_PLUGIN_DEV=1
+export PATH="$PWD/target/debug:$PATH"
 target/debug/lithos-sandbox --help
 ```
 
 Host plugins can recover across restarts on Linux and macOS. Set
-`SANDBOX_DRIVER_HOST_REGISTRY` to a caller-owned directory, or use
-`HostProvider::with_registry` in Rust. Stop fences sandbox process groups;
+`SANDBOX_DRIVER_HOST_REGISTRY` in an explicitly configured plugin environment
+to a caller-owned directory. Stop fences sandbox process groups;
 recovery never signals saved process ids. Named workspaces remain designated
 unless `workspace_ownership: Managed` explicitly transfers their creation and
 deletion to the provider. Managed workspaces are deleted only after work stops.
+
+The development opt-in above allows local binaries without checksum pins.
+For installed providers, configure checksum pins as described in
+[the CLI guide](docs/cli.md#provider-executables).
 
 Run a command in a temporary Host sandbox:
 

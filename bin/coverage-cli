@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Instrument the CLI and the separate provider processes it launches.
+set -euo pipefail
+
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target/llvm-cov-target}"
+coverage_env=$(mktemp)
+trap 'rm -f -- "$coverage_env"' EXIT HUP INT TERM
+cargo llvm-cov clean --workspace
+cargo llvm-cov show-env --sh > "$coverage_env"
+source "$coverage_env"
+cargo build --locked --bins \
+  -p sandbox-driver-host \
+  -p sandbox-driver-docker \
+  -p sandbox-driver-daytona
+cargo nextest run --locked -p sandbox-driver-cli \
+  --test trycmd --test live --test plugins
+cargo llvm-cov report --locked \
+  -p sandbox-driver-cli \
+  -p sandbox-driver \
+  -p sandbox-driver-host \
+  -p sandbox-driver-docker \
+  -p sandbox-driver-daytona \
+  --json --summary-only \
+  --output-path target/cli-full-stack-coverage.json

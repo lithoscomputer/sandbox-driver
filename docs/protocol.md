@@ -1,8 +1,7 @@
 # sandbox-driver plugin protocol, version 2
 
 This is the normative specification of the wire protocol between a
-**host** (an application embedding `sandbox-driver`, such as Petri or
-fabro) and a **plugin** (an executable serving one sandbox provider). It
+**host** (an application using the protocol client, primarily Petri) and a **plugin** (an executable serving one sandbox provider). It
 is written so a plugin can be implemented in any language without reading
 the Rust source. The Rust implementation lives in the
 `sandbox-driver-protocol` crate: `serve_stdio()` is the plugin side,
@@ -20,6 +19,11 @@ the handshake by version number (§4).
 Normative words: **must**, **must not**, **may**.
 
 ## 1. Model
+
+Applications reach every provider through this protocol, including the
+bundled Host, Docker, and Daytona providers. Each provider package builds
+its executable directly. Provider libraries support internal composition
+and tests; they are not supported application APIs.
 
 A plugin serves exactly one provider **kind** (e.g. `docker`) and
 multiplexes every sandbox of that kind over one connection. The host

@@ -23,6 +23,10 @@ run = "bin/style-guides prepare"
 description = "Build the workspace"
 run = "cargo build --locked"
 
+[tasks."plugins:build"]
+description = "Build the provider executables used by CLI tests"
+run = "cargo build --locked --bins -p sandbox-driver-host -p sandbox-driver-docker -p sandbox-driver-daytona"
+
 [tasks.fmt]
 description = "Format Rust with the pinned nightly formatter"
 run = "cargo +nightly-2026-04-14 fmt --all"
@@ -37,54 +41,26 @@ env = { CARGO_TARGET_DIR = "{{config_root}}/target/clippy" }
 run = "cargo clippy --locked --all-targets --all-features -- -D warnings"
 
 [tasks.test]
+depends = ["plugins:build"]
 description = "Run all Rust tests with Nextest"
 run = "cargo nextest run --locked --all-targets --all-features --no-tests=pass"
 
 [tasks."test:cli"]
+depends = ["plugins:build"]
 description = "Run CLI black-box tests, including available live providers"
-run = "cargo nextest run --locked -p sandbox-driver-cli --test trycmd --test live"
+run = "cargo nextest run --locked -p sandbox-driver-cli --test trycmd --test live --test plugins"
 
 [tasks."coverage:cli"]
 description = "Measure full-stack CLI black-box coverage with live providers required"
 env = { LITHOS_CLI_E2E_REQUIRE_LIVE = "1" }
-run = [
-  "cargo llvm-cov clean --workspace",
-  """
-  cargo llvm-cov --locked --workspace \
-    --exclude-from-test sandbox-driver \
-    --exclude-from-test sandbox-driver-daytona \
-    --exclude-from-test sandbox-driver-conformance \
-    --exclude-from-test sandbox-driver-protocol \
-    --exclude-from-test sandbox-driver-host \
-    --exclude-from-test sandbox-driver-docker \
-    --exclude-from-test sandbox-driver-host-plugin \
-    --exclude-from-test sandbox-driver-docker-plugin \
-    --exclude-from-test sandbox-driver-daytona-plugin \
-    --exclude-from-test sandbox-driver-docker-config \
-    --exclude-from-report sandbox-driver-conformance \
-    --exclude-from-report sandbox-driver-protocol \
-    --exclude-from-report sandbox-driver-host-plugin \
-    --exclude-from-report sandbox-driver-docker-plugin \
-    --exclude-from-report sandbox-driver-daytona-plugin \
-    --test trycmd \
-    --test live
-  """,
-  """
-  cargo llvm-cov report --locked \
-    -p sandbox-driver-cli \
-    -p sandbox-driver \
-    -p sandbox-driver-host \
-    -p sandbox-driver-docker \
-    -p sandbox-driver-daytona \
-    --json \
-    --summary-only \
-    --output-path target/cli-full-stack-coverage.json
-  """,
-]
+run = "bin/coverage-cli"
 
 [tasks."test:release"]
 description = "Run all Rust tests in release mode"
-run = "cargo nextest run --locked --release --all-targets --all-features --no-tests=pass"
+run = [
+  "cargo build --locked --release --bins -p sandbox-driver-host -p sandbox-driver-docker -p sandbox-driver-daytona",
+  "cargo nextest run --locked --release --all-targets --all-features --no-tests=pass",
+]
 
 [tasks."check:msrv"]
 description = "Check all targets with the declared minimum Rust version"

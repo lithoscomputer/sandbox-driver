@@ -9,5 +9,6 @@ fn cli_contract() {
             profile_file.to_string_lossy().into_owned(),
         );
     }
+    cases.env("SANDBOX_DRIVER_PLUGIN_DEV", "1");
     cases.case("tests/cmd/*.toml");
 }

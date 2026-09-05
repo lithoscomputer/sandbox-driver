@@ -1,5 +1,9 @@
 //! Docker container sandbox provider.
 //!
+//! Internal provider implementation, shared by the plugin executable and tests.
+//! Applications use this provider through JSON-RPC, via
+//! `sandbox-driver-protocol`.
+//!
 //! Containers created from OCI images, with kernel-sharing container
 //! isolation (`Isolation::Container`). The Docker socket is
 //! host-root-equivalent, so this provider is host-trusted by definition.

@@ -936,7 +936,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -1834,7 +1833,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
  "aws-lc-rs",
- "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -1949,9 +1947,6 @@ dependencies = [
  "clap",
  "nix",
  "sandbox-driver",
- "sandbox-driver-daytona",
- "sandbox-driver-docker",
- "sandbox-driver-host",
  "sandbox-driver-protocol",
  "serde",
  "serde_json",
@@ -1977,25 +1972,22 @@ dependencies = [
 name = "sandbox-driver-daytona"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
- "bollard",
+ "base64",
  "daytona-api-client",
  "daytona-sdk",
  "futures-util",
- "http",
- "hyper-rustls",
- "hyper-util",
  "rand 0.10.2",
- "rustls",
  "sandbox-driver",
  "sandbox-driver-conformance",
  "sandbox-driver-daytona-config",
  "sandbox-driver-docker",
+ "sandbox-driver-docker-config",
  "sandbox-driver-protocol",
  "serde",
  "serde_json",
  "tokio",
- "tokio-rustls",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
@@ -2011,22 +2003,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "sandbox-driver-daytona-plugin"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "sandbox-driver",
- "sandbox-driver-daytona",
- "sandbox-driver-protocol",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "sandbox-driver-docker"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "bollard",
  "futures-util",
@@ -2040,6 +2020,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2051,43 +2032,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "sandbox-driver-docker-plugin"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "sandbox-driver",
- "sandbox-driver-docker",
- "sandbox-driver-protocol",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "sandbox-driver-host"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "nix",
  "sandbox-driver",
  "sandbox-driver-conformance",
+ "sandbox-driver-protocol",
  "serde",
  "serde_json",
  "tokio",
  "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "sandbox-driver-host-plugin"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "sandbox-driver",
- "sandbox-driver-conformance",
- "sandbox-driver-host",
- "sandbox-driver-protocol",
- "tokio",
  "tracing",
  "tracing-subscriber",
 ]

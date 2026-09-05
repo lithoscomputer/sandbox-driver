@@ -691,6 +691,7 @@ impl CliRunner {
         command
             .current_dir(workspace_root())
             .env_remove("SANDBOX_DRIVER_CONFIG")
+            .env("SANDBOX_DRIVER_PLUGIN_DEV", "1")
             .env("NO_COLOR", "1")
             .env("RUST_LOG", "off")
             .env(

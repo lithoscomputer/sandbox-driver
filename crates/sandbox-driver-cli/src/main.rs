@@ -44,13 +44,8 @@ async fn run(cli: &Cli) -> Result<u8> {
     }
 
     let session = provider::ProviderSession::connect(selected, &config).await?;
-    let command_result = commands::execute(
-        &cli.command,
-        session.provider.as_ref(),
-        cli.output,
-        cli.events,
-    )
-    .await;
+    let command_result =
+        commands::execute(&cli.command, &session.provider, cli.output, cli.events).await;
     let shutdown_result = session.shutdown().await;
     match (command_result, shutdown_result) {
         (Ok(code), Ok(())) => Ok(code),

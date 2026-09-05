@@ -1,5 +1,9 @@
 //! Host (local) sandbox provider.
 //!
+//! Internal provider implementation, shared by the plugin executable and tests.
+//! Applications use this provider through JSON-RPC, via
+//! `sandbox-driver-protocol`.
+//!
 //! The base case of the provider family: sandboxes are directories on the
 //! local machine, commands run as the calling user, and there is **no
 //! isolation boundary** — the provider declares `Isolation::None`.

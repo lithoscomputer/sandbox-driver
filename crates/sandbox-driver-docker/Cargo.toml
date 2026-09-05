@@ -6,25 +6,31 @@ rust-version.workspace = true
 publish.workspace = true
 description = "Docker container sandbox provider for sandbox-driver"
 
+[[bin]]
+name = "sandbox-driver-docker"
+path = "src/main.rs"
+
 [lints]
 workspace = true
 
 [dependencies]
+anyhow.workspace = true
 async-trait.workspace = true
 bollard.workspace = true
 futures-util.workspace = true
 sandbox-driver.workspace = true
+sandbox-driver-protocol = { path = "../sandbox-driver-protocol" }
 sandbox-driver-docker-config.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tar.workspace = true
-tokio = { workspace = true, features = ["fs", "rt"] }
+tokio = { workspace = true, features = ["fs", "rt", "rt-multi-thread", "macros"] }
 tokio-util.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 bollard.workspace = true
 sandbox-driver-conformance.workspace = true
-sandbox-driver-protocol = { path = "../sandbox-driver-protocol" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }
 tokio-util.workspace = true

@@ -1,73 +1,306 @@
-//! Docker resources belong to the VM. Only their execution target is
-//! exposed; stopping or deleting the VM fences the entire nested daemon.
+//! Nested Docker resources controlled by Docker CLI commands through Daytona.
+//!
+//! Docker remains private to the sandbox. No Docker API listener or preview
+//! connection is created; the sandbox lifecycle owns all nested resources.
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use std::{future, io};
 
 use async_trait::async_trait;
 use sandbox_driver::{
-    Capabilities, Capability, DirEntry, Error, Exec, ExecControls, ExecFailure, ExecResult,
-    ExecSpec, ExecStreamingResult, FileMetadata, Filesystem, OneShot, OneShotSpec, PreviewUrls,
-    Pty, PtyOptions, PtySession, Result, Sandbox, SandboxId, SandboxProvider, SandboxSource,
-    SandboxSpec, SpawnSpec, StdioProcess,
+    Capabilities, DirEntry, Error, Exec, ExecControls, ExecFailure, ExecResult, ExecSpec,
+    ExecStreamingResult, FileMetadata, Filesystem, OneShot, OneShotCaps, OneShotImage, OneShotSpec,
+    OutputSink, Pty, PtyOptions, PtySession, Result, SandboxSpec, SpawnSpec, StdioProcess,
+    Termination, stop_signal,
 };
 use sandbox_driver_daytona_config::{DockerExecutionTarget, NestedDockerConfig};
-use sandbox_driver_docker::{BindMount, DockerProvider, docker_capabilities};
+use sandbox_driver_docker_config::{RegistryAuth, Sidecar};
+use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+use tokio::time;
+use tokio_util::sync::CancellationToken;
 
-use crate::{DaytonaAccess, DaytonaClient, DaytonaExec, RUNTIME_DIRECTORY, docker_transport};
+use crate::nested_exec::{NestedExec, run_cli};
+use crate::nested_fs::NestedFs;
+use crate::{DaytonaClient, DaytonaExec, DaytonaFs, DaytonaPty, RUNTIME_DIRECTORY};
 
 pub(super) const TARGET_LABEL: &str = "sh.sandbox-driver.docker-target";
-const CONTAINER_NAME: &str = "sandbox-driver-workspace";
-const DOCKER_PORT: u16 = 2375;
+pub(super) const CONTAINER_NAME: &str = "sandbox-driver-workspace";
+const NETWORK: &str = "sandbox-driver-services";
+const NETWORK_LABEL: &str = "sh.sandbox-driver.network";
+const SIDECAR_NETWORK_LABEL: &str = "sh.sandbox-driver.sidecar-network";
+const ONE_SHOT_LABEL: &str = "sh.sandbox-driver.one-shot";
+const MANAGED_LABEL: &str = "sh.sandbox-driver.managed=true";
 const START_TIMEOUT: Duration = Duration::from_secs(120);
-const BRIDGE: &str = include_str!("docker_bridge.py");
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(300);
+const DRAIN_GRACE: Duration = Duration::from_secs(10);
+
+/// Shared native Daytona facets and Docker command construction. Environment
+/// hygiene applies to the CLI itself; user environment belongs inside Docker.
+pub(super) struct DockerCli {
+    pub(super) exec:        Arc<dyn Exec>,
+    pub(super) fs:          Arc<dyn Filesystem>,
+    pub(super) pty:         Arc<dyn Pty>,
+    pub(super) working_dir: String,
+}
+
+impl DockerCli {
+    fn new(client: &DaytonaClient, sandbox_id: &str, working_dir: &str) -> Self {
+        Self {
+            exec:        Arc::new(DaytonaExec::new(
+                Arc::clone(client),
+                sandbox_id.to_owned(),
+                working_dir.to_owned(),
+            )),
+            fs:          Arc::new(DaytonaFs::new(
+                Arc::clone(client),
+                sandbox_id.to_owned(),
+                working_dir.to_owned(),
+            )),
+            pty:         Arc::new(DaytonaPty::new(
+                Arc::clone(client),
+                sandbox_id.to_owned(),
+                working_dir.to_owned(),
+            )),
+            working_dir: working_dir.to_owned(),
+        }
+    }
+
+    pub(super) fn command(args: Vec<String>) -> ExecSpec {
+        ExecSpec::new("docker")
+            .args(args)
+            .working_dir("/")
+            .env_var("DOCKER_HOST", "unix:///var/run/docker.sock")
+            .env_var("DOCKER_CONTEXT", "")
+            .env_var("DOCKER_TLS_VERIFY", "")
+            .env_var("DOCKER_CERT_PATH", "")
+            .env_var(
+                "DOCKER_CONFIG",
+                format!("{RUNTIME_DIRECTORY}/docker-config"),
+            )
+    }
+
+    pub(super) async fn run(&self, args: Vec<String>) -> Result<ExecResult> {
+        self.run_spec(&Self::command(args)).await
+    }
+
+    pub(super) async fn run_spec(&self, spec: &ExecSpec) -> Result<ExecResult> {
+        checked(self.exec.run(spec).await?, "nested Docker command")
+    }
+
+    pub(super) fn resolve(&self, path: &str) -> String {
+        if path.starts_with('/') {
+            path.to_owned()
+        } else {
+            format!("{}/{}", self.working_dir.trim_end_matches('/'), path)
+        }
+    }
+
+    pub(super) async fn inspect(&self, container: &str) -> Result<Value> {
+        let output = self
+            .run(words(["inspect", "--type", "container", container]))
+            .await?;
+        let mut values: Vec<Value> = serde_json::from_slice(&output.stdout)
+            .map_err(|error| Error::invalid_spec("docker inspect", error.to_string()))?;
+        values
+            .pop()
+            .ok_or_else(|| Error::invalid_spec("docker inspect", "container was not returned"))
+    }
+
+    async fn image_present(&self, image: &str) -> Result<bool> {
+        let output = self
+            .exec
+            .run(&Self::command(words(["image", "inspect", image])))
+            .await?;
+        if output.success() {
+            return Ok(true);
+        }
+        if output.stdout_lossy().contains("No such image")
+            || output.stderr_lossy().contains("No such image")
+        {
+            Ok(false)
+        } else {
+            checked(output, "inspecting nested Docker image").map(|_| false)
+        }
+    }
+
+    async fn pull(
+        &self,
+        image: &str,
+        auth: Option<&RegistryAuth>,
+        platform: Option<&str>,
+    ) -> Result<()> {
+        if self.image_present(image).await? {
+            return Ok(());
+        }
+        let config = format!("{RUNTIME_DIRECTORY}/pull-{:016x}", rand::random::<u64>());
+        let outcome = async {
+            if let Some(auth) = auth {
+                let mut args = words(["login", "--username", &auth.username, "--password-stdin"]);
+                if let Some(server) = &auth.server {
+                    args.push(server.clone());
+                }
+                self.run_spec(
+                    &Self::command(args)
+                        .env_var("DOCKER_CONFIG", &config)
+                        .stdin(auth.password.as_bytes().to_vec()),
+                )
+                .await?;
+            }
+            let mut args = words(["pull"]);
+            if let Some(platform) = platform {
+                args.extend(words(["--platform", platform]));
+            }
+            args.push(image.to_owned());
+            self.run_spec(&Self::command(args).env_var("DOCKER_CONFIG", &config))
+                .await?;
+            Ok(())
+        }
+        .await;
+        if auth.is_some() {
+            if let Err(error) = self.fs.delete(&config, true).await {
+                tracing::warn!(error = %error, "nested Docker registry credential cleanup failed");
+            }
+        }
+        outcome
+    }
+
+    async fn ids(&self, label: &str) -> Result<Vec<String>> {
+        let output = self
+            .run(words([
+                "ps",
+                "--all",
+                "--quiet",
+                "--filter",
+                &format!("label={label}"),
+            ]))
+            .await?;
+        Ok(output
+            .stdout_lossy()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect())
+    }
+
+    async fn remove(&self, container: &str) -> Result<()> {
+        let output = self
+            .exec
+            .run(&Self::command(words([
+                "rm",
+                "--force",
+                "--volumes",
+                container,
+            ])))
+            .await?;
+        if output.success()
+            || output.stdout_lossy().contains("No such container")
+            || output.stderr_lossy().contains("No such container")
+        {
+            Ok(())
+        } else {
+            checked(output, "removing nested Docker container").map(|_| ())
+        }
+    }
+
+    async fn await_health(&self, container: &str) -> Result<()> {
+        let deadline = Instant::now() + HEALTH_TIMEOUT;
+        loop {
+            let inspect = self.inspect(container).await?;
+            let state = &inspect["State"];
+            let Some(health) = state["Health"]["Status"].as_str() else {
+                return Ok(());
+            };
+            match health {
+                "healthy" => return Ok(()),
+                "unhealthy" => {
+                    return Err(Error::invalid_spec(
+                        "sidecar",
+                        format!("{container} reported unhealthy"),
+                    ));
+                }
+                _ if state["Running"] == false || Instant::now() >= deadline => {
+                    return Err(Error::invalid_spec(
+                        "sidecar",
+                        format!("{container} failed to become healthy"),
+                    ));
+                }
+                _ => time::sleep(Duration::from_millis(250)).await,
+            }
+        }
+    }
+}
+
+fn words<const N: usize>(values: [&str; N]) -> Vec<String> {
+    values.into_iter().map(str::to_owned).collect()
+}
+
+fn checked(result: ExecResult, operation: &str) -> Result<ExecResult> {
+    if result.success() {
+        Ok(result)
+    } else {
+        Err(Error::Exec(
+            ExecFailure::new(
+                operation,
+                result.termination,
+                result.exit_code,
+                result.stdout,
+                result.stderr,
+            )
+            .with_duration(result.duration),
+        ))
+    }
+}
 
 pub(super) struct NestedDocker {
-    target:      DockerExecutionTarget,
-    vm_exec:     DaytonaExec,
-    access:      DaytonaAccess,
-    working_dir: String,
-    sandbox:     Mutex<Option<Arc<dyn Sandbox>>>,
+    target: DockerExecutionTarget,
+    cli:    Arc<DockerCli>,
+    exec:   Arc<NestedExec>,
+    fs:     NestedFs,
+    ready:  Mutex<bool>,
 }
 
 impl NestedDocker {
     pub(super) fn new(
         client: &DaytonaClient,
-        vm_id: &str,
+        sandbox_id: &str,
         working_dir: &str,
         target: DockerExecutionTarget,
     ) -> Self {
+        let cli = Arc::new(DockerCli::new(client, sandbox_id, working_dir));
+        Self::from_cli(cli, target)
+    }
+
+    fn from_cli(cli: Arc<DockerCli>, target: DockerExecutionTarget) -> Self {
+        let exec = Arc::new(NestedExec::new(Arc::clone(&cli)));
+        let fs = NestedFs::new(Arc::clone(&cli), Arc::clone(&exec) as Arc<dyn Exec>);
         Self {
             target,
-            vm_exec: DaytonaExec::new(Arc::clone(client), vm_id.to_owned(), working_dir.to_owned()),
-            access: DaytonaAccess::new(Arc::clone(client), vm_id.to_owned()),
-            working_dir: working_dir.to_owned(),
-            sandbox: Mutex::new(None),
+            cli,
+            exec,
+            fs,
+            ready: Mutex::new(false),
         }
     }
 
     pub(super) fn targets_container(&self) -> bool {
         self.target == DockerExecutionTarget::Container
     }
-
     pub(super) fn target(&self) -> DockerExecutionTarget {
         self.target
     }
 
     pub(super) fn capabilities(&self, caps: &mut Capabilities) {
-        let docker = docker_capabilities();
-        caps.one_shot = docker.one_shot;
+        caps.one_shot = Some(one_shot_capabilities());
         if self.targets_container() {
-            caps.exec = docker.exec;
-            caps.fs = docker.fs;
-            caps.git = docker.git;
-            caps.pty = docker.pty;
-            // VM logs and remote desktop access do not describe the job
-            // container. VM lifecycle and network policy still apply.
+            caps.exec.stdin_stream = false;
+            caps.fs.native = false;
+            caps.git.native = false;
             caps.logs = None;
             caps.access.preview_urls = false;
             caps.access.signed_preview_urls = false;
@@ -79,44 +312,11 @@ impl NestedDocker {
         }
     }
 
-    async fn provider(&self) -> Result<DockerProvider> {
-        for spec in [
-            ExecSpec::new("start-docker").timeout(START_TIMEOUT),
-            ExecSpec::new("python3")
-                .args([
-                    "-c",
-                    BRIDGE,
-                    &format!("{RUNTIME_DIRECTORY}/docker-bridge.lock"),
-                    "/var/run/docker.sock",
-                    &DOCKER_PORT.to_string(),
-                ])
-                .timeout(START_TIMEOUT),
-        ] {
-            // Job environment variables must not redirect VM bootstrap
-            // commands to another Docker context or daemon.
-            let spec = spec
-                .env_var("DOCKER_HOST", "unix:///var/run/docker.sock")
-                .env_var("DOCKER_CONTEXT", "")
-                .env_var("DOCKER_TLS_VERIFY", "")
-                .env_var("DOCKER_CERT_PATH", "");
-            let result = self.vm_exec.run(&spec).await?;
-            if !result.success() {
-                return Err(Error::Exec(
-                    ExecFailure::new(
-                        format!("nested Docker bootstrap: {}", spec.program),
-                        result.termination,
-                        result.exit_code,
-                        result.stdout,
-                        result.stderr,
-                    )
-                    .with_duration(result.duration),
-                ));
-            }
-        }
-        let preview = self.access.preview_url(DOCKER_PORT).await?;
-        Ok(DockerProvider::from_client(docker_transport::connect(
-            preview,
-        )?))
+    async fn bootstrap(&self) -> Result<()> {
+        let mut spec = DockerCli::command(Vec::new());
+        "start-docker".clone_into(&mut spec.program);
+        spec.timeout = Some(START_TIMEOUT);
+        self.cli.run_spec(&spec).await.map(|_| ())
     }
 
     pub(super) async fn create(
@@ -124,45 +324,548 @@ impl NestedDocker {
         config: &NestedDockerConfig,
         env: &BTreeMap<String, String>,
     ) -> Result<()> {
-        let mut current = self.sandbox.lock().await;
-        let provider = self.provider().await?;
-        let mut spec = SandboxSpec::new(SandboxSource::Image {
-            reference: config.image.clone(),
-        });
-        spec.name = Some(CONTAINER_NAME.to_owned());
-        spec.working_directory = Some(self.working_dir.clone());
-        spec.env.clone_from(env);
-        spec.user.clone_from(&config.user);
-        let mut options = config.options.clone();
-        options.init = true;
-        options.host_network = !self.targets_container();
-        options.binds.push(BindMount {
-            host:      self.working_dir.clone(),
-            container: self.working_dir.clone(),
-            mode:      None,
-        });
-        spec.provider_config = options.into_value();
-        *current = Some(provider.create(&spec, None).await?);
+        if !self.targets_container() {
+            return Ok(());
+        }
+        let mut ready = self.ready.lock().await;
+        self.bootstrap().await?;
+        if config.options.auto_pull {
+            self.cli
+                .pull(
+                    &config.image,
+                    config.options.registry_auth.as_ref(),
+                    config.options.platform.as_deref(),
+                )
+                .await?;
+        }
+        let services = !config.options.sidecars.is_empty();
+        let network = if services { "none" } else { "bridge" };
+        let args = primary_args(config, env, &self.cli.working_dir, network);
+        self.cli.run(args).await?;
+        // The labeled primary exists before any network or sidecar, so a
+        // crashed allocation always remains owned by the outer sandbox.
+        if services {
+            self.cli
+                .run(words([
+                    "network",
+                    "create",
+                    "--label",
+                    MANAGED_LABEL,
+                    NETWORK,
+                ]))
+                .await?;
+            for sidecar in &config.options.sidecars {
+                self.cli
+                    .pull(&sidecar.image, sidecar.registry_auth.as_ref(), None)
+                    .await?;
+                let name = format!("{NETWORK}-{}", sidecar.name);
+                self.cli.run(sidecar_args(sidecar, &name)).await?;
+                self.cli.run(words(["start", &name])).await?;
+            }
+            for sidecar in &config.options.sidecars {
+                if sidecar.health.is_some() {
+                    self.cli
+                        .await_health(&format!("{NETWORK}-{}", sidecar.name))
+                        .await?;
+                }
+            }
+            self.cli
+                .run(words(["network", "disconnect", "none", CONTAINER_NAME]))
+                .await?;
+            self.cli
+                .run(words(["network", "connect", NETWORK, CONTAINER_NAME]))
+                .await?;
+        }
+        self.cli.run(words(["start", CONTAINER_NAME])).await?;
+        *ready = true;
         Ok(())
     }
 
-    /// Clear the old token after a successful VM stop. In-flight calls
-    /// have already lost their VM connection; no operation is retried.
     pub(super) async fn stopped(&self) {
-        *self.sandbox.lock().await = None;
+        *self.ready.lock().await = false;
     }
 
-    pub(super) async fn sandbox(&self) -> Result<Arc<dyn Sandbox>> {
-        let mut current = self.sandbox.lock().await;
-        if let Some(sandbox) = &*current {
-            return Ok(Arc::clone(sandbox));
+    pub(super) async fn ensure_ready(&self) -> Result<()> {
+        let mut ready = self.ready.lock().await;
+        if *ready {
+            return Ok(());
         }
-        let provider = self.provider().await?;
-        let id = SandboxId::try_new(CONTAINER_NAME).expect("constant sandbox name");
-        let sandbox = provider.attach(&id, None).await?;
-        sandbox.start().await?;
-        *current = Some(Arc::clone(&sandbox));
-        Ok(sandbox)
+        self.bootstrap().await?;
+        if !self.targets_container() {
+            for action in self.cli.ids(ONE_SHOT_LABEL).await? {
+                self.cli.remove(&action).await?;
+            }
+            *ready = true;
+            return Ok(());
+        }
+        let primary = self.cli.inspect(CONTAINER_NAME).await?;
+        let id = primary["Id"]
+            .as_str()
+            .ok_or_else(|| Error::invalid_spec("docker inspect", "container id missing"))?;
+        for action in self.cli.ids(&format!("{ONE_SHOT_LABEL}={id}")).await? {
+            self.cli.remove(&action).await?;
+        }
+        if let Some(network) = primary["Config"]["Labels"][SIDECAR_NETWORK_LABEL].as_str() {
+            if primary["NetworkSettings"]["Networks"][network].is_null() {
+                return Err(Error::invalid_spec(
+                    "nested Docker",
+                    "service allocation did not complete",
+                ));
+            }
+            let services = self.cli.ids(&format!("{NETWORK_LABEL}={network}")).await?;
+            for service in &services {
+                self.cli.run(words(["start", service])).await?;
+            }
+            for service in services {
+                self.cli.await_health(&service).await?;
+            }
+        }
+        self.cli.run(words(["start", CONTAINER_NAME])).await?;
+        *ready = true;
+        Ok(())
+    }
+}
+
+pub(super) fn one_shot_capabilities() -> OneShotCaps {
+    let mut caps = OneShotCaps::default();
+    caps.build = true;
+    caps
+}
+
+fn flags(args: &mut Vec<String>, name: &str, values: impl IntoIterator<Item = String>) {
+    for value in values {
+        args.extend([name.to_owned(), value]);
+    }
+}
+
+fn workspace_mount(path: &str) -> String {
+    [
+        "type=bind".to_owned(),
+        format!("source={path}"),
+        format!("target={path}"),
+    ]
+    .map(|field| {
+        if field.contains([',', '"', '\n', '\r']) {
+            format!("\"{}\"", field.replace('"', "\"\""))
+        } else {
+            field
+        }
+    })
+    .join(",")
+}
+
+fn primary_args(
+    config: &NestedDockerConfig,
+    env: &BTreeMap<String, String>,
+    working_dir: &str,
+    network: &str,
+) -> Vec<String> {
+    let mut args = words([
+        "create",
+        "--name",
+        CONTAINER_NAME,
+        "--init",
+        "--label",
+        MANAGED_LABEL,
+        "--network",
+        network,
+        "--workdir",
+        working_dir,
+    ]);
+    args.extend(words(["--mount", &workspace_mount(working_dir)]));
+    if !config.options.sidecars.is_empty() {
+        args.extend(words([
+            "--label",
+            &format!("{SIDECAR_NETWORK_LABEL}={NETWORK}"),
+        ]));
+    }
+    if let Some(user) = &config.user {
+        args.extend(words(["--user", user]));
+    }
+    if let Some(platform) = &config.options.platform {
+        args.extend(words(["--platform", platform]));
+    }
+    if config.options.privileged {
+        args.push("--privileged".to_owned());
+    }
+    flags(
+        &mut args,
+        "--env",
+        env.iter().map(|(key, value)| format!("{key}={value}")),
+    );
+    flags(&mut args, "--add-host", config.options.extra_hosts.clone());
+    flags(&mut args, "--dns", config.options.dns.clone());
+    flags(&mut args, "--cap-add", config.options.cap_add.clone());
+    args.extend(words([
+        "--entrypoint",
+        "/bin/sh",
+        &config.image,
+        "-c",
+        "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done",
+    ]));
+    args
+}
+
+fn sidecar_args(sidecar: &Sidecar, name: &str) -> Vec<String> {
+    let mut args = words([
+        "create",
+        "--name",
+        name,
+        "--network",
+        NETWORK,
+        "--network-alias",
+        &sidecar.name,
+        "--label",
+        MANAGED_LABEL,
+        "--label",
+        &format!("{NETWORK_LABEL}={NETWORK}"),
+    ]);
+    flags(
+        &mut args,
+        "--env",
+        sidecar
+            .env
+            .iter()
+            .map(|(key, value)| format!("{key}={value}")),
+    );
+    flags(&mut args, "--dns", sidecar.dns.clone());
+    flags(&mut args, "--cap-add", sidecar.cap_add.clone());
+    if sidecar.privileged {
+        args.push("--privileged".to_owned());
+    }
+    if let Some(user) = &sidecar.user {
+        args.extend(words(["--user", user]));
+    }
+    if let Some(health) = &sidecar.health {
+        args.extend(words(["--health-cmd", &health.cmd]));
+        for (flag, value) in [
+            ("--health-interval", health.interval_ms),
+            ("--health-timeout", health.timeout_ms),
+            ("--health-start-period", health.start_period_ms),
+        ] {
+            if let Some(ms) = value {
+                args.extend([flag.to_owned(), format!("{ms}ms")]);
+            }
+        }
+        if let Some(retries) = health.retries {
+            args.extend(["--health-retries".to_owned(), retries.to_string()]);
+        }
+    }
+    if let Some(entrypoint) = &sidecar.entrypoint {
+        args.extend(words([
+            "--entrypoint",
+            entrypoint.first().map_or("", String::as_str),
+        ]));
+    }
+    args.push(sidecar.image.clone());
+    if let Some(entrypoint) = &sidecar.entrypoint {
+        args.extend(entrypoint.iter().skip(1).cloned());
+    }
+    args
+}
+
+impl NestedDocker {
+    async fn prepare_action_image(&self, image: &OneShotImage) -> Result<String> {
+        match image {
+            OneShotImage::Registry { reference } => {
+                if let Err(error) = self.cli.pull(reference, None, None).await {
+                    if !error.to_string().contains("no matching manifest") {
+                        // Native CLI diagnostics live in the command's output.
+                        let missing = matches!(&error, Error::Exec(failure) if String::from_utf8_lossy(failure.stdout()).contains("no matching manifest") || String::from_utf8_lossy(failure.stderr()).contains("no matching manifest"));
+                        if !missing {
+                            return Err(error);
+                        }
+                    }
+                    self.cli
+                        .pull(reference, None, Some("linux/amd64"))
+                        .await
+                        .map_err(|_| error)?;
+                }
+                Ok(reference.clone())
+            }
+            OneShotImage::Build {
+                context,
+                dockerfile,
+                tag,
+                reuse,
+            } => {
+                if *reuse && self.cli.image_present(tag).await? {
+                    return Ok(tag.clone());
+                }
+                let context = self.cli.resolve(context);
+                if !self.targets_container() {
+                    let mut args = words(["build", "--tag", tag]);
+                    if let Some(dockerfile) = dockerfile {
+                        args.extend(words(["--file", &format!("{context}/{dockerfile}")]));
+                    }
+                    args.push(context);
+                    self.cli.run(args).await?;
+                    return Ok(tag.clone());
+                }
+                let stage = format!("{RUNTIME_DIRECTORY}/build-{:016x}", rand::random::<u64>());
+                self.cli.fs.create_dir(&stage).await?;
+                let outcome = async {
+                    // Docker resolves the context in the job container. It may
+                    // be outside the workspace bind or behind a container symlink.
+                    self.cli
+                        .run(words([
+                            "cp",
+                            "--",
+                            &format!("{CONTAINER_NAME}:{context}/."),
+                            &stage,
+                        ]))
+                        .await?;
+                    let mut args = words(["build", "--tag", tag]);
+                    if let Some(dockerfile) = dockerfile {
+                        if dockerfile.starts_with('/') {
+                            return Err(Error::invalid_spec(
+                                "dockerfile",
+                                "expected a path within the build context",
+                            ));
+                        }
+                        args.extend(words(["--file", &format!("{stage}/{dockerfile}")]));
+                    }
+                    args.push(stage.clone());
+                    self.cli.run(args).await?;
+                    Ok(tag.clone())
+                }
+                .await;
+                if let Err(error) = self.cli.fs.delete(&stage, true).await {
+                    tracing::warn!(error = %error, "nested Docker build context cleanup failed");
+                }
+                outcome
+            }
+            _ => Err(Error::invalid_spec("image", "unsupported one-shot image")),
+        }
+    }
+
+    async fn signal_action(cli: &DockerCli, container: &str, signal: &str) -> Result<()> {
+        let command =
+            DockerCli::command(words(["kill", "--signal", signal, container])).timeout(DRAIN_GRACE);
+        let output = cli.exec.run(&command).await?;
+        if output.success() {
+            return Ok(());
+        }
+        let message = format!("{}{}", output.stdout_lossy(), output.stderr_lossy());
+        if message.contains("No such container") {
+            return Ok(());
+        }
+        if message.contains("is not running") {
+            // Removing a created container fences a Docker start that has not
+            // reached the daemon yet. No later attach command can launch it.
+            return cli.remove(container).await;
+        }
+        checked(output, "signalling nested Docker action").map(|_| ())
+    }
+}
+
+#[async_trait]
+impl OneShot for NestedDocker {
+    async fn run(&self, spec: &OneShotSpec, controls: ExecControls) -> Result<ExecStreamingResult> {
+        let started = Instant::now();
+        let deadline = async {
+            match spec.timeout {
+                Some(limit) => time::sleep(limit).await,
+                None => future::pending().await,
+            }
+        };
+        let mut deadline = pin!(deadline);
+        let prepared = tokio::select! {
+            biased;
+            () = stop_signal(controls.kill.as_ref()) => Err(Termination::Killed),
+            () = stop_signal(controls.term.as_ref()) => Err(Termination::Cancelled),
+            () = &mut deadline => Err(Termination::TimedOut),
+            image = async { self.ensure_ready().await?; self.prepare_action_image(&spec.image).await } => Ok(image?),
+        };
+        let image = match prepared {
+            Ok(image) => image,
+            Err(reason) => {
+                return Ok(ExecStreamingResult::new(ExecResult::from_shell_status(
+                    reason,
+                    None,
+                    started.elapsed(),
+                )));
+            }
+        };
+        let (primary, network) = if self.targets_container() {
+            let inspect = self.cli.inspect(CONTAINER_NAME).await?;
+            let id = inspect["Id"]
+                .as_str()
+                .ok_or_else(|| Error::invalid_spec("docker inspect", "container id missing"))?
+                .to_owned();
+            let network = format!("container:{id}");
+            (id, network)
+        } else {
+            (CONTAINER_NAME.to_owned(), "host".to_owned())
+        };
+        let name = format!("sandbox-driver-action-{:016x}", rand::random::<u64>());
+        let mut args = words([
+            "create",
+            "--name",
+            &name,
+            "--init",
+            "--label",
+            MANAGED_LABEL,
+            "--label",
+            &format!("{ONE_SHOT_LABEL}={primary}"),
+            "--network",
+            &network,
+            "--mount",
+            &workspace_mount(&self.cli.working_dir),
+            "--workdir",
+            spec.working_dir.as_deref().unwrap_or(&self.cli.working_dir),
+        ]);
+        flags(
+            &mut args,
+            "--env",
+            spec.env.iter().map(|(key, value)| format!("{key}={value}")),
+        );
+        if let Some(entrypoint) = &spec.entrypoint {
+            args.extend(words(["--entrypoint", entrypoint]));
+        }
+        args.push(image);
+        args.extend(spec.args.clone());
+        let abandoned = CancellationToken::new();
+        let cli = Arc::clone(&self.cli);
+        let spec = spec.clone();
+        let controls = controls.clone();
+        let stopped = abandoned.clone();
+        let mut action = OwnedAction {
+            task: tokio::spawn(Self::run_action(
+                cli, name, args, spec, controls, started, stopped,
+            )),
+            abandoned,
+        };
+        (&mut action.task)
+            .await
+            .map_err(|error| Error::io("running nested Docker action", io::Error::other(error)))?
+    }
+}
+
+struct OwnedAction {
+    task:      JoinHandle<Result<ExecStreamingResult>>,
+    abandoned: CancellationToken,
+}
+
+impl Drop for OwnedAction {
+    fn drop(&mut self) {
+        // Do not abort: an accepted create/start must finish before its
+        // cleanup can reliably remove the named container.
+        self.abandoned.cancel();
+    }
+}
+
+impl NestedDocker {
+    async fn run_action(
+        cli: Arc<DockerCli>,
+        name: String,
+        args: Vec<String>,
+        spec: OneShotSpec,
+        controls: ExecControls,
+        started: Instant,
+        abandoned: CancellationToken,
+    ) -> Result<ExecStreamingResult> {
+        let deadline = async {
+            match spec.timeout {
+                Some(limit) => time::sleep(limit.saturating_sub(started.elapsed())).await,
+                None => future::pending().await,
+            }
+        };
+        let mut deadline = pin!(deadline);
+        cli.run(args).await?;
+        let outcome = async {
+            let sink_failed = CancellationToken::new();
+            let sink = controls.sink.clone().map(|sink| {
+                let failed = sink_failed.clone();
+                Arc::new(move |stream, bytes| {
+                    let sink = Arc::clone(&sink);
+                    let failed = failed.clone();
+                    Box::pin(async move {
+                        if sink(stream, bytes).await.is_err() {
+                            failed.cancel();
+                        }
+                        Ok(())
+                    })
+                        as Pin<Box<dyn future::Future<Output = Result<()>> + Send>>
+                }) as OutputSink
+            });
+            let transport_kill = CancellationToken::new();
+            let mut command = DockerCli::command(words(["start", "--attach", &name])).no_timeout();
+            command.output_sanitization = spec.output_sanitization;
+            let mut run = pin!(run_cli(&cli, &command, ExecControls {
+                sink,
+                kill: Some(transport_kill.clone()),
+                retained_output_limit: controls.retained_output_limit,
+                ..Default::default()
+            }));
+            let mut termination = None;
+            let mut term_sent = false;
+            let mut kill_sent = false;
+            let mut drain_deadline = None;
+            loop {
+                let drain_timeout = async {
+                    match drain_deadline {
+                        Some(deadline) => time::sleep_until(deadline).await,
+                        None => future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    () = abandoned.cancelled(), if !kill_sent => {
+                        termination = Some(Termination::Killed);
+                        kill_sent = true;
+                        drain_deadline = Some(time::Instant::now() + DRAIN_GRACE);
+                        Self::signal_action(&cli, &name, "KILL").await?;
+                    }
+                    result = &mut run => {
+                        let mut result = result?;
+                        if let Some(reason) = termination { result.result.termination = reason; }
+                        result.result.duration = started.elapsed();
+                        return Ok(result);
+                    }
+                    () = stop_signal(controls.term.as_ref()), if !term_sent && !kill_sent => {
+                        termination = Some(Termination::Cancelled);
+                        term_sent = true;
+                        Self::signal_action(&cli, &name, "TERM").await?;
+                    }
+                    () = stop_signal(controls.kill.as_ref()), if !kill_sent => {
+                        termination = Some(Termination::Killed);
+                        kill_sent = true;
+                        drain_deadline = Some(time::Instant::now() + DRAIN_GRACE);
+                        Self::signal_action(&cli, &name, "KILL").await?;
+                    }
+                    () = sink_failed.cancelled(), if !kill_sent => {
+                        termination = Some(Termination::Cancelled);
+                        kill_sent = true;
+                        drain_deadline = Some(time::Instant::now() + DRAIN_GRACE);
+                        Self::signal_action(&cli, &name, "KILL").await?;
+                    }
+                    () = &mut deadline, if !kill_sent => {
+                        termination = Some(Termination::TimedOut);
+                        kill_sent = true;
+                        drain_deadline = Some(time::Instant::now() + DRAIN_GRACE);
+                        Self::signal_action(&cli, &name, "KILL").await?;
+                    }
+                    () = drain_timeout => {
+                        transport_kill.cancel();
+                        drain_deadline = None;
+                    },
+                }
+            }
+        }
+        .await;
+        // Keep the primary error if both execution and cleanup failed.
+        let cleanup = cli.remove(&name).await;
+        match (outcome, cleanup) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(error), cleanup) => {
+                if let Err(cleanup) = cleanup {
+                    tracing::warn!(error = %cleanup, "nested Docker action cleanup failed");
+                }
+                Err(error)
+            }
+            (Ok(_), Err(error)) => Err(error),
+        }
     }
 }
 
@@ -187,17 +890,11 @@ pub(super) fn parse_target(label: &str) -> Result<DockerExecutionTarget> {
     }
 }
 
-pub(super) fn validate(config: &NestedDockerConfig, spec: &SandboxSpec) -> Result<()> {
-    if config.image.trim().is_empty() {
+pub(super) fn validate(config: &NestedDockerConfig, _spec: &SandboxSpec) -> Result<()> {
+    if config.target == DockerExecutionTarget::Container && config.image.trim().is_empty() {
         return Err(Error::invalid_spec(
             "provider_config.docker.image",
             "image must not be empty",
-        ));
-    }
-    if spec.public == Some(true) {
-        return Err(Error::invalid_spec(
-            "public",
-            "nested Docker requires private preview access",
         ));
     }
     if !config.options.binds.is_empty() || config.options.host_network {
@@ -219,7 +916,8 @@ pub(super) fn validate(config: &NestedDockerConfig, spec: &SandboxSpec) -> Resul
 #[async_trait]
 impl Exec for NestedDocker {
     async fn run(&self, spec: &ExecSpec) -> Result<ExecResult> {
-        self.sandbox().await?.exec().run(spec).await
+        self.ensure_ready().await?;
+        self.exec.run(spec).await
     }
 
     async fn run_streaming(
@@ -227,63 +925,45 @@ impl Exec for NestedDocker {
         spec: &ExecSpec,
         controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
-        self.sandbox()
-            .await?
-            .exec()
-            .run_streaming(spec, controls)
-            .await
+        self.ensure_ready().await?;
+        self.exec.run_streaming(spec, controls).await
     }
 
     async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
-        self.sandbox().await?.exec().spawn_stdio(spec).await
-    }
-}
-
-#[async_trait]
-impl OneShot for NestedDocker {
-    async fn run(&self, spec: &OneShotSpec, controls: ExecControls) -> Result<ExecStreamingResult> {
-        self.sandbox()
-            .await?
-            .one_shot()
-            .ok_or_else(|| Error::unsupported(Capability::OneShot))?
-            .run(spec, controls)
-            .await
+        self.ensure_ready().await?;
+        self.exec.spawn_stdio(spec).await
     }
 }
 
 #[async_trait]
 impl Pty for NestedDocker {
     async fn open(&self, options: &PtyOptions) -> Result<Box<dyn PtySession>> {
-        self.sandbox()
-            .await?
-            .pty()
-            .ok_or_else(|| Error::unsupported(Capability::Pty))?
-            .open(options)
-            .await
+        self.ensure_ready().await?;
+        self.exec.open(options).await
     }
 }
 
 #[async_trait]
 impl Filesystem for NestedDocker {
     async fn read(&self, path: &str) -> Result<Vec<u8>> {
-        self.sandbox().await?.fs().read(path).await
+        self.ensure_ready().await?;
+        self.fs.read(path).await
     }
     async fn read_to(
         &self,
         path: &str,
         output: &mut (dyn AsyncWrite + Unpin + Send),
     ) -> Result<()> {
-        self.sandbox().await?.fs().read_to(path, output).await
+        self.ensure_ready().await?;
+        self.fs.read_to(path, output).await
     }
     async fn read_range(&self, path: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
-        self.sandbox()
-            .await?
-            .fs()
-            .read_range(path, offset, length)
-            .await
+        self.ensure_ready().await?;
+        self.fs.read_range(path, offset, length).await
     }
     async fn write(&self, path: &str, content: &[u8]) -> Result<()> {
-        self.sandbox().await?.fs().write(path, content).await
+        self.ensure_ready().await?;
+        self.fs.write(path, content).await
     }
     async fn write_from(
         &self,
@@ -291,46 +971,56 @@ impl Filesystem for NestedDocker {
         input: &mut (dyn AsyncRead + Unpin + Send),
         length: u64,
     ) -> Result<()> {
-        self.sandbox()
-            .await?
-            .fs()
-            .write_from(path, input, length)
-            .await
+        self.ensure_ready().await?;
+        self.fs.write_from(path, input, length).await
     }
     async fn write_append(&self, path: &str, content: &[u8]) -> Result<()> {
-        self.sandbox().await?.fs().write_append(path, content).await
+        self.ensure_ready().await?;
+        self.fs.write_append(path, content).await
     }
     async fn delete(&self, path: &str, recursive: bool) -> Result<()> {
-        self.sandbox().await?.fs().delete(path, recursive).await
+        self.ensure_ready().await?;
+        self.fs.delete(path, recursive).await
     }
     async fn exists(&self, path: &str) -> Result<bool> {
-        self.sandbox().await?.fs().exists(path).await
+        self.ensure_ready().await?;
+        self.fs.exists(path).await
     }
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
-        self.sandbox().await?.fs().metadata(path).await
+        self.ensure_ready().await?;
+        self.fs.metadata(path).await
     }
     async fn list_dir(&self, path: &str, depth: usize) -> Result<Vec<DirEntry>> {
-        self.sandbox().await?.fs().list_dir(path, depth).await
+        self.ensure_ready().await?;
+        self.fs.list_dir(path, depth).await
     }
     async fn create_dir(&self, path: &str) -> Result<()> {
-        self.sandbox().await?.fs().create_dir(path).await
+        self.ensure_ready().await?;
+        self.fs.create_dir(path).await
     }
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
-        self.sandbox().await?.fs().rename(from, to).await
+        self.ensure_ready().await?;
+        self.fs.rename(from, to).await
     }
     async fn set_permissions(&self, path: &str, mode: u32) -> Result<()> {
-        self.sandbox().await?.fs().set_permissions(path, mode).await
+        self.ensure_ready().await?;
+        self.fs.set_permissions(path, mode).await
     }
     async fn upload(&self, local: &Path, remote: &str) -> Result<()> {
-        self.sandbox().await?.fs().upload(local, remote).await
+        self.ensure_ready().await?;
+        self.fs.upload(local, remote).await
     }
     async fn download(&self, remote: &str, local: &Path) -> Result<()> {
-        self.sandbox().await?.fs().download(remote, local).await
+        self.ensure_ready().await?;
+        self.fs.download(remote, local).await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use sandbox_driver::Capability;
+    use sandbox_driver_docker_config::DockerProviderConfig;
+
     use super::*;
     use crate::{DaytonaConfig, DaytonaProvider, daytona_capabilities};
 
@@ -370,5 +1060,159 @@ mod tests {
             assert_eq!(caps.supports(Capability::PreviewUrls), vm);
             assert_eq!(caps.supports(Capability::SignedPreviewUrls), vm);
         }
+    }
+    struct FakeExec {
+        reply: Box<dyn Fn(&ExecSpec) -> ExecResult + Send + Sync>,
+    }
+
+    #[async_trait]
+    impl Exec for FakeExec {
+        async fn run(&self, spec: &ExecSpec) -> Result<ExecResult> {
+            Ok((self.reply)(spec))
+        }
+        async fn run_streaming(
+            &self,
+            spec: &ExecSpec,
+            _: ExecControls,
+        ) -> Result<ExecStreamingResult> {
+            self.run(spec).await.map(ExecStreamingResult::new)
+        }
+    }
+
+    fn response(code: i32, stdout: impl Into<Vec<u8>>) -> ExecResult {
+        let mut result =
+            ExecResult::from_shell_status(Termination::Exited, Some(code), Duration::ZERO);
+        result.stdout = stdout.into();
+        result
+    }
+
+    async fn fake_nested(
+        reply: impl Fn(&ExecSpec) -> ExecResult + Send + Sync + 'static,
+    ) -> NestedDocker {
+        let provider = DaytonaProvider::connect_with_config(DaytonaConfig {
+            api_key: Some("test-key".to_owned()),
+            api_url: Some("https://daytona.example/api".to_owned()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let mut cli = DockerCli::new(&provider.client, "test-sandbox", "/workspace");
+        cli.exec = Arc::new(FakeExec {
+            reply: Box::new(reply),
+        });
+        NestedDocker::from_cli(Arc::new(cli), DockerExecutionTarget::Container)
+    }
+
+    #[tokio::test]
+    async fn failed_sidecar_creation_leaves_a_labeled_primary_for_outer_cleanup() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let primary = Arc::new(AtomicBool::new(false));
+        let marker = Arc::clone(&primary);
+        let nested = fake_nested(move |spec| {
+            if spec.program == "start-docker" {
+                return response(0, Vec::new());
+            }
+            if spec
+                .args
+                .starts_with(&words(["create", "--name", CONTAINER_NAME]))
+            {
+                assert!(
+                    spec.args
+                        .contains(&format!("{SIDECAR_NETWORK_LABEL}={NETWORK}"))
+                );
+                marker.store(true, Ordering::SeqCst);
+            } else if spec.args.starts_with(&words(["network", "create"])) {
+                assert!(
+                    marker.load(Ordering::SeqCst),
+                    "a primary must own every dependency"
+                );
+            } else if spec.args.starts_with(&words(["create"])) {
+                return response(1, b"injected service creation failure".to_vec());
+            }
+            response(0, Vec::new())
+        })
+        .await;
+        let config = NestedDockerConfig {
+            image:   "alpine:3.20".to_owned(),
+            target:  DockerExecutionTarget::Container,
+            user:    None,
+            options: DockerProviderConfig {
+                auto_pull: false,
+                sidecars: vec![Sidecar::new("db", "alpine:3.20")],
+                ..Default::default()
+            },
+        };
+        let result = nested.create(&config, &BTreeMap::new()).await;
+        assert!(result.is_err());
+        assert!(primary.load(Ordering::SeqCst));
+        assert!(!*nested.ready.lock().await);
+    }
+
+    #[tokio::test]
+    async fn restart_sweeps_actions_and_waits_for_services_before_starting_primary() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let removed = Arc::new(AtomicBool::new(false));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let health = Arc::new(AtomicUsize::new(0));
+        let (observed_removed, observed_starts, observed_health) = (
+            Arc::clone(&removed),
+            Arc::clone(&starts),
+            Arc::clone(&health),
+        );
+        let nested = fake_nested(move |spec| {
+            let args = &spec.args;
+            if spec.program == "start-docker" { return response(0, Vec::new()); }
+            if args.first().is_some_and(|arg| arg == "inspect") {
+                if args.last().is_some_and(|arg| arg == CONTAINER_NAME) {
+                    return response(0, serde_json::json!([{"Id":"main", "Config":{"Labels":{SIDECAR_NETWORK_LABEL:NETWORK}}, "NetworkSettings":{"Networks":{NETWORK:{}}}}]).to_string().into_bytes());
+                }
+                assert_eq!(observed_starts.load(Ordering::SeqCst), 2, "start every service before its health wait");
+                observed_health.fetch_add(1, Ordering::SeqCst);
+                return response(0, b"[{\"State\":{\"Running\":true,\"Health\":{\"Status\":\"healthy\"}}}]".to_vec());
+            }
+            if args.first().is_some_and(|arg| arg == "ps") {
+                return if args.last().is_some_and(|arg| arg.contains(ONE_SHOT_LABEL)) {
+                    response(0, b"old-action\n".to_vec())
+                } else { response(0, b"service-a\nservice-b\n".to_vec()) };
+            }
+            if args.first().is_some_and(|arg| arg == "rm") { observed_removed.store(true, Ordering::SeqCst); }
+            if args.first().is_some_and(|arg| arg == "start") {
+                assert!(observed_removed.load(Ordering::SeqCst));
+                if args.last().is_some_and(|arg| arg == CONTAINER_NAME) { assert_eq!(observed_health.load(Ordering::SeqCst), 2); }
+                else { observed_starts.fetch_add(1, Ordering::SeqCst); }
+            }
+            response(0, Vec::new())
+        }).await;
+        nested.ensure_ready().await.unwrap();
+        assert!(removed.load(Ordering::SeqCst));
+        assert_eq!(health.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_one_shot_does_not_bootstrap_pull_or_create() {
+        let nested = fake_nested(|_| panic!("a cancelled action must do no work")).await;
+        let kill = CancellationToken::new();
+        kill.cancel();
+        let result = OneShot::run(&nested, &OneShotSpec::registry("alpine"), ExecControls {
+            kill: Some(kill),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.result.termination, Termination::Killed);
+    }
+    #[tokio::test]
+    async fn process_scope_creation_does_not_start_docker_or_create_a_helper() {
+        let mut nested =
+            fake_nested(|_| panic!("process scope creation uses only native Daytona")).await;
+        nested.target = DockerExecutionTarget::VirtualMachine;
+        let config = NestedDockerConfig {
+            image:   String::new(),
+            target:  DockerExecutionTarget::VirtualMachine,
+            user:    None,
+            options: DockerProviderConfig::default(),
+        };
+        nested.create(&config, &BTreeMap::new()).await.unwrap();
+        assert!(!*nested.ready.lock().await);
     }
 }

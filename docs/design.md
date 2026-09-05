@@ -1,6 +1,8 @@
 # sandbox-driver: Rust Interface Design
 
-A library for driving sandboxes. Initial providers: **Daytona**, **Docker**, **Host** (local). Later: boxd, Azure, and third parties via the JSON-RPC plugin protocol. Fabro is the first consumer, so fabro's current `Sandbox` trait (34 methods, `fabro-sandbox/src/sandbox.rs:1237`) is the floor: everything fabro uses must have a home here or a documented home above this crate.
+Sandbox providers for managing sandboxes, snapshots, and volumes through JSON-RPC. Initial providers: **Daytona**, **Docker**, **Host** (local). Petri is the primary consumer. All applications, including the CLI, use the plugin protocol. The Rust traits describe the shared contract used by the protocol client, provider implementations, and tests. The original Fabro `Sandbox` trait informed the operation set and the migration map below.
+
+Each provider package builds its plugin executable directly. Provider libraries are internal implementation details; Daytona reuses Docker internally for nested Docker. Applications depend on `sandbox-driver`, `sandbox-driver-protocol`, and the typed configuration crates, never on provider implementations.
 
 ## Inputs
 
@@ -162,7 +164,7 @@ Notes:
 
 Two complementary mechanisms, by design:
 
-1. **Typed accessors** — `fn pty(&self) -> Option<&dyn Pty>`: absence is unrepresentable-misuse at compile time for in-process consumers.
+1. **Typed accessors** — `fn pty(&self) -> Option<&dyn Pty>`: absence is unrepresentable-misuse at compile time for Rust protocol clients and provider implementations.
 2. **Serializable `Capabilities`** — a data structure for preflight checks, `Unsupported` error payloads, and the JSON-RPC `initialize` handshake. Fine-grained flags live here (`exec.live_streaming`, `exec.streams_separated`, `fs.native`, `lifecycle.pause`, `snapshots.live_process_state_from_sandbox`, `network.modes`, …).
 
 ```rust
@@ -392,19 +394,19 @@ pub struct SandboxSpec {
 }
 ```
 
-`provider_config` is the pressure valve: Daytona's GPU type preference lists, spot instances, linked sandboxes, warm-pool hints, and future boxd golden-image options live there without polluting the common spec. It crosses the JSON-RPC boundary opaquely. Each provider crate exports its shape as a type — the Docker provider's `DockerProviderConfig` with `into_value()` — so an in-process consumer builds it type-checked and the provider parses it back through the same type; only the wire sees untyped JSON.
+`provider_config` is the pressure valve: Daytona's GPU type preference lists, spot instances, linked sandboxes, warm-pool hints, and future boxd golden-image options live there without polluting the common spec. It crosses the JSON-RPC boundary opaquely. The configuration crates export these shapes as types — such as `sandbox-driver-docker-config`'s `DockerProviderConfig` with `into_value()` — so a protocol client builds it type-checked and the provider parses it back through the same type; only the wire sees untyped JSON.
 
 ### Nested Docker on Daytona
 
 `sandbox-driver-daytona-config` defines `DaytonaProviderConfig`. Its optional `docker` field contains `NestedDockerConfig`: an `image`, an execution `target` (`container` or `virtual_machine`), an optional container `user`, and Docker provider `options`. Unknown fields are rejected. The outer sandbox source, provisioning kind, resources, and timers still describe the Daytona sandbox.
 
-The runner must provide `start-docker` and Python 3. The provider starts Docker and a VM-owned bridge to its Unix socket. Docker traffic uses an authenticated private HTTPS preview, including binary streaming and HTTP upgrades. Public preview access is rejected. Start and attach obtain a new preview token after a VM restart. Transport failures do not replay operations.
+The runner must provide `start-docker`, the Docker CLI, and Python 3. Nested Docker operations run through Daytona's native process APIs against the sandbox's private Unix socket. Command output uses bounded encoding to preserve binary bytes through the SDK's text session logs. File bytes use Daytona's native file API and Docker archive commands. The provider does not create a Docker API listener or preview connection. Failed operations are not replayed.
 
-With the `container` target, execution, files, environment, git, PTY, services, and one-shot containers use the nested Docker sandbox. With `virtual_machine`, ordinary operations stay in the VM; a helper container shares its workspace and host network so one-shots run in the same environment. Sidecar containers require the `container` target. The provider owns workspace binds and network placement. The Docker provider separately supports `host_network: true` with unrestricted networking and no sidecars.
+With the `container` target, execution, files, environment, git, PTY, services, and one-shot containers use the nested job container. With `virtual_machine`, ordinary operations stay in the outer sandbox; Docker starts only when a one-shot needs it. One-shots use the outer workspace and host network without a helper container. Sidecar containers require the `container` target. The provider owns workspace binds and network placement. The Docker provider separately supports `host_network: true` with unrestricted networking and no sidecars.
 
 The VM owns all nested resources. Stop fences the whole VM; delete removes it. Restart reattaches the existing named job container and preserves its workspace. It does not replace a missing job container. Docker start sweeps old one-shots when restarting a stopped sandbox and preserves active one-shots when already running. Only the execution target is stored in Daytona labels. Registry credentials and container configuration are not stored there. Nested containers retain VM lifecycle capabilities; VM desktop, SSH, and log facets are absent from a container execution target.
 
-Local tests cover the transport and bridge. The ignored live gate additionally requires `DAYTONA_API_KEY` and `SANDBOX_DRIVER_DAYTONA_DIND_SNAPSHOT`, a VM snapshot with at least 2 CPUs and 4 GiB of memory. The hosted preview's behavior still needs that live run before production use.
+Local tests cover Docker command construction, lifecycle behavior, and binary file transfers. The ignored live gate additionally requires `DAYTONA_API_KEY` and `SANDBOX_DRIVER_DAYTONA_DIND_SNAPSHOT`, a runner snapshot with at least 2 CPUs and 4 GiB of memory. That gate verifies the complete hosted nested Docker workflow.
 
 `working_directory` is the final workspace directory chosen before creation. A provider creates it when needed, uses it as the default for relative file and process operations, and returns the same value from handles created by `attach`. The Host provider treats an explicit path as designated and does not delete it by default. Setting `workspace_ownership: Managed` explicitly transfers creation and deletion of that named directory to Host. Other sources reject explicit workspace ownership.
 
@@ -527,7 +529,7 @@ Each of these is implementable over `Exec`/`Git`/core — the fabro survey confi
 4. **The bash health probe is a library helper** run by the `activate` convenience, not a trait method. Providers implement exec; the probe is a contract test over it.
 5. **Command sessions**: capability name reserved in the schema; no trait in v1.
 6. **`Logs` is follow-style streams only** in v1; historical querying is a later capability.
-7. **Workspace layout**: `crates/sandbox-driver` (core: types + traits + derived impls + wait helper), with `sandbox-driver-{protocol,host,docker,daytona}` siblings added as they are built.
+7. **Workspace layout**: nine packages: `sandbox-driver` (core types, traits, derived implementations, and helpers), `sandbox-driver-protocol`, `sandbox-driver-conformance`, `sandbox-driver-cli`, `sandbox-driver-{docker,daytona}-config`, and `sandbox-driver-{host,docker,daytona}`. Each provider package contains its internal library and plugin executable. JSON-RPC is the supported application boundary.
 8. **VNC v1 returns browser connection information.** VPN clients are
    guest software managed through exec.
 9. **The Docker image contract requires `setsid`** alongside bash, `stat`, `find`, and `base64` — reliable kill semantics need a separate session, and an image without it fails every exec with a clear message rather than degrading silently.

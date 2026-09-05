@@ -1,6 +1,7 @@
 # Developing
 
-TODO: Replace this introduction with project-specific development notes.
+The workspace builds the provider executables and the `lithos-sandbox` CLI.
+Applications use the providers through JSON-RPC. Petri is the primary consumer.
 
 ## Setup
 
@@ -17,7 +18,8 @@ mise run setup
 
 | Command | Purpose |
 | --- | --- |
-| `mise run dev` | Build and run the application |
+| `mise run dev` | Build the CLI and all provider executables |
+| `mise run plugins:build` | Build provider executables for CLI tests |
 | `mise run fmt` | Format Rust code |
 | `mise run fmt:check` | Check formatting without changing files |
 | `mise run lint` | Run Clippy with warnings denied |
@@ -25,7 +27,19 @@ mise run setup
 | `mise run check` | Run the routine verification gate |
 | `mise run check:nightly` | Run the extended verification gate |
 
-Run `mise run check` before opening a pull request.
+Run `mise run check` before opening a pull request. The test tasks build
+provider executables before CLI tests, including targeted `mise run test:cli`.
+
+For local CLI use after `mise run dev`:
+
+```sh
+export SANDBOX_DRIVER_PLUGIN_DEV=1
+target/debug/lithos-sandbox --provider host provider health
+```
+
+The CLI finds providers beside its own executable, then on `PATH`. Installed
+providers require a checksum pin or explicit development mode. See
+[the CLI guide](docs/cli.md#provider-executables).
 
 ## Rust policy
 

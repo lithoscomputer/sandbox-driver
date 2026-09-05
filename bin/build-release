@@ -42,9 +42,9 @@ if [[ "$host_target" != "$target" ]]; then
 fi
 
 cargo build --locked --release --target "$target" \
-  --package sandbox-driver-host-plugin \
-  --package sandbox-driver-docker-plugin \
-  --package sandbox-driver-daytona-plugin
+  --package sandbox-driver-host \
+  --package sandbox-driver-docker \
+  --package sandbox-driver-daytona
 
 output_dir=dist-release
 staging_dir=$(mktemp -d)

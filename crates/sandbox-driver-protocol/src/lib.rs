@@ -3,8 +3,9 @@
 //! The symmetry at the heart of the design: [`serve`] exposes any
 //! in-process [`sandbox_driver::SandboxProvider`] over newline-delimited
 //! JSON-RPC 2.0, and [`PluginProvider`] adapts a served plugin back into
-//! the same trait. A provider implemented once therefore runs in-process
-//! or out-of-process unchanged, and one conformance suite covers both.
+//! the same trait. Applications, primarily Petri, always use the plugin
+//! connection. Direct provider calls support internal composition and tests;
+//! one conformance suite covers both the implementation and the wire.
 //!
 //! Protocol version 2 (see `methods::PROTOCOL_VERSION`): lifecycle,
 //! streaming exec with client-generated exec ids, one-shot containers,

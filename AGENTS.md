@@ -2,11 +2,11 @@
 
 ## Project purpose
 
-This repository is `sandbox-driver`: a Rust library for driving sandboxes
-(manage sandboxes, snapshots, and volumes) across providers. Reference
-providers are Host, Docker, and Daytona; additional providers ship as
-plugin binaries speaking a JSON-RPC protocol. Fabro is the first
-consumer.
+This repository is `sandbox-driver`: providers for managing sandboxes,
+snapshots, and volumes through JSON-RPC. Petri is the primary consumer.
+Applications use the protocol client and shared types. Host, Docker, and
+Daytona each ship as a plugin executable. Their Rust libraries are internal
+implementations for provider composition and tests, not application APIs.
 
 Authoritative documents:
 
@@ -23,8 +23,9 @@ Authoritative documents:
   it.
 
 The workspace is `crates/sandbox-driver` (core traits and types) plus
-`sandbox-driver-{conformance,host,docker,docker-config,daytona,protocol,cli}`
-and the plugin executables `sandbox-driver-{host,docker,daytona}-plugin`.
+`sandbox-driver-{conformance,host,docker,docker-config,daytona,daytona-config,protocol,cli}`.
+The Host, Docker, and Daytona packages each build a same-named executable.
+There are no separate `*-plugin` packages.
 
 ## Rust style
 
