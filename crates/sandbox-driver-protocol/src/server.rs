@@ -460,12 +460,45 @@ async fn collect_stdin_frames(reader: &mut FrameReader<OwnedReadHalf>) -> Result
     }
 }
 
+/// Registration precedes opening the data channel. Its acceptance is the
+/// client's proof that a stop can be delivered. Drop also covers channel and
+/// stdin failures before provider execution starts.
+struct ExecRegistration<'a> {
+    state: &'a ServerState,
+    id:    &'a str,
+    term:  CancellationToken,
+    kill:  CancellationToken,
+}
+
+impl<'a> ExecRegistration<'a> {
+    fn new(state: &'a ServerState, id: &'a str) -> Self {
+        let term = CancellationToken::new();
+        let kill = CancellationToken::new();
+        state
+            .execs
+            .lock()
+            .expect("execs lock")
+            .insert(id.to_owned(), (term.clone(), kill.clone()));
+        Self {
+            state,
+            id,
+            term,
+            kill,
+        }
+    }
+}
+
+impl Drop for ExecRegistration<'_> {
+    fn drop(&mut self) {
+        self.state.execs.lock().expect("execs lock").remove(self.id);
+    }
+}
+
 /// Runs a streaming command whose output goes to the channel and whose
 /// stop tokens are addressable by `exec_id`, then closes the channel
 /// before the result is returned.
 async fn stream_through_channel<F, Fut>(
-    state: &ServerState,
-    exec_id: &str,
+    registration: ExecRegistration<'_>,
     channel: Channel,
     stdin: bool,
     run: F,
@@ -476,13 +509,6 @@ where
 {
     let Channel { reader, writer } = channel;
     let writer: SharedWriter = Arc::new(AsyncMutex::new(writer));
-    let term = CancellationToken::new();
-    let kill = CancellationToken::new();
-    state
-        .execs
-        .lock()
-        .expect("execs lock")
-        .insert(exec_id.to_owned(), (term.clone(), kill.clone()));
     let (stdin_source, stdin_task) = if stdin {
         let (source, task) = pump_stdin_frames(reader);
         (Some(source), Some(AbortOnDropHandle::new(task)))
@@ -490,8 +516,8 @@ where
         (None, None)
     };
     let controls = ExecControls {
-        term:                  Some(term),
-        kill:                  Some(kill),
+        term:                  Some(registration.term.clone()),
+        kill:                  Some(registration.kill.clone()),
         stdin:                 stdin_source,
         sink:                  Some(frame_sink(&writer)),
         // The host captures the frames. Retaining another copy here
@@ -499,7 +525,6 @@ where
         retained_output_limit: Some(0),
     };
     let outcome = run(controls).await;
-    state.execs.lock().expect("execs lock").remove(exec_id);
     if let Some(task) = stdin_task {
         task.abort();
     }
@@ -759,6 +784,7 @@ async fn dispatch(
             let request: m::ExecStreamParams = parse(params)?;
             let handle = state.sandbox(&request.sandbox_id).await?;
             let mut spec = request.spec.into_spec();
+            let registration = ExecRegistration::new(state, &request.exec_id);
             let mut channel = state.open_channel(&request.channel).await?;
             // A provider without streamed stdin takes the input as the
             // spec's fixed bytes, so the host's stream still reaches the
@@ -768,8 +794,7 @@ async fn dispatch(
                 spec.stdin = Some(collect_stdin_frames(&mut channel.reader).await?);
             }
             let streaming = stream_through_channel(
-                state,
-                &request.exec_id,
+                registration,
                 channel,
                 stream_stdin,
                 |controls| async move { handle.exec().run_streaming(&spec, controls).await },
@@ -783,16 +808,14 @@ async fn dispatch(
             let one_shot = handle
                 .one_shot()
                 .ok_or_else(|| Error::unsupported(Capability::OneShot))?;
+            let registration = ExecRegistration::new(state, &request.exec_id);
             let channel = state.open_channel(&request.channel).await?;
             let spec = request.spec;
-            let streaming = stream_through_channel(
-                state,
-                &request.exec_id,
-                channel,
-                false,
-                |controls| async move { one_shot.run(&spec, controls).await },
-            )
-            .await?;
+            let streaming =
+                stream_through_channel(registration, channel, false, |controls| async move {
+                    one_shot.run(&spec, controls).await
+                })
+                .await?;
             to_value(&stream_result(&streaming))
         }
         m::EXEC_STOP => {

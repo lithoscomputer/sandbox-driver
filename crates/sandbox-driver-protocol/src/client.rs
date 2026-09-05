@@ -22,13 +22,13 @@ use sandbox_driver::{
     Capabilities, Capability, DirEntry, Error, EventContext, EventSubject, Exec, ExecControls,
     ExecResult, ExecSpec, ExecStreamingResult, FileMetadata, Filesystem, ForkOptions, HealthStatus,
     LifecycleTimers, LogSink, LogSource, Logs, NetworkPolicy, OneShot, OneShotSpec,
-    OutputCaptureBuffer, OutputSink, OutputStream, PlatformInfo, PreviewUrl, PreviewUrls,
-    ProviderHealth, ProviderKind, Pty, PtyOptions, PtySession, PtySize, Resources, Result, Sandbox,
-    SandboxFilter, SandboxId, SandboxSnapshotOptions, SandboxSpec, SandboxStatus, SnapshotFilter,
-    SnapshotId, SnapshotProvider, SnapshotSpec, SnapshotStatus, SpawnSpec, SshAccess,
-    SshAccessInfo, StderrTail, StdinReader, StdioProcess, StdioProcessHandle, StopLevel,
-    Termination, TransportError, Vnc, VncConnection, VolumeId, VolumeProvider, VolumeSpec,
-    VolumeStatus, WebTerminal,
+    OutputCaptureBuffer, OutputStream, PlatformInfo, PreviewUrl, PreviewUrls, ProviderHealth,
+    ProviderKind, Pty, PtyOptions, PtySession, PtySize, Resources, Result, Sandbox, SandboxFilter,
+    SandboxId, SandboxSnapshotOptions, SandboxSpec, SandboxStatus, SnapshotFilter, SnapshotId,
+    SnapshotProvider, SnapshotSpec, SnapshotStatus, SpawnSpec, SshAccess, SshAccessInfo,
+    StderrTail, StdinReader, StdioProcess, StdioProcessHandle, StopLevel, Termination,
+    TransportError, Vnc, VncConnection, VolumeId, VolumeProvider, VolumeSpec, VolumeStatus,
+    WebTerminal,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -970,16 +970,20 @@ async fn pump_exec_channel(
     receiver: ChannelReceiver,
     accepted: Arc<AtomicBool>,
     stdin: Option<StdinReader>,
-    sink: Option<OutputSink>,
-    retained_output_limit: Option<usize>,
+    controls: ExecControls,
 ) -> Result<PumpedOutput> {
     let Channel { mut reader, writer } = receiver.accept().await?;
     accepted.store(true, Ordering::SeqCst);
+    // The server registers stop tokens before opening this channel. Waiting
+    // for acceptance prevents an already-cancelled token overtaking exec.
+    let _stop_task = client
+        .forward_stops(&exec_id, &controls)
+        .map(AbortOnDropHandle::new);
     let _stdin_task =
         stdin.map(|reader| AbortOnDropHandle::new(tokio::spawn(feed_stdin_frames(reader, writer))));
     let mut output = PumpedOutput {
-        stdout:     OutputCaptureBuffer::new(retained_output_limit),
-        stderr:     OutputCaptureBuffer::new(retained_output_limit),
+        stdout:     OutputCaptureBuffer::new(controls.retained_output_limit),
+        stderr:     OutputCaptureBuffer::new(controls.retained_output_limit),
         sink_error: None,
     };
     loop {
@@ -1002,7 +1006,7 @@ async fn pump_exec_channel(
         if output.sink_error.is_some() || payload.is_empty() {
             continue;
         }
-        if let Some(sink) = &sink {
+        if let Some(sink) = &controls.sink {
             if let Err(error) = sink(stream, payload).await {
                 // A failing sink is a hard stop on every provider; the
                 // rest of the stream is drained and dropped.
@@ -1059,12 +1063,8 @@ async fn run_channel_exec<P: Serialize>(
         receiver,
         Arc::clone(&accepted),
         stdin,
-        controls.sink.clone(),
-        controls.retained_output_limit,
+        controls.clone(),
     );
-    let _stop_task = client
-        .forward_stops(exec_id, controls)
-        .map(AbortOnDropHandle::new);
     let (result, pumped) = call_with_pump(
         client.call::<_, m::ExecStreamResult>(method, params),
         pump,

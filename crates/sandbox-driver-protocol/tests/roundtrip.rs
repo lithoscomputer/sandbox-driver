@@ -393,3 +393,44 @@ async fn version_one_handshakes_report_the_version_mismatch() {
     host_write.shutdown().await.expect("close requests");
     server.await.expect("join server").expect("server shutdown");
 }
+
+#[tokio::test]
+async fn cancellation_before_exec_registration_is_delivered_after_channel_acceptance() {
+    let provider = connect().await;
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+    for kill in [false, true] {
+        let token = CancellationToken::new();
+        token.cancel();
+        let controls = ExecControls {
+            term: (!kill).then(|| token.clone()),
+            kill: kill.then_some(token),
+            ..ExecControls::default()
+        };
+        let result = time::timeout(
+            Duration::from_secs(5),
+            sandbox
+                .exec()
+                .run_streaming(&ExecSpec::new("sleep").arg("30").no_timeout(), controls),
+        )
+        .await;
+        sandbox
+            .stop()
+            .await
+            .expect("stop even if the regression recurs");
+        assert_eq!(
+            result
+                .expect("pre-cancelled exec ends")
+                .expect("exec")
+                .result
+                .termination,
+            if kill {
+                Termination::Killed
+            } else {
+                Termination::Cancelled
+            }
+        );
+        sandbox.start().await.expect("restart");
+    }
+    sandbox.delete().await.expect("delete");
+    provider.shutdown().await.expect("shutdown");
+}
