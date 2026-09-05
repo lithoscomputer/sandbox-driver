@@ -668,6 +668,10 @@ Rules:
   the command on either level and reports the termination for the level
   it received. The plugin's own stops — `timeout_ms` elapsing, a failing
   output notification — have no host present to escalate, so they kill.
+  Stops and the exec timeout remain active while output drains after the
+  main process exits. A kill must not wait for a descendant's open pipe
+  or a blocked output sink. Abandoned output sets the capture's
+  `truncated` flag.
 - Every output frame for an exec must be sent **before** its `eof`, and
   the `eof` before the `exec/stream` response, in the order the output
   was observed.

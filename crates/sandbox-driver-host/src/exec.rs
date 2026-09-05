@@ -258,12 +258,11 @@ async fn kill_process_group(child: &mut HostChild) {
     let _ = child.kill().await;
 }
 
-enum PumpEnd {
-    Eof,
-    SinkError,
+enum PumpError {
+    Sink,
     /// A transport failure mid-stream: output is incomplete, which must
     /// surface as an error, never as a clean exit with truncated output.
-    ReadError(io::Error),
+    Read(io::Error),
 }
 
 /// Reads one output stream to EOF, feeding the capture buffer and sink.
@@ -273,7 +272,7 @@ async fn pump_stream(
     capture: &mut OutputCaptureBuffer,
     sink: Option<&OutputSink>,
     output_sanitization: OutputSanitization,
-) -> PumpEnd {
+) -> Result<(), PumpError> {
     let mut buffer = [0u8; 8192];
     let mut sanitizer = OutputSanitizer::new(output_sanitization);
     loop {
@@ -284,20 +283,20 @@ async fn pump_stream(
                 if !chunk.is_empty() {
                     if let Some(sink) = sink {
                         if sink(stream, chunk).await.is_err() {
-                            return PumpEnd::SinkError;
+                            return Err(PumpError::Sink);
                         }
                     }
                 }
-                return PumpEnd::Eof;
+                return Ok(());
             }
-            Err(error) => return PumpEnd::ReadError(error),
+            Err(error) => return Err(PumpError::Read(error)),
             Ok(read) => {
                 let chunk = sanitizer.push(&buffer[..read]);
                 capture.push(&chunk);
                 if !chunk.is_empty() {
                     if let Some(sink) = sink {
                         if sink(stream, chunk).await.is_err() {
-                            return PumpEnd::SinkError;
+                            return Err(PumpError::Sink);
                         }
                     }
                 }
@@ -370,7 +369,7 @@ impl Exec for HostExec {
         let mut drain_truncated = false;
         let (termination, status) = {
             let mut pumps = pin!(async {
-                tokio::join!(
+                tokio::try_join!(
                     pump_stream(
                         stdout,
                         OutputStream::Stdout,
@@ -400,18 +399,15 @@ impl Exec for HostExec {
                 }
             });
 
-            let (termination, status) = loop {
+            let (mut termination, status) = loop {
                 tokio::select! {
-                    (out_end, err_end) = &mut pumps, if !pumps_done => {
+                    outcome = &mut pumps, if !pumps_done => {
                         pumps_done = true;
-                        let sink_error = matches!(out_end, PumpEnd::SinkError)
-                            || matches!(err_end, PumpEnd::SinkError);
-                        for end in [out_end, err_end] {
-                            if let PumpEnd::ReadError(error) = end {
-                                read_error.get_or_insert(error);
+                        if let Err(error) = outcome {
+                            if let PumpError::Read(error) = error {
+                                read_error = Some(error);
                             }
-                        }
-                        if sink_error || read_error.is_some() {
+                            drain_truncated = true;
                             kill_process_group(&mut child).await;
                             break (Termination::Cancelled, None);
                         }
@@ -450,17 +446,46 @@ impl Exec for HostExec {
                     .map_err(|error| Error::io("waiting for exec process", error))?,
             };
             if !pumps_done {
-                match time::timeout(DRAIN_GRACE, &mut pumps).await {
-                    Ok((out_end, err_end)) => {
-                        for end in [out_end, err_end] {
-                            if let PumpEnd::ReadError(error) = end {
-                                read_error.get_or_insert(error);
+                // The leader can exit while descendants keep its pipes open
+                // or a sink stays blocked. Keep the caller's stop controls and
+                // the original timeout live until those pumps finish too.
+                let mut drain_deadline = pin!(time::sleep(DRAIN_GRACE));
+                loop {
+                    if matches!(termination, Termination::Killed | Termination::TimedOut) {
+                        drain_truncated = true;
+                        break;
+                    }
+                    tokio::select! {
+                        biased;
+                        () = &mut killed => {
+                            kill_process_group(&mut child).await;
+                            termination = Termination::Killed;
+                        }
+                        () = &mut timeout => {
+                            kill_process_group(&mut child).await;
+                            termination = Termination::TimedOut;
+                        }
+                        () = &mut termed, if !term_fired => {
+                            term_fired = true;
+                            term_process_group(&child);
+                            termination = Termination::Cancelled;
+                        }
+                        outcome = &mut pumps => {
+                            if let Err(error) = outcome {
+                                if let PumpError::Read(error) = error {
+                                    read_error = Some(error);
+                                }
+                                kill_process_group(&mut child).await;
+                                termination = Termination::Cancelled;
+                                drain_truncated = true;
                             }
+                            break;
+                        }
+                        () = &mut drain_deadline => {
+                            drain_truncated = true;
+                            break;
                         }
                     }
-                    // Unread bytes were abandoned with the pipes: the
-                    // capture stats must say the accounting is short.
-                    Err(_elapsed) => drain_truncated = true,
                 }
             }
             (termination, status)
