@@ -646,6 +646,11 @@ Rules:
 
 - `exec_id` is **host-generated** and unique per connection, so a stop
   can be addressed before the `exec/stream` response exists.
+- The plugin registers the exec's stop tokens before opening its data channel.
+  The host waits for channel acceptance before forwarding stop tokens. This
+  ordering also applies to one-shots and delivers cancellation that was
+  requested before exec started. Registration is removed on completion or
+  failure, including a failed channel connection.
 - When `stdin` is true the host writes the command's input as `stdin`
   frames and its `eof` closes the input; a plugin whose provider offers
   fixed stdin only (`exec.stdin` without `exec.stdin_stream`) reads the
