@@ -5,9 +5,6 @@ lockfile = true
 lockfile_platforms = ["macos-arm64", "linux-x64", "linux-arm64"]
 minimum_release_age = "24h"
 
-[env]
-RUST_TEMPLATE_BINARY_NAME = "sandbox-driver-host-plugin"
-
 [tools]
 "cargo:cargo-llvm-cov" = { version = "0.8.5", locked = true }
 "cargo:cargo-nextest" = { version = "0.9.140", locked = true }
@@ -61,9 +58,14 @@ run = [
     --exclude-from-test sandbox-driver-host \
     --exclude-from-test sandbox-driver-docker \
     --exclude-from-test sandbox-driver-host-plugin \
+    --exclude-from-test sandbox-driver-docker-plugin \
+    --exclude-from-test sandbox-driver-daytona-plugin \
+    --exclude-from-test sandbox-driver-docker-config \
     --exclude-from-report sandbox-driver-conformance \
     --exclude-from-report sandbox-driver-protocol \
     --exclude-from-report sandbox-driver-host-plugin \
+    --exclude-from-report sandbox-driver-docker-plugin \
+    --exclude-from-report sandbox-driver-daytona-plugin \
     --test trycmd \
     --test live
   """,
@@ -106,5 +108,5 @@ description = "Run the extended nightly verification gate"
 depends = ["check", "check:msrv", "test:release"]
 
 [tasks.release]
-description = "Build and package a release for the current platform"
+description = "Build and package the plugin executables for the current platform"
 run = "bin/build-release"

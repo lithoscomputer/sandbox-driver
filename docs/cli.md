@@ -145,7 +145,7 @@ Configure an external JSON-RPC plugin as follows:
 [providers.e2b]
 type = "plugin"
 kind = "e2b"
-path = "/usr/local/bin/lithos-sandbox-e2b"
+path = "/usr/local/bin/lithos-sandbox-e2b" # or omit: `lithos-sandbox-<kind>` on PATH
 sha256 = "0123456789abcdef..."
 inherit-env = ["PATH", "E2B_API_KEY"]
 ```

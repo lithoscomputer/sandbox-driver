@@ -2,8 +2,9 @@
 //!
 //! A reference plugin binary and a working one: speaks the JSON-RPC
 //! plugin protocol on stdin/stdout and drives directory-backed sandboxes
-//! on the machine it runs on. Stdout belongs to the protocol; logs go to
-//! stderr.
+//! on the machine it runs on. The executable is `sandbox-driver-host`,
+//! the name plugin discovery looks for under the `sandbox-driver` prefix.
+//! Stdout belongs to the protocol; logs go to stderr.
 
 use std::io::stderr;
 use std::sync::Arc;

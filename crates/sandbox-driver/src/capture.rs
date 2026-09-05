@@ -47,11 +47,11 @@ impl OutputCaptureBuffer {
             rest = &rest[take..];
         }
         let tail_cap = cap - self.head_cap;
+        if tail_cap == 0 {
+            self.omitted += rest.len();
+            return;
+        }
         for &byte in rest {
-            if tail_cap == 0 {
-                self.omitted += 1;
-                continue;
-            }
             if self.tail.len() == tail_cap {
                 self.tail.pop_front();
                 self.omitted += 1;
@@ -132,5 +132,18 @@ mod tests {
         let (bytes, stats) = buffer.into_parts();
         assert_eq!(bytes, b"short");
         assert_eq!(stats.omitted_bytes, 0);
+    }
+
+    #[test]
+    fn zero_retention_counts_output_without_truncating_delivery() {
+        let mut buffer = OutputCaptureBuffer::new(Some(0));
+        buffer.push(b"hello ");
+        buffer.push(b"world");
+        let (bytes, stats) = buffer.into_parts();
+        assert!(bytes.is_empty());
+        assert_eq!(stats.observed_bytes, 11);
+        assert_eq!(stats.retained_bytes, 0);
+        assert_eq!(stats.omitted_bytes, 11);
+        assert!(!stats.truncated);
     }
 }

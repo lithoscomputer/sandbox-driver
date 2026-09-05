@@ -34,7 +34,7 @@ use futures_util::StreamExt;
 use sandbox_driver::{Error, ProviderError, Result};
 use tokio::time;
 
-use crate::config::{Health, Sidecar};
+use crate::config::{Sidecar, to_health_config};
 use crate::exec::{docker_error, docker_kind, is_not_found, tolerate_not_modified};
 use crate::{MANAGED_LABEL, image_present, non_empty, pull_image};
 
@@ -116,7 +116,7 @@ async fn start_all(
             user: sidecar.user.clone(),
             entrypoint: sidecar.entrypoint.clone(),
             labels: Some(labels.clone()),
-            healthcheck: sidecar.health.as_ref().map(Health::to_config),
+            healthcheck: sidecar.health.as_ref().map(to_health_config),
             host_config: Some(host_config),
             networking_config: Some(NetworkingConfig {
                 endpoints_config: endpoints,

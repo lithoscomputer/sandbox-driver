@@ -1990,6 +1990,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandbox-driver-daytona-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "sandbox-driver",
+ "sandbox-driver-daytona",
+ "sandbox-driver-protocol",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sandbox-driver-docker"
 version = "0.1.0"
 dependencies = [
@@ -1998,12 +2011,35 @@ dependencies = [
  "futures-util",
  "sandbox-driver",
  "sandbox-driver-conformance",
+ "sandbox-driver-docker-config",
+ "sandbox-driver-protocol",
  "serde",
  "serde_json",
  "tar",
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "sandbox-driver-docker-config"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "sandbox-driver-docker-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "sandbox-driver",
+ "sandbox-driver-docker",
+ "sandbox-driver-protocol",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2040,6 +2076,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
+ "rand 0.10.2",
  "sandbox-driver",
  "sandbox-driver-conformance",
  "sandbox-driver-host",
@@ -2628,6 +2665,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",

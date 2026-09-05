@@ -1,27 +1,29 @@
 //! Method names and parameter/result DTOs.
 //!
-//! Wire DTOs may share their serde shape with core domain types in v1;
-//! their compatibility rules are verified by `tests/compat.rs`.
-//! Byte payloads always cross as base64 strings. Divergence, when a shape
-//! must evolve, is absorbed here — never by breaking core types.
+//! Wire DTOs may share their serde shape with core domain types; their
+//! compatibility rules are verified by `tests/compat.rs`. Byte payloads
+//! never cross as JSON: every byte stream rides a data channel
+//! ([`crate::channel`]) named by a [`ChannelRequest`] in the request that
+//! needs it. Divergence, when a shape must evolve, is absorbed here —
+//! never by breaking core types.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use sandbox_driver::{
     Capabilities, CaptureStats, CorrelationId, DirEntry, Error, Event, ExecResult, ExecSpec,
-    FileMetadata, ForkOptions, LifecycleTimers, LogSource, NetworkPolicy, OutputSanitization,
-    PlatformInfo, ProviderKind, PtyOptions, PtySize, Resources, SandboxFilter, SandboxId,
-    SandboxKind, SandboxSnapshotOptions, SandboxSource, SandboxSpec, SandboxStatus, SnapshotId,
-    SnapshotMode, SnapshotSource, SnapshotSpec, SpawnSpec, StopLevel, Termination, VncConnection,
-    VolumeMount,
+    FileMetadata, ForkOptions, LifecycleTimers, LogSource, NetworkPolicy, OneShotSpec,
+    OutputSanitization, PlatformInfo, ProviderKind, PtyOptions, PtySize, Resources, SandboxFilter,
+    SandboxId, SandboxKind, SandboxSnapshotOptions, SandboxSource, SandboxSpec, SandboxStatus,
+    SnapshotId, SnapshotMode, SnapshotSource, SnapshotSpec, SpawnSpec, StopLevel, Termination,
+    VncConnection, VolumeMount,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::wire::{decode_bytes, encode_bytes};
+pub use crate::channel::{ChannelRequest, DataTransport};
 
 /// Protocol version this crate speaks.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 // Method names, host → plugin.
 pub const INITIALIZE: &str = "initialize";
@@ -48,18 +50,14 @@ pub const SANDBOX_SNAPSHOT: &str = "sandbox/snapshot";
 pub const SANDBOX_SET_TIMERS: &str = "sandbox/set_timers";
 pub const SANDBOX_SET_LABELS: &str = "sandbox/set_labels";
 pub const SANDBOX_UPDATE_NETWORK: &str = "sandbox/update_network";
-pub const EXEC_RUN: &str = "exec/run";
+pub const SANDBOX_ENVIRONMENT: &str = "sandbox/environment";
 pub const EXEC_STREAM: &str = "exec/stream";
 pub const EXEC_STOP: &str = "exec/stop";
 pub const EXEC_STDIO_OPEN: &str = "exec/stdio_open";
-pub const EXEC_STDIO_INPUT: &str = "exec/stdio_input";
-pub const EXEC_STDIO_CLOSE_INPUT: &str = "exec/stdio_close_input";
-pub const EXEC_STDIO_OUTPUT: &str = "exec/stdio_output";
 pub const EXEC_STDIO_TERMINATE: &str = "exec/stdio_terminate";
 pub const EXEC_STDIO_WAIT: &str = "exec/stdio_wait";
+pub const ONE_SHOT_RUN: &str = "one_shot/run";
 pub const PTY_OPEN: &str = "pty/open";
-pub const PTY_INPUT: &str = "pty/input";
-pub const PTY_OUTPUT: &str = "pty/output";
 pub const PTY_RESIZE: &str = "pty/resize";
 pub const PTY_CLOSE: &str = "pty/close";
 pub const LOGS_FOLLOW: &str = "logs/follow";
@@ -94,14 +92,14 @@ pub const ACCESS_WEB_TERMINAL: &str = "access/web_terminal";
 pub const ACCESS_VNC: &str = "access/vnc";
 
 // Notifications, plugin → host.
-pub const EXEC_OUTPUT: &str = "exec/output";
 pub const HOST_EVENT: &str = "host/event";
 pub const HOST_LOG: &str = "host/log";
-pub const LOG_OUTPUT: &str = "logs/output";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InitializeParams {
     pub protocol_version: u32,
+    /// Where the plugin opens its data channels. Required in version 2.
+    pub data_transport:   DataTransport,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -395,7 +393,8 @@ pub struct UpdateNetworkParams {
     pub network:    NetworkPolicy,
 }
 
-/// [`ExecSpec`] with the stdin payload in base64.
+/// [`ExecSpec`] without its stdin: fixed and streamed stdin alike cross
+/// as `Stdin` frames on the exec's data channel.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExecSpecDto {
     pub program:             String,
@@ -404,7 +403,6 @@ pub struct ExecSpecDto {
     pub timeout_ms:          Option<u64>,
     pub working_dir:         Option<String>,
     pub env:                 BTreeMap<String, String>,
-    pub stdin_b64:           Option<String>,
     #[serde(default, skip_serializing_if = "output_sanitization_is_raw")]
     pub output_sanitization: OutputSanitization,
 }
@@ -419,12 +417,11 @@ impl ExecSpecDto {
                 .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
             working_dir:         spec.working_dir.clone(),
             env:                 spec.env.clone(),
-            stdin_b64:           spec.stdin.as_deref().map(encode_bytes),
             output_sanitization: spec.output_sanitization,
         }
     }
 
-    pub fn into_spec(self) -> Result<ExecSpec, sandbox_driver::Error> {
+    pub fn into_spec(self) -> ExecSpec {
         let mut spec = ExecSpec::new(self.program).args(self.args);
         // Wire semantics are authoritative: an absent timeout means
         // unbounded, so the constructor's default must not leak in.
@@ -435,11 +432,7 @@ impl ExecSpecDto {
         for (key, value) in self.env {
             spec = spec.env_var(key, value);
         }
-        if let Some(stdin) = self.stdin_b64 {
-            spec = spec.stdin(decode_bytes(&stdin)?);
-        }
-        spec = spec.output_sanitization(self.output_sanitization);
-        Ok(spec)
+        spec.output_sanitization(self.output_sanitization)
     }
 }
 
@@ -453,18 +446,12 @@ fn output_sanitization_is_raw(value: &OutputSanitization) -> bool {
     *value == OutputSanitization::Raw
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ExecRunParams {
-    pub sandbox_id: String,
-    pub spec:       ExecSpecDto,
-}
-
+/// The metadata of a finished exec. Its bytes went over the channel: the
+/// host keeps its own retained copy, bounded by the limit it asked for,
+/// and the accounting here is the plugin's.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExecResultDto {
-    pub stdout_b64:  String,
-    pub stderr_b64:  String,
     pub exit_code:   Option<i32>,
-    /// Additive: senders may omit it, receivers tolerate its absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal:      Option<i32>,
     pub termination: Termination,
@@ -474,8 +461,6 @@ pub struct ExecResultDto {
 impl ExecResultDto {
     pub fn from_result(result: &ExecResult) -> Self {
         Self {
-            stdout_b64:  encode_bytes(&result.stdout),
-            stderr_b64:  encode_bytes(&result.stderr),
             exit_code:   result.exit_code,
             signal:      result.signal,
             termination: result.termination,
@@ -483,26 +468,31 @@ impl ExecResultDto {
         }
     }
 
-    pub fn into_result(self) -> Result<ExecResult, sandbox_driver::Error> {
+    /// The result with `stdout` and `stderr` as the host retained them.
+    pub fn into_result(self, stdout: Vec<u8>, stderr: Vec<u8>) -> ExecResult {
         let mut result = ExecResult::new(
             self.termination,
             self.exit_code,
             Duration::from_millis(self.duration_ms),
         );
         result.signal = self.signal;
-        result.stdout = decode_bytes(&self.stdout_b64)?;
-        result.stderr = decode_bytes(&self.stderr_b64)?;
-        Ok(result)
+        result.stdout = stdout;
+        result.stderr = stderr;
+        result
     }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExecStreamParams {
     pub sandbox_id:            String,
-    /// Client-generated, routes `exec/output` notifications and
-    /// `exec/stop` before the response arrives.
+    /// Client-generated: routes `exec/stop` before the response arrives.
     pub exec_id:               String,
+    pub channel:               ChannelRequest,
     pub spec:                  ExecSpecDto,
+    /// The command reads its standard input from the channel's `Stdin`
+    /// frames. When false the plugin gives it end-of-file at once.
+    #[serde(default)]
+    pub stdin:                 bool,
     pub retained_output_limit: Option<usize>,
 }
 
@@ -516,13 +506,6 @@ pub struct ExecStreamResult {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ExecOutputNotification {
-    pub exec_id:  String,
-    pub stream:   sandbox_driver::OutputStream,
-    pub data_b64: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct ExecStopParams {
     pub exec_id: String,
     /// `term` or `kill`.
@@ -530,26 +513,27 @@ pub struct ExecStopParams {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct OneShotRunParams {
+    pub sandbox_id:            String,
+    /// Client-generated: routes `exec/stop` before the response arrives.
+    pub exec_id:               String,
+    pub channel:               ChannelRequest,
+    pub spec:                  OneShotSpec,
+    pub retained_output_limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct StdioOpenParams {
     pub sandbox_id: String,
     pub process_id: String,
+    /// Stdin travels host to plugin, stdout plugin to host.
+    pub channel:    ChannelRequest,
     pub spec:       SpawnSpec,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StdioIdParams {
     pub process_id: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StdioInputParams {
-    pub process_id: String,
-    pub data_b64:   String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StdioOutputResult {
-    pub data_b64: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -563,23 +547,14 @@ pub struct StdioWaitResult {
 pub struct PtyOpenParams {
     pub sandbox_id: String,
     pub pty_id:     String,
+    /// Input travels host to plugin, output plugin to host.
+    pub channel:    ChannelRequest,
     pub options:    PtyOptions,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PtyIdParams {
     pub pty_id: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PtyInputParams {
-    pub pty_id:   String,
-    pub data_b64: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PtyOutputResult {
-    pub data_b64: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -592,18 +567,13 @@ pub struct PtyResizeParams {
 pub struct LogsFollowParams {
     pub sandbox_id: String,
     pub stream_id:  String,
+    pub channel:    ChannelRequest,
     pub source:     LogSource,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StreamIdParams {
     pub stream_id: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct LogOutputNotification {
-    pub stream_id: String,
-    pub data_b64:  String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -616,6 +586,8 @@ pub struct FsPathParams {
 pub struct FsReadParams {
     pub sandbox_id: String,
     pub path:       String,
+    /// The file's bytes arrive as `Stdout` frames.
+    pub channel:    ChannelRequest,
     /// Byte offset to start reading at; whole-file read when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset:     Option<u64>,
@@ -625,18 +597,23 @@ pub struct FsReadParams {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct FsReadResult {
-    pub content_b64: String,
+pub struct FsWriteParams {
+    pub sandbox_id:     String,
+    pub path:           String,
+    /// The content arrives as `Stdin` frames, ended by the host's `Eof`.
+    pub channel:        ChannelRequest,
+    /// Append instead of truncating.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub append:         bool,
+    /// Exact byte count, allowing providers to stream an overwrite without
+    /// collecting the channel first. Absent on earlier version 2 requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_length: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct FsWriteParams {
-    pub sandbox_id:  String,
-    pub path:        String,
-    pub content_b64: String,
-    /// Append instead of truncating, for chunked uploads.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub append:      bool,
+pub struct EnvironmentResult {
+    pub environment: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -802,6 +779,7 @@ pub struct SnapshotIdResult {
 pub struct SnapshotBuildLogsParams {
     pub snapshot_id: String,
     pub stream_id:   String,
+    pub channel:     ChannelRequest,
     pub follow:      bool,
 }
 

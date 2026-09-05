@@ -5,20 +5,33 @@
 //! host-root-equivalent, so this provider is host-trusted by definition.
 //!
 //! The container's data plane is hybrid: file content moves through
-//! the daemon's archive API (single-call transfers of any size, reads
-//! that work on stopped containers), while metadata operations stay
-//! exec-derived — so `Capabilities::fs` still reports `native: false`.
-//! Every image must provide `/bin/sh`, `env`, and `setsid` for the exec
-//! wrapper (kill semantics need a separate session, and `env` carries
-//! the command's environment past the shell; an image without either
-//! fails every exec with a clear message). The exec-derived facets are
-//! Bash scripts, so an image that serves them must also provide `bash` on
-//! `PATH` and a Linux userland with `stat`, `find`, and `base64`. Because
-//! Docker advertises the normalized Search, Git, and background-services
-//! facets, the image must also provide the commands documented by
-//! [`sandbox_driver::Search`] and [`sandbox_driver::Services`], plus `git`,
-//! on `PATH`. A program that needs none of that — Petri's step runner, say
-//! — runs on any Linux image.
+//! the daemon's archive API (streamed reads that stop at the requested
+//! range, writes that carry their missing parents, both working on a
+//! stopped container), while metadata operations stay exec-derived — so
+//! `Capabilities::fs` still reports `native: false`. Every image must
+//! provide `/bin/sh`, `env`, and `setsid` for the exec wrapper (kill
+//! semantics need a separate session, and `env` carries the command's
+//! environment past the shell; an image without either fails every exec
+//! with a clear message). The exec-derived facets are Bash scripts, so an
+//! image that serves them must also provide `bash` on `PATH` and a Linux
+//! userland with `stat`, `find`, and `base64`. Because Docker advertises
+//! the normalized Search, Git, and background-services facets, the image
+//! must also provide the commands documented by [`sandbox_driver::Search`]
+//! and [`sandbox_driver::Services`], plus `git`, on `PATH`. A program that
+//! needs none of that — Petri's step runner, which execs, reads and writes
+//! files, and runs one-shot containers — runs on any Linux image with a
+//! POSIX userland, Alpine included.
+//!
+//! # The workspace
+//!
+//! The sandbox owns its workspace: the working directory is a Docker
+//! volume created with the container and removed with it, unless the
+//! caller's `provider_config.binds` mounts a host directory there. Every
+//! [`sandbox_driver::OneShot`] container the sandbox runs mounts the same
+//! volume at the same path and joins the sandbox container's network
+//! namespace, so it sees the workspace, the sidecars, and the daemon host
+//! exactly as the sandbox does. `stop` and `delete` end the sandbox's
+//! one-shot containers first.
 //!
 //! # Runtime behavior
 //!
@@ -33,6 +46,7 @@ mod access;
 mod config;
 mod exec;
 mod fs;
+mod one_shot;
 mod pty;
 mod sidecars;
 
@@ -47,15 +61,18 @@ use bollard::container::{
     RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use bollard::image::CreateImageOptions;
-use bollard::models::{ContainerInspectResponse, ContainerStateStatusEnum, HostConfig};
+use bollard::models::{
+    ContainerInspectResponse, ContainerStateStatusEnum, HostConfig, Mount, MountPointTypeEnum,
+    MountTypeEnum,
+};
 use futures_util::StreamExt;
 use sandbox_driver::{
     Action, BASH_ENV_VAR, Capabilities, Error, EventContext, EventEmitter, EventSubject, Exec,
-    ExecSpec, Filesystem, HealthStatus, Isolation, LifecycleTimers, NetworkPolicy,
-    OperationReporter, PlatformInfo, Progress, ProgressCode, ProviderError, ProviderHealth,
-    ProviderKind, Pty, PtyCaps, ResourceKind, Result, Sandbox, SandboxFilter, SandboxId,
-    SandboxKind, SandboxProvider, SandboxSource, SandboxSpec, SandboxState, SandboxStatus,
-    ShellCommand,
+    ExecSpec, Filesystem, HealthStatus, Isolation, LifecycleTimers, NetworkPolicy, OneShot,
+    OneShotCaps, OperationReporter, PlatformInfo, Progress, ProgressCode, ProviderError,
+    ProviderHealth, ProviderKind, Pty, PtyCaps, ResourceKind, Result, Sandbox, SandboxFilter,
+    SandboxId, SandboxKind, SandboxProvider, SandboxSource, SandboxSpec, SandboxState,
+    SandboxStatus, ShellCommand,
 };
 use serde::Deserialize;
 
@@ -67,6 +84,7 @@ use crate::exec::{
     tolerate_not_modified,
 };
 use crate::fs::DockerFs;
+use crate::one_shot::DockerOneShot;
 use crate::pty::DockerPty;
 
 pub(crate) const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
@@ -112,7 +130,7 @@ pub(crate) async fn pull_image(
     auth: Option<&RegistryAuth>,
     platform: Option<&str>,
 ) -> Result<()> {
-    let credentials = auth.map(RegistryAuth::to_credentials);
+    let credentials = auth.map(config::to_credentials);
     let mut stream =
         docker.create_image(Some(pull_options(reference, platform)), None, credentials);
     while let Some(progress) = stream.next().await {
@@ -132,12 +150,22 @@ impl DockerProvider {
     /// Connects to the local Docker daemon and verifies it responds.
     #[tracing::instrument(skip_all, fields(provider_kind = "docker"), err)]
     pub async fn connect() -> Result<Self> {
-        let docker = Docker::connect_with_local_defaults()
-            .map_err(|error| docker_error("connecting to the docker daemon", error))?;
-        docker
+        let provider = Self::connect_unverified()?;
+        provider
+            .docker
             .ping()
             .await
             .map_err(|error| docker_error("pinging the docker daemon", error))?;
+        Ok(provider)
+    }
+
+    /// Connects to the local Docker daemon (`DOCKER_HOST` and its TLS
+    /// companions honoured) without checking that it answers, so a plugin
+    /// can start and report an unreachable daemon through
+    /// [`SandboxProvider::health`] instead of failing to launch.
+    pub fn connect_unverified() -> Result<Self> {
+        let docker = Docker::connect_with_local_defaults()
+            .map_err(|error| docker_error("connecting to the docker daemon", error))?;
         Ok(Self {
             kind: docker_kind(),
             capabilities: docker_capabilities(),
@@ -206,6 +234,7 @@ impl DockerProvider {
         labels: BTreeMap<String, String>,
         env: BTreeMap<String, String>,
         network: Option<String>,
+        workspace: Option<Mount>,
         events: EventEmitter,
     ) -> Arc<DockerSandbox> {
         let pty = DockerPty::new(
@@ -213,6 +242,14 @@ impl DockerProvider {
             container_id.clone(),
             working_dir.clone(),
         );
+        let one_shot = workspace.map(|workspace| {
+            DockerOneShot::new(
+                self.docker.clone(),
+                container_id.clone(),
+                working_dir.clone(),
+                workspace,
+            )
+        });
         let shell_command = DockerShellCommand::new(container_id.clone(), working_dir.clone());
         let exec = Arc::new(DockerExec::new(
             self.docker.clone(),
@@ -237,6 +274,7 @@ impl DockerProvider {
             fs,
             pty,
             shell_command,
+            one_shot,
             network,
             events,
         })
@@ -283,6 +321,9 @@ fn docker_capabilities() -> Capabilities {
     pty.resize = true;
     caps.pty = Some(pty);
     caps.access.shell_command = true;
+    let mut one_shot = OneShotCaps::default();
+    one_shot.build = true;
+    caps.one_shot = Some(one_shot);
     caps.fs.native = false;
     caps.fs.upload = true;
     caps.fs.download = true;
@@ -362,9 +403,33 @@ fn sidecar_network_of(inspect: &ContainerInspectResponse) -> Option<String> {
         .filter(|mode| is_sidecar_network(mode))
 }
 
+/// Where an inspected container's workspace lives: the volume or bind
+/// mounted at its working directory, which its one-shot containers share.
+fn workspace_of(inspect: &ContainerInspectResponse, working_dir: &str) -> Option<Mount> {
+    let target = working_dir.trim_end_matches('/');
+    inspect.mounts.as_ref()?.iter().find_map(|mount| {
+        let destination = mount.destination.as_deref()?.trim_end_matches('/');
+        if destination != target {
+            return None;
+        }
+        let (typ, source) = match mount.typ {
+            Some(MountPointTypeEnum::VOLUME) => (MountTypeEnum::VOLUME, mount.name.clone()?),
+            Some(MountPointTypeEnum::BIND) => (MountTypeEnum::BIND, mount.source.clone()?),
+            _ => return None,
+        };
+        Some(Mount {
+            target: Some(working_dir.to_owned()),
+            source: Some(source),
+            typ: Some(typ),
+            read_only: mount.rw.map(|writable| !writable),
+            ..Default::default()
+        })
+    })
+}
+
 /// Labels the provider writes for itself, never reported as the caller's.
 fn is_internal_label(key: &str) -> bool {
-    key == MANAGED_LABEL
+    key == MANAGED_LABEL || key == one_shot::ONE_SHOT_LABEL
 }
 
 /// Whether a container's network mode names a managed sidecar network
@@ -531,6 +596,18 @@ impl SandboxProvider for DockerProvider {
                         ..
                     } = config_options;
                     let network_mode = sidecar_network.clone().or(base_network);
+                    // The workspace is the sandbox's own volume, unless the
+                    // caller bound a host directory there.
+                    let workspace_bound = binds.iter().any(|bind| {
+                        bind.container.trim_end_matches('/') == working_dir.trim_end_matches('/')
+                    });
+                    let mounts = (!workspace_bound).then(|| {
+                        vec![Mount {
+                            target: Some(working_dir.clone()),
+                            typ: Some(MountTypeEnum::VOLUME),
+                            ..Default::default()
+                        }]
+                    });
                     let binds: Vec<String> = binds
                         .iter()
                         .map(|bind| {
@@ -541,6 +618,7 @@ impl SandboxProvider for DockerProvider {
                     let host_config = HostConfig {
                         network_mode,
                         binds: non_empty(binds),
+                        mounts,
                         init: init.then_some(true),
                         privileged: privileged.then_some(true),
                         extra_hosts: non_empty(extra_hosts),
@@ -597,8 +675,27 @@ impl SandboxProvider for DockerProvider {
                             }
                         });
                     // From here a failure must sweep the sidecars it started.
-                    let sweep_on_error = |error: Error| async {
-                        if let Some(network) = &sidecar_network {
+                    let cleanup_network = &sidecar_network;
+                    let sweep_on_error = |error: Error, container: Option<String>| async move {
+                        if let Some(container) = container {
+                            if let Err(cleanup_error) = self.docker.remove_container(
+                                &container,
+                                Some(RemoveContainerOptions {
+                                    force: true,
+                                    v: true,
+                                    ..Default::default()
+                                }),
+                            ).await {
+                                if !is_not_found(&cleanup_error) {
+                                    tracing::warn!(
+                                        provider_kind = "docker",
+                                        error = %docker_error("removing failed sandbox", cleanup_error),
+                                        "failed sandbox cleanup failed"
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(network) = cleanup_network {
                             sidecars::sweep(&self.docker, network).await;
                         }
                         error
@@ -614,18 +711,23 @@ impl SandboxProvider for DockerProvider {
                             } else {
                                 docker_error("creating container", error)
                             };
-                            return Err(sweep_on_error(error).await);
+                            return Err(sweep_on_error(error, None).await);
                         }
                     };
-                    let event_id = SandboxId::try_new(created.id.clone())
-                        .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
+                    let event_id = match SandboxId::try_new(created.id.clone()) {
+                        Ok(id) => id,
+                        Err(error) => return Err(sweep_on_error(
+                            Error::invalid_spec("sandbox_id", error.to_string()),
+                            Some(created.id.clone()),
+                        ).await),
+                    };
                     reporter.set_subject(EventSubject::sandbox(Some(event_id)));
                     if let Err(error) = self
                         .docker
                         .start_container(&created.id, None::<StartContainerOptions<String>>)
                         .await
                     {
-                        return Err(sweep_on_error(docker_error("starting container", error)).await);
+                        return Err(sweep_on_error(docker_error("starting container", error), Some(created.id.clone())).await);
                     }
                     // `start` returning is not the container running: an init
                     // that exits at once (a missing interpreter, a bad user)
@@ -633,7 +735,7 @@ impl SandboxProvider for DockerProvider {
                     // Fail create instead, naming the cause.
                     let started = match self.inspect(&created.id).await {
                         Ok(inspect) => inspect,
-                        Err(error) => return Err(sweep_on_error(error).await),
+                        Err(error) => return Err(sweep_on_error(error, Some(created.id.clone())).await),
                     };
                     if map_state(&started) != SandboxState::Running {
                         let exit = started
@@ -641,16 +743,6 @@ impl SandboxProvider for DockerProvider {
                             .as_ref()
                             .and_then(|state| state.exit_code)
                             .unwrap_or_default();
-                        let _ = self
-                            .docker
-                            .remove_container(
-                                &created.id,
-                                Some(RemoveContainerOptions {
-                                    force: true,
-                                    ..Default::default()
-                                }),
-                            )
-                            .await;
                         let mut provider = ProviderError::new(
                             self.kind.clone(),
                             format!(
@@ -659,8 +751,9 @@ impl SandboxProvider for DockerProvider {
                             ),
                         );
                         provider.code = Some("exited".to_owned());
-                        return Err(sweep_on_error(Error::Provider(provider)).await);
+                        return Err(sweep_on_error(Error::Provider(provider), Some(created.id.clone())).await);
                     }
+                    let workspace = workspace_of(&started, &working_dir);
                     Ok(self.handle(
                         created.id,
                         spec.name.clone(),
@@ -668,6 +761,7 @@ impl SandboxProvider for DockerProvider {
                         spec.labels.clone(),
                         spec.env.clone(),
                         sidecar_network.clone(),
+                        workspace,
                         handle_emitter,
                     ) as Arc<dyn Sandbox>)
                 },
@@ -714,6 +808,7 @@ impl SandboxProvider for DockerProvider {
                         })
                         .unwrap_or_default();
                     let network = sidecar_network_of(&inspect);
+                    let workspace = workspace_of(&inspect, &working_dir);
                     let container_id = inspect.id.clone().unwrap_or_else(|| id.as_str().to_owned());
                     Ok(self.handle(
                         container_id,
@@ -722,6 +817,7 @@ impl SandboxProvider for DockerProvider {
                         user_labels,
                         BTreeMap::new(),
                         network,
+                        workspace,
                         handle_emitter,
                     ) as Arc<dyn Sandbox>)
                 },
@@ -756,8 +852,12 @@ impl SandboxProvider for DockerProvider {
                     }
                     let network = sidecar_network_of(&inspect);
                     let container_id = inspect.id.clone().unwrap_or_else(|| id.as_str().to_owned());
+                    // One-shot containers hold the workspace volume too, so
+                    // they go first and the volume goes with its last user.
+                    one_shot::sweep(&self.docker, &container_id).await;
                     let options = RemoveContainerOptions {
                         force: true,
+                        v: true,
                         ..Default::default()
                     };
                     let removed = match self
@@ -845,6 +945,9 @@ pub struct DockerSandbox {
     fs:            DockerFs,
     pty:           DockerPty,
     shell_command: DockerShellCommand,
+    /// One-shot containers over the sandbox's workspace, when the
+    /// container's mounts told where that workspace is.
+    one_shot:      Option<DockerOneShot>,
     /// The sidecar network to sweep on delete, when the sandbox has one.
     network:       Option<String>,
     events:        EventEmitter,
@@ -993,6 +1096,9 @@ impl Sandbox for DockerSandbox {
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Stop,
                 |_| async {
+                    // Whatever a one-shot was doing in the workspace ends
+                    // with the sandbox's own processes.
+                    one_shot::sweep(&self.docker, self.id.as_str()).await;
                     tolerate_not_modified(
                         self.docker
                             .stop_container(self.id.as_str(), Some(StopContainerOptions { t: 1 }))
@@ -1012,6 +1118,7 @@ impl Sandbox for DockerSandbox {
     async fn delete(&self) -> Result<()> {
         let options = RemoveContainerOptions {
             force: true,
+            v: true,
             ..Default::default()
         };
         self.events
@@ -1019,6 +1126,7 @@ impl Sandbox for DockerSandbox {
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Delete,
                 |_| async {
+                    one_shot::sweep(&self.docker, self.id.as_str()).await;
                     let removed = match self
                         .docker
                         .remove_container(self.id.as_str(), Some(options))
@@ -1081,6 +1189,12 @@ impl Sandbox for DockerSandbox {
         Some(&self.pty)
     }
 
+    fn one_shot(&self) -> Option<&dyn OneShot> {
+        self.one_shot
+            .as_ref()
+            .map(|one_shot| one_shot as &dyn OneShot)
+    }
+
     fn shell_command(&self) -> Option<&dyn ShellCommand> {
         Some(&self.shell_command)
     }
@@ -1088,7 +1202,27 @@ impl Sandbox for DockerSandbox {
 
 #[cfg(test)]
 mod tests {
+    use bollard::models::MountPoint;
+
     use super::*;
+
+    #[test]
+    fn workspace_mount_preserves_read_only_access() {
+        let inspect = ContainerInspectResponse {
+            mounts: Some(vec![MountPoint {
+                typ: Some(MountPointTypeEnum::BIND),
+                source: Some("/tmp/workspace".to_owned()),
+                destination: Some("/workspace".to_owned()),
+                rw: Some(false),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let mount = workspace_of(&inspect, "/workspace/").expect("workspace");
+        assert_eq!(mount.source.as_deref(), Some("/tmp/workspace"));
+        assert_eq!(mount.typ, Some(MountTypeEnum::BIND));
+        assert_eq!(mount.read_only, Some(true));
+    }
 
     fn image_spec() -> SandboxSpec {
         SandboxSpec::new(SandboxSource::Image {

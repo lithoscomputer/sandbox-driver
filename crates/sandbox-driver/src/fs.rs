@@ -1,8 +1,10 @@
+use std::io;
 use std::path::Path;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::capabilities::Capability;
 use crate::error::{Error, Result};
@@ -17,6 +19,29 @@ pub trait Filesystem: Send + Sync {
     /// Reads a file's bytes. Output is bytes: content is not guaranteed
     /// UTF-8.
     async fn read(&self, path: &str) -> Result<Vec<u8>>;
+
+    /// Copies a file's bytes to `output` and flushes it without closing it.
+    /// Read and output failures are returned to the caller. On failure,
+    /// `output` may already contain part of the file.
+    ///
+    /// The provided default buffers the whole file through [`Self::read`].
+    /// Providers with a streaming filesystem override this method to keep
+    /// memory use bounded independently of file size.
+    async fn read_to(
+        &self,
+        path: &str,
+        output: &mut (dyn AsyncWrite + Unpin + Send),
+    ) -> Result<()> {
+        let content = self.read(path).await?;
+        output
+            .write_all(&content)
+            .await
+            .map_err(|error| Error::io("writing file output", error))?;
+        output
+            .flush()
+            .await
+            .map_err(|error| Error::io("flushing file output", error))
+    }
 
     /// Reads `length` bytes (or to end of file when `None`) starting at
     /// `offset`. Reading at or past the end returns empty bytes.
@@ -40,6 +65,38 @@ pub trait Filesystem: Send + Sync {
 
     /// Writes a file, creating parent directories.
     async fn write(&self, path: &str, content: &[u8]) -> Result<()>;
+
+    /// Writes exactly `length` bytes from `input`, creating parent
+    /// directories. Bytes after `length` remain unread. An input that ends
+    /// early returns an I/O error with [`io::ErrorKind::UnexpectedEof`].
+    /// On failure, the destination may have been created or partly written.
+    ///
+    /// The provided default buffers all `length` bytes, then calls
+    /// [`Self::write`]. Providers with a streaming filesystem override this
+    /// method to keep memory use bounded independently of file size.
+    async fn write_from(
+        &self,
+        path: &str,
+        input: &mut (dyn AsyncRead + Unpin + Send),
+        length: u64,
+    ) -> Result<()> {
+        let mut content = Vec::new();
+        input
+            .take(length)
+            .read_to_end(&mut content)
+            .await
+            .map_err(|error| Error::io("reading file input", error))?;
+        if content.len() as u64 != length {
+            return Err(Error::io(
+                "reading file input",
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "file input ended before its length",
+                ),
+            ));
+        }
+        self.write(path, &content).await
+    }
 
     /// Appends to a file, creating it (and parent directories) when
     /// missing.

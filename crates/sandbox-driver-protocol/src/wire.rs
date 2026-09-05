@@ -2,7 +2,9 @@
 //!
 //! Newline-delimited JSON over any byte stream. Requests carry a `u64`
 //! id; notifications carry none. Out-of-order responses are expected —
-//! the protocol itself never serializes concurrent calls.
+//! the protocol itself never serializes concurrent calls. The only bytes
+//! that cross in JSON are the bounded output samples inside an `exec`
+//! error report.
 
 use std::time::Duration;
 use std::{error, fmt, io};

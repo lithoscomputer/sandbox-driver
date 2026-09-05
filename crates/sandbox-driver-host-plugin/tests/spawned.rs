@@ -11,7 +11,7 @@ use sandbox_driver_protocol::PluginProvider;
 use tokio::process::Command;
 
 fn plugin_command() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_sandbox-driver-host-plugin"))
+    Command::new(env!("CARGO_BIN_EXE_sandbox-driver-host"))
 }
 
 #[tokio::test(flavor = "multi_thread")]
