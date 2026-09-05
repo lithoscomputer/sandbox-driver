@@ -346,7 +346,14 @@ impl SandboxSpec {
             return Err(crate::Error::invalid_spec("region", "must not be empty"));
         }
         self.network.validate()?;
-        if self.timers.auto_stop_after_idle.is_some() && self.timers.auto_pause_after_idle.is_some()
+        if self
+            .timers
+            .auto_stop_after_idle
+            .is_some_and(|value| !value.is_zero())
+            && self
+                .timers
+                .auto_pause_after_idle
+                .is_some_and(|value| !value.is_zero())
         {
             return Err(crate::Error::invalid_spec(
                 "timers",
@@ -380,6 +387,24 @@ impl SandboxSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_idle_timers_can_be_set_together_or_beside_one_enabled_timer() {
+        for stop in [None, Some(Duration::ZERO), Some(Duration::from_secs(60))] {
+            for pause in [None, Some(Duration::ZERO), Some(Duration::from_secs(60))] {
+                let mut spec = SandboxSpec::new(SandboxSource::HostDirectory);
+                spec.timers.auto_stop_after_idle = stop;
+                spec.timers.auto_pause_after_idle = pause;
+                let both_enabled = stop.is_some_and(|value| !value.is_zero())
+                    && pause.is_some_and(|value| !value.is_zero());
+                assert_eq!(
+                    spec.validate().is_err(),
+                    both_enabled,
+                    "stop={stop:?}, pause={pause:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn spec_builder_sets_fields() {

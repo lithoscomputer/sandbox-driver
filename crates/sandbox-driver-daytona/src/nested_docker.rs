@@ -89,6 +89,13 @@ impl NestedDocker {
                 ])
                 .timeout(START_TIMEOUT),
         ] {
+            // Job environment variables must not redirect VM bootstrap
+            // commands to another Docker context or daemon.
+            let spec = spec
+                .env_var("DOCKER_HOST", "unix:///var/run/docker.sock")
+                .env_var("DOCKER_CONTEXT", "")
+                .env_var("DOCKER_TLS_VERIFY", "")
+                .env_var("DOCKER_CERT_PATH", "");
             let result = self.vm_exec.run(&spec).await?;
             if !result.success() {
                 return Err(Error::Provider(ProviderError::new(
