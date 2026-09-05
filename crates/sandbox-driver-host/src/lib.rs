@@ -5,9 +5,10 @@
 //! isolation boundary** — the provider declares `Isolation::None`.
 //!
 //! A workspace is either **designated** (a caller-owned directory named in
-//! `SandboxSpec::working_directory`; `delete` releases the handle and never
-//! touches its contents) or **managed** (a temporary directory this crate
-//! creates and removes on `delete`).
+//! `SandboxSpec::working_directory`; `delete` never touches its contents) or
+//! **managed** (created and removed by this provider). An explicit
+//! `workspace_ownership: Managed` transfers ownership of a named directory;
+//! without it, a named directory remains designated.
 //!
 //! The Host provider advertises normalized Search, Git, and
 //! background-services facets. The host environment must therefore provide
@@ -19,59 +20,96 @@
 //! Async on Tokio; the caller owns the runtime. This crate spawns tasks
 //! only for stream pumping inside a running `exec` call and the stderr
 //! tail reader of a spawned stdio process; both end when their process
-//! ends. `start`/`stop` are no-ops (the host is always running) and
-//! sandbox handles live in an in-process registry — they do not survive a
-//! process restart.
+//! ends. On Linux and macOS, a sentinel pins each process group until stop.
+//! `stop` fences all work before returning; `start` permits a new generation.
+//! [`HostProvider::with_registry`] keeps private records in a caller-owned
+//! directory. After a restart, attach and list read those records. A recovery
+//! fence writes markers and observes process death without signalling saved
+//! ids. Other platforms retain direct process execution and do not offer this
+//! crash fence.
 
 mod exec;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod fence;
 mod fs;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod observation;
+mod registry;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::{env, io, process};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+use std::{env, io};
 
 use async_trait::async_trait;
 use sandbox_driver::{
     Action, Capabilities, Error, EventContext, EventEmitter, EventSubject, Exec, ExecSpec,
     Filesystem, HealthStatus, Isolation, LifecycleTimers, PlatformInfo, Progress, ProgressCode,
-    ProviderHealth, ProviderKind, ResourceKind, Resources, Result, Sandbox, SandboxFilter,
-    SandboxId, SandboxProvider, SandboxSource, SandboxSpec, SandboxState, SandboxStatus,
-    WorkspaceOwnership,
+    ProviderHealth, ProviderKind, Resources, Result, Sandbox, SandboxFilter, SandboxId,
+    SandboxProvider, SandboxSource, SandboxSpec, SandboxState, SandboxStatus, WorkspaceOwnership,
 };
 use tokio::fs as tokio_fs;
+use tokio::sync::Mutex;
 
 pub use crate::exec::HostExec;
 use crate::exec::effective_env;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::fence::ProcessGroups;
 pub use crate::fs::HostFs;
+use crate::registry::Record;
 
-/// The host provider. Create one per process and share it.
+/// A directory-backed provider. Use [`Self::with_registry`] to preserve
+/// sandbox identity across provider or plugin restarts.
 pub struct HostProvider {
     kind:         ProviderKind,
     capabilities: Capabilities,
+    root:         PathBuf,
     registry:     Mutex<HashMap<SandboxId, Arc<HostSandbox>>>,
-    counter:      AtomicU64,
 }
 
 impl HostProvider {
     pub fn new() -> Self {
+        Self::at(
+            env::temp_dir()
+                .join("sandbox-driver-host")
+                .join(registry::fresh_id()),
+        )
+    }
+
+    /// Opens a caller-owned registry. Only one provider process may use this
+    /// directory at a time. The caller retains it for recovery and prune.
+    pub async fn with_registry(root: impl AsRef<Path>) -> Result<Self> {
+        registry::private_directory(root.as_ref()).await?;
+        let root = tokio_fs::canonicalize(root.as_ref())
+            .await
+            .map_err(|e| Error::io("resolving host registry", e))?;
+        Ok(Self::at(root))
+    }
+
+    fn at(root: PathBuf) -> Self {
         Self {
-            kind:         ProviderKind::try_new("host").expect("static kind is valid"),
+            kind: ProviderKind::try_new("host").expect("static kind is valid"),
             capabilities: host_capabilities(),
-            registry:     Mutex::new(HashMap::new()),
-            counter:      AtomicU64::new(0),
+            root,
+            registry: Mutex::new(HashMap::new()),
         }
     }
 
-    fn next_id(&self) -> SandboxId {
-        let count = self.counter.fetch_add(1, Ordering::Relaxed);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.subsec_nanos());
-        let id = format!("host-{}-{count}-{nanos:x}", process::id());
-        SandboxId::try_new(id).expect("generated id is valid")
+    async fn load(&self, id: &SandboxId) -> Result<Arc<HostSandbox>> {
+        let mut registry = self.registry.lock().await;
+        if let Some(sandbox) = registry.get(id) {
+            return Ok(sandbox.clone());
+        }
+        let record = registry::read(&self.root, id).await?;
+        let sandbox = Arc::new(HostSandbox::new(
+            record,
+            self.root.clone(),
+            self.capabilities.clone(),
+            EventEmitter::new(self.kind.clone(), None),
+        )?);
+        registry.insert(id.clone(), sandbox.clone());
+        Ok(sandbox)
     }
 }
 
@@ -199,7 +237,8 @@ impl SandboxProvider for HostProvider {
         }
 
         let emitter = EventEmitter::new(self.kind.clone(), events);
-        let id = self.next_id();
+        let id = SandboxId::try_new(format!("host-{}", registry::fresh_id()))
+            .expect("generated id is valid");
         let subject = EventSubject::Sandbox {
             id:   Some(id.clone()),
             name: spec.name.clone(),
@@ -212,6 +251,14 @@ impl SandboxProvider for HostProvider {
                     .await;
                 let (workspace, ownership) = if let Some(path) = &spec.working_directory {
                     let path = PathBuf::from(path.as_str());
+                    let ownership = spec
+                        .workspace_ownership
+                        .unwrap_or(WorkspaceOwnership::Designated);
+                    if ownership == WorkspaceOwnership::Managed {
+                        tokio_fs::create_dir_all(&path)
+                            .await
+                            .map_err(|e| Error::io("creating managed host workspace", e))?;
+                    }
                     let metadata = tokio_fs::metadata(&path).await.map_err(|error| {
                         Error::io(
                             format!("designated directory {} is not usable", path.display()),
@@ -230,11 +277,13 @@ impl SandboxProvider for HostProvider {
                             error,
                         )
                     })?;
-                    (path, WorkspaceOwnership::Designated)
+                    (path, ownership)
                 } else {
-                    let path = env::temp_dir()
-                        .join("sandbox-driver-host")
-                        .join(id.as_str());
+                    registry::private_directory(&self.root).await?;
+                    let root = tokio_fs::canonicalize(&self.root)
+                        .await
+                        .map_err(|e| Error::io("resolving host registry", e))?;
+                    let path = registry::resource_dir(&root, &id)?.join("workspace");
                     tokio_fs::create_dir_all(&path).await.map_err(|error| {
                         Error::io(
                             format!("creating managed workspace {}", path.display()),
@@ -249,20 +298,29 @@ impl SandboxProvider for HostProvider {
                     })?;
                     (path, WorkspaceOwnership::Managed)
                 };
-                let sandbox = Arc::new(HostSandbox::new(
-                    id.clone(),
-                    spec.name.clone(),
-                    self.capabilities.clone(),
+                registry::private_directory(&self.root).await?;
+                let root = tokio_fs::canonicalize(&self.root)
+                    .await
+                    .map_err(|e| Error::io("resolving host registry", e))?;
+                let record = Record {
+                    version: 1,
+                    id: id.clone(),
+                    name: spec.name.clone(),
                     workspace,
                     ownership,
-                    spec.env.clone(),
-                    spec.labels.clone(),
+                    env: spec.env.clone(),
+                    labels: spec.labels.clone(),
+                    state: SandboxState::Running,
+                    created_at: SystemTime::now(),
+                };
+                registry::write(&root, &record).await?;
+                let sandbox = Arc::new(HostSandbox::new(
+                    record,
+                    root,
+                    self.capabilities.clone(),
                     handle_emitter,
-                ));
-                self.registry
-                    .lock()
-                    .expect("registry lock")
-                    .insert(id, Arc::clone(&sandbox));
+                )?);
+                self.registry.lock().await.insert(id, sandbox.clone());
                 Ok(sandbox as Arc<dyn Sandbox>)
             })
             .await
@@ -285,16 +343,11 @@ impl SandboxProvider for HostProvider {
                 EventSubject::sandbox(Some(id.clone())),
                 Action::Attach,
                 |_| async move {
-                    let registry = self.registry.lock().expect("registry lock");
-                    registry
-                        .get(id)
-                        .map(|sandbox| {
-                            Arc::new(sandbox.with_emitter(handle_emitter)) as Arc<dyn Sandbox>
-                        })
-                        .ok_or_else(|| Error::NotFound {
-                            resource: ResourceKind::Sandbox,
-                            id:       id.as_str().to_owned(),
-                        })
+                    let sandbox = self.load(id).await?;
+                    if *sandbox.state.lock().await == SandboxState::Deleted {
+                        return Err(registry::missing(id));
+                    }
+                    Ok(Arc::new(sandbox.with_emitter(handle_emitter)) as Arc<dyn Sandbox>)
                 },
             )
             .await
@@ -306,15 +359,10 @@ impl SandboxProvider for HostProvider {
         err
     )]
     async fn delete(&self, id: &SandboxId, events: Option<EventContext>) -> Result<()> {
-        let sandbox = self
-            .registry
-            .lock()
-            .expect("registry lock")
-            .get(id)
-            .cloned();
-        // An id the registry does not know is already gone.
-        let Some(sandbox) = sandbox else {
-            return Ok(());
+        let sandbox = match self.load(id).await {
+            Ok(sandbox) => sandbox,
+            Err(Error::NotFound { .. }) => return Ok(()),
+            Err(error) => return Err(error),
         };
         let handle = sandbox.with_emitter(EventEmitter::new(self.kind.clone(), events));
         handle.delete().await
@@ -326,21 +374,41 @@ impl SandboxProvider for HostProvider {
         err
     )]
     async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>> {
-        let sandboxes: Vec<Arc<HostSandbox>> = self
-            .registry
-            .lock()
-            .expect("registry lock")
-            .values()
-            .cloned()
-            .collect();
+        let mut entries = match tokio_fs::read_dir(&self.root).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(Error::io("listing host registry", e)),
+        };
         let mut statuses = Vec::new();
-        for sandbox in sandboxes {
-            let status = sandbox.status();
-            let matches = filter
-                .labels
-                .iter()
-                .all(|(key, value)| status.labels.get(key) == Some(value));
-            if matches {
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| Error::io("reading host registry entry", e))?
+        {
+            if !entry
+                .file_type()
+                .await
+                .map_err(|e| Error::io("reading registry entry type", e))?
+                .is_dir()
+            {
+                continue;
+            }
+            let Ok(id) = SandboxId::try_new(entry.file_name().to_string_lossy().into_owned())
+            else {
+                continue;
+            };
+            let sandbox = match self.load(&id).await {
+                Ok(sandbox) => sandbox,
+                Err(Error::NotFound { .. }) => continue,
+                Err(error) => return Err(error),
+            };
+            let status = sandbox.status().await;
+            if status.state != SandboxState::Deleted
+                && filter
+                    .labels
+                    .iter()
+                    .all(|(key, value)| status.labels.get(key) == Some(value))
+            {
                 statuses.push(status);
             }
         }
@@ -350,6 +418,9 @@ impl SandboxProvider for HostProvider {
 
 /// A directory-backed sandbox on the local machine.
 pub struct HostSandbox {
+    root:              PathBuf,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    groups:            Arc<ProcessGroups>,
     id:                SandboxId,
     name:              Option<String>,
     capabilities:      Capabilities,
@@ -368,39 +439,63 @@ pub struct HostSandbox {
 
 impl HostSandbox {
     fn new(
-        id: SandboxId,
-        name: Option<String>,
+        record: Record,
+        root: PathBuf,
         capabilities: Capabilities,
-        workspace: PathBuf,
-        ownership: WorkspaceOwnership,
-        env: BTreeMap<String, String>,
-        labels: BTreeMap<String, String>,
         events: EventEmitter,
-    ) -> Self {
-        let working_directory = workspace.to_string_lossy().into_owned();
-        Self {
-            id,
-            name,
+    ) -> Result<Self> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let groups = Arc::new(ProcessGroups::new(
+            registry::resource_dir(&root, &record.id)?.join("groups"),
+            record.state == SandboxState::Running,
+        ));
+        let exec = HostExec::new(
+            record.workspace.clone(),
+            record.env.clone(),
+            record.ownership == WorkspaceOwnership::Managed,
+        );
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let exec = exec.with_groups(groups.clone());
+        Ok(Self {
+            root,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            groups,
+            id: record.id,
+            name: record.name,
             capabilities,
-            exec: Arc::new(HostExec::new(
-                workspace.clone(),
-                env.clone(),
-                matches!(ownership, WorkspaceOwnership::Managed),
-            )),
-            fs: HostFs::new(workspace.clone()),
-            workspace,
-            ownership,
-            labels,
-            state: Arc::new(Mutex::new(SandboxState::Running)),
-            env,
+            working_directory: record.workspace.to_string_lossy().into_owned(),
+            fs: HostFs::new(record.workspace.clone()),
+            workspace: record.workspace,
+            ownership: record.ownership,
+            labels: record.labels,
+            state: Arc::new(Mutex::new(record.state)),
+            env: record.env,
+            exec: Arc::new(exec),
             events,
-            working_directory,
-            created_at: SystemTime::now(),
-        }
+            created_at: record.created_at,
+        })
+    }
+
+    async fn persist(&self, state: SandboxState) -> Result<()> {
+        registry::write(&self.root, &Record {
+            version: 1,
+            id: self.id.clone(),
+            name: self.name.clone(),
+            workspace: self.workspace.clone(),
+            ownership: self.ownership,
+            env: self.env.clone(),
+            labels: self.labels.clone(),
+            state,
+            created_at: self.created_at,
+        })
+        .await
     }
 
     fn with_emitter(&self, events: EventEmitter) -> Self {
         Self {
+            root: self.root.clone(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            groups: self.groups.clone(),
             id: self.id.clone(),
             name: self.name.clone(),
             capabilities: self.capabilities.clone(),
@@ -422,8 +517,8 @@ impl HostSandbox {
         &self.workspace
     }
 
-    fn status(&self) -> SandboxStatus {
-        let state = *self.state.lock().expect("state lock");
+    async fn status(&self) -> SandboxStatus {
+        let state = *self.state.lock().await;
         let mut status = SandboxStatus::new(self.id.clone(), state);
         status.name.clone_from(&self.name);
         status.provider_state = format!("{state:?}").to_lowercase();
@@ -446,7 +541,7 @@ impl Sandbox for HostSandbox {
 
     #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.id), err)]
     async fn describe(&self) -> Result<SandboxStatus> {
-        Ok(self.status())
+        Ok(self.status().await)
     }
 
     fn working_directory(&self) -> &str {
@@ -476,26 +571,46 @@ impl Sandbox for HostSandbox {
         ))
     }
 
-    /// No-op: the host is always running.
+    /// Permit work after a successful stop, preserving the workspace.
     #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.id), err)]
     async fn start(&self) -> Result<()> {
         self.events
             .run(
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Start,
-                |_| async { Ok(()) },
+                |_| async {
+                    let mut state = self.state.lock().await;
+                    if *state == SandboxState::Deleted {
+                        return Err(registry::missing(&self.id));
+                    }
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    self.groups.start().await;
+                    self.persist(SandboxState::Running).await?;
+                    *state = SandboxState::Running;
+                    Ok(())
+                },
             )
             .await
     }
 
-    /// No-op: stopping the caller's own machine is not this crate's job.
+    /// End this sandbox's work while retaining its workspace.
     #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.id), err)]
     async fn stop(&self) -> Result<()> {
         self.events
             .run(
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Stop,
-                |_| async { Ok(()) },
+                |_| async {
+                    let mut state = self.state.lock().await;
+                    if *state == SandboxState::Deleted {
+                        return Ok(());
+                    }
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    self.groups.stop().await?;
+                    self.persist(SandboxState::Stopped).await?;
+                    *state = SandboxState::Stopped;
+                    Ok(())
+                },
             )
             .await
     }
@@ -507,9 +622,12 @@ impl Sandbox for HostSandbox {
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Delete,
                 |_| async {
-                    if *self.state.lock().expect("state lock") == SandboxState::Deleted {
+                    let mut state = self.state.lock().await;
+                    if *state == SandboxState::Deleted {
                         return Ok(());
                     }
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    self.groups.stop().await?;
                     if self.ownership == WorkspaceOwnership::Managed {
                         match tokio_fs::remove_dir_all(&self.workspace).await {
                             Ok(()) => {}
@@ -525,7 +643,8 @@ impl Sandbox for HostSandbox {
                             }
                         }
                     }
-                    *self.state.lock().expect("state lock") = SandboxState::Deleted;
+                    self.persist(SandboxState::Deleted).await?;
+                    *state = SandboxState::Deleted;
                     Ok(())
                 },
             )

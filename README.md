@@ -49,6 +49,13 @@ cargo build --locked -p sandbox-driver-cli
 target/debug/lithos-sandbox --help
 ```
 
+Host plugins can recover across restarts on Linux and macOS. Set
+`SANDBOX_DRIVER_HOST_REGISTRY` to a caller-owned directory, or use
+`HostProvider::with_registry` in Rust. Stop fences sandbox process groups;
+recovery never signals saved process ids. Named workspaces remain designated
+unless `workspace_ownership: Managed` explicitly transfers their creation and
+deletion to the provider. Managed workspaces are deleted only after work stops.
+
 Run a command in a temporary Host sandbox:
 
 ```sh

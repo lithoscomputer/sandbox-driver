@@ -6,6 +6,7 @@
 //! the name plugin discovery looks for under the `sandbox-driver` prefix.
 //! Stdout belongs to the protocol; logs go to stderr.
 
+use std::env;
 use std::io::stderr;
 use std::sync::Arc;
 
@@ -28,7 +29,13 @@ async fn main() -> anyhow::Result<()> {
         .context("configuring host plugin diagnostics")?;
 
     tracing::info!(provider_kind = "host", "host plugin starting");
-    serve_stdio(Arc::new(HostProvider::new()))
+    let provider = match env::var_os("SANDBOX_DRIVER_HOST_REGISTRY") {
+        Some(root) => HostProvider::with_registry(root)
+            .await
+            .context("opening the host registry")?,
+        None => HostProvider::new(),
+    };
+    serve_stdio(Arc::new(provider))
         .await
         .context("serving the host provider plugin")
 }

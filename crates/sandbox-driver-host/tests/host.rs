@@ -766,3 +766,41 @@ async fn attach_and_list_use_the_registry() {
 
     sandbox.delete().await.expect("delete");
 }
+
+#[tokio::test]
+async fn explicitly_managed_named_workspace_is_owned_across_registry_restarts() {
+    let root = env::temp_dir().join(format!("host-managed-{}", process::id()));
+    let workspace = root.join("named-workspace");
+    let provider = HostProvider::with_registry(root.join("registry"))
+        .await
+        .expect("registry");
+    let mut spec = host_spec().working_directory(workspace.to_string_lossy());
+    spec.workspace_ownership = Some(WorkspaceOwnership::Managed);
+    let sandbox = provider
+        .create(&spec, None)
+        .await
+        .expect("managed create makes the directory");
+    let id = sandbox.id().clone();
+    sandbox.fs().write("keep", b"hello").await.expect("write");
+    sandbox.stop().await.expect("stop");
+    drop(sandbox);
+    drop(provider);
+    let provider = HostProvider::with_registry(root.join("registry"))
+        .await
+        .expect("reopen registry");
+    let sandbox = provider
+        .attach(&id, None)
+        .await
+        .expect("attach stopped record");
+    let bytes = sandbox.fs().read("keep").await.expect("retained bytes");
+    sandbox.start().await.expect("restart");
+    sandbox
+        .delete()
+        .await
+        .expect("provider deletes its explicitly owned directory");
+    assert_eq!(bytes, b"hello");
+    assert!(!workspace.exists());
+    tokio_fs::remove_dir_all(root)
+        .await
+        .expect("registry cleanup");
+}

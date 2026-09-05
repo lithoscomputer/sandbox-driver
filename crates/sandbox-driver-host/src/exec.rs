@@ -4,8 +4,10 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::process::Stdio;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{env, fs, future, io};
+use std::{env, future, io};
 
 use async_trait::async_trait;
 #[cfg(unix)]
@@ -16,9 +18,16 @@ use sandbox_driver::{
     StdioProcess, StdioProcessHandle, Termination, feed_stdin, stop_signal,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::{Child, Command};
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+use tokio::process::Child as HostChild;
+use tokio::process::Command;
 use tokio::sync::watch;
-use tokio::time;
+use tokio::{fs, time};
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::fence::{HostChild, ProcessGroups};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::registry;
 
 /// Bash sources this file at startup. Dropped from the inherited
 /// environment so a worker's startup file never runs inside a sandboxed
@@ -96,8 +105,11 @@ pub(crate) fn effective_env(base_env: &BTreeMap<String, String>) -> BTreeMap<Str
 /// cleared and rebuilt through a fail-closed secret filter, so ambient
 /// worker credentials never reach sandboxed commands. Processes run in
 /// their own process group so cancellation and timeouts kill the whole
-/// tree.
+/// tree. On Linux and macOS, a sandbox-owned sentinel keeps the group id
+/// pinned until stop, including after the workload exits.
 pub struct HostExec {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    groups:                     Arc<ProcessGroups>,
     working_dir:                PathBuf,
     base_env:                   BTreeMap<String, String>,
     /// Managed workspaces live under the OS temp directory, which the
@@ -114,6 +126,13 @@ impl HostExec {
         recreate_missing_workspace: bool,
     ) -> Self {
         Self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            groups: Arc::new(ProcessGroups::new(
+                env::temp_dir()
+                    .join("sandbox-driver-host-groups")
+                    .join(registry::fresh_id()),
+                true,
+            )),
             working_dir,
             base_env,
             recreate_missing_workspace,
@@ -134,32 +153,59 @@ impl HostExec {
         }
     }
 
-    fn command(
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn with_groups(mut self, groups: Arc<ProcessGroups>) -> Self {
+        self.groups = groups;
+        self
+    }
+
+    async fn spawn_command(
         &self,
         program: &str,
         args: &[String],
         working_dir: Option<&str>,
         env: &BTreeMap<String, String>,
-    ) -> Result<Command> {
-        if self.recreate_missing_workspace && !self.working_dir.exists() {
+        stdin: Stdio,
+    ) -> Result<HostChild> {
+        if self.recreate_missing_workspace {
             fs::create_dir_all(&self.working_dir)
+                .await
                 .map_err(|error| Error::io("recreating managed workspace", error))?;
         }
-        let mut command = Command::new(program);
-        command.args(args);
-        command.current_dir(self.resolve_dir(working_dir));
-        command.env_clear();
-        command.envs(effective_env(&self.base_env));
-        command.envs(env);
-        #[cfg(unix)]
-        command.process_group(0);
-        command.kill_on_drop(true);
-        Ok(command)
+        let configure = |command: &mut Command| {
+            command.current_dir(self.resolve_dir(working_dir));
+            command.env_clear();
+            command.envs(effective_env(&self.base_env));
+            command.envs(env);
+            command
+                .stdin(stdin)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+        };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            self.groups.spawn(program, args, configure).await
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let mut command = Command::new(program);
+            command.args(args);
+            configure(&mut command);
+            #[cfg(unix)]
+            command.process_group(0);
+            command.kill_on_drop(true);
+            command
+                .spawn()
+                .map_err(|error| Error::io("spawning host command", error))
+        }
     }
 }
 
 #[cfg(unix)]
-fn signal_process_group(child: &Child, signal: Signal) {
+fn signal_process_group(child: &HostChild, signal: Signal) {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    child.signal(signal);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     if let Some(pid) = child.id() {
         use nix::sys::signal::killpg;
         use nix::unistd::Pid;
@@ -181,7 +227,7 @@ fn signal_process_group(child: &Child, signal: Signal) {
 /// an empty group is ESRCH), and the callers' subsequent `wait()` would
 /// hang forever. SIGKILL to the immediate child always lands, and
 /// `kill()` reaps it, so a completed terminate means a returned wait.
-async fn terminate_process_group(child: &mut Child, grace: Duration) {
+async fn terminate_process_group(child: &mut HostChild, grace: Duration) {
     #[cfg(unix)]
     {
         signal_process_group(child, Signal::SIGTERM);
@@ -197,7 +243,7 @@ async fn terminate_process_group(child: &mut Child, grace: Duration) {
 /// SIGTERMs the process group, once, and returns: the
 /// [`ExecControls::term`] path. Whether the command ends is the
 /// command's business; the caller escalates to `kill` if it must.
-fn term_process_group(child: &Child) {
+fn term_process_group(child: &HostChild) {
     #[cfg(unix)]
     signal_process_group(child, Signal::SIGTERM);
     #[cfg(not(unix))]
@@ -206,7 +252,7 @@ fn term_process_group(child: &Child) {
 
 /// SIGKILLs the process group and the child directly: the
 /// [`ExecControls::kill`] path, the timeout, and a failing sink.
-async fn kill_process_group(child: &mut Child) {
+async fn kill_process_group(child: &mut HostChild) {
     #[cfg(unix)]
     signal_process_group(child, Signal::SIGKILL);
     let _ = child.kill().await;
@@ -284,23 +330,19 @@ impl Exec for HostExec {
     ) -> Result<ExecStreamingResult> {
         let started = Instant::now();
         let stdin_reader = controls.stdin_reader(spec);
-        let mut command = self.command(
-            &spec.program,
-            &spec.args,
-            spec.working_dir.as_deref(),
-            &spec.env,
-        )?;
-        command.stdin(if stdin_reader.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        });
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-
-        let mut child = command
-            .spawn()
-            .map_err(|error| Error::io("spawning exec process", error))?;
+        let mut child = self
+            .spawn_command(
+                &spec.program,
+                &spec.args,
+                spec.working_dir.as_deref(),
+                &spec.env,
+                if stdin_reader.is_some() {
+                    Stdio::piped()
+                } else {
+                    Stdio::null()
+                },
+            )
+            .await?;
 
         // Write-then-EOF, concurrently with output pumping so a large
         // write cannot deadlock against a full output pipe.
@@ -470,19 +512,15 @@ impl Exec for HostExec {
 
     #[tracing::instrument(skip_all, fields(provider_kind = "host"), err)]
     async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
-        let mut command = self.command(
-            &spec.program,
-            &spec.args,
-            spec.working_dir.as_deref(),
-            &spec.env,
-        )?;
-        command.stdin(Stdio::piped());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-
-        let mut child = command
-            .spawn()
-            .map_err(|error| Error::io("spawning stdio process", error))?;
+        let mut child = self
+            .spawn_command(
+                &spec.program,
+                &spec.args,
+                spec.working_dir.as_deref(),
+                &spec.env,
+                Stdio::piped(),
+            )
+            .await?;
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
@@ -528,7 +566,7 @@ struct HostStdioHandle {
 }
 
 impl HostStdioHandle {
-    fn supervise(mut child: Child) -> Self {
+    fn supervise(mut child: HostChild) -> Self {
         let (terminate_tx, mut terminate_rx) = watch::channel(false);
         let (outcome_tx, outcome_rx) = watch::channel(None);
         tokio::spawn(async move {

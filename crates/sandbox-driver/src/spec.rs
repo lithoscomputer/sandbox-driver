@@ -174,45 +174,49 @@ impl PlatformInfo {
 #[non_exhaustive]
 pub struct SandboxSpec {
     #[serde(default)]
-    pub name:              Option<String>,
-    pub source:            SandboxSource,
+    pub name:                Option<String>,
+    pub source:              SandboxSource,
     #[serde(default)]
-    pub resources:         Resources,
+    pub resources:           Resources,
     /// Required provisioning kind for the resulting sandbox. Providers
     /// must honor it or reject the request; they must not silently change
     /// the kind or create hidden intermediate snapshots.
     #[serde(default)]
-    pub sandbox_kind:      Option<SandboxKind>,
+    pub sandbox_kind:        Option<SandboxKind>,
     #[serde(default)]
-    pub env:               BTreeMap<String, String>,
+    pub env:                 BTreeMap<String, String>,
     #[serde(default)]
-    pub labels:            BTreeMap<String, String>,
+    pub labels:              BTreeMap<String, String>,
     #[serde(default)]
-    pub user:              Option<String>,
+    pub user:                Option<String>,
     /// The workspace directory commands use by default. Providers create
     /// it when needed and preserve it when a sandbox is attached again.
     /// For the Host provider, `Some(path)` designates a caller-owned
     /// directory that `delete` must never remove; `None` asks for a
     /// managed temporary workspace.
     #[serde(default)]
-    pub working_directory: Option<String>,
+    pub working_directory:   Option<String>,
+    /// Host only. A named directory is designated by default. Setting
+    /// `Managed` explicitly transfers its creation and deletion to Host.
     #[serde(default)]
-    pub network:           NetworkPolicy,
+    pub workspace_ownership: Option<crate::WorkspaceOwnership>,
     #[serde(default)]
-    pub volumes:           Vec<VolumeMount>,
+    pub network:             NetworkPolicy,
     #[serde(default)]
-    pub timers:            LifecycleTimers,
+    pub volumes:             Vec<VolumeMount>,
+    #[serde(default)]
+    pub timers:              LifecycleTimers,
     /// First-class ephemeral flag; providers translate to their encoding
     /// (Daytona: `auto_delete_interval == 0`).
     #[serde(default)]
-    pub ephemeral:         bool,
+    pub ephemeral:           bool,
     #[serde(default)]
-    pub public:            Option<bool>,
+    pub public:              Option<bool>,
     #[serde(default)]
-    pub region:            Option<String>,
+    pub region:              Option<String>,
     /// Provider-specific options, documented by each provider's schema.
     #[serde(default)]
-    pub provider_config:   serde_json::Value,
+    pub provider_config:     serde_json::Value,
 }
 
 // The env map is the designated secret channel and provider_config can
@@ -229,6 +233,7 @@ impl fmt::Debug for SandboxSpec {
             .field("labels", &self.labels)
             .field("user", &self.user)
             .field("working_directory", &self.working_directory)
+            .field("workspace_ownership", &self.workspace_ownership)
             .field("network", &self.network)
             .field("volumes", &self.volumes)
             .field("timers", &self.timers)
@@ -251,6 +256,7 @@ impl SandboxSpec {
             labels: BTreeMap::new(),
             user: None,
             working_directory: None,
+            workspace_ownership: None,
             network: NetworkPolicy::default(),
             volumes: Vec::new(),
             timers: LifecycleTimers::default(),
@@ -336,6 +342,22 @@ impl SandboxSpec {
     /// Checks the cross-provider invariants. Providers call this at
     /// `create` before their own provider-specific validation.
     pub fn validate(&self) -> Result<(), crate::Error> {
+        if self.workspace_ownership.is_some()
+            && !matches!(self.source, SandboxSource::HostDirectory)
+        {
+            return Err(crate::Error::invalid_spec(
+                "workspace_ownership",
+                "only a host directory has explicit workspace ownership",
+            ));
+        }
+        if self.workspace_ownership == Some(crate::WorkspaceOwnership::Designated)
+            && self.working_directory.is_none()
+        {
+            return Err(crate::Error::invalid_spec(
+                "working_directory",
+                "a designated workspace needs a directory",
+            ));
+        }
         if self.sandbox_kind == Some(SandboxKind::Unknown) {
             return Err(crate::Error::invalid_spec(
                 "sandbox_kind",

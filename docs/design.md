@@ -92,7 +92,7 @@ The full vocabulary. **Core** actions are required of every provider. Everything
 | `set_labels` | Replace label map | opt | — | ✔ | ✔ | ✔ (tags) |
 | `update_network` | Change network policy on a live sandbox | opt | — | — | ✔ | ✔ |
 
-¹ Host implements `start`/`stop` as no-ops (nothing to boot); they are still in the core so callers never branch on provider kind.
+¹ On Linux and macOS, Host `stop` ends sandbox process groups and `start` permits a new generation. They do not stop or boot the machine.
 
 ² The current Daytona API returns a route-level 404 for resize, and the
 current official SDK leaves resize disabled. Daytona reports
@@ -194,6 +194,14 @@ Capabilities are **negotiated metadata, not live state**. They are captured once
 ### Wire compatibility
 
 The protocol crate owns wire compatibility; domain types never absorb a wire break. The `initialize` handshake negotiates a protocol version, a data transport, and a capability set. Control messages are JSON on the plugin's stdio; every byte stream — exec output and stdin, stdio and PTY traffic, logs, file contents — rides a per-operation Unix-socket data channel the plugin opens back to the host, so no base64 crosses the control connection and a slow consumer of one stream stalls only that stream (see `docs/protocol.md` §2.1). Readers ignore unknown optional object fields and return a structured protocol error for unknown required semantics. Enums define stable string values and an unknown-value policy. Durations, timestamps, paths, and byte payloads use explicit wire formats. Provider configuration carries a provider kind and schema version and is validated at the provider boundary. In v1 the wire DTOs may share their serde shape with core domain types, verified by behavioral compatibility tests in the protocol crate (era-JSON decoding, per-field encoding checks, `#[serde(default)]` field tolerance) and by `#[serde(other)]` unknown-variant fallbacks on state enums; when a shape needs to diverge, the protocol crate grows a dedicated DTO and conversion — core types are never broken for wire reasons.
+
+## Durable Host recovery
+
+`HostProvider::with_registry(directory)` stores private records in a caller-owned directory. The Host plugin reads that directory from `SANDBOX_DRIVER_HOST_REGISTRY`. One provider process owns the directory at a time. Records preserve resource identity, labels, environment, workspace ownership, and lifecycle state. Attach and list work after a plugin restart. Delete retains a tombstone and removes only managed workspaces.
+
+On Linux and macOS, each exec runs under a sentinel in its own process group. The provider holds the unreaped sentinel until stop, so live signals cannot reach a recycled id. The sentinel publishes its group record before checking its generation's fence marker and starting the workload. An in-group watcher observes that marker and kills its own group even after the plugin dies. Recovery writes markers first and then observes process death through procfs or libproc. It never signals a saved id. A group that does not drain within five seconds reports provider code `fence_leaked`; stop and delete remain retryable after the operator ends it. Stream output and stdin use the same provider exec implementation.
+
+Tests cross a real plugin process boundary: crash during exec, reopen the registry, fence surviving writes, preserve binary workspace files, isolate new exit status, reject work in a prefenced generation, and leave an unrelated saved process-group id alive. This fence covers the recorded process groups; Host remains an environment with no isolation boundary.
 
 ## The traits
 
@@ -373,6 +381,7 @@ pub struct SandboxSpec {
     pub labels: BTreeMap<String, String>,
     pub user: Option<String>,
     pub working_directory: Option<String>,
+    pub workspace_ownership: Option<WorkspaceOwnership>, // Host only
     pub network: NetworkPolicy,           // AllowAll | Block | CidrAllowList | DomainAllowList | proxy
     pub volumes: Vec<VolumeMount>,
     pub timers: LifecycleTimers,
@@ -397,7 +406,7 @@ The VM owns all nested resources. Stop fences the whole VM; delete removes it. R
 
 Local tests cover the transport and bridge. The ignored live gate additionally requires `DAYTONA_API_KEY` and `SANDBOX_DRIVER_DAYTONA_DIND_SNAPSHOT`, a VM snapshot with at least 2 CPUs and 4 GiB of memory. The hosted preview's behavior still needs that live run before production use.
 
-`working_directory` is the final workspace directory chosen before creation. A provider creates it when needed, uses it as the default for relative file and process operations, and returns the same value from handles created by `attach`. The Host provider treats an explicit path as caller-owned and does not delete it.
+`working_directory` is the final workspace directory chosen before creation. A provider creates it when needed, uses it as the default for relative file and process operations, and returns the same value from handles created by `attach`. The Host provider treats an explicit path as designated and does not delete it by default. Setting `workspace_ownership: Managed` explicitly transfers creation and deletion of that named directory to Host. Other sources reject explicit workspace ownership.
 
 When `runtime_directory()` returns a path, the provider creates that directory outside the workspace with owner-only permissions (`0700`) before returning from `create`. The path remains stable across `attach`. Host returns `None`; Docker and Daytona return `/tmp/sandbox-driver/runtime` inside the sandbox.
 
