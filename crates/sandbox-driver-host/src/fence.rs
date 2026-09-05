@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
-use std::{fs as sync_fs, io};
+use std::{fs as sync_fs, io, slice};
 
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, killpg};
@@ -85,6 +85,46 @@ impl PinnedGroup {
         let mut child = self.child.lock().unwrap_or_else(PoisonError::into_inner);
         // No other handle can signal after this removes its proof of ownership.
         child.take()
+    }
+}
+
+/// A fork can publish a child after a group signal, and process-table
+/// snapshots can briefly miss that child. Require two empty observations
+/// while retaining the sentinels that pin these ids. Poll groups together
+/// so stopping many completed commands pays one settling interval.
+async fn kill_owned_groups(groups: &[Arc<PinnedGroup>]) -> io::Result<()> {
+    let mut was_empty = false;
+    loop {
+        let signals: Vec<_> = groups
+            .iter()
+            .filter(|group| {
+                group
+                    .child
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_some()
+            })
+            .map(|group| (group.pgid, group.signal(Signal::SIGKILL)))
+            .collect();
+        let live = spawn_blocking(move || {
+            let mut live = false;
+            for (pgid, signalled) in signals {
+                if group_is_live(pgid) {
+                    // macOS can reject signals to zombie-only groups.
+                    // A failed signal matters only if a live member remains.
+                    signalled?;
+                    live = true;
+                }
+            }
+            Ok::<_, io::Error>(live)
+        })
+        .await
+        .map_err(io::Error::other)??;
+        if !live && was_empty {
+            return Ok(());
+        }
+        was_empty = !live;
+        time::sleep(POLL).await;
     }
 }
 
@@ -207,23 +247,11 @@ impl ProcessGroups {
         if let Some(generation) = &mut state.generation {
             // Kill every owned group before waiting for any. Persisted ids are
             // never used here: each handle still owns its unreaped sentinel.
-            for group in &generation.groups {
-                pgids.push(group.pgid);
-                if let Err(error) = group.signal(Signal::SIGKILL) {
-                    // Some platforms reject a signal to an already-dead
-                    // group. Only a live group still needs a successful kill.
-                    let pgid = group.pgid;
-                    let live =
-                        spawn_blocking(move || group_is_live(pgid))
-                            .await
-                            .map_err(|error| {
-                                Error::io("observing process group", io::Error::other(error))
-                            })?;
-                    if live {
-                        return Err(Error::io("killing host process group", error));
-                    }
-                }
-            }
+            pgids.extend(generation.groups.iter().map(|group| group.pgid));
+            time::timeout_at(deadline, kill_owned_groups(&generation.groups))
+                .await
+                .map_err(|_| fence_leaked(&pgids))?
+                .map_err(|error| Error::io("killing host process group", error))?;
             for group in &generation.groups {
                 let Some(mut child) = group.take_for_reap() else {
                     continue;
@@ -392,8 +420,7 @@ impl HostChild {
     }
 
     pub(crate) async fn kill(&mut self) -> io::Result<()> {
-        self.group.signal(Signal::SIGKILL)?;
-        self.wait().await.map(|_| ())
+        kill_owned_groups(slice::from_ref(&self.group)).await
     }
 
     pub(crate) async fn wait(&mut self) -> io::Result<ExitStatus> {

@@ -1212,6 +1212,8 @@ async fn cancellation_during_streamed_input_drops_the_source_and_preserves_other
         running
             .exec()
             .run_streaming(
+                // Readiness can arrive while the shell is still spawning cat.
+                // Cancellation must also kill children created during the stop.
                 &ExecSpec::bash("echo ready; cat >/dev/null"),
                 ExecControls {
                     stdin: Some(StdinSource::new(stdin)),
