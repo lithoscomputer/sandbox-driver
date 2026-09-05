@@ -579,7 +579,10 @@ async fn stop_resize_archive_restore_lifecycle() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fork_and_snapshot_modes_preserve_their_declared_state() {
+    // An explicit VM verification must fail when access is unavailable.
+    let require_vm = env::var("SANDBOX_DRIVER_DAYTONA_REQUIRE_VM").as_deref() == Ok("1");
     if env::var("DAYTONA_API_KEY").is_err() {
+        assert!(!require_vm, "VM verification requires DAYTONA_API_KEY");
         return;
     }
     init_diagnostics();
@@ -595,8 +598,9 @@ async fn fork_and_snapshot_modes_preserve_their_declared_state() {
     let vm_snapshot_id = match snapshots.create(&vm_snapshot_spec, None).await {
         Ok(id) => id,
         Err(error)
-            if error_chain_contains(&error, "No runners are configured")
-                || error_chain_contains(&error, "not available to the organization") =>
+            if !require_vm
+                && (error_chain_contains(&error, "No runners are configured")
+                    || error_chain_contains(&error, "not available to the organization")) =>
         {
             tracing::info!(
                 target: "sandbox_driver_daytona",
