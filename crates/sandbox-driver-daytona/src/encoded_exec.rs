@@ -17,24 +17,32 @@ const MAX_FRAME_BYTES: usize = 512;
 
 const ENCODE_OUTPUT: &str = r#"
 encode() {
-    local LC_ALL=C chunk status count=96
-    local -a options=(-r -d '' -n 96 -t 0.05)
-    # Bash 3 discards partial input on a read timeout. Its byte-at-a-time
-    # fallback preserves both NULs and live output without a timeout.
-    if (( BASH_VERSINFO[0] < 4 )); then
-        count=1
-        options=(-r -d '' -n 1)
-    fi
+    local LC_ALL=C chunk= byte status count=96
+    # Timed reads can consume a NUL just as the timeout fires, then report
+    # a timeout instead of the delimiter. Read bytes without a timer and
+    # use a non-consuming readiness check to flush short, live output.
+    # Bash 3 does not support that readiness check.
+    if (( BASH_VERSINFO[0] < 4 )); then count=1; fi
     while :; do
-        chunk=
-        IFS= read "${options[@]}" chunk
+        byte=
+        IFS= read -r -d '' -n 1 byte
         status=$?
-        if [[ -n $chunk ]]; then printf '%s%q\n' "$1" "$chunk"; fi
-        if (( status == 0 && ${#chunk} < count )); then
-            printf '%s%s\n' "$1" "$'\0'"
+        if (( status != 0 )); then
+            if [[ -n $chunk ]]; then printf '%s%q\n' "$1" "$chunk"; fi
+            if (( status == 1 )); then return 0; fi
+            return "$status"
         fi
-        if (( status == 1 )); then break; fi
-        if (( status != 0 && status <= 128 )); then return "$status"; fi
+        if [[ -z $byte ]]; then
+            if [[ -n $chunk ]]; then printf '%s%q\n' "$1" "$chunk"; fi
+            chunk=
+            printf '%s%s\n' "$1" "$'\0'"
+        else
+            chunk+=$byte
+            if (( ${#chunk} >= count )) || ! read -t 0; then
+                printf '%s%q\n' "$1" "$chunk"
+                chunk=
+            fi
+        fi
     done
 }
 exec 3> >(encode O)
@@ -291,9 +299,50 @@ mod tests {
     use std::time::Duration;
 
     use sandbox_driver::{ExecResult, Termination};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::process::Command as TokioCommand;
     use tokio::task::spawn_blocking;
+    use tokio::time::timeout;
 
     use super::*;
+
+    #[tokio::test]
+    async fn short_binary_output_arrives_before_the_command_needs_input() {
+        let spec = ExecSpec::new("python3").args([
+            "-c",
+            r"import os; os.write(1, b'\0\xff'); assert os.read(0, 1) == b'x'",
+        ]);
+        let encoded = encoded_spec(&spec);
+        let mut child = TokioCommand::new(encoded.program)
+            .args(encoded.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("command wrapper");
+        timeout(Duration::from_secs(5), async {
+            let mut output = BufReader::new(child.stdout.take().expect("output pipe"));
+            let mut decoded = Vec::new();
+            while decoded.len() < 2 {
+                let mut line = Vec::new();
+                assert_ne!(output.read_until(b'\n', &mut line).await.expect("frame"), 0);
+                assert_eq!(line.first(), Some(&b'O'));
+                decoded.extend(decode_quoted(&line[1..line.len() - 1]).expect("quoted bytes"));
+            }
+            assert_eq!(decoded, [0, 255]);
+            child
+                .stdin
+                .take()
+                .expect("input pipe")
+                .write_all(b"x")
+                .await
+                .expect("acknowledge output");
+            assert!(child.wait().await.expect("command completed").success());
+        })
+        .await
+        .expect("short output must arrive while the command is still running");
+    }
 
     #[tokio::test]
     async fn all_bytes_and_literal_arguments_survive_concurrent_streams() {
@@ -302,12 +351,17 @@ mod tests {
             .args([
                 "-c",
                 r"
-import os, sys, threading
+import os, sys, threading, time
 assert os.environ['dash-key'] == sys.argv[1]
 assert os.environ['LC_ALL'] == 'C'
 out = bytes(range(256)) * 8 + b'\0\0x'
 err = bytes(reversed(range(256))) * 8 + b'\n\n'
-threads = [threading.Thread(target=os.write, args=pair) for pair in [(1, out), (2, err)]]
+def write(fd, data):
+    for offset in range(0, len(data), 256):
+        # Exercise idle reads followed by NULs at the old timeout boundary.
+        time.sleep(0.05)
+        os.write(fd, data[offset:offset + 256])
+threads = [threading.Thread(target=write, args=pair) for pair in [(1, out), (2, err)]]
 for thread in threads: thread.start()
 for thread in threads: thread.join()
 sys.exit(7)
