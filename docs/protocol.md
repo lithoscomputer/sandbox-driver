@@ -523,7 +523,7 @@ sandbox working directory.
 | method | params | result |
 | --- | --- | --- |
 | `fs/read` | `{sandbox_id, path, channel, offset?, length?}` | `{}` after the bytes |
-| `fs/write` | `{sandbox_id, path, channel, append?}` | `{}` (creates parents) |
+| `fs/write` | `{sandbox_id, path, channel, append?, content_length?}` | `{}` (creates parents) |
 | `fs/delete` | `{sandbox_id, path, recursive}` | `{}` |
 | `fs/exists` | `{sandbox_id, path}` | `{exists}` |
 | `fs/metadata` | `{sandbox_id, path}` | `{metadata:{kind,size,mode,modified_at}}` |
@@ -537,15 +537,26 @@ bytes as `stdout` frames on its channel, then `eof`, then the response;
 it takes an optional byte `offset` (default `0`) and `length` (default:
 to end of file), and reading at or past the end sends no bytes. A
 missing file is the `not_found` error kind with resource `file`.
-`fs/write` reads the content from the channel's `stdin` frames to the
-host's `eof`, then writes it; `append` (default `false`) appends instead
-of truncating, creating the file when missing. A plugin must create
-missing parent directories, and must not need a shell in the sandbox to
-do it.
+`fs/write` reads content from the channel's `stdin` frames through the
+host's `eof`; it may write each chunk as it arrives. `append` (default
+`false`) appends instead of truncating, creating the file when missing.
+A plugin must create missing parent directories, and must not need a
+shell in the sandbox to do it.
+
+`content_length`, when present, is the exact number of file bytes in the
+write channel, excluding frame headers. It lets a plugin start a
+size-dependent upload, such as a tar entry, before it has received the
+whole file. Too few bytes return an `io` error; too many return
+`invalid_spec` for field `content_length`. The host must still send
+`eof`. When the field is absent, the plugin accepts content through
+`eof` and may buffer it to determine the length. A failed write may
+leave a partial destination file.
 
 Upload/download have no wire methods: the host composes them from local
 I/O plus `fs/read`/`fs/write`. Frames bound every message, so a large
-file crosses in pieces without paging by the host.
+file crosses in pieces without paging by the host. Providers can stream
+file content with bounded memory; providers whose native APIs require
+complete byte arrays may still buffer it.
 
 ### 8.6 Snapshots and volumes
 

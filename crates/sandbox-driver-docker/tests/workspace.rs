@@ -8,9 +8,11 @@
 
 use std::collections::HashMap;
 use std::error::Error as StdError;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
-use std::{env, future, process};
+use std::{env, future, io, process};
 
 use bollard::Docker;
 use bollard::container::{
@@ -24,7 +26,7 @@ use sandbox_driver::{
 };
 use sandbox_driver_docker::{BindMount, DockerProvider, DockerProviderConfig};
 use sandbox_driver_protocol::{PluginProvider, serve};
-use tokio::io::{duplex, split};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, duplex, split};
 use tokio::{fs, time};
 use tokio_util::sync::CancellationToken;
 
@@ -602,4 +604,147 @@ async fn blocked_output_sinks_do_not_block_kill() {
         );
     }
     sandbox.delete().await.expect("delete");
+}
+
+fn pattern_byte(offset: usize) -> u8 {
+    u8::try_from(offset % 251).expect("pattern byte fits")
+}
+
+/// Generates input without a file-sized allocation and records consumption.
+struct PatternInput {
+    position: usize,
+    length:   usize,
+}
+
+impl AsyncRead for PatternInput {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let count = buffer.remaining().min(self.length - self.position);
+        for offset in self.position..self.position + count {
+            buffer.put_slice(&[pattern_byte(offset)]);
+        }
+        self.position += count;
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Validates output as it arrives, retaining only an offset.
+#[derive(Default)]
+struct PatternOutput {
+    position: usize,
+    flushed:  bool,
+    fail:     bool,
+}
+
+impl AsyncWrite for PatternOutput {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.fail {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "output rejected",
+            )));
+        }
+        for (index, byte) in bytes.iter().enumerate() {
+            assert_eq!(*byte, pattern_byte(self.position + index));
+        }
+        self.position += bytes.len();
+        Poll::Ready(Ok(bytes.len()))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.flushed = true;
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        panic!("read_to must not close the caller's output")
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn docker_file_transfers_stream_and_report_input_and_output_failures() {
+    let Ok(provider) = DockerProvider::connect().await else {
+        return;
+    };
+    let sandbox = provider
+        .create(&alpine_spec("streaming-files"), None)
+        .await
+        .expect("sandbox");
+    let file = format!("missing/parents/{}.bin", "name".repeat(40));
+    let length = 4 * 1024 * 1024 + 29;
+    let mut input = PatternInput {
+        position: 0,
+        length:   length + 7,
+    };
+    sandbox
+        .fs()
+        .write_from(&file, &mut input, length as u64)
+        .await
+        .expect("stream upload");
+    assert_eq!(input.position, length, "extra input is left unread");
+    let mut output = PatternOutput::default();
+    sandbox
+        .fs()
+        .read_to(&file, &mut output)
+        .await
+        .expect("stream download");
+    assert_eq!(output.position, length);
+    assert!(output.flushed, "download flushes the caller's output");
+
+    let mut rejected = PatternOutput {
+        fail: true,
+        ..PatternOutput::default()
+    };
+    let error = sandbox
+        .fs()
+        .read_to(&file, &mut rejected)
+        .await
+        .expect_err("sink failure");
+    assert!(
+        matches!(error, Error::Io { source, .. } if source.kind() == io::ErrorKind::PermissionDenied)
+    );
+    let mut short = b"short".as_slice();
+    let error = sandbox
+        .fs()
+        .write_from("short.bin", &mut short, 6)
+        .await
+        .expect_err("short source");
+    assert!(
+        matches!(error, Error::Io { source, .. } if source.kind() == io::ErrorKind::UnexpectedEof)
+    );
+
+    // Local upload/download exercise the same streaming path on stopped
+    // containers and do not require an exec-derived filesystem command.
+    let directory = env::temp_dir().join(marker("sandbox-driver-streaming-files"));
+    fs::create_dir_all(&directory)
+        .await
+        .expect("local directory");
+    let local = directory.join("download.bin");
+    sandbox.stop().await.expect("stop");
+    sandbox
+        .fs()
+        .download(&file, &local)
+        .await
+        .expect("local download");
+    sandbox
+        .fs()
+        .upload(&local, "other/missing/parents/copy.bin")
+        .await
+        .expect("local upload");
+    let mut copied = PatternOutput::default();
+    sandbox
+        .fs()
+        .read_to("other/missing/parents/copy.bin", &mut copied)
+        .await
+        .expect("uploaded copy");
+    assert_eq!(copied.position, length);
+    sandbox.delete().await.expect("delete");
+    fs::remove_dir_all(directory).await.expect("local cleanup");
 }

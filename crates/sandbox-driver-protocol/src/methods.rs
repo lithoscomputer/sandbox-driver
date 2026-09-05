@@ -602,13 +602,17 @@ pub struct FsReadParams {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FsWriteParams {
-    pub sandbox_id: String,
-    pub path:       String,
+    pub sandbox_id:     String,
+    pub path:           String,
     /// The content arrives as `Stdin` frames, ended by the host's `Eof`.
-    pub channel:    ChannelRequest,
+    pub channel:        ChannelRequest,
     /// Append instead of truncating.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub append:     bool,
+    pub append:         bool,
+    /// Exact byte count, allowing providers to stream an overwrite without
+    /// collecting the channel first. Absent on earlier version 2 requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_length: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use sandbox_driver::{DirEntry, Error, FileKind, FileMetadata, Filesystem, ResourceKind, Result};
 use tokio::fs;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, BufReader, copy_buf};
+
+const TRANSFER_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Native filesystem access rooted at the sandbox workspace.
 ///
@@ -72,6 +75,25 @@ impl Filesystem for HostFs {
         fs::read(&full).await.map_err(read_error(path, &full))
     }
 
+    #[tracing::instrument(skip_all, fields(provider_kind = "host"), err)]
+    async fn read_to(
+        &self,
+        path: &str,
+        output: &mut (dyn AsyncWrite + Unpin + Send),
+    ) -> Result<()> {
+        let full = self.resolve(path);
+        let mut file = fs::File::open(&full)
+            .await
+            .map_err(read_error(path, &full))?;
+        copy_buf(
+            &mut BufReader::with_capacity(TRANSFER_BUFFER_BYTES, &mut file),
+            output,
+        )
+        .await
+        .map(|_| ())
+        .map_err(io_error(format!("copying {} to output", full.display())))
+    }
+
     #[tracing::instrument(skip_all, fields(provider_kind = "host", offset), err)]
     async fn read_range(&self, path: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -110,6 +132,35 @@ impl Filesystem for HostFs {
         fs::write(&full, content)
             .await
             .map_err(io_error(format!("writing {}", full.display())))
+    }
+
+    #[tracing::instrument(skip_all, fields(provider_kind = "host", byte_count = length), err)]
+    async fn write_from(
+        &self,
+        path: &str,
+        input: &mut (dyn AsyncRead + Unpin + Send),
+        length: u64,
+    ) -> Result<()> {
+        let full = self.resolve(path);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(io_error(format!("creating parent of {}", full.display())))?;
+        }
+        let outcome = async {
+            let mut file = fs::File::create(&full).await?;
+            let mut input = BufReader::with_capacity(TRANSFER_BUFFER_BYTES, input.take(length));
+            let copied = copy_buf(&mut input, &mut file).await?;
+            if copied != length {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "file input ended before its length",
+                ));
+            }
+            Ok(())
+        }
+        .await;
+        outcome.map_err(io_error(format!("writing {}", full.display())))
     }
 
     #[tracing::instrument(
