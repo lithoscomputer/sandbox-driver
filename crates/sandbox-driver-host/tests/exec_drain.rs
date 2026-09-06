@@ -8,9 +8,55 @@ use sandbox_driver::{
     Error, ExecControls, ExecSpec, SandboxProvider, SandboxSource, SandboxSpec, Termination,
 };
 use sandbox_driver_host::HostProvider;
-use tokio::sync::Notify;
+use tokio::sync::{Barrier, Notify};
+use tokio::task::JoinSet;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_sandboxes_do_not_keep_each_others_output_open() {
+    let provider = HostProvider::new();
+    let mut sandboxes = Vec::new();
+    for _ in 0..8 {
+        sandboxes.push(
+            provider
+                .create(&SandboxSpec::new(SandboxSource::HostDirectory), None)
+                .await
+                .expect("sandbox"),
+        );
+    }
+    let barrier = Arc::new(Barrier::new(sandboxes.len()));
+    let mut jobs = JoinSet::new();
+    for sandbox in &sandboxes {
+        let sandbox = Arc::clone(sandbox);
+        let barrier = Arc::clone(&barrier);
+        jobs.spawn(async move {
+            barrier.wait().await;
+            for _ in 0..16 {
+                let result = sandbox
+                    .exec()
+                    .run(&ExecSpec::bash("printf stdout; printf stderr >&2"))
+                    .await?;
+                assert!(result.success());
+                assert_eq!(result.stdout, b"stdout");
+                assert_eq!(result.stderr, b"stderr");
+            }
+            Ok::<(), Error>(())
+        });
+    }
+    let mut outcomes = Vec::new();
+    while let Some(outcome) = jobs.join_next().await {
+        outcomes.push(outcome);
+    }
+    // Keep the sentinels alive until every command has drained its own
+    // pipes. Teardown must not hide a pipe inherited by another sandbox.
+    for sandbox in sandboxes {
+        sandbox.delete().await.expect("delete sandbox");
+    }
+    for outcome in outcomes {
+        outcome.expect("command task").expect("complete output");
+    }
+}
 
 #[tokio::test]
 async fn kill_interrupts_a_blocked_output_drain() {

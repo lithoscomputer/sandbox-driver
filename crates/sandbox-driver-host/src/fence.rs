@@ -26,6 +26,12 @@ const POLL: Duration = Duration::from_millis(25);
 const DRAIN: Duration = Duration::from_secs(5);
 const FENCED: &str = "fenced";
 
+// macOS creates pipes and sets close-on-exec in separate system calls.
+// Serialize pipe creation and spawn across sandboxes so a sentinel cannot
+// inherit another command's pipe during that gap and prevent its EOF.
+#[cfg(target_os = "macos")]
+static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
 use crate::registry::fresh_id;
 
 fn sentinel_shell() -> &'static str {
@@ -210,9 +216,12 @@ impl ProcessGroups {
         configure(&mut command);
         command.process_group(0);
         command.kill_on_drop(false);
-        let mut child = command
-            .spawn()
-            .map_err(|e| Error::io("spawning host sentinel", e))?;
+        let mut child = {
+            #[cfg(target_os = "macos")]
+            let _spawn = SPAWN_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+            command.spawn()
+        }
+        .map_err(|e| Error::io("spawning host sentinel", e))?;
         let pgid = child
             .id()
             .and_then(|id| i32::try_from(id).ok())
