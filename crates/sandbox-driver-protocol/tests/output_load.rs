@@ -4,6 +4,7 @@
 //! sink, with no `truncated` flag.
 
 use std::hint::black_box;
+use std::num::NonZero;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -15,7 +16,8 @@ use sandbox_driver::{
 use sandbox_driver_host::HostProvider;
 use sandbox_driver_protocol::{PluginProvider, serve};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex, split};
-use tokio::task::JoinSet;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::task::{JoinSet, yield_now};
 use tokio::time;
 
 const LINES: usize = 20_000;
@@ -30,7 +32,7 @@ struct Load {
 impl Load {
     fn start() -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let count = thread::available_parallelism().map_or(4, |n| n.get()) * 2;
+        let count = thread::available_parallelism().map_or(4, NonZero::get) * 2;
         let threads = (0..count)
             .map(|_| {
                 let stop = Arc::clone(&stop);
@@ -72,10 +74,12 @@ async fn connect() -> PluginProvider {
 }
 
 fn expected() -> Vec<u8> {
-    (1..=LINES)
-        .map(|n| format!("{n}\n"))
-        .collect::<String>()
-        .into_bytes()
+    let mut lines = String::new();
+    for n in 1..=LINES {
+        lines.push_str(&n.to_string());
+        lines.push('\n');
+    }
+    lines.into_bytes()
 }
 
 /// Runs `seq 1 20000` with a sink shaped like Petri's: each chunk is written
@@ -100,11 +104,11 @@ async fn stream_lines(sandbox: &Arc<dyn sandbox_driver::Sandbox>) -> (Vec<u8>, b
             if reads % 8 == 0 {
                 time::sleep(Duration::from_millis(1)).await;
             } else {
-                tokio::task::yield_now().await;
+                yield_now().await;
             }
         }
     });
-    let writer = Arc::new(tokio::sync::Mutex::new(Some(writer)));
+    let writer = Arc::new(AsyncMutex::new(Some(writer)));
     let sink_writer = Arc::clone(&writer);
     let controls = ExecControls {
         sink: Some(Arc::new(move |stream, chunk| {
@@ -173,7 +177,7 @@ async fn twenty_thousand_lines_arrive_in_order_under_load() {
     for round in 0..3 {
         let (bytes, truncated) = stream_lines(&sandbox).await;
         assert!(!truncated, "round {round}: the plugin reported truncation");
-        let lines = bytes.iter().filter(|byte| **byte == b'\n').count();
+        let lines = bytes.split(|byte| *byte == b'\n').count().saturating_sub(1);
         assert_eq!(
             lines, LINES,
             "round {round}: {lines} of {LINES} lines arrived"

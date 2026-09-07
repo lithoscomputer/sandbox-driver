@@ -29,6 +29,10 @@ fn specs() -> SpecFactory {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::print_stderr,
+    reason = "the per-check report is the test's evidence"
+)]
 async fn docker_provider_passes_conformance() {
     let Ok(provider) = DockerProvider::connect().await else {
         // No Docker daemon on this machine; nothing to verify.
@@ -42,6 +46,10 @@ async fn docker_provider_passes_conformance() {
 /// The same battery through the wire: what a host that links no provider
 /// crate — Petri — actually exercises.
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::print_stderr,
+    reason = "the per-check report is the test's evidence"
+)]
 async fn docker_provider_passes_conformance_over_the_wire() {
     let Ok(provider) = DockerProvider::connect().await else {
         return;

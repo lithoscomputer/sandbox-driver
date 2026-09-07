@@ -722,6 +722,8 @@ impl StdioProcessHandle for HostStdioHandle {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
+    use std::sync::Mutex;
+
     use sandbox_driver::{SandboxProvider, SandboxSource, SandboxSpec};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::task::spawn_blocking;
@@ -744,10 +746,12 @@ mod tests {
     }
 
     fn expected_seq(count: usize) -> Vec<u8> {
-        (1..=count)
-            .map(|n| format!("{n}\n"))
-            .collect::<String>()
-            .into_bytes()
+        let mut lines = String::new();
+        for n in 1..=count {
+            lines.push_str(&n.to_string());
+            lines.push('\n');
+        }
+        lines.into_bytes()
     }
 
     /// The consumer is slower than the whole drain grace, but it keeps
@@ -756,7 +760,7 @@ mod tests {
     async fn a_slow_consumer_receives_every_byte_after_the_process_exits() {
         let exec = HostExec::new(env::temp_dir(), BTreeMap::new(), false)
             .with_drain_grace(Duration::from_millis(150));
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
         let sink_seen = Arc::clone(&seen);
         let controls = ExecControls {
             sink: Some(Arc::new(move |stream, chunk| {

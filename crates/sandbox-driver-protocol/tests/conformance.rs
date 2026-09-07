@@ -11,6 +11,10 @@ use sandbox_driver_protocol::{PluginProvider, serve};
 use tokio::io::{duplex, split};
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::print_stderr,
+    reason = "the per-check report is the test's evidence"
+)]
 async fn host_provider_passes_conformance_over_the_wire() {
     let (host_side, plugin_side) = duplex(1024 * 1024);
     let (host_read, host_write) = split(host_side);
