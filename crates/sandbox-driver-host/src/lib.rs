@@ -34,6 +34,7 @@
 //! Temporary providers end owned process groups when their last owner drops.
 //! Caller-owned registries retain groups for explicit stop or recovery.
 
+mod access;
 mod exec;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod fence;
@@ -51,13 +52,15 @@ use std::{env, io};
 use async_trait::async_trait;
 use sandbox_driver::{
     Action, Capabilities, Error, EventContext, EventEmitter, EventSubject, Exec, ExecSpec,
-    Filesystem, HealthStatus, Isolation, LifecycleTimers, PlatformInfo, Progress, ProgressCode,
-    ProviderHealth, ProviderKind, Resources, Result, Sandbox, SandboxFilter, SandboxId,
-    SandboxProvider, SandboxSource, SandboxSpec, SandboxState, SandboxStatus, WorkspaceOwnership,
+    Filesystem, HealthStatus, Isolation, LifecycleTimers, PlatformInfo, PreviewUrls, Progress,
+    ProgressCode, ProviderHealth, ProviderKind, Resources, Result, Sandbox, SandboxFilter,
+    SandboxId, SandboxProvider, SandboxSource, SandboxSpec, SandboxState, SandboxStatus,
+    WorkspaceOwnership,
 };
 use tokio::fs as tokio_fs;
 use tokio::sync::Mutex;
 
+use crate::access::HostPreview;
 pub use crate::exec::HostExec;
 use crate::exec::effective_env;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -151,6 +154,8 @@ fn host_capabilities() -> Capabilities {
     caps.search.supported = true;
     caps.git.supported = true;
     caps.services.supported = true;
+    // A port inside a host sandbox is a port on this machine.
+    caps.access.preview_urls = true;
     caps
 }
 
@@ -666,6 +671,10 @@ impl Sandbox for HostSandbox {
 
     fn fs(&self) -> &dyn Filesystem {
         &self.fs
+    }
+
+    fn preview_urls(&self) -> Option<&dyn PreviewUrls> {
+        Some(&HostPreview)
     }
 }
 

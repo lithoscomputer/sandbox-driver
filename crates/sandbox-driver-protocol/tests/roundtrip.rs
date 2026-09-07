@@ -555,6 +555,75 @@ async fn streaming_exec_delivers_output_notifications_and_stops() {
 }
 
 #[tokio::test]
+async fn preview_urls_reach_the_host_sandbox_and_release_is_idempotent() {
+    let provider = connect().await;
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+    assert!(sandbox.capabilities().access.preview_urls);
+    let preview = sandbox.preview_urls().expect("declared facet");
+    let url = preview.preview_url(8080).await.expect("preview url");
+    assert_eq!(url.url, "http://127.0.0.1:8080");
+    assert!(url.headers.is_empty());
+    preview.release_preview_url(8080).await.expect("release");
+    preview
+        .release_preview_url(8080)
+        .await
+        .expect("a second release succeeds");
+    preview
+        .release_preview_url(9)
+        .await
+        .expect("releasing a port never requested succeeds");
+    sandbox.delete().await.expect("delete");
+    provider.shutdown().await.expect("shutdown");
+}
+
+/// Output crosses the wire as bytes: a last line without its newline
+/// arrives without one, and nothing is added or reframed on the way.
+#[tokio::test]
+async fn exec_output_is_byte_exact_without_a_trailing_newline() {
+    let provider = connect().await;
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+    let chunks: SeenChunks = Arc::new(Mutex::new(Vec::new()));
+    let sink_chunks = Arc::clone(&chunks);
+    let controls = ExecControls {
+        sink: Some(Arc::new(move |stream, chunk| {
+            let chunks = Arc::clone(&sink_chunks);
+            Box::pin(async move {
+                chunks.lock().expect("chunks lock").push((stream, chunk));
+                Ok(())
+            })
+        })),
+        retained_output_limit: Some(64),
+        ..ExecControls::buffered()
+    };
+    let spec = ExecSpec::new("printf")
+        .args(["a\\nb"])
+        .timeout(Duration::from_secs(10));
+    let streaming = sandbox
+        .exec()
+        .run_streaming(&spec, controls)
+        .await
+        .expect("stream");
+    assert!(streaming.result.success());
+    let stdout: Vec<u8> = chunks
+        .lock()
+        .expect("chunks lock")
+        .iter()
+        .filter(|(stream, _)| *stream == OutputStream::Stdout)
+        .flat_map(|(_, chunk)| chunk.clone())
+        .collect();
+    assert_eq!(stdout, b"a\nb");
+    assert_eq!(streaming.result.stdout, b"a\nb");
+    let buffered = sandbox
+        .exec()
+        .run(&ExecSpec::new("printf").args(["a\\nb"]))
+        .await
+        .expect("buffered run");
+    assert_eq!(buffered.stdout, b"a\nb");
+    sandbox.delete().await.expect("delete");
+    provider.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn slow_calls_do_not_block_fast_calls() {
     let provider = connect().await;
     let sandbox = provider.create(&host_spec(), None).await.expect("create");

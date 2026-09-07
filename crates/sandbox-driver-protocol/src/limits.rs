@@ -120,6 +120,7 @@ pub(crate) fn reserved(method: &str) -> bool {
             | m::SHUTDOWN
             | m::SANDBOX_STOP
             | m::SANDBOX_DELETE
+            | m::ACCESS_PREVIEW_RELEASE
             | m::TRANSPORT_DIAGNOSTICS
             | m::PROVIDER_HEALTH
     )

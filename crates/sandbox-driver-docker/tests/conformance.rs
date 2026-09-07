@@ -35,6 +35,7 @@ async fn docker_provider_passes_conformance() {
         return;
     };
     let report = Conformance::new(Arc::new(provider), specs()).run().await;
+    eprintln!("{report}");
     report.assert_pass();
 }
 
@@ -57,5 +58,6 @@ async fn docker_provider_passes_conformance_over_the_wire() {
     assert!(remote.capabilities().exec.stdin_stream);
     assert!(remote.capabilities().exec.environment);
     let report = Conformance::new(Arc::new(remote), specs()).run().await;
+    eprintln!("{report}");
     report.assert_pass();
 }

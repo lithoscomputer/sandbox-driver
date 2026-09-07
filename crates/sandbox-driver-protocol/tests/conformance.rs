@@ -26,5 +26,6 @@ async fn host_provider_passes_conformance_over_the_wire() {
 
     let specs = SpecFactory::new(|| SandboxSpec::new(SandboxSource::HostDirectory));
     let report = Conformance::new(Arc::new(provider), specs).run().await;
+    eprintln!("{report}");
     report.assert_pass();
 }

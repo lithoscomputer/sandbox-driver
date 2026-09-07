@@ -1690,6 +1690,17 @@ async fn dispatch(
                 .await?;
             to_value(&m::PreviewUrlResult { preview })
         }
+        m::ACCESS_PREVIEW_RELEASE => {
+            let request: m::PreviewUrlParams = parse(params)?;
+            let handle = state.sandbox(&request.sandbox_id).await?;
+            let facet = handle
+                .preview_urls()
+                .ok_or(DispatchError::App(Error::unsupported(
+                    Capability::PreviewUrls,
+                )))?;
+            facet.release_preview_url(request.port).await?;
+            to_value(&m::Empty)
+        }
         m::ACCESS_SSH_CREATE => {
             let request: m::SshCreateParams = parse(params)?;
             let handle = state.sandbox(&request.sandbox_id).await?;
