@@ -238,6 +238,9 @@ impl Conformance {
             ("exec_streaming_is_honest", |ctx| {
                 Box::pin(exec_streaming_is_honest(ctx))
             }),
+            ("exec_streams_large_output_in_order", |ctx| {
+                Box::pin(exec_streams_large_output_in_order(ctx))
+            }),
             ("exec_retention_accounting_is_consistent", |ctx| {
                 Box::pin(exec_retention_accounting_is_consistent(ctx))
             }),
@@ -1290,6 +1293,71 @@ async fn exec_streaming_is_honest(ctx: &Conformance) -> CheckOutcome {
             if !String::from_utf8_lossy(&stderr).contains("to-stderr") {
                 return fail("streams_separated is set but stderr never arrived on stderr");
             }
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+/// Every line of a large output reaches a slow sink, in order, with no
+/// truncation: the drain after the command exits is bounded by silence,
+/// not by a clock the consumer can miss.
+async fn exec_streams_large_output_in_order(ctx: &Conformance) -> CheckOutcome {
+    const LINES: usize = 20_000;
+    if !ctx.caps().exec.live_streaming {
+        return Ok(Some(
+            "capability exec.live_streaming not declared".to_owned(),
+        ));
+    }
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let seen: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let controls = ExecControls {
+            sink: Some(Arc::new(move |stream, chunk| {
+                let seen = Arc::clone(&sink_seen);
+                Box::pin(async move {
+                    // A consumer that is busy between chunks, like a host
+                    // writing a log under load.
+                    time::sleep(Duration::from_millis(5)).await;
+                    if stream == OutputStream::Stdout {
+                        seen.lock().expect("seen lock").extend_from_slice(&chunk);
+                    }
+                    Ok(())
+                })
+            })),
+            retained_output_limit: Some(0),
+            ..ExecControls::buffered()
+        };
+        let spec = ExecSpec::bash(&format!("seq 1 {LINES}")).timeout(Duration::from_secs(300));
+        let streaming = sandbox
+            .exec()
+            .run_streaming(&spec, controls)
+            .await
+            .map_err(|error| format!("exec failed: {error}"))?;
+        if !streaming.result.success() {
+            return fail(format!(
+                "command failed: {}",
+                streaming.result.stderr_lossy()
+            ));
+        }
+        if streaming.stdout_capture.truncated {
+            return fail("stdout was reported truncated");
+        }
+        let expected: Vec<u8> = (1..=LINES)
+            .map(|n| format!("{n}\n"))
+            .collect::<String>()
+            .into_bytes();
+        let seen = seen.lock().expect("seen lock").clone();
+        if seen != expected {
+            let lines = seen.iter().filter(|byte| **byte == b'\n').count();
+            return fail(format!(
+                "{lines} of {LINES} lines arrived ({} of {} bytes), or out of order",
+                seen.len(),
+                expected.len()
+            ));
         }
         PASS
     }
