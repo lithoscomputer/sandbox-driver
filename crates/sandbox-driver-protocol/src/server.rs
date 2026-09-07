@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::future::Future;
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -585,19 +585,30 @@ fn pty(state: &ServerState, id: &str) -> Result<Arc<dyn sandbox_driver::PtySessi
 
 type SharedWriter = Arc<AsyncMutex<FrameWriter<OwnedWriteHalf>>>;
 
+/// Bytes an exec's sink has written to its data channel, per stream.
+#[derive(Default)]
+struct Delivered {
+    stdout: AtomicU64,
+    stderr: AtomicU64,
+}
+
 /// A sink that writes every chunk as one frame of its stream, awaiting
 /// the connection: a slow host consumer backpressures exactly this
-/// operation.
-fn frame_sink(writer: &SharedWriter) -> OutputSink {
+/// operation. `delivered` counts the bytes the channel accepted.
+fn frame_sink(writer: &SharedWriter, delivered: &Arc<Delivered>) -> OutputSink {
     let writer = Arc::clone(writer);
+    let delivered = Arc::clone(delivered);
     Arc::new(move |stream, chunk| {
         let writer = Arc::clone(&writer);
+        let delivered = Arc::clone(&delivered);
         Box::pin(async move {
-            let kind = match stream {
-                OutputStream::Stdout => FrameKind::Stdout,
-                OutputStream::Stderr => FrameKind::Stderr,
+            let (kind, counter) = match stream {
+                OutputStream::Stdout => (FrameKind::Stdout, &delivered.stdout),
+                OutputStream::Stderr => (FrameKind::Stderr, &delivered.stderr),
             };
-            writer.lock().await.write(kind, &chunk).await
+            writer.lock().await.write(kind, &chunk).await?;
+            counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            Ok(())
         })
     })
 }
@@ -846,11 +857,12 @@ where
     } else {
         (None, None)
     };
+    let delivered = Arc::new(Delivered::default());
     let controls = ExecControls {
         term:                  Some(registration.term.clone()),
         kill:                  Some(registration.kill.clone()),
         stdin:                 stdin_source,
-        sink:                  Some(frame_sink(&writer)),
+        sink:                  Some(frame_sink(&writer, &delivered)),
         // The host captures the frames. Retaining another copy here
         // would grow memory with output the response never contains.
         retained_output_limit: Some(0),
@@ -860,6 +872,16 @@ where
         task.abort();
     }
     finish_channel(&writer).await?;
+    tracing::debug!(
+        exec_id = registration.id,
+        stdout_bytes = delivered.stdout.load(Ordering::Relaxed),
+        stderr_bytes = delivered.stderr.load(Ordering::Relaxed),
+        truncated = outcome
+            .as_ref()
+            .is_ok_and(|streaming| streaming.stdout_capture.truncated
+                || streaming.stderr_capture.truncated),
+        "exec output delivered to its data channel before the response"
+    );
     if let Some(error) = input_error.lock().expect("input error lock").take() {
         return Err(error);
     }
