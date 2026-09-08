@@ -128,7 +128,7 @@ for measurements and the tested configuration.
 | `pending_opens` | 1,024 | Host channel expectations and plugin connection attempts before authentication |
 | `unauthenticated_handshakes` | 64 | Accepted host sockets before authentication |
 | `provider_requests` | 2,048 | Ordinary requests before dispatch through reply delivery |
-| `reserved_requests` | 64 | Stop, terminate, close, cancel, shutdown, delete, health, and diagnostics calls |
+| `reserved_requests` | 64 | Stop, terminate, close, cancel, preview release, shutdown, delete, health, and diagnostics calls |
 | `control_message_bytes` | 1 MiB | Serialized JSON line including newline, before allocation beyond the cap |
 | `queued_control_bytes` | 8 MiB | Ordinary serialized control delivery, including the writer's current message |
 | `reserved_control_bytes` | 1 MiB | Reserved control delivery, including the current message |
@@ -695,10 +695,32 @@ Dockerfile sources for containers only.
 | --- | --- | --- |
 | `access/preview_url` | `{sandbox_id, port}` | `{preview:{url,headers,expires_at}}` |
 | `access/signed_preview_url` | `{sandbox_id, port, expires_in_ms}` | `{preview}` |
+| `access/preview_release` | `{sandbox_id, port}` | `{}` |
 | `access/ssh_create` | `{sandbox_id, ttl_ms}` | `{access:{command,token,expires_at}}` |
 | `access/ssh_revoke` | `{sandbox_id, token}` | `{}` |
 | `access/web_terminal` | `{sandbox_id}` | `{url}` |
 | `access/vnc` | `{sandbox_id}` | `{connection:{url,password}}` |
+
+`access/preview_url` is how a host reaches a port a process inside the
+sandbox listens on. The URL is one the *host's* machine can open: the
+Host provider returns `http://127.0.0.1:<port>` (the sandbox is that
+machine); the Docker provider opens a **port forward** — a listener on
+the plugin's own loopback interface, each connection bridged into the
+container by a process that connects to the port from inside — and
+returns `http://127.0.0.1:<local port>`; Daytona returns its HTTPS
+preview link with the headers it requires. A forward's listener accepts
+before the container port does: a connection made before anything
+listens inside closes with no data, so a host waiting for a server to
+come up retries the request rather than the connect. Repeating
+`access/preview_url` for the same port returns the same forward.
+
+`access/preview_release` ends the host's use of the port's preview URL:
+a provider holding a forward for it closes the forward; one whose URLs
+hold nothing answers `{}`. Releasing a port never requested, or twice,
+succeeds. `sandbox/stop` and `sandbox/delete` release every port of the
+sandbox. The method is additive within version 2: a host treats
+`-32601` from an older plugin as released. It uses reserved request
+capacity, like the other close and cancel calls.
 
 `access/ssh_create` returns a ready-to-run command. When `ttl_ms` is
 absent, a provider may return stable access or use its default temporary

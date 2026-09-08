@@ -139,7 +139,7 @@ Per-sandbox functionality is grouped into small **facet traits** (per the style 
 | `Pty` | create/resize/kill + bidirectional byte stream (fabro's `TerminalSession`) | ✔ | ✔ (exec+tty) | ✔ (websocket) | ✔ (console) |
 | `Logs` | Provider-side logs: build/provision logs, entrypoint output, sandbox event log; streaming follow | — | ✔ (container logs) | ✔ | ? |
 | `OneShot` | Ephemeral containers in the sandbox's world: same workspace, same network namespace, own image (registry or built from the workspace); stream, term/kill, timeout; ended by the sandbox's `stop`/`delete` | — | ✔ (workspace volume, `container:` network) | ✔ (with nested Docker configured) | — |
-| `PreviewUrls` | port → `{ url, headers }`; signed expiring URLs; revocation | \~ (localhost) | future (port map) | ✔ | ✔ (HTTPS proxies) |
+| `PreviewUrls` | port → `{ url, headers }`; release; signed expiring URLs | ✔ (`http://127.0.0.1:<port>`) | ✔ (a loopback port forward bridged into the container; released explicitly or with the sandbox) | ✔ | ✔ (HTTPS proxies) |
 | `SshAccess` | Return a ready-to-run SSH command; optional exact TTL and token revocation are separate capabilities | — | — | ✔ | ✔ |
 | `ShellCommand` | A local command string that opens a shell (Docker's `docker exec -it …`) — distinct from real SSH | trivial | ✔ | — | — |
 | `WebTerminal` | URL to a browser terminal | — | — | ✔ | ✔ |

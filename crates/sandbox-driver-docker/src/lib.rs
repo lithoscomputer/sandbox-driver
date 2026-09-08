@@ -49,6 +49,7 @@
 mod access;
 mod config;
 mod exec;
+mod forward;
 mod fs;
 mod one_shot;
 mod pty;
@@ -74,10 +75,10 @@ use futures_util::StreamExt;
 use sandbox_driver::{
     Action, BASH_ENV_VAR, Capabilities, Error, EventContext, EventEmitter, EventSubject, Exec,
     ExecSpec, Filesystem, HealthStatus, Isolation, LifecycleTimers, NetworkPolicy, OneShot,
-    OneShotCaps, OperationReporter, PlatformInfo, Progress, ProgressCode, ProviderError,
-    ProviderHealth, ProviderKind, Pty, PtyCaps, ResourceKind, Result, Sandbox, SandboxFilter,
-    SandboxId, SandboxKind, SandboxProvider, SandboxSource, SandboxSpec, SandboxState,
-    SandboxStatus, ShellCommand,
+    OneShotCaps, OperationReporter, PlatformInfo, PreviewUrls, Progress, ProgressCode,
+    ProviderError, ProviderHealth, ProviderKind, Pty, PtyCaps, ResourceKind, Result, Sandbox,
+    SandboxFilter, SandboxId, SandboxKind, SandboxProvider, SandboxSource, SandboxSpec,
+    SandboxState, SandboxStatus, ShellCommand,
 };
 use serde::Deserialize;
 
@@ -88,6 +89,7 @@ use crate::exec::{
     POSIX_SH, docker_error, docker_kind, is_conflict, is_not_found, is_not_modified, shell_quote,
     tolerate_not_modified,
 };
+use crate::forward::DockerForwards;
 use crate::fs::DockerFs;
 use crate::one_shot::DockerOneShot;
 use crate::pty::DockerPty;
@@ -277,6 +279,7 @@ impl DockerProvider {
             working_dir.clone(),
             Arc::clone(&exec) as Arc<dyn Exec>,
         );
+        let forwards = DockerForwards::new(Arc::clone(&exec));
         Arc::new(DockerSandbox {
             id: SandboxId::try_new(container_id).expect("container id is a valid sandbox id"),
             name,
@@ -289,6 +292,7 @@ impl DockerProvider {
             pty,
             shell_command,
             one_shot,
+            forwards,
             network,
             events,
         })
@@ -337,6 +341,9 @@ pub fn docker_capabilities() -> Capabilities {
     pty.resize = true;
     caps.pty = Some(pty);
     caps.access.shell_command = true;
+    // A container port is reached through a forward the plugin opens on
+    // its own machine; see `forward.rs`.
+    caps.access.preview_urls = true;
     let mut one_shot = OneShotCaps::default();
     one_shot.build = true;
     caps.one_shot = Some(one_shot);
@@ -1006,6 +1013,8 @@ pub struct DockerSandbox {
     /// One-shot containers over the sandbox's workspace, when the
     /// container's mounts told where that workspace is.
     one_shot:      Option<DockerOneShot>,
+    /// Port forwards into the container, closed with it.
+    forwards:      DockerForwards,
     /// The sidecar network to sweep on delete, when the sandbox has one.
     network:       Option<String>,
     events:        EventEmitter,
@@ -1177,6 +1186,7 @@ impl Sandbox for DockerSandbox {
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Stop,
                 |_| async {
+                    self.forwards.close_all().await;
                     // Whatever a one-shot was doing in the workspace ends
                     // with the sandbox's own processes.
                     one_shot::sweep(&self.docker, self.id.as_str()).await?;
@@ -1207,6 +1217,7 @@ impl Sandbox for DockerSandbox {
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Delete,
                 |_| async {
+                    self.forwards.close_all().await;
                     one_shot::sweep(&self.docker, self.id.as_str()).await?;
                     if let Some(network) = &self.network {
                         sidecars::sweep(&self.docker, network, Some(self.id.as_str())).await?;
@@ -1277,6 +1288,10 @@ impl Sandbox for DockerSandbox {
 
     fn shell_command(&self) -> Option<&dyn ShellCommand> {
         Some(&self.shell_command)
+    }
+
+    fn preview_urls(&self) -> Option<&dyn PreviewUrls> {
+        Some(&self.forwards)
     }
 }
 

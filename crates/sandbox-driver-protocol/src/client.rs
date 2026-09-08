@@ -612,6 +612,23 @@ impl PreviewUrls for SandboxAccess {
             .await?;
         Ok(result.preview)
     }
+
+    async fn release_preview_url(&self, port: u16) -> Result<()> {
+        let outcome: Result<m::Empty> = self
+            .client
+            .call(m::ACCESS_PREVIEW_RELEASE, &m::PreviewUrlParams {
+                sandbox_id: self.sandbox_id.as_str().to_owned(),
+                port,
+            })
+            .await;
+        match outcome {
+            Ok(_) => Ok(()),
+            // A plugin predating the method holds nothing for a preview
+            // URL, so there is nothing to release.
+            Err(Error::Provider(provider)) if provider.code.as_deref() == Some("-32601") => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 #[async_trait]

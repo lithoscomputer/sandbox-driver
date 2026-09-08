@@ -19,6 +19,18 @@ pub trait PreviewUrls: Send + Sync {
         let _ = (port, expires_in);
         Err(Error::unsupported(Capability::SignedPreviewUrls))
     }
+
+    /// Ends the caller's use of `preview_url(port)`.
+    ///
+    /// A provider that holds resources for the port on the caller's behalf
+    /// (the Docker provider's local port forward) closes them; one whose
+    /// URLs hold nothing returns `Ok`. Releasing a port that was never
+    /// requested, or twice, succeeds. Every port is released when the
+    /// sandbox stops or is deleted.
+    async fn release_preview_url(&self, port: u16) -> Result<()> {
+        let _ = port;
+        Ok(())
+    }
 }
 
 /// A URL plus the headers needed to use it.

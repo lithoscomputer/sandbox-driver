@@ -6,6 +6,7 @@ use std::pin::pin;
 use std::process::Stdio;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::{env, future, io};
 
@@ -34,8 +35,11 @@ use crate::registry;
 /// `bash -c`; [`sandbox_driver::ExecSpec::bash`] blanks it per command.
 const BASH_ENV_VAR: &str = "BASH_ENV";
 
-/// Bound on draining remaining output after the process has ended, so a
-/// backgrounded grandchild holding the pipes cannot stall the call.
+/// How long the output pipes may stay silent after the process has ended
+/// before the drain gives up, so a backgrounded grandchild holding the
+/// pipes without writing cannot stall the call. Output that keeps arriving
+/// resets the bound: a slow consumer is backpressure, never a reason to
+/// drop what the command wrote.
 const DRAIN_GRACE: Duration = Duration::from_secs(10);
 
 /// Grace between SIGTERM and SIGKILL when a stdio process is terminated
@@ -120,6 +124,8 @@ pub struct HostExec {
     /// forever. Designated directories stay caller-owned and are never
     /// created here.
     recreate_missing_workspace: bool,
+    /// Silence on the output pipes after exit that ends the drain.
+    drain_grace:                Duration,
 }
 
 impl HostExec {
@@ -155,7 +161,14 @@ impl HostExec {
             working_dir,
             base_env,
             recreate_missing_workspace,
+            drain_grace: DRAIN_GRACE,
         }
+    }
+
+    #[cfg(test)]
+    fn with_drain_grace(mut self, grace: Duration) -> Self {
+        self.drain_grace = grace;
+        self
     }
 
     fn resolve_dir(&self, dir: Option<&str>) -> PathBuf {
@@ -279,12 +292,15 @@ enum PumpError {
 }
 
 /// Reads one output stream to EOF, feeding the capture buffer and sink.
+/// `progress` counts the chunks read, so the post-exit drain can tell a
+/// silent pipe from a slow consumer.
 async fn pump_stream(
     mut reader: impl AsyncRead + Unpin,
     stream: OutputStream,
     capture: &mut OutputCaptureBuffer,
     sink: Option<&OutputSink>,
     output_sanitization: OutputSanitization,
+    progress: &AtomicU64,
 ) -> Result<(), PumpError> {
     let mut buffer = [0u8; 8192];
     let mut sanitizer = OutputSanitizer::new(output_sanitization);
@@ -304,6 +320,7 @@ async fn pump_stream(
             }
             Err(error) => return Err(PumpError::Read(error)),
             Ok(read) => {
+                progress.fetch_add(1, Ordering::Relaxed);
                 let chunk = sanitizer.push(&buffer[..read]);
                 capture.push(&chunk);
                 if !chunk.is_empty() {
@@ -377,9 +394,11 @@ impl Exec for HostExec {
         // signals and keeps waiting — the command may exit, or the
         // caller's `kill` may follow — so it records the termination
         // rather than ending the race. Remaining output is drained after
-        // the process ends, bounded by `DRAIN_GRACE`.
+        // the process ends, until the pipes have been silent for
+        // `drain_grace`.
         let mut read_error: Option<io::Error> = None;
         let mut drain_truncated = false;
+        let progress = AtomicU64::new(0);
         let (termination, status) = {
             let mut pumps = pin!(async {
                 tokio::try_join!(
@@ -389,6 +408,7 @@ impl Exec for HostExec {
                         &mut stdout_capture,
                         sink,
                         spec.output_sanitization,
+                        &progress,
                     ),
                     pump_stream(
                         stderr,
@@ -396,6 +416,7 @@ impl Exec for HostExec {
                         &mut stderr_capture,
                         sink,
                         spec.output_sanitization,
+                        &progress,
                     ),
                 )
             });
@@ -462,7 +483,11 @@ impl Exec for HostExec {
                 // The leader can exit while descendants keep its pipes open
                 // or a sink stays blocked. Keep the caller's stop controls and
                 // the original timeout live until those pumps finish too.
-                let mut drain_deadline = pin!(time::sleep(DRAIN_GRACE));
+                // The deadline measures silence: output still arriving, however
+                // slowly the sink takes it, re-arms it, so a loaded consumer
+                // never loses the tail of a command that already exited.
+                let mut seen = progress.load(Ordering::Relaxed);
+                let mut drain_deadline = pin!(time::sleep(self.drain_grace));
                 loop {
                     if matches!(termination, Termination::Killed | Termination::TimedOut) {
                         drain_truncated = true;
@@ -495,6 +520,14 @@ impl Exec for HostExec {
                             break;
                         }
                         () = &mut drain_deadline => {
+                            let now = progress.load(Ordering::Relaxed);
+                            if now != seen {
+                                seen = now;
+                                drain_deadline
+                                    .as_mut()
+                                    .reset(time::Instant::now() + self.drain_grace);
+                                continue;
+                            }
                             drain_truncated = true;
                             break;
                         }
@@ -689,6 +722,8 @@ impl StdioProcessHandle for HostStdioHandle {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
+    use std::sync::Mutex;
+
     use sandbox_driver::{SandboxProvider, SandboxSource, SandboxSpec};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::task::spawn_blocking;
@@ -708,6 +743,65 @@ mod tests {
         })
         .await
         .expect("the final temporary owner releases its sentinel");
+    }
+
+    fn expected_seq(count: usize) -> Vec<u8> {
+        let mut lines = String::new();
+        for n in 1..=count {
+            lines.push_str(&n.to_string());
+            lines.push('\n');
+        }
+        lines.into_bytes()
+    }
+
+    /// The consumer is slower than the whole drain grace, but it keeps
+    /// taking output: every byte the exited command wrote arrives.
+    #[tokio::test]
+    async fn a_slow_consumer_receives_every_byte_after_the_process_exits() {
+        let exec = HostExec::new(env::temp_dir(), BTreeMap::new(), false)
+            .with_drain_grace(Duration::from_millis(150));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let controls = ExecControls {
+            sink: Some(Arc::new(move |stream, chunk| {
+                let seen = Arc::clone(&sink_seen);
+                Box::pin(async move {
+                    time::sleep(Duration::from_millis(60)).await;
+                    if stream == OutputStream::Stdout {
+                        seen.lock().unwrap().extend_from_slice(&chunk);
+                    }
+                    Ok(())
+                })
+            })),
+            retained_output_limit: Some(0),
+            ..ExecControls::buffered()
+        };
+        let spec = ExecSpec::new("seq")
+            .args(["1", "20000"])
+            .timeout(Duration::from_secs(60));
+        let streaming = exec.run_streaming(&spec, controls).await.unwrap();
+        assert!(streaming.result.success());
+        assert!(!streaming.stdout_capture.truncated);
+        assert_eq!(*seen.lock().unwrap(), expected_seq(20000));
+    }
+
+    /// A grandchild that keeps the pipe open without writing ends the
+    /// drain after the grace, reported as truncated output.
+    #[tokio::test]
+    async fn a_silent_grandchild_ends_the_drain_after_the_grace() {
+        let exec = HostExec::new(env::temp_dir(), BTreeMap::new(), false)
+            .with_drain_grace(Duration::from_millis(200));
+        let started = Instant::now();
+        let spec =
+            ExecSpec::bash("echo leader; sleep 30 & exit 0").timeout(Duration::from_secs(60));
+        let streaming = exec
+            .run_streaming(&spec, ExecControls::buffered())
+            .await
+            .unwrap();
+        assert_eq!(streaming.result.stdout, b"leader\n");
+        assert!(streaming.stdout_capture.truncated);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(exec);
     }
 
     #[tokio::test]

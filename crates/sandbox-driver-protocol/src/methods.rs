@@ -87,6 +87,7 @@ pub const VOLUME_LIST: &str = "volume/list";
 pub const VOLUME_DELETE: &str = "volume/delete";
 pub const ACCESS_PREVIEW_URL: &str = "access/preview_url";
 pub const ACCESS_SIGNED_PREVIEW_URL: &str = "access/signed_preview_url";
+pub const ACCESS_PREVIEW_RELEASE: &str = "access/preview_release";
 pub const ACCESS_SSH_CREATE: &str = "access/ssh_create";
 pub const ACCESS_SSH_REVOKE: &str = "access/ssh_revoke";
 pub const ACCESS_WEB_TERMINAL: &str = "access/web_terminal";

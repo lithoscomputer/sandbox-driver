@@ -57,7 +57,7 @@ stdout = """
   "logs": null,
   "one_shot": null,
   "access": {
-    "preview_urls": false,
+    "preview_urls": true,
     "signed_preview_urls": false,
     "ssh": false,
     "ssh_ttl": false,

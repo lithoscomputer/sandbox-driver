@@ -24,7 +24,7 @@ use std::future::Future;
 use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fmt, process};
 
 use async_trait::async_trait;
@@ -37,6 +37,7 @@ use sandbox_driver::{
     VolumeId, VolumeMount, WaitOptions, activate, wait_for_state,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::Notify;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
@@ -237,6 +238,15 @@ impl Conformance {
             }),
             ("exec_streaming_is_honest", |ctx| {
                 Box::pin(exec_streaming_is_honest(ctx))
+            }),
+            ("exec_streams_large_output_in_order", |ctx| {
+                Box::pin(exec_streams_large_output_in_order(ctx))
+            }),
+            ("exec_output_keeps_a_partial_last_line", |ctx| {
+                Box::pin(exec_output_keeps_a_partial_last_line(ctx))
+            }),
+            ("preview_url_reaches_a_listening_port", |ctx| {
+                Box::pin(preview_url_reaches_a_listening_port(ctx))
             }),
             ("exec_retention_accounting_is_consistent", |ctx| {
                 Box::pin(exec_retention_accounting_is_consistent(ctx))
@@ -1290,6 +1300,270 @@ async fn exec_streaming_is_honest(ctx: &Conformance) -> CheckOutcome {
             if !String::from_utf8_lossy(&stderr).contains("to-stderr") {
                 return fail("streams_separated is set but stderr never arrived on stderr");
             }
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+/// Every line of a large output reaches a slow sink, in order, with no
+/// truncation: the drain after the command exits is bounded by silence,
+/// not by a clock the consumer can miss.
+async fn exec_streams_large_output_in_order(ctx: &Conformance) -> CheckOutcome {
+    const LINES: usize = 20_000;
+    if !ctx.caps().exec.live_streaming {
+        return Ok(Some(
+            "capability exec.live_streaming not declared".to_owned(),
+        ));
+    }
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let seen: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let controls = ExecControls {
+            sink: Some(Arc::new(move |stream, chunk| {
+                let seen = Arc::clone(&sink_seen);
+                Box::pin(async move {
+                    // A consumer that is busy between chunks, like a host
+                    // writing a log under load.
+                    time::sleep(Duration::from_millis(5)).await;
+                    if stream == OutputStream::Stdout {
+                        seen.lock().expect("seen lock").extend_from_slice(&chunk);
+                    }
+                    Ok(())
+                })
+            })),
+            retained_output_limit: Some(0),
+            ..ExecControls::buffered()
+        };
+        let spec = ExecSpec::bash(format!("seq 1 {LINES}")).timeout(Duration::from_secs(300));
+        let streaming = sandbox
+            .exec()
+            .run_streaming(&spec, controls)
+            .await
+            .map_err(|error| format!("exec failed: {error}"))?;
+        if !streaming.result.success() {
+            return fail(format!(
+                "command failed: {}",
+                streaming.result.stderr_lossy()
+            ));
+        }
+        if streaming.stdout_capture.truncated {
+            return fail("stdout was reported truncated");
+        }
+        let expected = numbered_lines(LINES);
+        let seen = seen.lock().expect("seen lock").clone();
+        if seen != expected {
+            let lines = seen.split(|byte| *byte == b'\n').count().saturating_sub(1);
+            return fail(format!(
+                "{lines} of {LINES} lines arrived ({} of {} bytes), or out of order",
+                seen.len(),
+                expected.len()
+            ));
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+/// `1\n2\n…count\n`, what `seq 1 count` prints.
+fn numbered_lines(count: usize) -> Vec<u8> {
+    let mut lines = String::new();
+    for n in 1..=count {
+        lines.push_str(&n.to_string());
+        lines.push('\n');
+    }
+    lines.into_bytes()
+}
+
+/// A Bash script that answers one HTTP request on `port` with `body` and
+/// exits: Perl where the image has it (Debian, Ubuntu, macOS), else
+/// BusyBox or OpenBSD `nc`.
+fn one_request_server(port: u16, body: &str) -> String {
+    format!(
+        r#"if command -v perl >/dev/null 2>&1; then
+  exec perl -e 'use IO::Socket::INET; my $s = IO::Socket::INET->new(LocalAddr => "127.0.0.1", LocalPort => $ARGV[0], Listen => 5, ReuseAddr => 1) or exit 3; my $c = $s->accept or exit 4; my $b = $ARGV[1]; print $c "HTTP/1.0 200 OK
+Content-Length: " . length($b) . "
+Connection: close
+
+$b"; close $c;' {port} {body}
+fi
+resp="$(printf 'HTTP/1.0 200 OK
+Content-Length: {len}
+Connection: close
+
+{body}')"
+if nc --help 2>&1 | grep -qi busybox; then printf '%s' "$resp" | nc -l -p {port}
+else printf '%s' "$resp" | nc -l 127.0.0.1 {port}; fi"#,
+        len = body.len(),
+    )
+}
+
+/// Output is bytes, not lines: a final line without a newline arrives
+/// exactly as written, buffered and streamed alike.
+async fn exec_output_keeps_a_partial_last_line(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let spec = ExecSpec::bash("printf 'a\\nb'").timeout(Duration::from_secs(30));
+        let buffered = sandbox
+            .exec()
+            .run(&spec)
+            .await
+            .map_err(|error| format!("exec failed: {error}"))?;
+        if buffered.stdout != b"a\nb" {
+            return fail(format!(
+                "buffered stdout was {:?}, expected {:?}",
+                String::from_utf8_lossy(&buffered.stdout),
+                "a\nb"
+            ));
+        }
+        if !ctx.caps().exec.live_streaming {
+            return PASS;
+        }
+        let seen: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let controls = ExecControls {
+            sink: Some(Arc::new(move |stream, chunk| {
+                let seen = Arc::clone(&sink_seen);
+                Box::pin(async move {
+                    if stream == OutputStream::Stdout {
+                        seen.lock().expect("seen lock").extend_from_slice(&chunk);
+                    }
+                    Ok(())
+                })
+            })),
+            retained_output_limit: Some(0),
+            ..ExecControls::buffered()
+        };
+        let streaming = sandbox
+            .exec()
+            .run_streaming(&spec, controls)
+            .await
+            .map_err(|error| format!("streaming exec failed: {error}"))?;
+        if !streaming.result.success() {
+            return fail("streaming command failed");
+        }
+        let seen = seen.lock().expect("seen lock").clone();
+        if seen != b"a\nb" {
+            return fail(format!(
+                "streamed stdout was {:?}, expected {:?}",
+                String::from_utf8_lossy(&seen),
+                "a\nb"
+            ));
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+/// A port a process inside the sandbox listens on is reachable through the
+/// sandbox's preview URL when that URL points at this machine; releasing
+/// the URL succeeds. Remote (HTTPS) preview URLs are the provider's live
+/// tests' business and are skipped here.
+async fn preview_url_reaches_a_listening_port(ctx: &Conformance) -> CheckOutcome {
+    if !ctx.caps().access.preview_urls {
+        return Ok(Some(
+            "capability access.preview_urls not declared".to_owned(),
+        ));
+    }
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let Some(preview) = sandbox.preview_urls() else {
+            return fail("access.preview_urls is declared but the facet is absent");
+        };
+        let can_listen = sandbox
+            .exec()
+            .run(
+                &ExecSpec::bash("command -v perl || command -v nc")
+                    .timeout(Duration::from_secs(30)),
+            )
+            .await
+            .map_err(|error| format!("probe failed: {error}"))?;
+        if !can_listen.success() {
+            return Ok(Some(
+                "the sandbox has neither perl nor nc to listen with".to_owned(),
+            ));
+        }
+        // A port unlikely to collide with another sandbox on a shared
+        // machine (the Host provider's sandboxes share this machine's ports).
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let port = 20_000 + u16::try_from((nanos ^ process::id()) % 40_000).unwrap_or(0);
+        let body = "preview-ok";
+        let script = one_request_server(port, body);
+        let server_sandbox = Arc::clone(&sandbox);
+        let kill = CancellationToken::new();
+        let server_kill = kill.clone();
+        let server = tokio::spawn(async move {
+            server_sandbox
+                .exec()
+                .run_streaming(
+                    &ExecSpec::bash(script).timeout(Duration::from_secs(120)),
+                    ExecControls {
+                        kill: Some(server_kill),
+                        ..ExecControls::buffered()
+                    },
+                )
+                .await
+        });
+        let url = preview
+            .preview_url(port)
+            .await
+            .map_err(|error| format!("preview_url failed: {error}"))?;
+        let Some(address) = url
+            .url
+            .strip_prefix("http://")
+            .filter(|rest| rest.starts_with("127.0.0.1:") || rest.starts_with("localhost:"))
+            .map(|rest| rest.trim_end_matches('/').to_owned())
+        else {
+            kill.cancel();
+            let _ = server.await;
+            let _ = preview.release_preview_url(port).await;
+            return Ok(Some(format!(
+                "preview URL {} is not on this machine; reachability is the provider's live test",
+                url.url
+            )));
+        };
+        // The server takes a moment to listen; a forward accepts before the
+        // container port does and then closes, so retry until the body arrives.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut response = String::new();
+        loop {
+            if let Ok(Ok(mut stream)) =
+                time::timeout(Duration::from_secs(5), TcpStream::connect(&address)).await
+            {
+                let _ = stream
+                    .write_all(b"GET / HTTP/1.0\r\nHost: sandbox\r\n\r\n")
+                    .await;
+                let mut bytes = Vec::new();
+                let _ = time::timeout(Duration::from_secs(5), stream.read_to_end(&mut bytes)).await;
+                response = String::from_utf8_lossy(&bytes).into_owned();
+                if response.contains(body) {
+                    break;
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            time::sleep(Duration::from_millis(200)).await;
+        }
+        kill.cancel();
+        let _ = server.await;
+        preview
+            .release_preview_url(port)
+            .await
+            .map_err(|error| format!("release_preview_url failed: {error}"))?;
+        if !response.contains(body) {
+            return fail(format!(
+                "no response through {address}; last response: {response:?}"
+            ));
         }
         PASS
     }
