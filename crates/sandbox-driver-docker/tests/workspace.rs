@@ -29,7 +29,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, duplex, split};
 use tokio::{fs, time};
 use tokio_util::sync::CancellationToken;
 
-const ALPINE: &str = "alpine:3.20";
+const ALPINE: &str = "ghcr.io/fabro-sh/dhi-alpine-base:3.23-dev-2026-06-17";
 const WORKSPACE: &str = "/workspace";
 
 #[tokio::test(flavor = "multi_thread")]
@@ -421,7 +421,7 @@ async fn a_one_shot_builds_from_the_workspace() {
         .fs()
         .write(
             "action/Dockerfile",
-            b"FROM alpine:3.20\nCOPY greeting.txt /greeting.txt\nENTRYPOINT [\"cat\", \"/greeting.txt\"]\n",
+            format!("FROM {ALPINE}\nCOPY greeting.txt /greeting.txt\nENTRYPOINT [\"cat\", \"/greeting.txt\"]\n").as_bytes(),
         )
         .await
         .expect("write dockerfile");

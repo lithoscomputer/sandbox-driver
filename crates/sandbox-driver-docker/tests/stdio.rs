@@ -9,7 +9,7 @@ use std::time::Duration;
 use sandbox_driver::{ExecSpec, SandboxProvider, SandboxSource, SandboxSpec, SpawnSpec};
 use sandbox_driver_docker::DockerProvider;
 
-const TEST_IMAGE: &str = "buildpack-deps:noble";
+const TEST_IMAGE: &str = "ghcr.io/lithoscomputer/ubuntu-24.04:slim-df708f910111";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn late_terminate_leaves_no_stray_stop_file() {

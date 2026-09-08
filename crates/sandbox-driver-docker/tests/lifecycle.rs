@@ -367,11 +367,11 @@ async fn interrupted_service_creation_remains_discoverable_for_cleanup() {
     })
     .await;
     let mut spec = SandboxSpec::new(SandboxSource::Image {
-        reference: "alpine:3.20".to_owned(),
+        reference: "ghcr.io/fabro-sh/dhi-alpine-base:3.23-dev-2026-06-17".to_owned(),
     })
     .name("example")
     .label("petri.workspace", "test/work");
-    spec.provider_config = json!({"sidecars": [{"name": "db", "image": "alpine:3.20"}]});
+    spec.provider_config = json!({"sidecars": [{"name": "db", "image": "ghcr.io/fabro-sh/dhi-alpine-base:3.23-dev-2026-06-17"}]});
     let error = daemon
         .provider
         .create(&spec, None)

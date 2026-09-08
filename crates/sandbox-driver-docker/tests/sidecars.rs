@@ -8,8 +8,8 @@ use std::process;
 use sandbox_driver::{ExecSpec, SandboxProvider, SandboxSource, SandboxSpec};
 use sandbox_driver_docker::DockerProvider;
 
-const TEST_IMAGE: &str = "buildpack-deps:noble";
-const SIDECAR_IMAGE: &str = "alpine:3.20";
+const TEST_IMAGE: &str = "ghcr.io/lithoscomputer/ubuntu-24.04:slim-df708f910111";
+const SIDECAR_IMAGE: &str = "ghcr.io/fabro-sh/dhi-alpine-base:3.23-dev-2026-06-17";
 
 fn spec_with_sidecar(name: &str, sidecar: &serde_json::Value) -> SandboxSpec {
     let mut spec = SandboxSpec::new(SandboxSource::Image {

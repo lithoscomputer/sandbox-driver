@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 /// The image the conformance suite uses: Bash for the bridge and Perl for
 /// the test server.
-const IMAGE: &str = "buildpack-deps:noble";
+const IMAGE: &str = "ghcr.io/lithoscomputer/ubuntu-24.04:slim-df708f910111";
 const PORT: u16 = 8123;
 
 fn spec() -> SandboxSpec {
@@ -159,10 +159,10 @@ async fn preview_url_fails_when_the_image_has_neither_bash_nor_nc() {
     let Ok(provider) = DockerProvider::connect().await else {
         return;
     };
-    // Alpine has no Bash; its `nc` is a BusyBox link that is removed here
-    // to leave the image with neither tool.
+    // The Alpine image has no Bash; its `nc` is a BusyBox link that is
+    // removed here to leave the image with neither tool.
     let spec = SandboxSpec::new(SandboxSource::Image {
-        reference: "alpine:3.20".to_owned(),
+        reference: "ghcr.io/fabro-sh/dhi-alpine-base:3.23-dev-2026-06-17".to_owned(),
     })
     .working_directory("/workspace");
     let sandbox = provider.create(&spec, None).await.expect("create");
