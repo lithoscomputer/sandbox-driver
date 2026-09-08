@@ -24,7 +24,7 @@ const DAYTONA_ENV: &[&str] = &[
     "DAYTONA_TARGET",
 ];
 const REQUIRE_LIVE_ENV: &str = "LITHOS_CLI_E2E_REQUIRE_LIVE";
-const TEST_IMAGE: &str = "buildpack-deps:noble";
+const TEST_IMAGE: &str = "ghcr.io/lithoscomputer/ubuntu-24.04:slim-df708f910111";
 const TEST_SNAPSHOT: &str = "daytona-medium";
 
 #[test]

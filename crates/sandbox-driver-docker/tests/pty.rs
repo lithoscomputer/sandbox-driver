@@ -10,7 +10,7 @@ use sandbox_driver::{ExecSpec, PtyOptions, SandboxProvider, SandboxSource, Sandb
 use sandbox_driver_docker::DockerProvider;
 use tokio::time;
 
-const TEST_IMAGE: &str = "buildpack-deps:noble";
+const TEST_IMAGE: &str = "ghcr.io/lithoscomputer/ubuntu-24.04:slim-df708f910111";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn close_kills_a_shell_that_ignores_term() {

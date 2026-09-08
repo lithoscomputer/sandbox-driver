@@ -14,9 +14,9 @@ use tokio::io::{duplex, split};
 
 /// The conformance image must satisfy the provider's documented data-plane
 /// contract, including `git` for the normalized Git facet.
-const TEST_IMAGE: &str = "buildpack-deps:noble";
+const TEST_IMAGE: &str = "ghcr.io/lithoscomputer/ubuntu-24.04:slim-df708f910111";
 /// The one-shot image needs only a POSIX userland.
-const ONE_SHOT_IMAGE: &str = "alpine:3.20";
+const ONE_SHOT_IMAGE: &str = "ghcr.io/fabro-sh/dhi-alpine-base:3.23-dev-2026-06-17";
 
 fn specs() -> SpecFactory {
     SpecFactory::new(|| {
