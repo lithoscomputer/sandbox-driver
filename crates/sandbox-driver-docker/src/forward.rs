@@ -5,24 +5,32 @@
 //! the same on a local daemon, a remote one, and a daemon whose container
 //! addresses the plugin's machine cannot route to (Docker Desktop).
 //!
+//! The bridge needs Bash (its `/dev/tcp` redirect) or `nc` in the image.
+//! The first `preview_url` of a sandbox probes for one of them and fails
+//! when neither is present, so an image that cannot forward is reported
+//! at the request rather than as connections that close with no data.
+//!
 //! A forward lives until it is released, the sandbox stops or is deleted,
 //! or the handle is dropped.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sandbox_driver::{Error, Exec, PreviewUrl, PreviewUrls, Result, SpawnSpec, StdioProcess};
+use sandbox_driver::{
+    Error, Exec, ExecSpec, PreviewUrl, PreviewUrls, ProviderError, Result, SpawnSpec, StdioProcess,
+};
 use tokio::io::{AsyncWriteExt, copy};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
-use crate::exec::{DockerExec, POSIX_SH};
+use crate::exec::{DockerExec, POSIX_SH, docker_kind};
 
 /// After the client has closed its side, how long the container side may
 /// still send (a response to a request the client half-closed after).
@@ -33,10 +41,23 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Pause after a failed accept, so a transient error is not a hot loop.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
+/// How long the tool probe may take; a healthy container answers in
+/// milliseconds.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Why a forward cannot be opened on an image without either bridge tool.
+const MISSING_TOOLS: &str = "the container image must provide bash or nc to forward a port";
+
+/// Runs inside the container once per sandbox before its first forward:
+/// succeeds when either bridge tool is present.
+const PROBE_SCRIPT: &str = "command -v bash >/dev/null 2>&1 || command -v nc >/dev/null 2>&1";
+
 /// Runs inside the container for one accepted connection: connects to the
 /// port on the container's loopback and relays both directions. Bash's
 /// `/dev/tcp` when the image has Bash, else BusyBox or OpenBSD `nc`; the
 /// bridge exits when the container side closes, so the caller sees EOF.
+/// The last lines report the case the probe should have caught, in case a
+/// tool went away after it.
 const BRIDGE_SCRIPT: &str = r#"port="$1"
 if command -v bash >/dev/null 2>&1; then
   exec bash -c 'exec 4<>"/dev/tcp/127.0.0.1/$1" || exit 1
@@ -61,6 +82,9 @@ struct Forward {
 pub(crate) struct DockerForwards {
     exec:     Arc<DockerExec>,
     forwards: Mutex<HashMap<u16, Forward>>,
+    /// Whether the container has been seen to hold a bridge tool. Two
+    /// first requests may both probe; the second answer is the same.
+    probed:   AtomicBool,
 }
 
 impl DockerForwards {
@@ -68,7 +92,28 @@ impl DockerForwards {
         Self {
             exec,
             forwards: Mutex::new(HashMap::new()),
+            probed: AtomicBool::new(false),
         }
+    }
+
+    /// Fails unless the container can run a bridge, checking once per
+    /// sandbox.
+    async fn ensure_bridge_tools(&self) -> Result<()> {
+        if self.probed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let spec = ExecSpec::new(POSIX_SH)
+            .args(["-c", PROBE_SCRIPT])
+            .timeout(PROBE_TIMEOUT);
+        let result = self.exec.run(&spec).await?;
+        if !result.success() {
+            return Err(Error::Provider(ProviderError::new(
+                docker_kind(),
+                MISSING_TOOLS,
+            )));
+        }
+        self.probed.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// The local address forwarding to `port`, opening one when none is.
@@ -180,6 +225,7 @@ impl PreviewUrls for DockerForwards {
         if port == 0 {
             return Err(Error::invalid_spec("port", "a port forward needs a port"));
         }
+        self.ensure_bridge_tools().await?;
         let address = self.open(port).await?;
         Ok(PreviewUrl::new(format!("http://{address}")))
     }
@@ -259,7 +305,17 @@ async fn bridge(exec: Arc<DockerExec>, port: u16, client: TcpStream, cancel: Can
     }
     handle.terminate().await;
     let tail = stderr_tail.to_string_lossy();
-    if !tail.trim().is_empty() {
-        tracing::debug!(provider_kind = "docker", port, tail = %tail.trim(), "port forward bridge ended with diagnostics");
+    let tail = tail.trim();
+    if tail.contains(MISSING_TOOLS) {
+        // The probe passed and a tool has since gone away: every connection
+        // will close with no data, which a client cannot tell from a server
+        // that is not yet listening.
+        tracing::warn!(
+            provider_kind = "docker",
+            port,
+            "port forward bridge found neither bash nor nc"
+        );
+    } else if !tail.is_empty() {
+        tracing::debug!(provider_kind = "docker", port, tail = %tail, "port forward bridge ended with diagnostics");
     }
 }

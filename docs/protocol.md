@@ -712,7 +712,11 @@ preview link with the headers it requires. A forward's listener accepts
 before the container port does: a connection made before anything
 listens inside closes with no data, so a host waiting for a server to
 come up retries the request rather than the connect. Repeating
-`access/preview_url` for the same port returns the same forward.
+`access/preview_url` for the same port returns the same forward. The
+bridge runs Bash (its `/dev/tcp` redirect) or `nc` inside the container;
+the sandbox's first `access/preview_url` probes for one of them and
+fails with a provider error when the image has neither, so an image
+that cannot forward is reported at the request.
 
 `access/preview_release` ends the host's use of the port's preview URL:
 a provider holding a forward for it closes the forward; one whose URLs
