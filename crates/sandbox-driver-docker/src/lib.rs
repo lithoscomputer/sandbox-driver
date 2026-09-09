@@ -1,8 +1,10 @@
 //! Docker container sandbox provider.
 //!
-//! Internal provider implementation, shared by the plugin executable and tests.
-//! Applications use this provider through JSON-RPC, via
-//! `sandbox-driver-protocol`.
+//! A supported library for in-process embedding, and the implementation
+//! behind the same-named plugin executable. An application either links
+//! this crate and constructs the provider directly, or launches the
+//! executable and reaches it through `sandbox-driver-protocol`. Both
+//! present the same trait family.
 //!
 //! Containers created from OCI images, with kernel-sharing container
 //! isolation (`Isolation::Container`). The Docker socket is

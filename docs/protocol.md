@@ -20,10 +20,13 @@ Normative words: **must**, **must not**, **may**.
 
 ## 1. Model
 
-Applications reach every provider through this protocol, including the
-bundled Host, Docker, and Daytona providers. Each provider package builds
-its executable directly. Provider libraries support internal composition
-and tests; they are not supported application APIs.
+This protocol is one of two supported ways to reach a provider. The
+bundled Host, Docker, and Daytona providers are also libraries an
+application can link in-process; each provider package builds its plugin
+executable from that same library. Third-party providers ship as plugins
+only. Both paths present the same trait family, so a host written against
+the traits works with either; §5 lists the few capabilities that cannot
+cross the wire.
 
 A plugin serves exactly one provider **kind** (e.g. `docker`) and
 multiplexes every sandbox of that kind over one connection. The host

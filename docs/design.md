@@ -1,8 +1,13 @@
 # sandbox-driver: Rust Interface Design
 
-Sandbox providers for managing sandboxes, snapshots, and volumes through JSON-RPC. Initial providers: **Daytona**, **Docker**, **Host** (local). Petri is the primary consumer. All applications, including the CLI, use the plugin protocol. The Rust traits describe the shared contract used by the protocol client, provider implementations, and tests. The original Fabro `Sandbox` trait informed the operation set and the migration map below.
+Sandbox providers for managing sandboxes, snapshots, and volumes. Initial providers: **Daytona**, **Docker**, **Host** (local). Petri and fabro are the primary consumers. The Rust traits are the contract: provider implementations, the protocol client, and tests all speak them. The original Fabro `Sandbox` trait informed the operation set and the migration map below.
 
-Each provider package builds its plugin executable directly. Provider libraries are internal implementation details; Daytona reuses Docker internally for nested Docker. Applications depend on `sandbox-driver`, `sandbox-driver-protocol`, and the typed configuration crates, never on provider implementations.
+Two supported ways to reach a provider, one trait family:
+
+- **In-process embedding.** The bundled provider crates (`sandbox-driver-host`, `sandbox-driver-docker`, `sandbox-driver-daytona`) are libraries with a supported public API. An application links them and constructs `Arc<dyn SandboxProvider>` directly. There is no IPC and no wire mask; the Host filesystem facet is direct Tokio filesystem I/O. Fabro embeds the bundled providers this way.
+- **JSON-RPC plugins.** Each provider package also builds an executable that serves the same provider over `sandbox-driver-protocol`. Third-party providers ship only as plugins, and an operator may run a bundled provider out of process by configuration alone. Petri uses plugins for every provider.
+
+Application code is written once against the traits. Only construction differs between the two paths, plus the wire mask in `docs/protocol.md` §5 for capabilities that cannot cross a process boundary. The conformance suite runs every bundled provider both in-process and over the wire so the two paths cannot drift. Daytona reuses the Docker library internally for nested Docker.
 
 ## Inputs
 
@@ -554,7 +559,7 @@ Each of these is implementable over `Exec`/`Git`/core — the fabro survey confi
 4. **The bash health probe is a library helper** run by the `activate` convenience, not a trait method. Providers implement exec; the probe is a contract test over it.
 5. **Command sessions**: capability name reserved in the schema; no trait in v1.
 6. **`Logs` is follow-style streams only** in v1; historical querying is a later capability.
-7. **Workspace layout**: nine packages: `sandbox-driver` (core types, traits, derived implementations, and helpers), `sandbox-driver-protocol`, `sandbox-driver-conformance`, `sandbox-driver-cli`, `sandbox-driver-{docker,daytona}-config`, and `sandbox-driver-{host,docker,daytona}`. Each provider package contains its internal library and plugin executable. JSON-RPC is the supported application boundary.
+7. **Workspace layout**: nine packages: `sandbox-driver` (core types, traits, derived implementations, and helpers), `sandbox-driver-protocol`, `sandbox-driver-conformance`, `sandbox-driver-cli`, `sandbox-driver-{docker,daytona}-config`, and `sandbox-driver-{host,docker,daytona}`. Each provider package contains a library with a supported public API for in-process embedding and a plugin executable serving the same provider over JSON-RPC. Both are supported application boundaries; third-party providers use JSON-RPC only.
 8. **VNC v1 returns browser connection information.** VPN clients are
    guest software managed through exec.
 9. **The Docker image contract requires `setsid`** alongside bash, `stat`, `find`, and `base64` — reliable kill semantics need a separate session, and an image without it fails every exec with a clear message rather than degrading silently.

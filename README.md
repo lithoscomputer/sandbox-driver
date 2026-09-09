@@ -1,9 +1,21 @@
 # sandbox-driver
 
-Sandbox providers for managing sandboxes, snapshots, and volumes through a
-JSON-RPC protocol. Petri is the primary consumer. Applications use the
-protocol client and shared types; provider libraries are internal
-implementations for the executables and tests.
+Sandbox providers for managing sandboxes, snapshots, and volumes. Every
+provider implements one trait family from `sandbox-driver`, and an
+application reaches it in one of two supported ways:
+
+- **In-process.** The application links a bundled provider library
+  (`sandbox-driver-host`, `sandbox-driver-docker`, `sandbox-driver-daytona`)
+  and constructs the provider directly. Fabro embeds the bundled providers
+  this way.
+- **JSON-RPC plugin.** The application launches a provider executable and
+  speaks the protocol in `sandbox-driver-protocol`. Third-party providers,
+  and any bundled provider an operator prefers to run out of process, take
+  this path. Petri uses it for every provider.
+
+Both paths present the same `SandboxProvider` and `Sandbox` traits, so
+application code is written once. The difference is confined to
+construction and to the wire mask in `docs/protocol.md` §5.
 
 | Crate | Purpose |
 | --- | --- |
@@ -17,10 +29,11 @@ implementations for the executables and tests.
 | `sandbox-driver-conformance` | Black-box conformance suite every provider must pass |
 | `sandbox-driver-cli` | `lithos-sandbox` command for provider diagnostics and sandbox operations |
 
-Each provider package builds an executable with the same name as the package.
-The Docker library is also reused inside Daytona for nested Docker. These
-libraries are not supported application APIs. All applications, including
-`lithos-sandbox`, reach providers through JSON-RPC.
+Each provider package is a library with a supported public API for in-process
+embedding, and also builds a plugin executable with the same name as the
+package. The Docker library is reused inside Daytona for nested Docker.
+`lithos-sandbox` reaches every provider through JSON-RPC so it exercises the
+same path a third-party plugin does.
 
 Host and Docker pass conformance locally (Docker needs a daemon), in
 process and served over the plugin wire; the Daytona suite runs live with

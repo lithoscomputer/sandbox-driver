@@ -3,10 +3,12 @@
 ## Project purpose
 
 This repository is `sandbox-driver`: providers for managing sandboxes,
-snapshots, and volumes through JSON-RPC. Petri is the primary consumer.
-Applications use the protocol client and shared types. Host, Docker, and
-Daytona each ship as a plugin executable. Their Rust libraries are internal
-implementations for provider composition and tests, not application APIs.
+snapshots, and volumes. Petri and fabro are the primary consumers. Host,
+Docker, and Daytona are each a library with a supported public API for
+in-process embedding and a plugin executable that serves the same provider
+over JSON-RPC. Applications either link a bundled provider library or use
+the protocol client; both present the same trait family. Third-party
+providers are plugins.
 
 Authoritative documents:
 

@@ -1,7 +1,9 @@
 # Developing
 
-The workspace builds the provider executables and the `lithos-sandbox` CLI.
-Applications use the providers through JSON-RPC. Petri is the primary consumer.
+The workspace builds the provider libraries, their plugin executables, and
+the `lithos-sandbox` CLI. Applications link the bundled provider libraries
+in-process or use the providers through JSON-RPC. Petri and fabro are the
+primary consumers.
 
 ## Setup
 
