@@ -16,8 +16,8 @@ use sandbox_driver::{
     SnapshotSpec, Termination,
 };
 use sandbox_driver_protocol::methods::{
-    ForkOptionsDto, FsWriteParams, HealthResult, SandboxSnapshotOptionsDto, SandboxSpecDto,
-    SnapshotSourceDto, SnapshotSpecDto,
+    ForkOptionsDto, FsWriteParams, GitCloneParams, HealthResult, SandboxSnapshotOptionsDto,
+    SandboxSpecDto, SnapshotSourceDto, SnapshotSpecDto,
 };
 
 #[test]
@@ -323,4 +323,30 @@ fn snapshot_build_kind_and_region_cross_as_additive_fields() {
     let back = SnapshotSpec::from(dto);
     assert_eq!(back.sandbox_kind, Some(SandboxKind::VirtualMachine));
     assert_eq!(back.region.as_deref(), Some("us"));
+}
+
+#[test]
+fn git_clone_requests_default_their_options_and_redact_their_url() {
+    let request: GitCloneParams = serde_json::from_str(
+        r#"{"sandbox_id":"host:test","url":"https://u:secret@example.com/r.git","target_path":"r"}"#,
+    )
+    .expect("clone request without options");
+    assert!(request.options.branch.is_none());
+    assert!(request.options.commit.is_none());
+    assert!(request.options.depth.is_none());
+    assert!(request.options.credentials.is_none());
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("secret"), "debug: {debug}");
+    assert!(debug.contains("host:test"), "debug: {debug}");
+
+    let request: GitCloneParams = serde_json::from_str(
+        r#"{"sandbox_id":"host:test","url":"https://example.com/r.git","target_path":"r",
+            "options":{"branch":"main","commit":"0123456789abcdef0123456789abcdef01234567",
+                       "depth":1,"credentials":{"username":"u","password":"hunter2"},
+                       "future_option":true}}"#,
+    )
+    .expect("clone request with unknown option field");
+    assert_eq!(request.options.depth, Some(1));
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("hunter2"), "debug: {debug}");
 }

@@ -17,9 +17,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use sandbox_driver::{
     Capability, Error, Event, EventContext, EventObserver, ExecControls, ExecStreamingResult,
-    Filesystem, LogSink, OutputSink, OutputStream, Result, Sandbox, SandboxId, SandboxProvider,
-    SandboxSpec, SandboxStatus, SnapshotId, StderrTail, StdinSource, StdioProcessHandle, StopLevel,
-    TransportError, VolumeId,
+    Filesystem, Git, LogSink, OutputSink, OutputStream, Result, Sandbox, SandboxId,
+    SandboxProvider, SandboxSpec, SandboxStatus, SnapshotId, StderrTail, StdinSource,
+    StdioProcessHandle, StopLevel, TransportError, VolumeId,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -1519,6 +1519,19 @@ async fn dispatch(
                 .await?
                 .fs()
                 .set_permissions(&request.path, request.mode)
+                .await?;
+            to_value(&m::Empty)
+        }
+        m::GIT_CLONE => {
+            let request: m::GitCloneParams = parse(params)?;
+            let handle = state.sandbox(&request.sandbox_id).await?;
+            // The sandbox selects native, hybrid, or derived git exactly as
+            // it does in-process, so a host sees one clone implementation
+            // regardless of transport.
+            let git = handle
+                .git()
+                .ok_or(DispatchError::App(Error::unsupported(Capability::Git)))?;
+            git.clone_repo(&request.url, &request.target_path, &request.options)
                 .await?;
             to_value(&m::Empty)
         }

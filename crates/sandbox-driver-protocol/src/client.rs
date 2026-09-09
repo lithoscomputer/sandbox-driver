@@ -20,10 +20,11 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use sandbox_driver::{
-    Capabilities, Capability, DirEntry, Error, EventContext, EventSubject, Exec, ExecControls,
-    ExecResult, ExecSpec, ExecStreamingResult, FileMetadata, Filesystem, ForkOptions, HealthStatus,
-    IncompleteOperation, LifecycleTimers, LogSink, LogSource, Logs, NetworkPolicy, OneShot,
-    OneShotSpec, OutputCaptureBuffer, OutputStream, PlatformInfo, PreviewUrl, PreviewUrls,
+    Capabilities, Capability, DerivedGit, DirEntry, Error, EventContext, EventSubject, Exec,
+    ExecControls, ExecResult, ExecSpec, ExecStreamingResult, FileMetadata, Filesystem, ForkOptions,
+    Git, GitBranches, GitCloneOptions, GitCommitOptions, GitCredentials, GitPushOptions, GitStatus,
+    HealthStatus, IncompleteOperation, LifecycleTimers, LogSink, LogSource, Logs, NetworkPolicy,
+    OneShot, OneShotSpec, OutputCaptureBuffer, OutputStream, PlatformInfo, PreviewUrl, PreviewUrls,
     ProviderHealth, ProviderKind, Pty, PtyOptions, PtySession, PtySize, Resources, Result, Sandbox,
     SandboxFilter, SandboxId, SandboxSnapshotOptions, SandboxSpec, SandboxStatus, SnapshotFilter,
     SnapshotId, SnapshotProvider, SnapshotSpec, SnapshotStatus, SpawnSpec, SshAccess,
@@ -683,12 +684,14 @@ impl Vnc for SandboxAccess {
 }
 
 /// Removes capabilities the protocol cannot deliver through the wire.
-/// Native search/git/service passthrough and local shell commands remain
-/// process-local; everything else, streamed stdin and the effective
-/// environment included, crosses in version 2.
+/// Native search/service passthrough and local shell commands remain
+/// process-local; everything else, streamed stdin, the effective
+/// environment, and the provider's own git clone included, crosses in
+/// version 2. `git.native` stays as declared: when true the host sends
+/// `git/clone` so the plugin runs its native clone, and the host derives
+/// the remaining operations either way.
 fn mask_wire_capabilities(capabilities: &mut Capabilities) {
     capabilities.search.native = false;
-    capabilities.git.native = false;
     capabilities.services.native = false;
     capabilities.access.shell_command = false;
 }
@@ -1590,6 +1593,7 @@ struct SandboxHandle {
     working_directory: String,
     runtime_directory: Option<String>,
     exec:              SandboxExec,
+    git:               SandboxGit,
     one_shot:          SandboxOneShot,
     access:            SandboxAccess,
     pty:               SandboxPty,
@@ -1611,6 +1615,14 @@ impl SandboxHandle {
             exec: SandboxExec {
                 client:     Arc::clone(&client),
                 sandbox_id: id.clone(),
+            },
+            git: SandboxGit {
+                client:     Arc::clone(&client),
+                sandbox_id: id.clone(),
+                exec:       SandboxExec {
+                    client:     Arc::clone(&client),
+                    sandbox_id: id.clone(),
+                },
             },
             one_shot: SandboxOneShot {
                 client:     Arc::clone(&client),
@@ -1820,6 +1832,17 @@ impl Sandbox for SandboxHandle {
         &self.fs
     }
 
+    fn provider_git(&self) -> Option<&dyn Git> {
+        // A plugin whose clone is exec-derived runs exactly what the host's
+        // derived git runs, so the host derives every operation itself and
+        // the wire carries nothing extra. A native clone must run in the
+        // plugin, so the host routes it through `git/clone`.
+        self.capabilities
+            .git
+            .native
+            .then_some(&self.git as &dyn Git)
+    }
+
     fn one_shot(&self) -> Option<&dyn OneShot> {
         self.capabilities
             .one_shot
@@ -1867,6 +1890,81 @@ impl Sandbox for SandboxHandle {
             .access
             .vnc
             .then_some(&self.access as &dyn Vnc)
+    }
+}
+
+/// The host side of a plugin sandbox's git facet, selected when the
+/// plugin declares `git.native`: clone crosses the wire so the plugin runs
+/// its native clone (Daytona's toolbox clone, say), and every other
+/// operation is exec-derived here.
+struct SandboxGit {
+    client:     Arc<Client>,
+    sandbox_id: SandboxId,
+    exec:       SandboxExec,
+}
+
+impl SandboxGit {
+    fn derived(&self) -> DerivedGit<'_> {
+        DerivedGit::new(&self.exec)
+    }
+}
+
+#[async_trait]
+impl Git for SandboxGit {
+    async fn clone_repo(
+        &self,
+        url: &str,
+        target_path: &str,
+        options: &GitCloneOptions,
+    ) -> Result<()> {
+        options.validate()?;
+        let outcome: Result<m::Empty> = self
+            .client
+            .call(m::GIT_CLONE, &m::GitCloneParams {
+                sandbox_id:  self.sandbox_id.as_str().to_owned(),
+                url:         url.to_owned(),
+                target_path: target_path.to_owned(),
+                options:     options.clone(),
+            })
+            .await;
+        match outcome {
+            Ok(_) => Ok(()),
+            // A plugin predating `git/clone` served git through exec only;
+            // the derived clone is what such a host ran before the method
+            // existed, so the fallback changes nothing for it.
+            Err(Error::Provider(provider)) if provider.code.as_deref() == Some("-32601") => {
+                self.derived().clone_repo(url, target_path, options).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn status(&self, repo_path: &str) -> Result<GitStatus> {
+        self.derived().status(repo_path).await
+    }
+
+    async fn add(&self, repo_path: &str, paths: &[String]) -> Result<()> {
+        self.derived().add(repo_path, paths).await
+    }
+
+    async fn commit(&self, repo_path: &str, options: &GitCommitOptions) -> Result<String> {
+        self.derived().commit(repo_path, options).await
+    }
+
+    async fn push(&self, repo_path: &str, options: &GitPushOptions) -> Result<()> {
+        self.derived().push(repo_path, options).await
+    }
+
+    async fn pull(&self, repo_path: &str, credentials: Option<&GitCredentials>) -> Result<()> {
+        self.derived().pull(repo_path, credentials).await
+    }
+
+    async fn branches(&self, repo_path: &str) -> Result<GitBranches> {
+        self.derived().branches(repo_path).await
+    }
+
+    async fn checkout(&self, repo_path: &str, branch: &str, create: bool) -> Result<()> {
+        self.derived().checkout(repo_path, branch, create).await
     }
 }
 

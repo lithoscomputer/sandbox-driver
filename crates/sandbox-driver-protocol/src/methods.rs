@@ -8,15 +8,16 @@
 //! never by breaking core types.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::time::Duration;
 
 use sandbox_driver::{
     Capabilities, CaptureStats, CorrelationId, DirEntry, Error, Event, ExecResult, ExecSpec,
-    FileMetadata, ForkOptions, LifecycleTimers, LogSource, NetworkPolicy, OneShotSpec,
-    OutputSanitization, PlatformInfo, ProviderKind, PtyOptions, PtySize, Resources, SandboxFilter,
-    SandboxId, SandboxKind, SandboxSnapshotOptions, SandboxSource, SandboxSpec, SandboxStatus,
-    SnapshotId, SnapshotMode, SnapshotSource, SnapshotSpec, SpawnSpec, StopLevel, Termination,
-    VncConnection, VolumeMount,
+    FileMetadata, ForkOptions, GitCloneOptions, LifecycleTimers, LogSource, NetworkPolicy,
+    OneShotSpec, OutputSanitization, PlatformInfo, ProviderKind, PtyOptions, PtySize, Resources,
+    SandboxFilter, SandboxId, SandboxKind, SandboxSnapshotOptions, SandboxSource, SandboxSpec,
+    SandboxStatus, SnapshotId, SnapshotMode, SnapshotSource, SnapshotSpec, SpawnSpec, StopLevel,
+    Termination, VncConnection, VolumeMount,
 };
 use serde::{Deserialize, Serialize};
 
@@ -71,6 +72,7 @@ pub const FS_LIST_DIR: &str = "fs/list_dir";
 pub const FS_CREATE_DIR: &str = "fs/create_dir";
 pub const FS_RENAME: &str = "fs/rename";
 pub const FS_SET_PERMISSIONS: &str = "fs/set_permissions";
+pub const GIT_CLONE: &str = "git/clone";
 
 pub const SNAPSHOT_CREATE: &str = "snapshot/create";
 pub const SNAPSHOT_GET: &str = "snapshot/get";
@@ -663,6 +665,33 @@ pub struct FsSetPermissionsParams {
     pub sandbox_id: String,
     pub path:       String,
     pub mode:       u32,
+}
+
+/// A repository clone the plugin runs with the provider's own git
+/// implementation (native, derived, or hybrid), so a host sees the same
+/// clone whether the provider is in-process or a plugin. The remaining
+/// git operations stay exec-derived on the host side.
+///
+/// `Debug` redacts the URL, which can embed credentials, and relies on
+/// [`GitCloneOptions`] to redact the credential password.
+#[derive(Serialize, Deserialize)]
+pub struct GitCloneParams {
+    pub sandbox_id:  String,
+    pub url:         String,
+    pub target_path: String,
+    #[serde(default)]
+    pub options:     GitCloneOptions,
+}
+
+impl fmt::Debug for GitCloneParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GitCloneParams")
+            .field("sandbox_id", &self.sandbox_id)
+            .field("url", &"<redacted>")
+            .field("target_path", &self.target_path)
+            .field("options", &self.options)
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

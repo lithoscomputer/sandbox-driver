@@ -312,13 +312,20 @@ Rules:
   work; an undeclared operation must fail with the `unsupported` error
   kind (§7). Capabilities optimize failure timing; the error is still
   the enforcement.
-- **The wire mask.** Native search/git/service passthrough and local
-  shell commands do not cross the wire. A host forces `search.native`,
-  `git.native`, `services.native`, and `access.shell_command` to false.
+- **The wire mask.** Native search/service passthrough and local shell
+  commands do not cross the wire. A host forces `search.native`,
+  `services.native`, and `access.shell_command` to false.
   `search.supported`, `git.supported`, and `services.supported` remain true when
   the complete facets can run through `exec/stream`; the host then selects the
-  exec-derived implementations. Streamed stdin (`exec.stdin_stream`) and
-  the effective environment (`exec.environment`) cross as declared.
+  exec-derived implementations for search and services. `git.native`
+  crosses as declared and selects the clone path: when true the host
+  sends `git/clone` (§8.6) so the plugin runs its native clone; when
+  false the host's exec-derived clone is the plugin's own implementation
+  and runs host-side. Either way a plugin and an in-process provider
+  select the same implementation, and the host derives every other git
+  operation. Streamed stdin
+  (`exec.stdin_stream`) and the effective environment
+  (`exec.environment`) cross as declared.
 - `one_shot` is a nullable object `{"build": false}`: non-null authorizes
   `one_shot/run`, and `build` authorizes the `build` image source.
 - Older peers send `search`, `git`, and `services` groups as `{"native":false}`.
@@ -663,7 +670,34 @@ file crosses in pieces without paging by the host. Providers can stream
 file content with bounded memory; providers whose native APIs require
 complete byte arrays may still buffer it.
 
-### 8.6 Snapshots and volumes
+### 8.6 Git
+
+Available when `git.supported` is true. The plugin runs the clone with
+the sandbox's own git implementation — native (Daytona's toolbox),
+derived (Host and Docker), or hybrid — exactly as it would in-process.
+A host sends it when the sandbox declares `git.native`; for a sandbox
+that does not, the host's exec-derived clone is the same implementation
+the plugin would run, so the host runs it locally through `exec/stream`.
+Both transports therefore select one implementation. Every other git
+operation (status, add, commit, push, pull, branches, checkout) is
+exec-derived on the host and has no wire method.
+
+| method | params | result |
+| --- | --- | --- |
+| `git/clone` | `{sandbox_id, url, target_path, options:{branch?, commit?, depth?, credentials?:{username,password}}}` | `{}` |
+
+`target_path` resolves against the sandbox working directory when
+relative. `commit`, when present, must be a full 40-hex SHA; the clone
+is pinned to it whatever `depth` says, and with `branch` also present the
+checkout ends attached to that branch at the pinned commit. An
+unavailable commit fails with the provider's error; the plugin must not
+fall back to the branch head. `credentials` are applied to this one
+network operation and never written into the repository configuration.
+The method is additive within version 2: a host that receives `-32601`
+from an older plugin runs the exec-derived clone it ran before the
+method existed.
+
+### 8.7 Snapshots and volumes
 
 Available only when the corresponding capability object is non-null.
 Deletes must be idempotent, including while deletion is in progress.
@@ -692,7 +726,7 @@ from a sandbox inherits its kind and resources; a conflicting request is
 `invalid_spec`. Daytona supports image sources for both sandbox kinds and
 Dockerfile sources for containers only.
 
-### 8.7 Access
+### 8.8 Access
 
 | method | params | result |
 | --- | --- | --- |
@@ -737,7 +771,7 @@ are optional. `access/ssh_revoke` is available only when
 `access.ssh.revoke` is true; a provider that declares it must return a
 token that can be revoked.
 
-### 8.8 Provider health
+### 8.9 Provider health
 
 `provider/health` (params `{}`) reports whether the provider's backend
 is reachable and its credential accepted, for host preflight and
@@ -755,7 +789,7 @@ are reserved for failures of the check itself. Hosts must treat a
 `-32601` reply (a plugin predating this method) as
 `{"status":"unknown"}`.
 
-### 8.9 Shutdown
+### 8.10 Shutdown
 
 `shutdown` (params `{}`) asks the plugin to exit. The plugin must stop
 reading new requests, flush its reply, cancel active commands, and exit
@@ -987,9 +1021,10 @@ in-process provider must pass, covering lifecycle, the bash probe,
 exec semantics (literal argv, exit codes, env, binary safety, fixed and
 streamed stdin, the effective environment, timeout, term and kill),
 streaming honesty and isolation, retention accounting, filesystem round
-trips including bounded reads and missing files, one-shot containers,
-capability honesty in both directions, label listing, event delivery,
-and service/facet-capability consistency. The Host and Docker providers
+trips including bounded reads and missing files, the git round trip
+(whose clone is `git/clone`), one-shot containers, capability honesty in
+both directions, label listing, event delivery, and
+service/facet-capability consistency. The Host and Docker providers
 run it over the wire in this repository's own tests.
 
 ## 13. Compatibility policy
@@ -1014,6 +1049,6 @@ version-1 `fs/read` or `fs/write` shape is a `-32600` here.
 
 ## 14. Deferred beyond version 2
 
-Native search/git/service passthrough, local `shell_command`, and
+Native search/service passthrough, local `shell_command`, and
 `host/credentials` (per-call secret fetches from the host) remain
 deferred. They are masked or absent per §5.

@@ -11,13 +11,13 @@
 //! streaming exec with client-generated exec ids, one-shot containers,
 //! filesystem, list/attach, snapshot and volume services, bidirectional
 //! stdio and PTY, provider and snapshot logs, the effective environment,
-//! preview-URL, SSH, web-terminal, and VNC access facets, plugin→host
-//! `host/event` notifications, and plugin binaries spawned over stdio
-//! ([`serve_stdio`], [`PluginProvider::spawn`]). Control messages are
-//! JSON on the plugin's stdio; every byte stream rides a per-operation
-//! Unix-socket data channel ([`channel`]). Native search/git/service
-//! passthrough, local shell commands, and `host/credentials` remain
-//! deferred.
+//! preview-URL, SSH, web-terminal, and VNC access facets, the provider's
+//! own git clone (`git/clone`), plugin→host `host/event` notifications,
+//! and plugin binaries spawned over stdio ([`serve_stdio`],
+//! [`PluginProvider::spawn`]). Control messages are JSON on the plugin's
+//! stdio; every byte stream rides a per-operation Unix-socket data
+//! channel ([`channel`]). Native search/service passthrough, local shell
+//! commands, and `host/credentials` remain deferred.
 //!
 //! The normative wire specification is `docs/protocol.md` at the
 //! repository root; the compatibility tests in this crate verify its

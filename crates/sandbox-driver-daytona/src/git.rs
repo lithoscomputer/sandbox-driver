@@ -49,6 +49,26 @@ impl DaytonaGit {
     fn derived(&self) -> DerivedGit<'_> {
         DerivedGit::new(&self.derived_exec)
     }
+
+    /// Best-effort removal of a clone target after the clone failed. The
+    /// clone error is what the caller sees; a cleanup failure is logged
+    /// because it leaves a partial checkout that a retry would trip over.
+    async fn remove_failed_clone(&self, sandbox: &daytona_sdk::Sandbox, repo_path: &str) {
+        let fs = match sandbox.fs().await {
+            Ok(fs) => fs,
+            Err(error) => {
+                tracing::warn!(error = %error, "failed clone cleanup could not reach the toolbox");
+                return;
+            }
+        };
+        match fs.delete_file(repo_path, true).await {
+            Ok(()) => {}
+            Err(error) if crate::is_not_found(&error) => {}
+            Err(error) => {
+                tracing::warn!(error = %error, "failed clone left a partial checkout behind");
+            }
+        }
+    }
 }
 
 fn clone_options(options: &GitCloneOptions) -> Result<DaytonaGitCloneOptions> {
@@ -107,9 +127,18 @@ impl Git for DaytonaGit {
             .await
             .map_err(|error| daytona_error("connecting to the git toolbox", error))?;
         let repo_path = self.resolve_path(target_path);
-        git.clone(url, &repo_path, clone_options(options)?)
+        let cloned = git
+            .clone(url, &repo_path, clone_options(options)?)
             .await
-            .map_err(|error| daytona_error("cloning git repository", error))?;
+            .map_err(|error| daytona_error("cloning git repository", error));
+        if let Err(error) = cloned {
+            // The toolbox clones the branch first and pins afterwards, so a
+            // failed pin leaves a checkout at the branch head. The contract
+            // says an unavailable commit fails outright, never substitutes
+            // the head, so remove whatever the failed clone wrote.
+            self.remove_failed_clone(&sandbox, &repo_path).await;
+            return Err(error);
+        }
         // The toolbox leaves a pinned clone detached; attach the
         // requested branch for cross-provider consistency (fabro ran
         // the same step after every native pinned clone).

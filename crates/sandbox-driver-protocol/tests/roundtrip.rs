@@ -11,11 +11,11 @@ use std::{future, io, mem, process};
 
 use async_trait::async_trait;
 use sandbox_driver::{
-    Action, Capabilities, Capability, CorrelationId, Error, Event, EventBody, EventContext,
-    EventEmitter, EventObserver, EventSubject, ExecControls, ExecSpec, Git, GitCommitOptions,
-    OutputStream, ProviderKind, Result, Sandbox, SandboxFilter, SandboxId, SandboxProvider,
-    SandboxSource, SandboxSpec, SandboxStatus, SpawnSpec, StdinSource, Termination, WaitOptions,
-    activate,
+    Action, Capabilities, Capability, CorrelationId, DerivedGit, Error, Event, EventBody,
+    EventContext, EventEmitter, EventObserver, EventSubject, ExecControls, ExecSpec, Git,
+    GitCloneOptions, GitCommitOptions, OutputStream, ProviderKind, Result, Sandbox, SandboxFilter,
+    SandboxId, SandboxProvider, SandboxSource, SandboxSpec, SandboxStatus, SpawnSpec, StdinSource,
+    Termination, WaitOptions, activate,
 };
 use sandbox_driver_host::HostProvider;
 use sandbox_driver_protocol::channel::TrustedPeer;
@@ -447,6 +447,341 @@ async fn derived_git_is_selected_transparently_over_the_wire() {
         .await
         .expect("git commit over wire");
     assert_eq!(sha.len(), 40, "sha: {sha}");
+
+    sandbox.delete().await.expect("delete");
+    provider.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn derived_pinned_clone_through_a_plugin_sandbox_attaches_the_branch() {
+    let provider = connect().await;
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+    let workspace = sandbox.working_directory().to_owned();
+
+    // A source repo whose main advanced past the commit being pinned.
+    let setup = sandbox
+        .exec()
+        .run(
+            &ExecSpec::bash(
+                "git init -q -b main src && cd src && \
+                 git -c user.name=T -c user.email=t@example.com commit -q --allow-empty -m one && \
+                 git rev-parse HEAD && \
+                 git -c user.name=T -c user.email=t@example.com commit -q --allow-empty -m two && \
+                 git config uploadpack.allowReachableSHA1InWant true",
+            )
+            .timeout(Duration::from_secs(30)),
+        )
+        .await
+        .expect("source repo setup");
+    assert!(setup.success(), "stderr: {}", setup.stderr_lossy());
+    let pinned = setup.stdout_lossy().trim().to_owned();
+    assert_eq!(pinned.len(), 40, "sha: {pinned}");
+
+    let git = sandbox.git().expect("git facet over the wire");
+    let mut options = GitCloneOptions::default();
+    options.branch = Some("main".to_owned());
+    options.commit = Some(pinned.clone());
+    options.depth = Some(1);
+    git.clone_repo(&format!("file://{workspace}/src"), "dst", &options)
+        .await
+        .expect("pinned clone over the wire");
+
+    let status = git.status("dst").await.expect("status");
+    assert_eq!(status.current_branch.as_deref(), Some("main"));
+    assert!(!status.detached);
+    let head = sandbox
+        .exec()
+        .run(
+            &ExecSpec::new("git")
+                .args(["rev-parse", "HEAD"])
+                .working_dir("dst")
+                .timeout(Duration::from_secs(10)),
+        )
+        .await
+        .expect("rev-parse");
+    assert_eq!(head.stdout_lossy().trim(), pinned);
+
+    // An unavailable commit fails; nothing falls back to the branch head.
+    let mut missing = GitCloneOptions::default();
+    missing.branch = Some("main".to_owned());
+    missing.commit = Some("0123456789abcdef0123456789abcdef01234567".to_owned());
+    let error = git
+        .clone_repo(&format!("file://{workspace}/src"), "missing", &missing)
+        .await
+        .expect_err("unavailable commit fails over the wire");
+    assert!(matches!(error, Error::Exec(_)), "error: {error}");
+    assert!(
+        !sandbox
+            .fs()
+            .exists("missing/.git/HEAD")
+            .await
+            .expect("exists")
+            || !sandbox
+                .exec()
+                .run(
+                    &ExecSpec::new("git")
+                        .args(["rev-parse", "--verify", "HEAD"])
+                        .working_dir("missing")
+                )
+                .await
+                .expect("rev-parse")
+                .success(),
+        "a failed pinned clone must not leave a checkout at the branch head"
+    );
+
+    // A flag-shaped pin is rejected on the host before any request.
+    let mut flag = GitCloneOptions::default();
+    flag.commit = Some("-q".to_owned());
+    let error = git
+        .clone_repo(&format!("file://{workspace}/src"), "flag", &flag)
+        .await
+        .expect_err("flag-shaped commit is rejected");
+    assert!(matches!(error, Error::InvalidSpec { .. }), "error: {error}");
+
+    sandbox.delete().await.expect("delete");
+    provider.shutdown().await.expect("shutdown");
+}
+
+/// Wraps a Host sandbox as a provider that declares a native git clone,
+/// recording each clone request it receives — the shape of Daytona's
+/// hybrid git without a cloud account.
+struct NativeGitProvider {
+    host:   Arc<HostProvider>,
+    caps:   Capabilities,
+    clones: Arc<Mutex<Vec<(String, String, GitCloneOptions)>>>,
+}
+
+struct NativeGitSandbox {
+    inner: Arc<dyn Sandbox>,
+    caps:  Capabilities,
+    git:   RecordingGit,
+}
+
+struct RecordingGit {
+    inner:  Arc<dyn Sandbox>,
+    clones: Arc<Mutex<Vec<(String, String, GitCloneOptions)>>>,
+}
+
+impl NativeGitProvider {
+    fn wrap(&self, inner: Arc<dyn Sandbox>) -> Arc<dyn Sandbox> {
+        let mut caps = inner.capabilities().clone();
+        caps.git.native = true;
+        Arc::new(NativeGitSandbox {
+            git: RecordingGit {
+                inner:  Arc::clone(&inner),
+                clones: Arc::clone(&self.clones),
+            },
+            inner,
+            caps,
+        })
+    }
+}
+
+#[async_trait]
+impl SandboxProvider for NativeGitProvider {
+    fn kind(&self) -> &ProviderKind {
+        self.host.kind()
+    }
+
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    async fn create(
+        &self,
+        spec: &SandboxSpec,
+        events: Option<EventContext>,
+    ) -> Result<Arc<dyn Sandbox>> {
+        Ok(self.wrap(self.host.create(spec, events).await?))
+    }
+
+    async fn attach(
+        &self,
+        id: &SandboxId,
+        events: Option<EventContext>,
+    ) -> Result<Arc<dyn Sandbox>> {
+        Ok(self.wrap(self.host.attach(id, events).await?))
+    }
+
+    async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>> {
+        self.host.list(filter).await
+    }
+}
+
+#[async_trait]
+impl Sandbox for NativeGitSandbox {
+    fn id(&self) -> &SandboxId {
+        self.inner.id()
+    }
+
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    async fn describe(&self) -> Result<SandboxStatus> {
+        self.inner.describe().await
+    }
+
+    fn working_directory(&self) -> &str {
+        self.inner.working_directory()
+    }
+
+    async fn platform_info(&self) -> Result<sandbox_driver::PlatformInfo> {
+        self.inner.platform_info().await
+    }
+
+    async fn start(&self) -> Result<()> {
+        self.inner.start().await
+    }
+
+    async fn stop(&self) -> Result<()> {
+        self.inner.stop().await
+    }
+
+    async fn delete(&self) -> Result<()> {
+        self.inner.delete().await
+    }
+
+    fn exec(&self) -> &dyn sandbox_driver::Exec {
+        self.inner.exec()
+    }
+
+    fn fs(&self) -> &dyn sandbox_driver::Filesystem {
+        self.inner.fs()
+    }
+
+    fn provider_git(&self) -> Option<&dyn Git> {
+        Some(&self.git)
+    }
+}
+
+#[async_trait]
+impl Git for RecordingGit {
+    async fn clone_repo(
+        &self,
+        url: &str,
+        target_path: &str,
+        options: &GitCloneOptions,
+    ) -> Result<()> {
+        self.clones.lock().expect("clones lock").push((
+            url.to_owned(),
+            target_path.to_owned(),
+            options.clone(),
+        ));
+        DerivedGit::new(self.inner.exec())
+            .clone_repo(url, target_path, options)
+            .await
+    }
+
+    async fn status(&self, repo_path: &str) -> Result<sandbox_driver::GitStatus> {
+        DerivedGit::new(self.inner.exec()).status(repo_path).await
+    }
+
+    async fn add(&self, repo_path: &str, paths: &[String]) -> Result<()> {
+        DerivedGit::new(self.inner.exec())
+            .add(repo_path, paths)
+            .await
+    }
+
+    async fn commit(&self, repo_path: &str, options: &GitCommitOptions) -> Result<String> {
+        DerivedGit::new(self.inner.exec())
+            .commit(repo_path, options)
+            .await
+    }
+
+    async fn push(&self, repo_path: &str, options: &sandbox_driver::GitPushOptions) -> Result<()> {
+        DerivedGit::new(self.inner.exec())
+            .push(repo_path, options)
+            .await
+    }
+
+    async fn pull(
+        &self,
+        repo_path: &str,
+        credentials: Option<&sandbox_driver::GitCredentials>,
+    ) -> Result<()> {
+        DerivedGit::new(self.inner.exec())
+            .pull(repo_path, credentials)
+            .await
+    }
+
+    async fn branches(&self, repo_path: &str) -> Result<sandbox_driver::GitBranches> {
+        DerivedGit::new(self.inner.exec()).branches(repo_path).await
+    }
+
+    async fn checkout(&self, repo_path: &str, branch: &str, create: bool) -> Result<()> {
+        DerivedGit::new(self.inner.exec())
+            .checkout(repo_path, branch, create)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn native_git_clone_is_routed_through_the_plugin() {
+    let clones = Arc::new(Mutex::new(Vec::new()));
+    let host = Arc::new(HostProvider::new());
+    let mut caps = host.capabilities().clone();
+    caps.git.native = true;
+    let native = Arc::new(NativeGitProvider {
+        host,
+        caps,
+        clones: Arc::clone(&clones),
+    });
+    let (host_side, plugin_side) = duplex(1024 * 1024);
+    let (host_read, host_write) = split(host_side);
+    let (plugin_read, plugin_write) = split(plugin_side);
+    tokio::spawn(serve(native, plugin_read, plugin_write));
+    let provider = PluginProvider::connect(host_read, host_write)
+        .await
+        .expect("handshake");
+    // A native clone survives the wire mask; only search, services, and
+    // shell commands are forced off.
+    assert!(provider.capabilities().git.native);
+    assert!(!provider.capabilities().search.native);
+
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+    assert!(sandbox.capabilities().git.native);
+    let workspace = sandbox.working_directory().to_owned();
+    let setup = sandbox
+        .exec()
+        .run(
+            &ExecSpec::bash(
+                "git init -q -b main src && cd src && \
+                 git -c user.name=T -c user.email=t@example.com commit -q --allow-empty -m one",
+            )
+            .timeout(Duration::from_secs(30)),
+        )
+        .await
+        .expect("source repo setup");
+    assert!(setup.success(), "stderr: {}", setup.stderr_lossy());
+
+    let git = sandbox.git().expect("git facet");
+    let mut options = GitCloneOptions::default();
+    options.branch = Some("main".to_owned());
+    options.depth = Some(1);
+    options.credentials = Some(sandbox_driver::GitCredentials::new("user", "hunter2"));
+    git.clone_repo(&format!("file://{workspace}/src"), "dst", &options)
+        .await
+        .expect("clone over the wire");
+
+    // The plugin's own clone ran, with every option intact.
+    {
+        let recorded = clones.lock().expect("clones lock");
+        assert_eq!(recorded.len(), 1, "exactly one git/clone request");
+        let (url, target, received) = &recorded[0];
+        assert_eq!(url, &format!("file://{workspace}/src"));
+        assert_eq!(target, "dst");
+        assert_eq!(received.branch.as_deref(), Some("main"));
+        assert_eq!(received.depth, Some(1));
+        let credentials = received.credentials.as_ref().expect("credentials cross");
+        assert_eq!(credentials.username, "user");
+        assert_eq!(credentials.password, "hunter2");
+    }
+
+    // The remaining operations derive on the host and see the plugin's clone.
+    let status = git.status("dst").await.expect("status");
+    assert_eq!(status.current_branch.as_deref(), Some("main"));
+    assert_eq!(clones.lock().expect("clones lock").len(), 1);
 
     sandbox.delete().await.expect("delete");
     provider.shutdown().await.expect("shutdown");

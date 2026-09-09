@@ -139,7 +139,7 @@ Per-sandbox functionality is grouped into small **facet traits** (per the style 
 | `StdioProcess` | Spawn long-lived bidirectional process (ACP backends) | ✔ | ✔ | ✔ (command sessions; UTF-8 payloads only — the ACP case) | ? |
 | `Filesystem` (core) | read/write/delete/exists/stat/list/move/mkdir/permissions, upload/download (binary-safe, chunked) | native | native | native (toolbox FS) | ✔ |
 | `Search` (core, derived) | grep, glob, walk — default impl derived from `Exec` (rg with grep/find fallback); provider may override | derived | derived | derived (native find/replace exists) | derived |
-| `Git` | clone, status, add, commit, push, pull, branches, checkout — low-level plumbing only; providers hide native, derived, or hybrid selection; per-call credentials | derived | derived | hybrid: native clone, derived remainder | derived |
+| `Git` | clone, status, add, commit, push, pull, branches, checkout — low-level plumbing only; providers hide native, derived, or hybrid selection; per-call credentials; over the wire, clone is the plugin's own (`git/clone`) and the rest derive on the host | derived | derived | hybrid: native clone, derived remainder | derived |
 | `Services` (derived) | Background processes that outlive their exec (MCP servers, dev servers): spawn / status / logs / stop — default impl derived from `Exec` (`setsid` + pidfile, fabro's proven pattern); state is per-boot | derived | derived | derived | derived |
 | `Pty` | create/resize/kill + bidirectional byte stream (fabro's `TerminalSession`) | ✔ | ✔ (exec+tty) | ✔ (websocket) | ✔ (console) |
 | `Logs` | Provider-side logs: build/provision logs, entrypoint output, sandbox event log; streaming follow | — | ✔ (container logs) | ✔ | ? |
