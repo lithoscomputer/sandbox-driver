@@ -1,8 +1,10 @@
 //! Daytona cloud sandbox provider.
 //!
-//! Internal provider implementation, shared by the plugin executable and tests.
-//! Applications use this provider through JSON-RPC, via
-//! `sandbox-driver-protocol`.
+//! A supported library for in-process embedding, and the implementation
+//! behind the same-named plugin executable. An application either links
+//! this crate and constructs the provider directly, or launches the
+//! executable and reaches it through `sandbox-driver-protocol`. Both
+//! present the same trait family.
 //!
 //! VM-backed sandboxes (`Isolation::Vm`) through the Daytona control
 //! plane and per-sandbox toolbox daemon, with snapshots and volumes as
@@ -52,9 +54,11 @@
 //! [`DaytonaProvider::connect`] uses the SDK's environment configuration:
 //! `DAYTONA_API_KEY` (or `DAYTONA_JWT_TOKEN` + `DAYTONA_ORGANIZATION_ID`),
 //! optional `DAYTONA_API_URL` and `DAYTONA_TARGET`.
-//! [`DaytonaProvider::connect_with_config`] accepts the same values explicitly,
-//! so an embedding application can pass vault-resolved credentials without
-//! changing the process environment.
+//! [`DaytonaProvider::connect_with_config`] accepts the same values explicitly
+//! and falls back to the environment for anything left unset.
+//! [`DaytonaProvider::connect_explicit`] never reads the environment, so an
+//! embedding application that resolves credentials itself can be sure the
+//! worker's environment cannot substitute for them.
 
 mod access;
 mod encoded_exec;
@@ -612,6 +616,55 @@ impl DaytonaProvider {
                 .api_key
                 .unwrap_or_else(|| env::var("DAYTONA_API_KEY").unwrap_or_default()),
         );
+        Self::connect_resolved(config).await
+    }
+
+    /// Connects using only the values in `config`, never the process
+    /// environment.
+    ///
+    /// An embedding application that resolves credentials itself (from a
+    /// vault, a server secret store, or per-request input) passes them
+    /// here so nothing in the worker's environment can substitute for
+    /// them. Every unset field takes the SDK's built-in default: the
+    /// hosted API URL, no organization header, no target region, no
+    /// injected HTTP client. `config.user_agent` identifies the
+    /// application to the control plane.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Auth`] when `config` carries neither an API key
+    /// nor a JWT with an organization id, and a provider error when the
+    /// SDK client cannot be initialized.
+    #[tracing::instrument(skip_all, fields(provider_kind = "daytona"), err)]
+    pub async fn connect_explicit(mut config: DaytonaConfig) -> Result<Self> {
+        let kind = ProviderKind::try_new("daytona").expect("static kind is valid");
+        let has_api_key = config.api_key.as_deref().is_some_and(|key| !key.is_empty());
+        let has_jwt = config
+            .jwt_token
+            .as_deref()
+            .is_some_and(|jwt| !jwt.is_empty());
+        if !has_api_key && !has_jwt {
+            return Err(Error::Auth(AuthError::new(
+                kind,
+                "no Daytona API key or JWT was supplied and the process environment is not                  consulted",
+            )));
+        }
+        // The SDK reads the environment for every field left `None` and
+        // treats an empty string as "unset without fallback", so blank
+        // every field the caller did not set.
+        for field in [
+            &mut config.api_key,
+            &mut config.jwt_token,
+            &mut config.organization_id,
+            &mut config.api_url,
+            &mut config.target,
+        ] {
+            field.get_or_insert_with(String::new);
+        }
+        Self::connect_resolved(config).await
+    }
+
+    async fn connect_resolved(config: DaytonaConfig) -> Result<Self> {
         let uses_api_key = config.api_key.as_ref().is_some_and(|key| !key.is_empty());
         let client = Client::new_with_config(config)
             .await
@@ -2531,6 +2584,59 @@ mod tests {
     use std::error::Error as _;
 
     use super::*;
+
+    #[tokio::test]
+    async fn connect_explicit_rejects_missing_credentials_without_consulting_the_environment() {
+        // Whatever DAYTONA_* the test process carries, an explicit
+        // configuration with no credential is an authentication error.
+        let Err(error) = DaytonaProvider::connect_explicit(DaytonaConfig::default()).await else {
+            panic!("no credential must be rejected");
+        };
+        assert!(matches!(error, Error::Auth(_)), "{error}");
+        let Err(error) = DaytonaProvider::connect_explicit(DaytonaConfig {
+            api_key: Some(String::new()),
+            jwt_token: Some(String::new()),
+            ..DaytonaConfig::default()
+        })
+        .await
+        else {
+            panic!("blank credentials must be rejected");
+        };
+        assert!(matches!(error, Error::Auth(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn connect_explicit_uses_only_the_supplied_values() {
+        let provider = DaytonaProvider::connect_explicit(DaytonaConfig {
+            api_key: Some("explicit-key".to_owned()),
+            user_agent: Some("embedding-app/1.0".to_owned()),
+            ..DaytonaConfig::default()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("explicit API key connects: {error}"));
+        assert!(provider.uses_api_key);
+        let api = provider.client.api_configuration();
+        // Unset fields take the SDK defaults rather than environment values.
+        assert_eq!(api.base_path, "https://app.daytona.io/api");
+        assert_eq!(api.bearer_access_token.as_deref(), Some("explicit-key"));
+        assert_eq!(api.user_agent.as_deref(), Some("embedding-app/1.0"));
+        assert_eq!(provider.client.organization_id(), None);
+
+        let provider = DaytonaProvider::connect_explicit(DaytonaConfig {
+            jwt_token: Some("explicit-jwt".to_owned()),
+            organization_id: Some("org-1".to_owned()),
+            api_url: Some("https://daytona.example/api".to_owned()),
+            ..DaytonaConfig::default()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("explicit JWT connects: {error}"));
+        assert!(!provider.uses_api_key);
+        assert_eq!(
+            provider.client.api_configuration().base_path,
+            "https://daytona.example/api"
+        );
+        assert_eq!(provider.client.organization_id(), Some("org-1"));
+    }
 
     #[test]
     fn current_key_identity_uses_its_organization_and_ignores_credentials() {
