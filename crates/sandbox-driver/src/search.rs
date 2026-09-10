@@ -105,6 +105,16 @@ pub struct GrepMatch {
     pub line:        String,
 }
 
+impl GrepMatch {
+    pub fn new(path: impl Into<String>, line_number: u64, line: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            line_number,
+            line: line.into(),
+        }
+    }
+}
+
 /// Options for [`Search::walk`].
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -122,4 +132,13 @@ pub struct WalkedFile {
     pub path: String,
     /// `None` when the transport cannot report sizes (BSD find fallback).
     pub size: Option<u64>,
+}
+
+impl WalkedFile {
+    pub fn new(path: impl Into<String>, size: Option<u64>) -> Self {
+        Self {
+            path: path.into(),
+            size,
+        }
+    }
 }

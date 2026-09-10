@@ -32,6 +32,7 @@ sandbox-driver-docker = { path = "crates/sandbox-driver-docker" }
 sandbox-driver-conformance = { path = "crates/sandbox-driver-conformance" }
 sandbox-driver-docker-config = { path = "crates/sandbox-driver-docker-config" }
 sandbox-driver-host = { path = "crates/sandbox-driver-host" }
+sandbox-driver-testing = { path = "crates/sandbox-driver-testing" }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 serde_json = "1"
