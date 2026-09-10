@@ -17,6 +17,7 @@ use crate::exec::{Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
 pub(crate) struct ScriptedExec {
     responses: Mutex<VecDeque<ExecResult>>,
     commands:  Mutex<Vec<String>>,
+    timeouts:  Mutex<Vec<Option<Duration>>>,
 }
 
 impl ScriptedExec {
@@ -24,6 +25,7 @@ impl ScriptedExec {
         Self {
             responses: Mutex::new(responses.into_iter().collect()),
             commands:  Mutex::new(Vec::new()),
+            timeouts:  Mutex::new(Vec::new()),
         }
     }
 
@@ -55,6 +57,11 @@ impl ScriptedExec {
     pub(crate) fn commands(&self) -> Vec<String> {
         self.commands.lock().expect("commands lock").clone()
     }
+
+    /// The timeout each command ran with, in order.
+    pub(crate) fn timeouts(&self) -> Vec<Option<Duration>> {
+        self.timeouts.lock().expect("timeouts lock").clone()
+    }
 }
 
 fn recorded(spec: &ExecSpec) -> String {
@@ -78,6 +85,10 @@ impl Exec for ScriptedExec {
             .lock()
             .expect("commands lock")
             .push(recorded(spec));
+        self.timeouts
+            .lock()
+            .expect("timeouts lock")
+            .push(spec.timeout);
         self.responses
             .lock()
             .expect("responses lock")

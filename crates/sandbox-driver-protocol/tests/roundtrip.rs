@@ -715,9 +715,13 @@ impl Git for RecordingGit {
         DerivedGit::new(self.inner.exec()).branches(repo_path).await
     }
 
-    async fn checkout(&self, repo_path: &str, branch: &str, create: bool) -> Result<()> {
+    async fn checkout(
+        &self,
+        repo_path: &str,
+        options: &sandbox_driver::GitCheckoutOptions,
+    ) -> Result<()> {
         DerivedGit::new(self.inner.exec())
-            .checkout(repo_path, branch, create)
+            .checkout(repo_path, options)
             .await
     }
 }

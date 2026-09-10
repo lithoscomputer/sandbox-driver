@@ -22,15 +22,16 @@ use async_trait::async_trait;
 use sandbox_driver::{
     Capabilities, Capability, DerivedGit, DirEntry, Error, EventContext, EventSubject, Exec,
     ExecControls, ExecResult, ExecSpec, ExecStreamingResult, FileMetadata, Filesystem, ForkOptions,
-    Git, GitBranches, GitCloneOptions, GitCommitOptions, GitCredentials, GitPushOptions, GitStatus,
-    HealthStatus, IncompleteOperation, LifecycleTimers, LogSink, LogSource, Logs, NetworkPolicy,
-    OneShot, OneShotSpec, OutputCaptureBuffer, OutputStream, PlatformInfo, PreviewUrl, PreviewUrls,
-    ProviderHealth, ProviderKind, Pty, PtyOptions, PtySession, PtySize, Resources, Result, Sandbox,
-    SandboxFilter, SandboxId, SandboxSnapshotOptions, SandboxSpec, SandboxStatus, SnapshotFilter,
-    SnapshotId, SnapshotProvider, SnapshotSpec, SnapshotStatus, SpawnSpec, SshAccess,
-    SshAccessInfo, StderrTail, StdinReader, StdioProcess, StdioProcessHandle, StopLevel,
-    Termination, TransportError, Vnc, VncConnection, VolumeId, VolumeProvider, VolumeSpec,
-    VolumeStatus, WebTerminal,
+    Git, GitBranches, GitCheckoutOptions, GitCloneOptions, GitCommitOptions, GitCredentials,
+    GitPushOptions, GitStatus, HealthStatus, IncompleteOperation, LifecycleTimers, LogSink,
+    LogSource, Logs, NetworkPolicy, OneShot, OneShotSpec, OutputCaptureBuffer, OutputStream,
+    PlatformInfo, PreviewUrl, PreviewUrls, ProviderHealth, ProviderKind, Pty, PtyOptions,
+    PtySession, PtySize, Resources, Result, Sandbox, SandboxFilter, SandboxId,
+    SandboxSnapshotOptions, SandboxSpec, SandboxStatus, SnapshotFilter, SnapshotId,
+    SnapshotProvider, SnapshotSpec, SnapshotStatus, SpawnSpec, SshAccess, SshAccessInfo,
+    StderrTail, StdinReader, StdioProcess, StdioProcessHandle, StopLevel, Termination,
+    TransportError, Vnc, VncConnection, VolumeId, VolumeProvider, VolumeSpec, VolumeStatus,
+    WebTerminal,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -1963,8 +1964,8 @@ impl Git for SandboxGit {
         self.derived().branches(repo_path).await
     }
 
-    async fn checkout(&self, repo_path: &str, branch: &str, create: bool) -> Result<()> {
-        self.derived().checkout(repo_path, branch, create).await
+    async fn checkout(&self, repo_path: &str, options: &GitCheckoutOptions) -> Result<()> {
+        self.derived().checkout(repo_path, options).await
     }
 }
 

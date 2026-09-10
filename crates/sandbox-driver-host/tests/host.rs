@@ -10,10 +10,10 @@ use std::{env, process};
 use async_trait::async_trait;
 use sandbox_driver::{
     Action, Capability, Error, Event, EventBody, EventContext, EventObserver, ExecControls,
-    ExecSpec, Git, GitCommitOptions, GrepOptions, NetworkPolicy, OutputStream, OwnedProvider,
-    Ownership, SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec, Search,
-    SpawnSpec, StdioProcessHandle, Termination, WaitOptions, WalkOptions, WorkspaceOwnership,
-    activate,
+    ExecSpec, Git, GitCheckoutOptions, GitCommitOptions, GrepOptions, NetworkPolicy, OutputStream,
+    OwnedProvider, Ownership, SandboxFilter, SandboxId, SandboxProvider, SandboxSource,
+    SandboxSpec, Search, SpawnSpec, StdioProcessHandle, Termination, WaitOptions, WalkOptions,
+    WorkspaceOwnership, activate,
 };
 use sandbox_driver_host::HostProvider;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -899,7 +899,7 @@ async fn normalized_git_drives_a_real_repository() {
     let branches = git.branches(&repo).await.expect("git branches");
     assert_eq!(branches.current.as_deref(), Some("main"));
 
-    git.checkout(&repo, "feature", true)
+    git.checkout(&repo, &GitCheckoutOptions::new("feature").create())
         .await
         .expect("git checkout -b");
     let status = git.status(&repo).await.expect("git status");

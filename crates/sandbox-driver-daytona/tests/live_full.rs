@@ -11,10 +11,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, process};
 
 use sandbox_driver::{
-    Action, Capability, Error, ExecSpec, Git, GitCloneOptions, GitCommitOptions, LifecycleTimers,
-    LogSink, LogSource, NetworkPolicy, Resources, SandboxKind, SandboxProvider,
-    SandboxSnapshotOptions, SandboxSource, SandboxSpec, SandboxState, SnapshotId, SnapshotMode,
-    SnapshotSource, SnapshotSpec, SnapshotState, WaitOptions, wait_for_state,
+    Action, Capability, Error, ExecSpec, Git, GitCheckoutOptions, GitCloneOptions,
+    GitCommitOptions, LifecycleTimers, LogSink, LogSource, NetworkPolicy, Resources, SandboxKind,
+    SandboxProvider, SandboxSnapshotOptions, SandboxSource, SandboxSpec, SandboxState, SnapshotId,
+    SnapshotMode, SnapshotSource, SnapshotSpec, SnapshotState, WaitOptions, wait_for_state,
 };
 use sandbox_driver_daytona::DaytonaProvider;
 use tokio::time;
@@ -246,9 +246,12 @@ async fn hybrid_git_uses_native_clone_and_derived_worktree_operations() {
         if sha.len() != 40 {
             return Err(format!("commit returned an unexpected SHA: {sha:?}"));
         }
-        git.checkout("hybrid-repo", "sandbox-driver-test", true)
-            .await
-            .map_err(|error| format!("derived checkout: {error}"))?;
+        git.checkout(
+            "hybrid-repo",
+            &GitCheckoutOptions::new("sandbox-driver-test").create(),
+        )
+        .await
+        .map_err(|error| format!("derived checkout: {error}"))?;
         let branches = git
             .branches("hybrid-repo")
             .await
