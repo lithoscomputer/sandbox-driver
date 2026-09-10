@@ -1,8 +1,11 @@
 //! Hybrid git operations for Daytona sandboxes.
 //!
 //! Clone uses Daytona's toolbox git API, matching Fabro's established path.
-//! The remaining operations use the shared exec-derived implementation, which
-//! preserves Fabro's command semantics and per-call credential handling.
+//! The toolbox selects a branch (`refs/heads/<name>`) or a commit and has no
+//! tag selector, so a clone pinned to a tag runs the shared exec-derived
+//! pinned clone instead. The remaining operations use the shared
+//! exec-derived implementation, which preserves Fabro's command semantics
+//! and per-call credential handling.
 
 use std::sync::Arc;
 
@@ -117,6 +120,11 @@ impl Git for DaytonaGit {
         options: &GitCloneOptions,
     ) -> Result<()> {
         options.validate()?;
+        if options.tag.is_some() {
+            // The toolbox has no tag selector; the derived pinned clone
+            // fetches the qualified tag ref and attaches the branch.
+            return self.derived().clone_repo(url, target_path, options).await;
+        }
         let sandbox = self
             .client
             .get(&self.sandbox_id)

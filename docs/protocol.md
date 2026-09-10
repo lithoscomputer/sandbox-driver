@@ -684,18 +684,24 @@ exec-derived on the host and has no wire method.
 
 | method | params | result |
 | --- | --- | --- |
-| `git/clone` | `{sandbox_id, url, target_path, options:{branch?, commit?, depth?, credentials?:{username,password}}}` | `{}` |
+| `git/clone` | `{sandbox_id, url, target_path, options:{branch?, commit?, tag?, depth?, credentials?:{username,password}}}` | `{}` |
 
 `target_path` resolves against the sandbox working directory when
 relative. `commit`, when present, must be a full 40-hex SHA; the clone
 is pinned to it whatever `depth` says, and with `branch` also present the
-checkout ends attached to that branch at the pinned commit. An
-unavailable commit fails with the provider's error; the plugin must not
-fall back to the branch head. `credentials` are applied to this one
-network operation and never written into the repository configuration.
-The method is additive within version 2: a host that receives `-32601`
-from an older plugin runs the exec-derived clone it ran before the
-method existed.
+checkout ends attached to that branch at the pinned commit. `tag` names
+a tag without its `refs/tags/` prefix and pins the clone the same way,
+at the tagged commit; the plugin fetches it by its fully qualified ref so
+a branch of the same name is never selected. `commit` and `tag` are
+alternative pins and must not both be present. An unavailable commit or
+tag fails with the provider's error; the plugin must not fall back to
+the branch head. `credentials` are applied to this one network operation
+and never written into the repository configuration. The method is
+additive within version 2: a host that receives `-32601` from an older
+plugin runs the exec-derived clone it ran before the method existed. A
+plugin built before `tag` existed ignores the unknown field and clones
+the branch head, so a host that pins tags must run a plugin at least as
+new as itself.
 
 ### 8.7 Snapshots and volumes
 

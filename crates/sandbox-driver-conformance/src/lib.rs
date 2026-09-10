@@ -259,6 +259,9 @@ impl Conformance {
                 Box::pin(search_greps_directories_and_single_files(ctx))
             }),
             ("git_round_trip", |ctx| Box::pin(git_round_trip(ctx))),
+            ("git_clone_pins_a_tag", |ctx| {
+                Box::pin(git_clone_pins_a_tag(ctx))
+            }),
             ("unsupported_actions_say_so", |ctx| {
                 Box::pin(unsupported_actions_say_so(ctx))
             }),
@@ -1891,6 +1894,130 @@ async fn search_greps_directories_and_single_files(ctx: &Conformance) -> CheckOu
             if matches[0].line_number != 1 || !matches[0].line.contains("needle") {
                 return fail(format!("grep of {path} returned {:?}", matches[0]));
             }
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+/// A clone pinned to a tag checks out the tagged commit on the admitted
+/// branch, whatever the provider's clone implementation is. The fixture
+/// advances `main` past the tag and adds a branch that shares the tag's
+/// name, so only a clone that fetches the fully qualified tag ref passes.
+async fn git_clone_pins_a_tag(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        if !sandbox.capabilities().supports(Capability::Git) {
+            return Ok(Some("capability git not declared".to_owned()));
+        }
+        let Some(git) = sandbox.git() else {
+            return fail("git is declared but the facet is absent");
+        };
+
+        let setup = sandbox
+            .exec()
+            .run(
+                &ExecSpec::bash(
+                    "rm -rf conformance-tag && \
+                     mkdir conformance-tag && \
+                     cd conformance-tag && \
+                     git init -q --bare remote.git && \
+                     git init -q -b main seed && \
+                     cd seed && \
+                     git -c user.name=Conformance \
+                         -c user.email=conformance@example.com \
+                         commit -q --allow-empty -m tagged && \
+                     git -c user.name=Conformance \
+                         -c user.email=conformance@example.com \
+                         tag -a -m release v1.0.0 && \
+                     git rev-parse 'HEAD^{commit}' && \
+                     git -c user.name=Conformance \
+                         -c user.email=conformance@example.com \
+                         commit -q --allow-empty -m later && \
+                     git branch v1.0.0 HEAD && \
+                     git remote add origin ../remote.git && \
+                     git push -q origin refs/heads/main refs/heads/v1.0.0 refs/tags/v1.0.0 && \
+                     git --git-dir=../remote.git symbolic-ref HEAD refs/heads/main",
+                )
+                .timeout(Duration::from_secs(60)),
+            )
+            .await
+            .map_err(|error| format!("tag fixture setup failed: {error}"))?;
+        if !setup.success() {
+            return fail(format!(
+                "tag fixture setup exited {:?}: {}",
+                setup.exit_code,
+                setup.stderr_lossy()
+            ));
+        }
+        let tagged = setup.stdout_lossy().trim().to_owned();
+        if tagged.len() != 40 {
+            return fail(format!("tag fixture printed no commit SHA: {tagged:?}"));
+        }
+
+        let root = sandbox.working_directory().trim_end_matches('/');
+        let remote_url = format!("file://{root}/conformance-tag/remote.git");
+        let mut options = GitCloneOptions::default();
+        options.branch = Some("main".to_owned());
+        options.tag = Some("v1.0.0".to_owned());
+        options.depth = Some(1);
+        git.clone_repo(&remote_url, "conformance-tag/clone", &options)
+            .await
+            .map_err(|error| format!("tag clone failed: {error}"))?;
+
+        let repo = "conformance-tag/clone";
+        let status = git
+            .status(repo)
+            .await
+            .map_err(|error| format!("tag clone status failed: {error}"))?;
+        if status.current_branch.as_deref() != Some("main") || status.detached {
+            return fail(format!("tag clone status is wrong: {status:?}"));
+        }
+        let head = sandbox
+            .exec()
+            .run(
+                &ExecSpec::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .working_dir(repo)
+                    .timeout(Duration::from_secs(30)),
+            )
+            .await
+            .map_err(|error| format!("tag clone rev-parse failed: {error}"))?;
+        if !head.success() || head.stdout_lossy().trim() != tagged {
+            return fail(format!(
+                "tag clone checked out {:?}, not the tagged commit {tagged}",
+                head.stdout_lossy().trim()
+            ));
+        }
+
+        let mut missing = GitCloneOptions::default();
+        missing.branch = Some("main".to_owned());
+        missing.tag = Some("v9.9.9".to_owned());
+        match git
+            .clone_repo(&remote_url, "conformance-tag/missing", &missing)
+            .await
+        {
+            Ok(()) => return fail("a clone pinned to a missing tag succeeded"),
+            Err(Error::Provider(_) | Error::Exec(_)) => {}
+            Err(error) => {
+                return fail(format!(
+                    "missing tag failed with an unexpected kind: {error}"
+                ));
+            }
+        }
+        let leftover = sandbox
+            .exec()
+            .run(
+                &ExecSpec::new("git")
+                    .args(["rev-parse", "--verify", "HEAD"])
+                    .working_dir("conformance-tag/missing")
+                    .timeout(Duration::from_secs(30)),
+            )
+            .await;
+        if leftover.is_ok_and(|result| result.success()) {
+            return fail("a failed tag clone left a checkout at the branch head");
         }
         PASS
     }

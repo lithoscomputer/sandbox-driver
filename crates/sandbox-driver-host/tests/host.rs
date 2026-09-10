@@ -703,6 +703,79 @@ async fn pinned_clone_attaches_the_admitted_branch() {
 }
 
 #[tokio::test]
+async fn tag_pinned_clone_attaches_the_admitted_branch() {
+    let provider = HostProvider::new();
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+    let exec = sandbox.exec();
+    let workspace = sandbox.working_directory().to_owned();
+
+    // A source repo whose main advanced past the tagged commit, with a
+    // branch that shares the tag's name so a short-name lookup would
+    // pick the wrong revision.
+    let setup = ExecSpec::bash(
+        "git init -q -b main src && cd src && \
+         git -c user.name=T -c user.email=t@example.com commit -q --allow-empty -m one && \
+         git tag -a -m release v1.0.0 && \
+         git rev-parse HEAD^{commit} && \
+         git -c user.name=T -c user.email=t@example.com commit -q --allow-empty -m two && \
+         git branch v1.0.0 HEAD",
+    )
+    .timeout(Duration::from_secs(30));
+    let result = exec.run(&setup).await.expect("source repo setup");
+    assert!(result.success(), "stderr: {}", result.stderr_lossy());
+    let tagged = result.stdout_lossy().trim().to_owned();
+    assert_eq!(tagged.len(), 40, "sha: {tagged}");
+
+    let git = sandbox.git().expect("git facet");
+    let mut options = sandbox_driver::GitCloneOptions::default();
+    options.branch = Some("main".to_owned());
+    options.tag = Some("v1.0.0".to_owned());
+    options.depth = Some(1);
+    git.clone_repo(&format!("file://{workspace}/src"), "dst", &options)
+        .await
+        .expect("tag clone");
+
+    let repo = format!("{workspace}/dst");
+    let status = git.status(&repo).await.expect("git status");
+    assert_eq!(status.current_branch.as_deref(), Some("main"));
+    assert!(!status.detached);
+    let head = exec
+        .run(
+            &ExecSpec::new("git")
+                .args(["-C", &repo, "rev-parse", "HEAD"])
+                .timeout(Duration::from_secs(10)),
+        )
+        .await
+        .expect("rev-parse");
+    assert_eq!(head.stdout_lossy().trim(), tagged);
+
+    // A missing tag fails instead of leaving a branch-head checkout.
+    let mut missing = sandbox_driver::GitCloneOptions::default();
+    missing.branch = Some("main".to_owned());
+    missing.tag = Some("v9.9.9".to_owned());
+    git.clone_repo(&format!("file://{workspace}/src"), "missing", &missing)
+        .await
+        .expect_err("missing tag fails");
+    let leftover = exec
+        .run(
+            &ExecSpec::new("git")
+                .args([
+                    "-C",
+                    &format!("{workspace}/missing"),
+                    "rev-parse",
+                    "--verify",
+                    "HEAD",
+                ])
+                .timeout(Duration::from_secs(10)),
+        )
+        .await
+        .expect("rev-parse");
+    assert!(!leftover.success(), "a failed tag clone left a checkout");
+
+    sandbox.delete().await.expect("delete");
+}
+
+#[tokio::test]
 async fn normalized_git_drives_a_real_repository() {
     let provider = HostProvider::new();
     let sandbox = provider.create(&host_spec(), None).await.expect("create");
