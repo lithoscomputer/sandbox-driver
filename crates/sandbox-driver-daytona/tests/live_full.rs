@@ -948,38 +948,35 @@ async fn snapshot_provider_round_trip() {
     .sandbox_kind(SandboxKind::Container)
     .region("us")
     .resources(snapshot_resources(1024));
+    // `ensure` creates the snapshot and waits for the build to settle.
     let id = snapshots
-        .create(&spec, None)
+        .ensure(&spec, Duration::from_secs(600), None)
         .await
-        .expect("snapshot create");
+        .expect("snapshot ensure");
 
     let outcome = async {
-        // Poll until the build settles.
-        let deadline = Instant::now() + Duration::from_secs(600);
-        loop {
-            let status = snapshots
-                .get(&id)
-                .await
-                .map_err(|error| format!("snapshot get: {error}"))?;
-            match status.state {
-                SnapshotState::Active => {
-                    if status.sandbox_kind != Some(SandboxKind::Container)
-                        || !status.regions.iter().any(|region| region == "us")
-                    {
-                        return Err(format!(
-                            "snapshot status did not preserve kind and region: {status:?}"
-                        ));
-                    }
-                    break;
-                }
-                SnapshotState::Error => {
-                    return Err(format!("snapshot build failed: {:?}", status.error_reason));
-                }
-                _ if Instant::now() >= deadline => {
-                    return Err(format!("snapshot never became active ({:?})", status.state));
-                }
-                _ => time::sleep(Duration::from_secs(5)).await,
-            }
+        let status = snapshots
+            .get(&id)
+            .await
+            .map_err(|error| format!("snapshot get: {error}"))?;
+        if status.state != SnapshotState::Active
+            || status.sandbox_kind != Some(SandboxKind::Container)
+            || !status.regions.iter().any(|region| region == "us")
+        {
+            return Err(format!(
+                "snapshot status did not preserve kind and region: {status:?}"
+            ));
+        }
+        // A second ensure finds the active snapshot and returns the same
+        // id without creating another.
+        let again = snapshots
+            .ensure(&spec, Duration::from_secs(60), None)
+            .await
+            .map_err(|error| format!("second ensure: {error}"))?;
+        if again != id {
+            return Err(format!(
+                "ensure returned {again} for the existing snapshot {id}"
+            ));
         }
         // It must appear in a name-filtered list.
         let mut filter = sandbox_driver::SnapshotFilter::default();

@@ -362,6 +362,12 @@ pub trait SnapshotProvider: Send + Sync {
     // for two weeks; content-addressed reuse needs a way back.
     async fn activate(&self, id: &SnapshotId) -> Result<(), Error>;
     async fn deactivate(&self, id: &SnapshotId) -> Result<(), Error>;
+    // Default, composed from the methods above: look the named snapshot
+    // up, activate or create it as needed, and wait within `budget` for
+    // it to become active. Every consumer wants exactly this sequence
+    // before creating a sandbox from a content-addressed snapshot, and it
+    // works over the wire without a method of its own.
+    async fn ensure(&self, spec: &SnapshotSpec, budget: Duration) -> Result<SnapshotId, Error>;
 }
 
 pub struct SnapshotSpec {

@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::time::{Instant, sleep};
 
 use crate::capabilities::{Capabilities, Capability};
-use crate::error::{Error, ResourceKind, Result};
+use crate::error::{Error, ProviderError, ResourceKind, Result};
 use crate::event::EventContext;
 use crate::id::{ProviderKind, SandboxId, SnapshotId, VolumeId};
 use crate::logs::LogSink;
@@ -196,6 +197,107 @@ pub trait SnapshotProvider: Send + Sync {
         let _ = (id, events);
         Err(Error::unsupported(Capability::SnapshotsActivation))
     }
+
+    /// Makes the snapshot named by `spec.name` usable and returns its id,
+    /// whatever state it starts in: an active snapshot is returned at
+    /// once, an inactive one is activated, a missing one is created from
+    /// `spec`, and a building one is waited for. The wait polls
+    /// [`SnapshotProvider::get`] with a growing interval until the
+    /// snapshot is active, fails with the provider's reason when it
+    /// enters the error state or starts deleting, and fails with
+    /// [`Error::Timeout`] once `budget` has passed. `events` reach the
+    /// create or activate operation this runs.
+    ///
+    /// The default is composed from the other methods, so it holds for
+    /// every provider and both transports without a wire method of its
+    /// own; a provider with a native equivalent may override it.
+    async fn ensure(
+        &self,
+        spec: &SnapshotSpec,
+        budget: Duration,
+        events: Option<EventContext>,
+    ) -> Result<SnapshotId> {
+        ensure_snapshot(self, spec, budget, events).await
+    }
+}
+
+/// First poll interval of [`SnapshotProvider::ensure`]; doubles up to
+/// [`ENSURE_MAX_POLL`]. An image pull settles in seconds, a Dockerfile
+/// build in minutes, and neither is helped by a tight loop.
+const ENSURE_FIRST_POLL: Duration = Duration::from_secs(2);
+const ENSURE_MAX_POLL: Duration = Duration::from_secs(30);
+
+async fn ensure_snapshot<P: SnapshotProvider + ?Sized>(
+    provider: &P,
+    spec: &SnapshotSpec,
+    budget: Duration,
+    events: Option<EventContext>,
+) -> Result<SnapshotId> {
+    let Some(name) = spec.name.as_deref() else {
+        return Err(Error::invalid_spec(
+            "name",
+            "ensure looks a snapshot up by name, so the spec must carry one",
+        ));
+    };
+    let started = Instant::now();
+    let filter = SnapshotFilter {
+        name: Some(name.to_owned()),
+    };
+    let existing = provider
+        .list(&filter)
+        .await?
+        .into_iter()
+        .find(|status| status.name.as_deref() == Some(name));
+    let id = match existing {
+        Some(status) => match status.state {
+            SnapshotState::Active => return Ok(status.id),
+            SnapshotState::Error | SnapshotState::Deleting => {
+                return Err(snapshot_unusable(name, &status));
+            }
+            SnapshotState::Inactive => {
+                provider.activate(&status.id, events).await?;
+                status.id
+            }
+            SnapshotState::Building | SnapshotState::Unknown => status.id,
+        },
+        None => provider.create(spec, events).await?,
+    };
+
+    let mut interval = ENSURE_FIRST_POLL;
+    loop {
+        let elapsed = started.elapsed();
+        if elapsed >= budget {
+            return Err(Error::Timeout {
+                operation: format!("waiting for snapshot {name:?} to become active"),
+                elapsed,
+            });
+        }
+        sleep(interval.min(budget.saturating_sub(elapsed))).await;
+        let status = provider.get(&id).await?;
+        tracing::debug!(snapshot = name, state = ?status.state, "snapshot state observed");
+        match status.state {
+            SnapshotState::Active => return Ok(id),
+            SnapshotState::Error | SnapshotState::Deleting => {
+                return Err(snapshot_unusable(name, &status));
+            }
+            SnapshotState::Building | SnapshotState::Inactive | SnapshotState::Unknown => {
+                interval = (interval * 2).min(ENSURE_MAX_POLL);
+            }
+        }
+    }
+}
+
+/// The failure for a snapshot that cannot become active, carrying the
+/// provider's reason the way [`crate::wait_for_state`] does for a sandbox.
+fn snapshot_unusable(name: &str, status: &SnapshotStatus) -> Error {
+    let reason = status
+        .error_reason
+        .clone()
+        .unwrap_or_else(|| format!("snapshot is in state {:?}", status.state));
+    Error::Provider(ProviderError::new(
+        ProviderKind::try_new("unknown").expect("static kind is valid"),
+        format!("snapshot {name:?} cannot become active: {reason}"),
+    ))
 }
 
 /// What a snapshot is built from.
@@ -424,6 +526,9 @@ impl VolumeStatus {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
     use super::*;
 
     #[test]
@@ -445,5 +550,169 @@ mod tests {
         assert_eq!(spec.region.as_deref(), Some("eu"));
         assert_eq!(spec.resources, resources);
         assert!(spec.validate().is_ok());
+    }
+
+    /// A snapshot provider that replays scripted `get` states and records
+    /// the mutating calls it receives.
+    struct ScriptedSnapshots {
+        listed: Vec<SnapshotStatus>,
+        states: Mutex<VecDeque<SnapshotState>>,
+        calls:  Mutex<Vec<&'static str>>,
+    }
+
+    impl ScriptedSnapshots {
+        fn new(listed: Vec<SnapshotStatus>, states: Vec<SnapshotState>) -> Self {
+            Self {
+                listed,
+                states: Mutex::new(states.into_iter().collect()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().expect("calls lock").clone()
+        }
+    }
+
+    fn snapshot_id(text: &str) -> SnapshotId {
+        SnapshotId::try_new(text).expect("valid id")
+    }
+
+    fn named_status(text: &str, state: SnapshotState) -> SnapshotStatus {
+        let mut status = SnapshotStatus::new(snapshot_id(text), state);
+        status.name = Some("fabro-snap".to_owned());
+        status
+    }
+
+    fn named_spec() -> SnapshotSpec {
+        SnapshotSpec::new(SnapshotSource::Image {
+            reference: "ubuntu:24.04".to_owned(),
+        })
+        .name("fabro-snap")
+    }
+
+    #[async_trait]
+    impl SnapshotProvider for ScriptedSnapshots {
+        async fn create(
+            &self,
+            spec: &SnapshotSpec,
+            _events: Option<EventContext>,
+        ) -> Result<SnapshotId> {
+            assert_eq!(spec.name.as_deref(), Some("fabro-snap"));
+            self.calls.lock().expect("calls lock").push("create");
+            Ok(snapshot_id("created"))
+        }
+
+        async fn get(&self, id: &SnapshotId) -> Result<SnapshotStatus> {
+            self.calls.lock().expect("calls lock").push("get");
+            let state = self
+                .states
+                .lock()
+                .expect("states lock")
+                .pop_front()
+                .expect("a scripted state for every poll");
+            Ok(SnapshotStatus::new(id.clone(), state))
+        }
+
+        async fn list(&self, filter: &SnapshotFilter) -> Result<Vec<SnapshotStatus>> {
+            assert_eq!(filter.name.as_deref(), Some("fabro-snap"));
+            self.calls.lock().expect("calls lock").push("list");
+            Ok(self.listed.clone())
+        }
+
+        async fn delete(&self, _id: &SnapshotId, _events: Option<EventContext>) -> Result<()> {
+            unreachable!("ensure never deletes")
+        }
+
+        async fn activate(&self, _id: &SnapshotId, _events: Option<EventContext>) -> Result<()> {
+            self.calls.lock().expect("calls lock").push("activate");
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ensure_returns_an_active_snapshot_without_a_poll() {
+        let provider =
+            ScriptedSnapshots::new(vec![named_status("live", SnapshotState::Active)], vec![]);
+        let id = provider
+            .ensure(&named_spec(), Duration::from_secs(60), None)
+            .await
+            .expect("ensure");
+        assert_eq!(id.as_str(), "live");
+        assert_eq!(provider.calls(), ["list"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ensure_creates_a_missing_snapshot_and_waits_with_a_growing_interval() {
+        let provider = ScriptedSnapshots::new(vec![], vec![
+            SnapshotState::Building,
+            SnapshotState::Building,
+            SnapshotState::Active,
+        ]);
+        let started = Instant::now();
+        let id = provider
+            .ensure(&named_spec(), Duration::from_secs(600), None)
+            .await
+            .expect("ensure");
+        assert_eq!(id.as_str(), "created");
+        assert_eq!(provider.calls(), ["list", "create", "get", "get", "get"]);
+        // Polls after 2s, 4s, and 8s.
+        assert_eq!(started.elapsed(), Duration::from_secs(14));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ensure_activates_an_inactive_snapshot_then_waits() {
+        let provider =
+            ScriptedSnapshots::new(vec![named_status("cold", SnapshotState::Inactive)], vec![
+                SnapshotState::Active,
+            ]);
+        let id = provider
+            .ensure(&named_spec(), Duration::from_secs(60), None)
+            .await
+            .expect("ensure");
+        assert_eq!(id.as_str(), "cold");
+        assert_eq!(provider.calls(), ["list", "activate", "get"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ensure_reports_the_providers_reason_for_a_failed_snapshot() {
+        let mut failed = named_status("broken", SnapshotState::Error);
+        failed.error_reason = Some("base image not found".to_owned());
+        let provider = ScriptedSnapshots::new(vec![failed], vec![]);
+        let error = provider
+            .ensure(&named_spec(), Duration::from_secs(60), None)
+            .await
+            .expect_err("errored snapshot fails");
+        assert!(
+            error.to_string().contains("base image not found"),
+            "{error}"
+        );
+        assert_eq!(provider.calls(), ["list"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ensure_times_out_when_a_build_outlives_the_budget() {
+        let provider = ScriptedSnapshots::new(vec![], vec![SnapshotState::Building; 8]);
+        let error = provider
+            .ensure(&named_spec(), Duration::from_secs(10), None)
+            .await
+            .expect_err("budget exhausted");
+        assert!(matches!(error, Error::Timeout { .. }), "{error}");
+        // Polls at 2s, 6s, and 10s (the last sleep is cut to the budget);
+        // none starts past it.
+        assert_eq!(provider.calls(), ["list", "create", "get", "get", "get"]);
+    }
+
+    #[tokio::test]
+    async fn ensure_needs_a_name() {
+        let provider = ScriptedSnapshots::new(vec![], vec![]);
+        let mut spec = named_spec();
+        spec.name = None;
+        let error = provider
+            .ensure(&spec, Duration::from_secs(60), None)
+            .await
+            .expect_err("unnamed spec is rejected");
+        assert!(matches!(error, Error::InvalidSpec { .. }), "{error}");
+        assert!(provider.calls().is_empty());
     }
 }
