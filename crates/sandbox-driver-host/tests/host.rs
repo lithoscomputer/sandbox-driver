@@ -794,7 +794,7 @@ async fn tag_pinned_clone_attaches_the_admitted_branch() {
     let setup = ExecSpec::bash(
         "git init -q -b main src && cd src && \
          git -c user.name=T -c user.email=t@example.com commit -q --allow-empty -m one && \
-         git tag -a -m release v1.0.0 && \
+         git -c user.name=T -c user.email=t@example.com tag -a -m release v1.0.0 && \
          git rev-parse HEAD^{commit} && \
          git -c user.name=T -c user.email=t@example.com commit -q --allow-empty -m two && \
          git branch v1.0.0 HEAD",
