@@ -36,7 +36,7 @@ type Responder = Box<dyn Fn(&ExecSpec) -> Option<ExecResult> + Send + Sync>;
 pub struct ScriptedExec {
     responder:         Mutex<Option<Responder>>,
     outcomes:          Mutex<VecDeque<Outcome>>,
-    default:           Mutex<ExecResult>,
+    default:           Mutex<Outcome>,
     recorded:          Mutex<Vec<ExecSpec>>,
     stdin:             Mutex<Vec<Vec<u8>>>,
     probe_fails:       AtomicBool,
@@ -56,7 +56,7 @@ impl ScriptedExec {
         Self {
             responder:         Mutex::new(None),
             outcomes:          Mutex::new(VecDeque::new()),
-            default:           Mutex::new(Self::ok("")),
+            default:           Mutex::new(Outcome::Result(Self::ok(""))),
             recorded:          Mutex::new(Vec::new()),
             stdin:             Mutex::new(Vec::new()),
             probe_fails:       AtomicBool::new(false),
@@ -116,7 +116,15 @@ impl ScriptedExec {
 
     /// Replaces the result that answers when the queue is empty.
     pub fn set_default(&self, result: ExecResult) -> &Self {
-        *self.default.lock().unwrap_or_else(PoisonError::into_inner) = result;
+        *self.default.lock().unwrap_or_else(PoisonError::into_inner) = Outcome::Result(result);
+        self
+    }
+
+    /// Makes every command the queue does not answer fail as a transport
+    /// failure with this message: the sandbox is unreachable.
+    pub fn fail_by_default(&self, message: impl Into<String>) -> &Self {
+        *self.default.lock().unwrap_or_else(PoisonError::into_inner) =
+            Outcome::Failure(message.into());
         self
     }
 
@@ -201,14 +209,16 @@ impl ScriptedExec {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .pop_front();
-        match next {
-            Some(Outcome::Result(result)) => Ok(result),
-            Some(Outcome::Failure(message)) => Err(Error::Transport(TransportError::new(message))),
-            None => Ok(self
-                .default
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone()),
+        let outcome = match next {
+            Some(outcome) => outcome,
+            None => match &*self.default.lock().unwrap_or_else(PoisonError::into_inner) {
+                Outcome::Result(result) => Outcome::Result(result.clone()),
+                Outcome::Failure(message) => Outcome::Failure(message.clone()),
+            },
+        };
+        match outcome {
+            Outcome::Result(result) => Ok(result),
+            Outcome::Failure(message) => Err(Error::Transport(TransportError::new(message))),
         }
     }
 }

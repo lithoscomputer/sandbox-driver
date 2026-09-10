@@ -67,6 +67,22 @@ async fn scripted_results_answer_in_order_then_the_default() {
 }
 
 #[tokio::test]
+async fn an_unreachable_sandbox_fails_every_unscripted_command() {
+    let sandbox = ScriptedSandbox::new();
+    sandbox
+        .scripted_exec()
+        .push_result(ScriptedExec::ok("once"))
+        .fail_by_default("daemon went away");
+    assert!(sandbox.exec().run(&ExecSpec::new("ls")).await.is_ok());
+    let error = sandbox
+        .exec()
+        .run(&ExecSpec::new("ls"))
+        .await
+        .expect_err("default failure");
+    assert!(matches!(error, Error::Transport(_)), "{error}");
+}
+
+#[tokio::test]
 async fn a_responder_answers_by_spec_before_the_queue() {
     let sandbox = ScriptedSandbox::new();
     sandbox
