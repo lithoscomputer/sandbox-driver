@@ -67,6 +67,33 @@ async fn scripted_results_answer_in_order_then_the_default() {
 }
 
 #[tokio::test]
+async fn a_responder_answers_by_spec_before_the_queue() {
+    let sandbox = ScriptedSandbox::new();
+    sandbox
+        .scripted_exec()
+        .respond_with(|spec| {
+            spec.args
+                .iter()
+                .any(|arg| arg.contains("remote set-url"))
+                .then(|| ScriptedExec::failed(2, "set-url refused"))
+        })
+        .push_result(ScriptedExec::ok("pushed"));
+    let set_url = sandbox
+        .exec()
+        .run(&ExecSpec::bash("git remote set-url origin x"))
+        .await
+        .expect("set-url");
+    assert_eq!(set_url.exit_code, Some(2));
+    let push = sandbox
+        .exec()
+        .run(&ExecSpec::bash("git push origin main"))
+        .await
+        .expect("push");
+    assert_eq!(push.stdout_lossy(), "pushed");
+    assert_eq!(sandbox.scripted_exec().commands().len(), 2);
+}
+
+#[tokio::test]
 async fn streaming_delivers_output_and_captures_stdin() {
     let sandbox = ScriptedSandbox::new();
     let mut result = ScriptedExec::ok("out");

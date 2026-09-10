@@ -19,16 +19,22 @@ enum Outcome {
     Failure(String),
 }
 
+/// A test's own answer for a command, consulted before the queue.
+type Responder = Box<dyn Fn(&ExecSpec) -> Option<ExecResult> + Send + Sync>;
+
 /// An [`Exec`] that answers commands from a script.
 ///
-/// Results are consumed in order from a queue; when the queue is empty
-/// the default result answers (exit 0, no output, unless replaced with
-/// [`ScriptedExec::set_default`]). Every spec is recorded for assertions.
+/// A responder set with [`ScriptedExec::respond_with`] answers first, by
+/// looking at the spec; otherwise results are consumed in order from a
+/// queue; when the queue is empty the default result answers (exit 0, no
+/// output, unless replaced with [`ScriptedExec::set_default`]). Every spec
+/// is recorded for assertions.
 /// The bash probe that `activate` runs is answered on the side — passing
 /// unless [`ScriptedExec::fail_probe`] was set — and is neither queued
 /// nor recorded, so a test's expectations about the commands it drove
 /// are not disturbed by activation.
 pub struct ScriptedExec {
+    responder:         Mutex<Option<Responder>>,
     outcomes:          Mutex<VecDeque<Outcome>>,
     default:           Mutex<ExecResult>,
     recorded:          Mutex<Vec<ExecSpec>>,
@@ -48,6 +54,7 @@ impl Default for ScriptedExec {
 impl ScriptedExec {
     pub fn new() -> Self {
         Self {
+            responder:         Mutex::new(None),
             outcomes:          Mutex::new(VecDeque::new()),
             default:           Mutex::new(Self::ok("")),
             recorded:          Mutex::new(Vec::new()),
@@ -89,6 +96,21 @@ impl ScriptedExec {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push_back(Outcome::Failure(message.into()));
+        self
+    }
+
+    /// Answers commands by looking at their spec: a responder that returns
+    /// `Some` decides the result, `None` falls through to the queue and the
+    /// default. For tests that interleave different commands and want each
+    /// answered by what it is rather than by its position.
+    pub fn respond_with(
+        &self,
+        responder: impl Fn(&ExecSpec) -> Option<ExecResult> + Send + Sync + 'static,
+    ) -> &Self {
+        *self
+            .responder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(responder));
         self
     }
 
@@ -165,6 +187,15 @@ impl ScriptedExec {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(spec.clone());
+        if let Some(result) = self
+            .responder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .and_then(|responder| responder(spec))
+        {
+            return Ok(result);
+        }
         let next = self
             .outcomes
             .lock()
