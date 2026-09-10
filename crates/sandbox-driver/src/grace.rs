@@ -11,6 +11,7 @@
 //! process is destroyed.
 
 use std::future::{self, Future};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use tokio::time;
@@ -67,6 +68,10 @@ where
         retained_output_limit: controls.retained_output_limit,
     };
 
+    // The cause is recorded the moment the ladder starts, not when it
+    // finishes: a command that honours the TERM ends before the grace has
+    // passed, and its termination must still say why it was stopped.
+    let cause = Mutex::new(None);
     let ladder = drive(
         spec.timeout,
         grace,
@@ -74,18 +79,16 @@ where
         controls.kill.as_ref(),
         &inner_term,
         &inner_kill,
+        &cause,
     );
     let mut ladder = std::pin::pin!(ladder);
     let mut running = std::pin::pin!(run(inner_spec, inner_controls));
-    let mut cause = None;
-    let mut result = loop {
-        tokio::select! {
-            result = &mut running => break result?,
-            // The ladder resolves once, when its KILL has been sent; the
-            // guard keeps a finished future from being polled again.
-            fired = &mut ladder, if cause.is_none() => cause = Some(fired),
-        }
+    let mut result = tokio::select! {
+        result = &mut running => result?,
+        // The ladder never resolves; it only drives the tokens.
+        () = &mut ladder => unreachable!("the stop ladder never resolves"),
     };
+    let cause = *cause.lock().unwrap_or_else(PoisonError::into_inner);
     if cause == Some(Cause::TimedOut)
         && matches!(
             result.result.termination,
@@ -97,9 +100,9 @@ where
     Ok(result)
 }
 
-/// Waits for the timeout or the caller's stop, fires TERM, waits the
-/// grace (or the caller's kill), fires KILL, then reports why and never
-/// resolves again.
+/// Waits for the timeout or the caller's stop, records why, fires TERM,
+/// waits the grace (or the caller's kill), fires KILL, and then waits
+/// forever so it can sit beside the command in a `select!`.
 async fn drive(
     timeout: Option<Duration>,
     grace: Duration,
@@ -107,22 +110,25 @@ async fn drive(
     kill: Option<&CancellationToken>,
     inner_term: &CancellationToken,
     inner_kill: &CancellationToken,
-) -> Cause {
-    let cause = tokio::select! {
+    cause: &Mutex<Option<Cause>>,
+) {
+    let fired = tokio::select! {
         () = sleep_or_never(timeout) => Cause::TimedOut,
         () = stop_signal(term) => Cause::Stopped,
         () = stop_signal(kill) => {
+            *cause.lock().unwrap_or_else(PoisonError::into_inner) = Some(Cause::Stopped);
             inner_kill.cancel();
-            return Cause::Stopped;
+            return future::pending::<()>().await;
         }
     };
+    *cause.lock().unwrap_or_else(PoisonError::into_inner) = Some(fired);
     inner_term.cancel();
     tokio::select! {
         () = time::sleep(grace) => {}
         () = stop_signal(kill) => {}
     }
     inner_kill.cancel();
-    cause
+    future::pending::<()>().await;
 }
 
 async fn sleep_or_never(timeout: Option<Duration>) {
@@ -192,6 +198,49 @@ mod tests {
         Arc::new(Stubborn {
             terms: AtomicUsize::new(0),
         })
+    }
+
+    /// A command that ends as soon as it is asked to.
+    struct Obedient;
+
+    #[async_trait]
+    impl Exec for Obedient {
+        async fn run(&self, _spec: &ExecSpec) -> Result<ExecResult> {
+            unreachable!("tests go through run_streaming")
+        }
+
+        async fn run_streaming(
+            &self,
+            _spec: &ExecSpec,
+            controls: ExecControls,
+        ) -> Result<ExecStreamingResult> {
+            let term = controls.term.expect("ladder term");
+            term.cancelled().await;
+            let mut result =
+                ExecResult::new(Termination::Cancelled, None, Duration::from_millis(1));
+            result.signal = Some(15);
+            Ok(ExecStreamingResult::new(result))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_command_that_honours_the_term_still_reports_the_timeout() {
+        let spec = ExecSpec::new("sleep")
+            .timeout(Duration::from_secs(2))
+            .stop_grace(Duration::from_secs(30));
+        let started = time::Instant::now();
+        let result = run_with_stop_grace(
+            &spec,
+            ExecControls::default(),
+            |spec, controls| async move { Obedient.run_streaming(&spec, controls).await },
+        )
+        .await
+        .expect("run");
+        // The command ended on the TERM, long before the grace; the cause
+        // was recorded when the ladder fired, not when it would have killed.
+        assert_eq!(result.result.termination, Termination::TimedOut);
+        assert_eq!(result.result.signal, Some(15));
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
     }
 
     #[tokio::test(start_paused = true)]
