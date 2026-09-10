@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
 use async_trait::async_trait;
@@ -6,6 +7,7 @@ use sandbox_driver::{
     DirEntry, Error, FileKind, FileMetadata, Filesystem, ResourceKind, Result, WalkOptions,
     WalkedFile,
 };
+use tokio::fs;
 
 /// An in-memory [`Filesystem`].
 ///
@@ -339,6 +341,27 @@ impl Filesystem for MemoryFs {
             .unwrap_or_else(PoisonError::into_inner)
             .insert(resolved);
         Ok(())
+    }
+
+    /// Copies a local file into the memory filesystem, recorded as a write.
+    async fn upload(&self, local: &Path, remote: &str) -> Result<()> {
+        let content = fs::read(local)
+            .await
+            .map_err(|error| Error::io(format!("reading {}", local.display()), error))?;
+        self.write(remote, &content).await
+    }
+
+    /// Copies a memory file to the local filesystem, creating its parents.
+    async fn download(&self, remote: &str, local: &Path) -> Result<()> {
+        let content = self.read(remote).await?;
+        if let Some(parent) = local.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|error| Error::io(format!("creating {}", parent.display()), error))?;
+        }
+        fs::write(local, content)
+            .await
+            .map_err(|error| Error::io(format!("writing {}", local.display()), error))
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<()> {

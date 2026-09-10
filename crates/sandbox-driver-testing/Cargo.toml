@@ -12,7 +12,7 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 sandbox-driver.workspace = true
-tokio = { workspace = true, features = ["io-util", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "sync", "time"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

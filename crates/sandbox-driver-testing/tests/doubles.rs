@@ -3,6 +3,7 @@
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::{env, process};
 
 use sandbox_driver::{
     Error, ExecControls, ExecSpec, OutputStream, OwnedProvider, Ownership, Sandbox, SandboxFilter,
@@ -12,6 +13,7 @@ use sandbox_driver::{
 use sandbox_driver_testing::{
     ScriptedExec, ScriptedProvider, ScriptedSandbox, ScriptedStdioProcess,
 };
+use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
@@ -196,6 +198,33 @@ async fn memory_fs_records_deletes_and_counts_existence_probes() {
     let memory = sandbox.memory_fs();
     assert_eq!(memory.exists_calls(), 2);
     assert_eq!(memory.deletes(), vec![memory.resolve("notes.txt")]);
+}
+
+#[tokio::test]
+async fn memory_fs_uploads_and_downloads_local_files() {
+    let sandbox = ScriptedSandbox::new().file("out/report.md", "report");
+    let fs = sandbox.fs();
+    let local = env::temp_dir().join(format!(
+        "sandbox-driver-testing-{}-{}",
+        process::id(),
+        line!()
+    ));
+    let downloaded = local.join("nested").join("report.md");
+    fs.download("out/report.md", &downloaded)
+        .await
+        .expect("download");
+    assert_eq!(
+        fs::read(&downloaded).await.expect("read download"),
+        b"report"
+    );
+    fs.upload(&downloaded, "in/report.md")
+        .await
+        .expect("upload");
+    assert_eq!(
+        sandbox.memory_fs().contents("in/report.md"),
+        Some(b"report".to_vec())
+    );
+    fs::remove_dir_all(&local).await.expect("clean up");
 }
 
 #[tokio::test]

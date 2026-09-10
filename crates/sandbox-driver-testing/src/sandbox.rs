@@ -85,6 +85,8 @@ impl ScriptedSandbox {
         capabilities.exec.stdin_stream = true;
         capabilities.exec.stop = true;
         capabilities.exec.stdio_process = true;
+        capabilities.fs.upload = true;
+        capabilities.fs.download = true;
         capabilities.search.supported = true;
         capabilities.search.native = true;
         capabilities.git.supported = true;
