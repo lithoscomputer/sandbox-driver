@@ -13,20 +13,24 @@ use sandbox_driver::{
 /// double was built with. Writes are applied and recorded, so a test can
 /// read back what the code wrote or assert on the sequence of writes.
 pub struct MemoryFs {
-    root:   String,
-    files:  Mutex<BTreeMap<String, Vec<u8>>>,
-    dirs:   Mutex<BTreeSet<String>>,
-    writes: Mutex<Vec<(String, Vec<u8>)>>,
+    root:         String,
+    files:        Mutex<BTreeMap<String, Vec<u8>>>,
+    dirs:         Mutex<BTreeSet<String>>,
+    writes:       Mutex<Vec<(String, Vec<u8>)>>,
+    deletes:      Mutex<Vec<String>>,
+    exists_calls: Mutex<usize>,
 }
 
 impl MemoryFs {
     pub fn new(root: impl Into<String>) -> Self {
         let root = root.into();
         let fs = Self {
-            root:   root.clone(),
-            files:  Mutex::new(BTreeMap::new()),
-            dirs:   Mutex::new(BTreeSet::new()),
-            writes: Mutex::new(Vec::new()),
+            root:         root.clone(),
+            files:        Mutex::new(BTreeMap::new()),
+            dirs:         Mutex::new(BTreeSet::new()),
+            writes:       Mutex::new(Vec::new()),
+            deletes:      Mutex::new(Vec::new()),
+            exists_calls: Mutex::new(0),
         };
         fs.dirs
             .lock()
@@ -108,6 +112,23 @@ impl MemoryFs {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// Every delete so far as an absolute path, in order.
+    pub fn deletes(&self) -> Vec<String> {
+        self.deletes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// How many times `exists` was asked, for tests that assert a probe
+    /// is paid once.
+    pub fn exists_calls(&self) -> usize {
+        *self
+            .exists_calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn ensure_parents(&self, path: &str) {
@@ -215,6 +236,10 @@ impl Filesystem for MemoryFs {
 
     async fn delete(&self, path: &str, recursive: bool) -> Result<()> {
         let resolved = self.resolve(path);
+        self.deletes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(resolved.clone());
         let prefix = format!("{resolved}/");
         let mut files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
         let mut dirs = self.dirs.lock().unwrap_or_else(PoisonError::into_inner);
@@ -236,6 +261,10 @@ impl Filesystem for MemoryFs {
     }
 
     async fn exists(&self, path: &str) -> Result<bool> {
+        *self
+            .exists_calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) += 1;
         let resolved = self.resolve(path);
         Ok(self
             .files

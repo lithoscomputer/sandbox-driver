@@ -16,3 +16,4 @@ tokio = { workspace = true, features = ["io-util", "sync", "time"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tokio-util.workspace = true

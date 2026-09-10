@@ -13,6 +13,7 @@ use sandbox_driver_testing::{
     ScriptedExec, ScriptedProvider, ScriptedSandbox, ScriptedStdioProcess,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 async fn activate_passes_the_probe_without_recording_it() {
@@ -163,6 +164,38 @@ async fn streaming_keeps_only_what_the_retention_cap_allows() {
     assert_eq!(streaming.stdout_capture.retained_bytes, 8);
     assert_eq!(streaming.stdout_capture.omitted_bytes, 8);
     assert_eq!(streaming.stderr_capture.observed_bytes, 0);
+}
+
+#[tokio::test]
+async fn streaming_records_whether_a_term_stop_was_given() {
+    let sandbox = ScriptedSandbox::new();
+    let with_term = ExecControls {
+        term: Some(CancellationToken::new()),
+        ..ExecControls::buffered()
+    };
+    sandbox
+        .exec()
+        .run_streaming(&ExecSpec::bash("true"), with_term)
+        .await
+        .expect("stream");
+    sandbox
+        .exec()
+        .run_streaming(&ExecSpec::bash("true"), ExecControls::buffered())
+        .await
+        .expect("stream");
+    assert_eq!(sandbox.scripted_exec().term_stops(), vec![true, false]);
+}
+
+#[tokio::test]
+async fn memory_fs_records_deletes_and_counts_existence_probes() {
+    let sandbox = ScriptedSandbox::new().file("notes.txt", "n");
+    let fs = sandbox.fs();
+    assert!(fs.exists("notes.txt").await.expect("exists"));
+    assert!(!fs.exists("missing.txt").await.expect("exists"));
+    fs.delete("notes.txt", false).await.expect("delete");
+    let memory = sandbox.memory_fs();
+    assert_eq!(memory.exists_calls(), 2);
+    assert_eq!(memory.deletes(), vec![memory.resolve("notes.txt")]);
 }
 
 #[tokio::test]

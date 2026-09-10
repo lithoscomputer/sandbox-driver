@@ -38,6 +38,7 @@ pub struct ScriptedExec {
     outcomes:          Mutex<VecDeque<Outcome>>,
     default:           Mutex<Outcome>,
     recorded:          Mutex<Vec<ExecSpec>>,
+    term_stops:        Mutex<Vec<bool>>,
     stdin:             Mutex<Vec<Vec<u8>>>,
     probe_fails:       AtomicBool,
     streams_separated: AtomicBool,
@@ -58,6 +59,7 @@ impl ScriptedExec {
             outcomes:          Mutex::new(VecDeque::new()),
             default:           Mutex::new(Outcome::Result(Self::ok(""))),
             recorded:          Mutex::new(Vec::new()),
+            term_stops:        Mutex::new(Vec::new()),
             stdin:             Mutex::new(Vec::new()),
             probe_fails:       AtomicBool::new(false),
             streams_separated: AtomicBool::new(true),
@@ -171,6 +173,16 @@ impl ScriptedExec {
         self.recorded().iter().map(render).collect()
     }
 
+    /// Whether each streaming command was given a `term` stop, in order,
+    /// probes excluded. For tests that assert a cancellation reaches the
+    /// provider.
+    pub fn term_stops(&self) -> Vec<bool> {
+        self.term_stops
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// The standard input each streaming command was fed, in order.
     pub fn captured_stdin(&self) -> Vec<Vec<u8>> {
         self.stdin
@@ -249,6 +261,12 @@ impl Exec for ScriptedExec {
         controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
         let result = self.answer(spec)?;
+        if !Self::is_probe(spec) {
+            self.term_stops
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(controls.term.is_some());
+        }
         if let Some(mut reader) = controls.stdin_reader(spec) {
             let mut bytes = Vec::new();
             reader
