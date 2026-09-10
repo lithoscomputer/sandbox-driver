@@ -1,4 +1,5 @@
 use std::fmt;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -308,6 +309,11 @@ pub struct GitPushOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refspec:      Option<String>,
     pub credentials:  Option<GitCredentials>,
+    /// How long the push may run before the provider stops it. The
+    /// provider's network default when absent. A caller retrying under a
+    /// budget sets what remains of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout:      Option<Duration>,
 }
 
 impl GitPushOptions {

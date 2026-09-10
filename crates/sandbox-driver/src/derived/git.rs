@@ -402,7 +402,8 @@ impl Git for DerivedGit<'_> {
         if let Some(target) = options.refspec.as_ref().or(options.branch.as_ref()) {
             args.push(target.clone());
         }
-        self.run("git push", Some(repo_path), &args, NETWORK_TIMEOUT)
+        let timeout = options.timeout.unwrap_or(NETWORK_TIMEOUT);
+        self.run("git push", Some(repo_path), &args, timeout)
             .await?;
         Ok(())
     }
@@ -608,6 +609,7 @@ mod tests {
             set_upstream: true,
             refspec:      None,
             credentials:  Some(GitCredentials::new("user", "pass")),
+            timeout:      None,
         };
         git.push("/repo", &options).await.expect("push succeeds");
 
@@ -635,6 +637,7 @@ mod tests {
         let git = DerivedGit::new(&exec);
         let options = GitPushOptions {
             refspec: Some("+HEAD:refs/heads/run/42".to_owned()),
+            timeout: Some(Duration::from_secs(7)),
             ..GitPushOptions::default()
         };
         git.push("/repo", &options).await.expect("push succeeds");
@@ -642,6 +645,11 @@ mod tests {
             exec.commands()[0].contains("'push' 'origin' '+HEAD:refs/heads/run/42'"),
             "push: {}",
             exec.commands()[0]
+        );
+        assert_eq!(
+            exec.timeouts()[0],
+            Some(Duration::from_secs(7)),
+            "the caller's budget bounds the push"
         );
 
         let both = GitPushOptions {
