@@ -144,6 +144,28 @@ async fn streaming_delivers_output_and_captures_stdin() {
 }
 
 #[tokio::test]
+async fn streaming_keeps_only_what_the_retention_cap_allows() {
+    let sandbox = ScriptedSandbox::new();
+    sandbox
+        .scripted_exec()
+        .push_result(ScriptedExec::ok("0123456789ABCDEF"));
+    let controls = ExecControls {
+        retained_output_limit: Some(8),
+        ..ExecControls::default()
+    };
+    let streaming = sandbox
+        .exec()
+        .run_streaming(&ExecSpec::bash("seq"), controls)
+        .await
+        .expect("stream");
+    assert_eq!(streaming.result.stdout_lossy(), "0123CDEF");
+    assert_eq!(streaming.stdout_capture.observed_bytes, 16);
+    assert_eq!(streaming.stdout_capture.retained_bytes, 8);
+    assert_eq!(streaming.stdout_capture.omitted_bytes, 8);
+    assert_eq!(streaming.stderr_capture.observed_bytes, 0);
+}
+
+#[tokio::test]
 async fn memory_fs_round_trips_relative_paths_and_records_writes() {
     let sandbox = ScriptedSandbox::new().file("src/main.rs", "fn main() {}");
     let fs = sandbox.fs();

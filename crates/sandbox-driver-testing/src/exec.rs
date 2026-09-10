@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sandbox_driver::{
-    BASH_PROBE_SCRIPT, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
-    OutputStream, Result, SpawnSpec, StderrTail, StdioProcess, StdioProcessHandle, Termination,
-    TransportError,
+    BASH_PROBE_SCRIPT, CaptureStats, Error, Exec, ExecControls, ExecResult, ExecSpec,
+    ExecStreamingResult, OutputCaptureBuffer, OutputStream, Result, SpawnSpec, StderrTail,
+    StdioProcess, StdioProcessHandle, Termination, TransportError,
 };
 use tokio::io::{AsyncReadExt, DuplexStream, duplex};
 use tokio::time::sleep;
@@ -270,7 +270,16 @@ impl Exec for ScriptedExec {
                 sink(OutputStream::Stderr, result.stderr.clone()).await?;
             }
         }
+        // The scripted output is what the process wrote; the result keeps
+        // only what the caller's retention cap allows, as a provider would.
+        let (stdout, stdout_capture) = retain(&result.stdout, controls.retained_output_limit);
+        let (stderr, stderr_capture) = retain(&result.stderr, controls.retained_output_limit);
+        let mut result = result;
+        result.stdout = stdout;
+        result.stderr = stderr;
         let mut streaming = ExecStreamingResult::new(result);
+        streaming.stdout_capture = stdout_capture;
+        streaming.stderr_capture = stderr_capture;
         streaming.streams_separated = self.streams_separated.load(Ordering::SeqCst);
         streaming.live_streaming = true;
         Ok(streaming)
@@ -297,6 +306,13 @@ impl Exec for ScriptedExec {
         };
         Ok(process.start())
     }
+}
+
+/// The bytes of one stream a result keeps under `cap`, and the accounting.
+fn retain(output: &[u8], cap: Option<usize>) -> (Vec<u8>, CaptureStats) {
+    let mut buffer = OutputCaptureBuffer::new(cap);
+    buffer.push(output);
+    buffer.into_parts()
 }
 
 /// The process side of a scripted stdio spawn.
