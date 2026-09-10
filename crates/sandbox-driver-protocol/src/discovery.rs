@@ -1,6 +1,6 @@
 //! Plugin discovery and trust mechanisms: resolve a plugin binary by
-//! naming convention, verify a pinned checksum before exec, scrub the
-//! environment, and confirm the plugin's identity after the handshake.
+//! naming convention, verify a pinned checksum before exec, and scrub the
+//! environment.
 //!
 //! These are **mechanisms**; policy stays with the embedder. The library
 //! does not decide where plugin configuration lives, when `dev` mode is
@@ -16,15 +16,18 @@
 //! - **No ambient environment.** The child starts from an empty environment
 //!   plus exactly the variables the config declares or forwards. Secrets never
 //!   ride along by accident.
-//! - **Identity check.** After the handshake, the plugin's declared kind must
-//!   match the configured kind; a mismatch kills the child.
+//! - **The configuration names the plugin.** The configured kind is the
+//!   embedder's name for whatever the executable serves; the kind the plugin
+//!   declares in the handshake is not compared against it. An embedder that
+//!   pins a checksum has already decided which executable it trusts, and the
+//!   same executable may legitimately serve under several configured names.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
-use sandbox_driver::{Error, ProviderKind, ResourceKind, Result, SandboxProvider as _};
+use sandbox_driver::{Error, ProviderKind, ResourceKind, Result};
 use sha2::{Digest, Sha256};
 use tokio::fs as tokio_fs;
 use tokio::process::Command;
@@ -205,7 +208,9 @@ pub struct PluginLaunch {
 }
 
 /// Resolves, verifies, and launches a plugin with a scrubbed
-/// environment, then confirms its declared kind matches the config.
+/// environment. The configured kind names the plugin for the embedder;
+/// the kind the plugin declares is reported by the returned provider and
+/// is not required to match.
 ///
 /// `prefix` is the embedder's binary naming convention prefix (fabro
 /// uses `fabro-sandbox`, giving binaries like `fabro-sandbox-e2b`).
@@ -230,22 +235,6 @@ pub async fn launch_plugin(prefix: &str, config: &PluginConfig) -> Result<Plugin
     }
 
     let provider = PluginProvider::spawn(command).await?;
-    if *provider.kind() != config.kind {
-        let declared = provider.kind().clone();
-        // The child dies with the provider (kill-on-drop); ask nicely
-        // first so a well-behaved plugin exits cleanly.
-        if let Err(error) = provider.shutdown().await {
-            tracing::warn!(error = %error, "mismatched plugin shutdown failed");
-        }
-        return Err(Error::invalid_spec(
-            "kind",
-            format!(
-                "plugin at {} declares kind {declared} but was configured as {}",
-                path.display(),
-                config.kind
-            ),
-        ));
-    }
     Ok(PluginLaunch {
         provider,
         path,

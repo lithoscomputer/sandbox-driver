@@ -262,8 +262,8 @@ error. `data_transport` is required: a plugin that receives none must
 refuse the handshake, and every channel the host names later opens
 against the announced socket. `provider.kind` is the plugin's declared kind: lowercase ASCII
 letters, digits, and interior hyphens, at most 64 bytes. A host that
-launched the plugin from configuration must refuse a plugin whose
-declared kind differs from the configured kind (§12).
+launched the plugin from configuration names it by the configured kind;
+the declared kind is informational and need not match (§11).
 
 ## 5. Capabilities
 
@@ -1008,8 +1008,11 @@ implementation is `sandbox_driver_protocol::discovery`.
   environment plus exactly the variables its configuration declares or
   explicitly forwards. Provider credentials should be passed this way
   deliberately, never inherited.
-- **Identity check.** After `initialize`, a declared `provider.kind`
-  differing from the configured kind must abort the plugin.
+- **The configuration names the plugin.** The configured kind is the
+  host's name for whatever the executable serves; a declared
+  `provider.kind` that differs from it is not an error. A host that has
+  pinned the checksum has already decided which executable it trusts,
+  and one executable may serve under several configured names.
 - A plugin is inside the trust domain of every sandbox it drives; see
   the security section of the interface design document.
 
