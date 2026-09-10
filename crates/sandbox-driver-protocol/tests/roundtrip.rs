@@ -13,9 +13,9 @@ use async_trait::async_trait;
 use sandbox_driver::{
     Action, Capabilities, Capability, CorrelationId, DerivedGit, Error, Event, EventBody,
     EventContext, EventEmitter, EventObserver, EventSubject, ExecControls, ExecSpec, Git,
-    GitCloneOptions, GitCommitOptions, OutputStream, ProviderKind, Result, Sandbox, SandboxFilter,
-    SandboxId, SandboxProvider, SandboxSource, SandboxSpec, SandboxStatus, SpawnSpec, StdinSource,
-    Termination, WaitOptions, activate,
+    GitCloneOptions, GitCommitOptions, GitFailureKind, OutputStream, ProviderKind, Result, Sandbox,
+    SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec, SandboxStatus,
+    SpawnSpec, StdinSource, Termination, WaitOptions, activate,
 };
 use sandbox_driver_host::HostProvider;
 use sandbox_driver_protocol::channel::TrustedPeer;
@@ -509,7 +509,13 @@ async fn derived_pinned_clone_through_a_plugin_sandbox_attaches_the_branch() {
         .clone_repo(&format!("file://{workspace}/src"), "missing", &missing)
         .await
         .expect_err("unavailable commit fails over the wire");
-    assert!(matches!(error, Error::Exec(_)), "error: {error}");
+    // The failure crosses the wire classified: the derived fetch of an
+    // unavailable SHA is a missing revision, not an opaque exec error.
+    assert!(
+        matches!(&error, Error::Git(failure)
+            if failure.kind() == GitFailureKind::RefNotFound && failure.output().is_some()),
+        "error: {error}"
+    );
     assert!(
         !sandbox
             .fs()

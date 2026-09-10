@@ -30,11 +30,11 @@ use std::{fmt, process};
 use async_trait::async_trait;
 use sandbox_driver::{
     Action, Capability, Error, Event, EventBody, EventContext, EventObserver, ExecControls,
-    ExecSpec, Git, GitCloneOptions, GitCommitOptions, GitPushOptions, GrepOptions, HealthStatus,
-    LogSink, LogSource, NetworkPolicy, OneShotSpec, OutputSanitization, OutputStream, PtyOptions,
-    PtySize, Resources, Sandbox, SandboxFilter, SandboxId, SandboxProvider, SandboxSpec,
-    SandboxState, Search, ServiceSpec, Services, SnapshotMode, SpawnSpec, StdinSource, Termination,
-    VolumeId, VolumeMount, WaitOptions, activate, wait_for_state,
+    ExecSpec, Git, GitCloneOptions, GitCommitOptions, GitFailureKind, GitPushOptions, GrepOptions,
+    HealthStatus, LogSink, LogSource, NetworkPolicy, OneShotSpec, OutputSanitization, OutputStream,
+    PtyOptions, PtySize, Resources, Sandbox, SandboxFilter, SandboxId, SandboxProvider,
+    SandboxSpec, SandboxState, Search, ServiceSpec, Services, SnapshotMode, SpawnSpec, StdinSource,
+    Termination, VolumeId, VolumeMount, WaitOptions, activate, wait_for_state,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -2000,7 +2000,7 @@ async fn git_clone_pins_a_tag(ctx: &Conformance) -> CheckOutcome {
             .await
         {
             Ok(()) => return fail("a clone pinned to a missing tag succeeded"),
-            Err(Error::Provider(_) | Error::Exec(_)) => {}
+            Err(Error::Git(failure)) if failure.kind() == GitFailureKind::RefNotFound => {}
             Err(error) => {
                 return fail(format!(
                     "missing tag failed with an unexpected kind: {error}"

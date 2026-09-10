@@ -90,6 +90,7 @@ impl From<&Error> for ErrorReport {
             Error::Overloaded { .. } => "overloaded",
             Error::LimitExceeded { .. } => "limit_exceeded",
             Error::Exec(_) => "exec",
+            Error::Git(_) => "git",
             Error::Provider(_) => "provider",
             Error::Transport(_) => "transport",
             Error::Incomplete(_) => "incomplete",
@@ -98,6 +99,7 @@ impl From<&Error> for ErrorReport {
         let retryable = match error {
             Error::Timeout { .. } | Error::RateLimited { .. } | Error::Transport(_) => true,
             Error::Provider(provider) => provider.retryable,
+            Error::Git(failure) => failure.kind().is_transient(),
             _ => false,
         };
         let mut causes = Vec::new();

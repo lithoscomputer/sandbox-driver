@@ -86,6 +86,12 @@ pub enum Error {
     #[error(transparent)]
     Exec(#[from] ExecFailure),
 
+    /// A git operation failed, classified by what the remote or the
+    /// working tree said so callers decide about retries and reporting
+    /// without parsing git output themselves.
+    #[error(transparent)]
+    Git(#[from] GitFailure),
+
     #[error(transparent)]
     Provider(#[from] ProviderError),
 
@@ -244,8 +250,8 @@ impl StdError for ExecFailure {}
 impl ExecFailure {
     /// A bounded diagnosis matched from stderr — static text only, so
     /// the redaction boundary holds: raw output never enters `Display`.
-    /// Only provider-agnostic classes live here; fabro keeps its
-    /// git-push classifications caller-side.
+    /// Only provider-agnostic classes live here; git operations carry
+    /// their classification in [`GitFailure`].
     fn hint(&self) -> Option<&'static str> {
         let stderr = String::from_utf8_lossy(&self.stderr).to_ascii_lowercase();
         if stderr.contains("could not resolve host") || stderr.contains("network is unreachable") {
@@ -310,6 +316,254 @@ impl ExecFailure {
     /// Raw captured stderr. Not included in `Display`.
     pub fn stderr(&self) -> &[u8] {
         &self.stderr
+    }
+}
+
+/// Why a git operation failed, read from what the remote or the working
+/// tree reported.
+///
+/// The classes are the decisions a caller makes: whether waiting and
+/// retrying can help, whether a different credential can, or whether the
+/// request itself was wrong. Message matching lives here, once, so every
+/// provider and both transports classify the same way.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum GitFailureKind {
+    /// The remote rejected the supplied credential or hid the repository
+    /// from it. GitHub answers `Repository not found.` for a private
+    /// repository the credential cannot see and rejects a just-minted
+    /// token until it has replicated, so the same shape covers a bad
+    /// credential and one that is not visible yet; the caller knows
+    /// which it holds.
+    AuthRejected,
+    /// The remote could not be reached or failed on its side. Retrying
+    /// after a pause can succeed.
+    RemoteUnavailable,
+    /// The requested branch, tag, or commit does not exist at the remote.
+    RefNotFound,
+    /// Git needed a credential that was not supplied, or the remote
+    /// denied access in a way no wait resolves (an SSH key it does not
+    /// know, a user without permission).
+    AccessDenied,
+    /// The clone target already exists.
+    TargetExists,
+    /// The output matched no known class.
+    Unclassified,
+}
+
+/// Message fragments that mean the operation failed on infrastructure.
+const REMOTE_UNAVAILABLE_HINTS: &[&str] = &[
+    "could not resolve host",
+    "temporary failure in name resolution",
+    "connection refused",
+    "connection reset",
+    "connection timed out",
+    "timed out",
+    "network is unreachable",
+    "no route to host",
+    "tls handshake",
+    "early eof",
+    "rpc failed",
+    "unexpected disconnect",
+    "the remote end hung up unexpectedly",
+    "index-pack failed",
+    "service unavailable",
+    "gateway timeout",
+    "too many requests",
+    "rate limit",
+];
+
+/// Message fragments GitHub uses when a credential is rejected or not
+/// yet visible; git over HTTP and libgit2 spell the status differently.
+const AUTH_REJECTED_HINTS: &[&str] = &[
+    "repository not found",
+    "authentication failed",
+    "invalid username or password",
+    "bad credentials",
+    "the requested url returned error: 401",
+    "the requested url returned error: 403",
+    "the requested url returned error: 404",
+    "unexpected http status code: 401",
+    "unexpected http status code: 403",
+    "unexpected http status code: 404",
+];
+
+const REF_NOT_FOUND_HINTS: &[&str] = &[
+    "couldn't find remote ref",
+    "could not find remote branch",
+    "not our ref",
+    "unadvertised object",
+    "reference is not a tree",
+    "did not match any file(s) known to git",
+    "unknown revision or path not in the working tree",
+];
+
+impl GitFailureKind {
+    /// Classifies a failed git command by its output. stderr is read
+    /// first; stdout only when stderr matches nothing.
+    #[must_use]
+    pub fn from_output(stderr: &[u8], stdout: &[u8]) -> Self {
+        let by_stderr = Self::from_message(&String::from_utf8_lossy(stderr));
+        if by_stderr == Self::Unclassified {
+            Self::from_message(&String::from_utf8_lossy(stdout))
+        } else {
+            by_stderr
+        }
+    }
+
+    /// Classifies a rendered git failure message.
+    #[must_use]
+    pub fn from_message(message: &str) -> Self {
+        let lower = message.to_ascii_lowercase();
+        if REMOTE_UNAVAILABLE_HINTS
+            .iter()
+            .any(|hint| lower.contains(hint))
+        {
+            return Self::RemoteUnavailable;
+        }
+        if AUTH_REJECTED_HINTS.iter().any(|hint| lower.contains(hint)) {
+            return Self::AuthRejected;
+        }
+        if lower.contains("could not read username")
+            || lower.contains("terminal prompts disabled")
+            || lower.contains("permission denied")
+            || (lower.contains("permission to") && lower.contains("denied"))
+        {
+            return Self::AccessDenied;
+        }
+        if lower.contains("destination path") && lower.contains("already exists") {
+            return Self::TargetExists;
+        }
+        if REF_NOT_FOUND_HINTS.iter().any(|hint| lower.contains(hint))
+            || (lower.contains("remote branch") && lower.contains("not found"))
+        {
+            return Self::RefNotFound;
+        }
+        Self::Unclassified
+    }
+
+    /// Whether a retry after a pause can succeed with the same request.
+    #[must_use]
+    pub fn is_transient(self) -> bool {
+        matches!(self, Self::RemoteUnavailable)
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Self::AuthRejected => "the remote rejected the credential or hid the repository",
+            Self::RemoteUnavailable => "the remote could not be reached",
+            Self::RefNotFound => "the requested revision does not exist at the remote",
+            Self::AccessDenied => "access was denied",
+            Self::TargetExists => "the clone target already exists",
+            Self::Unclassified => "unclassified failure",
+        }
+    }
+}
+
+/// A failed git operation with its classification and the evidence it was
+/// read from: the command's output when git ran inside the sandbox, or
+/// the provider's reported failure when a native clone ran it.
+///
+/// `Display` carries the operation and the class only; raw output stays
+/// behind [`GitFailure::output`] so the caller controls exposure and
+/// redaction, as with [`ExecFailure`].
+#[derive(Debug)]
+pub struct GitFailure {
+    operation: String,
+    kind:      GitFailureKind,
+    // Boxed so the error enum stays small on every `Result`.
+    output:    Option<Box<ExecFailure>>,
+    provider:  Option<Box<ProviderError>>,
+}
+
+impl fmt::Display for GitFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} failed: {}", self.operation, self.kind.describe())?;
+        if let Some(output) = &self.output {
+            write!(f, " (exit code {:?})", output.exit_code())?;
+        }
+        Ok(())
+    }
+}
+
+impl StdError for GitFailure {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        self.provider
+            .as_deref()
+            .map(|provider| provider as &(dyn StdError + 'static))
+    }
+}
+
+impl GitFailure {
+    /// A git command that ran inside the sandbox and failed; the class is
+    /// read from its output.
+    pub fn from_command(operation: impl Into<String>, output: ExecFailure) -> Self {
+        Self {
+            operation: operation.into(),
+            kind:      GitFailureKind::from_output(output.stderr(), output.stdout()),
+            output:    Some(Box::new(output)),
+            provider:  None,
+        }
+    }
+
+    /// A provider's native git operation that failed; the class is read
+    /// from the provider's message, and a failure the provider marks
+    /// retryable that matches nothing else is treated as the remote
+    /// being unavailable.
+    pub fn from_provider(operation: impl Into<String>, provider: ProviderError) -> Self {
+        let mut kind = GitFailureKind::from_message(&provider.message);
+        if kind == GitFailureKind::Unclassified && provider.retryable {
+            kind = GitFailureKind::RemoteUnavailable;
+        }
+        Self {
+            operation: operation.into(),
+            kind,
+            output: None,
+            provider: Some(Box::new(provider)),
+        }
+    }
+
+    /// Builds a failure with an explicit class, for a provider that
+    /// already knows why the operation failed.
+    pub fn classified(
+        operation: impl Into<String>,
+        kind: GitFailureKind,
+        provider: Option<ProviderError>,
+    ) -> Self {
+        Self {
+            operation: operation.into(),
+            kind,
+            output: None,
+            provider: provider.map(Box::new),
+        }
+    }
+
+    /// Attaches the command output a reconstructed failure was read from.
+    #[must_use]
+    pub fn with_output(mut self, output: ExecFailure) -> Self {
+        self.output = Some(Box::new(output));
+        self
+    }
+
+    /// The operation that failed (`"git clone"`, `"git push"`).
+    pub fn operation(&self) -> &str {
+        &self.operation
+    }
+
+    pub fn kind(&self) -> GitFailureKind {
+        self.kind
+    }
+
+    /// The failed command, with its raw output, when git ran inside the
+    /// sandbox. Not included in `Display`.
+    pub fn output(&self) -> Option<&ExecFailure> {
+        self.output.as_deref()
+    }
+
+    /// The provider's reported failure, when a native operation ran it.
+    pub fn provider(&self) -> Option<&ProviderError> {
+        self.provider.as_deref()
     }
 }
 
@@ -446,6 +700,115 @@ mod tests {
 
         let source = error.source().expect("provider error has a source");
         assert_eq!(source.to_string(), "daemon disconnected");
+    }
+
+    #[test]
+    fn git_failures_classify_output_without_exposing_it() {
+        let cases: &[(&str, GitFailureKind)] = &[
+            (
+                "fatal: could not resolve host: github.com",
+                GitFailureKind::RemoteUnavailable,
+            ),
+            (
+                "error: RPC failed; curl 56 Recv failure",
+                GitFailureKind::RemoteUnavailable,
+            ),
+            (
+                "remote: Repository not found.\nfatal: repository 'https://github.com/o/secret.git/' not found",
+                GitFailureKind::AuthRejected,
+            ),
+            (
+                "fatal: Authentication failed for 'https://github.com/o/r.git/'",
+                GitFailureKind::AuthRejected,
+            ),
+            (
+                "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+                GitFailureKind::AccessDenied,
+            ),
+            (
+                "git@github.com: Permission denied (publickey).",
+                GitFailureKind::AccessDenied,
+            ),
+            (
+                "fatal: destination path 'repo' already exists and is not an empty directory.",
+                GitFailureKind::TargetExists,
+            ),
+            (
+                "fatal: couldn't find remote ref refs/tags/v9.9.9",
+                GitFailureKind::RefNotFound,
+            ),
+            (
+                "fatal: Remote branch nope not found in upstream origin",
+                GitFailureKind::RefNotFound,
+            ),
+            (
+                "error: Server does not allow request for unadvertised object 0123",
+                GitFailureKind::RefNotFound,
+            ),
+            (
+                "fatal: remote error: upload-pack: not our ref 0123",
+                GitFailureKind::RefNotFound,
+            ),
+            ("something else entirely", GitFailureKind::Unclassified),
+        ];
+        for (stderr, expected) in cases {
+            let failure = GitFailure::from_command(
+                "git clone",
+                ExecFailure::new(
+                    "git clone",
+                    Termination::Exited,
+                    Some(128),
+                    Vec::new(),
+                    stderr.as_bytes().to_vec(),
+                ),
+            );
+            assert_eq!(failure.kind(), *expected, "{stderr}");
+            let rendered = failure.to_string();
+            assert!(
+                !rendered.contains("github.com"),
+                "raw output must stay behind accessors: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_failures_read_stdout_when_stderr_says_nothing() {
+        let failure = GitFailure::from_command(
+            "git push",
+            ExecFailure::new(
+                "git push",
+                Termination::Exited,
+                Some(1),
+                b"remote: Bad credentials".to_vec(),
+                b"".to_vec(),
+            ),
+        );
+        assert_eq!(failure.kind(), GitFailureKind::AuthRejected);
+    }
+
+    #[test]
+    fn provider_git_failures_classify_the_message_and_honor_retryable() {
+        let provider = ProviderKind::try_new("test").expect("static provider kind is valid");
+        let failure = GitFailure::from_provider(
+            "git clone",
+            ProviderError::new(provider.clone(), "authentication failed"),
+        );
+        assert_eq!(failure.kind(), GitFailureKind::AuthRejected);
+
+        let mut retryable = ProviderError::new(provider.clone(), "toolbox unavailable");
+        retryable.retryable = true;
+        let failure = GitFailure::from_provider("git clone", retryable);
+        assert_eq!(failure.kind(), GitFailureKind::RemoteUnavailable);
+        assert!(failure.kind().is_transient());
+
+        let failure =
+            GitFailure::from_provider("git clone", ProviderError::new(provider, "no idea"));
+        assert_eq!(failure.kind(), GitFailureKind::Unclassified);
+        assert!(!failure.kind().is_transient());
+        assert!(
+            failure.source().is_some(),
+            "the provider failure stays in the chain"
+        );
     }
 
     #[test]

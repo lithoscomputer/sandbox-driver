@@ -4,7 +4,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::derived::shell_quote;
-use crate::error::{Error, ExecFailure, Result};
+use crate::error::{Error, ExecFailure, GitFailure, Result};
 use crate::exec::{Exec, ExecResult, ExecSpec};
 use crate::git::{
     Git, GitBranches, GitCloneOptions, GitCommitOptions, GitCredentials, GitPushOptions, GitStatus,
@@ -54,7 +54,11 @@ impl<'e> DerivedGit<'e> {
         if result.success() {
             return Ok(result);
         }
-        Err(Error::Exec(
+        // A command that ran and failed is a git failure, classified from
+        // its output; a failure to run it at all (transport, timeout)
+        // passed through above unchanged.
+        Err(Error::Git(GitFailure::from_command(
+            label,
             ExecFailure::new(
                 label,
                 result.termination,
@@ -63,7 +67,7 @@ impl<'e> DerivedGit<'e> {
                 result.stderr,
             )
             .with_duration(result.duration),
-        ))
+        )))
     }
 
     /// A per-call config value (`url.<authed>.insteadOf=<plain>`) that
@@ -521,6 +525,7 @@ fn parse_status_v2(output: &str) -> GitStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::GitFailureKind;
     use crate::test_exec::ScriptedExec;
 
     #[test]
@@ -837,6 +842,70 @@ mod tests {
             );
         }
         assert!(exec.commands().is_empty(), "no command may run");
+    }
+
+    #[tokio::test]
+    async fn failed_commands_surface_as_classified_git_failures() {
+        let exec = ScriptedExec::new(vec![ScriptedExec::failed_with_stderr(
+            128,
+            "remote: Repository not found.\nfatal: repository 'https://github.com/o/r.git/' not found",
+        )]);
+        let git = DerivedGit::new(&exec);
+        let options = GitCloneOptions {
+            branch:      Some("main".to_owned()),
+            commit:      None,
+            tag:         None,
+            depth:       Some(1),
+            credentials: None,
+        };
+        let error = git
+            .clone_repo("https://github.com/o/r.git", "/dst", &options)
+            .await
+            .expect_err("clone fails");
+        let Error::Git(failure) = error else {
+            panic!("expected a git failure, got {error}");
+        };
+        assert_eq!(failure.operation(), "git clone");
+        assert_eq!(failure.kind(), GitFailureKind::AuthRejected);
+        let output = failure.output().expect("command output is attached");
+        assert_eq!(output.exit_code(), Some(128));
+        assert!(
+            String::from_utf8_lossy(output.stderr()).contains("Repository not found"),
+            "raw stderr is reachable through the accessor"
+        );
+        assert!(
+            !failure.to_string().contains("github.com"),
+            "display never carries raw output: {failure}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_tag_is_a_ref_not_found_failure() {
+        let exec = ScriptedExec::new(vec![
+            ScriptedExec::ok(""),
+            ScriptedExec::ok(""),
+            ScriptedExec::failed_with_stderr(
+                128,
+                "fatal: couldn't find remote ref refs/tags/v9.9.9",
+            ),
+        ]);
+        let git = DerivedGit::new(&exec);
+        let options = GitCloneOptions {
+            branch:      None,
+            commit:      None,
+            tag:         Some("v9.9.9".to_owned()),
+            depth:       None,
+            credentials: None,
+        };
+        let error = git
+            .clone_repo("https://github.com/o/r.git", "/dst", &options)
+            .await
+            .expect_err("clone fails");
+        assert!(
+            matches!(&error, Error::Git(failure)
+                if failure.kind() == GitFailureKind::RefNotFound && failure.operation() == "git fetch"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

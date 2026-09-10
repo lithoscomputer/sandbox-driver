@@ -397,7 +397,7 @@ method, `-32000` application failure. Application failures carry `data`:
 
 `report.kind` is the stable machine-readable classification:
 `not_found`, `unsupported`, `invalid_state`, `invalid_spec`, `timeout`,
-`auth`, `rate_limited`, `overloaded`, `limit_exceeded`, `exec`, `provider`, `transport`, `incomplete`, `io`.
+`auth`, `rate_limited`, `overloaded`, `limit_exceeded`, `exec`, `git`, `provider`, `transport`, `incomplete`, `io`.
 `report.causes` is a bounded rendered source chain. A receiver restores
 these rendered causes as an opaque remote source chain. `detail` carries
 kind-specific fields for faithful reconstruction:
@@ -416,11 +416,12 @@ kind-specific fields for faithful reconstruction:
 | `incomplete` | `operation`, `output_abandoned`, `stop_acknowledged`, `termination_confirmed`, `cleanup_confirmed` |
 | `provider` | `provider` object: `{provider, code, message, retryable, detail}` |
 | `exec` | `exec` object: `{label, termination, exit_code, stdout_b64, stderr_b64, duration_ms?}` (`duration_ms` is additive: senders may omit it, receivers must tolerate its absence) |
+| `git` | `git` object: `{operation, kind, exec?, provider?}` — `kind` is one of `auth_rejected`, `remote_unavailable`, `ref_not_found`, `access_denied`, `target_exists`, `unclassified`; `exec` (same shape as the `exec` detail) is present when git ran inside the sandbox, `provider` (same shape as the `provider` detail) when a native operation ran it. `report.retryable` is true only for `remote_unavailable`. |
 | `transport` | `transport_context` |
 | `io` | `io_context` |
 
-Raw command output appears only inside the `exec` detail — never in
-`message` or `report`. Secret redaction is the host's responsibility.
+Raw command output appears only inside the `exec` detail and the `exec`
+member of the `git` detail — never in `message` or `report`. Secret redaction is the host's responsibility.
 
 ## 8. Method catalog
 

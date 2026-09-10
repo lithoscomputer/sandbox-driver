@@ -44,6 +44,13 @@ impl ScriptedExec {
         ExecResult::new(Termination::Exited, Some(code), Duration::from_millis(1))
     }
 
+    /// A clean exit with a non-zero code and the given stderr text.
+    pub(crate) fn failed_with_stderr(code: i32, stderr: &str) -> ExecResult {
+        let mut result = Self::failed(code);
+        result.stderr = stderr.as_bytes().to_vec();
+        result
+    }
+
     /// Every command run so far, in order.
     pub(crate) fn commands(&self) -> Vec<String> {
         self.commands.lock().expect("commands lock").clone()

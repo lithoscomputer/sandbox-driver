@@ -502,6 +502,7 @@ pub enum Error {
     Auth(AuthError),
     RateLimited { retry_after: Option<Duration> },
     Exec(ExecError),                                    // bounded, classified; raw output behind accessors
+    Git(GitFailure),                                    // a git operation classified by what the remote said
     Provider(ProviderError),                            // structured provider detail, serializable
     Transport(TransportError),                          // out-of-process provider communication
     Io { context: String, source: io::Error },          // local filesystem and process I/O
@@ -509,6 +510,8 @@ pub enum Error {
 ```
 
 The `Exec` variant preserves fabro's redaction boundary: `Display` shows bounded classified metadata only; raw stdout/stderr is available through explicit accessors so callers control exposure. Redaction hooks stay caller-side (fabro keeps `fabro_redact`).
+
+The `Git` variant classifies a failed git operation once, in this crate, from the command's output or the provider's native failure: the remote rejected the credential, the remote is unavailable, the revision does not exist, access is denied, the target exists, or unclassified. Every provider and both transports produce the same class for the same failure, so a consumer decides about retries by matching the class and never parses git output. Whether a rejected credential is worth retrying depends on the credential's provenance, which only the consumer knows.
 
 Provider adapters retain SDK errors as opaque sources on `AuthError` and
 `ProviderError`. The protocol adapter classifies framing, encoding, and

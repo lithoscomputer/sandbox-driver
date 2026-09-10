@@ -12,8 +12,8 @@ use std::{error, fmt, io};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use sandbox_driver::{
-    Action, AuthError, Capability, Error, ErrorReport, ExecFailure, ProviderError, ProviderKind,
-    ResourceKind, SandboxState, Termination, TransportError,
+    Action, AuthError, Capability, Error, ErrorReport, ExecFailure, GitFailure, GitFailureKind,
+    ProviderError, ProviderKind, ResourceKind, SandboxState, Termination, TransportError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -165,6 +165,8 @@ struct Detail {
     #[serde(skip_serializing_if = "Option::is_none")]
     exec:              Option<ExecDetail>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    git:               Option<GitDetail>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     io_context:        Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     transport_context: Option<String>,
@@ -186,6 +188,60 @@ struct ExecDetail {
     /// Additive since v1: absent from older peers, tolerated by them.
     #[serde(default)]
     duration_ms: Option<u64>,
+}
+
+/// A classified git failure: the class plus whichever evidence it was
+/// read from.
+#[derive(Debug, Serialize, Deserialize)]
+struct GitDetail {
+    operation: String,
+    kind:      GitFailureKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exec:      Option<ExecDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider:  Option<ProviderError>,
+}
+
+fn exec_detail(failure: &ExecFailure) -> ExecDetail {
+    ExecDetail {
+        label:       failure.label().to_owned(),
+        termination: failure.termination(),
+        exit_code:   failure.exit_code(),
+        stdout_b64:  encode_bytes(failure.stdout()),
+        stderr_b64:  encode_bytes(failure.stderr()),
+        duration_ms: failure
+            .duration()
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
+    }
+}
+
+fn exec_failure(detail: ExecDetail) -> Option<ExecFailure> {
+    let (Ok(stdout), Ok(stderr)) = (
+        decode_bytes(&detail.stdout_b64),
+        decode_bytes(&detail.stderr_b64),
+    ) else {
+        return None;
+    };
+    let mut failure = ExecFailure::new(
+        detail.label,
+        detail.termination,
+        detail.exit_code,
+        stdout,
+        stderr,
+    );
+    if let Some(duration_ms) = detail.duration_ms {
+        failure = failure.with_duration(Duration::from_millis(duration_ms));
+    }
+    Some(failure)
+}
+
+/// A provider error without its in-process source, for the wire.
+fn provider_copy(provider: &ProviderError) -> ProviderError {
+    let mut copy = ProviderError::new(provider.provider.clone(), provider.message.clone());
+    copy.code.clone_from(&provider.code);
+    copy.retryable = provider.retryable;
+    copy.detail.clone_from(&provider.detail);
+    copy
 }
 
 #[derive(Debug)]
@@ -257,24 +313,14 @@ impl WireError {
                 });
             }
             Error::RateLimited { retry_after } => detail.retry_after = *retry_after,
-            Error::Provider(provider) => {
-                let mut copy =
-                    ProviderError::new(provider.provider.clone(), provider.message.clone());
-                copy.code.clone_from(&provider.code);
-                copy.retryable = provider.retryable;
-                copy.detail.clone_from(&provider.detail);
-                detail.provider = Some(copy);
-            }
-            Error::Exec(failure) => {
-                detail.exec = Some(ExecDetail {
-                    label:       failure.label().to_owned(),
-                    termination: failure.termination(),
-                    exit_code:   failure.exit_code(),
-                    stdout_b64:  encode_bytes(failure.stdout()),
-                    stderr_b64:  encode_bytes(failure.stderr()),
-                    duration_ms: failure
-                        .duration()
-                        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
+            Error::Provider(provider) => detail.provider = Some(provider_copy(provider)),
+            Error::Exec(failure) => detail.exec = Some(exec_detail(failure)),
+            Error::Git(failure) => {
+                detail.git = Some(GitDetail {
+                    operation: failure.operation().to_owned(),
+                    kind:      failure.kind(),
+                    exec:      failure.output().map(exec_detail),
+                    provider:  failure.provider().map(provider_copy),
                 });
             }
             Error::Io { context, .. } => detail.io_context = Some(context.clone()),
@@ -375,23 +421,17 @@ impl WireError {
                 }
             }
             "exec" => {
-                if let Some(exec) = detail.exec {
-                    if let (Ok(stdout), Ok(stderr)) = (
-                        decode_bytes(&exec.stdout_b64),
-                        decode_bytes(&exec.stderr_b64),
-                    ) {
-                        let mut failure = ExecFailure::new(
-                            exec.label,
-                            exec.termination,
-                            exec.exit_code,
-                            stdout,
-                            stderr,
-                        );
-                        if let Some(duration_ms) = exec.duration_ms {
-                            failure = failure.with_duration(Duration::from_millis(duration_ms));
-                        }
-                        return Error::Exec(failure);
+                if let Some(failure) = detail.exec.and_then(exec_failure) {
+                    return Error::Exec(failure);
+                }
+            }
+            "git" => {
+                if let Some(git) = detail.git {
+                    let mut failure = GitFailure::classified(git.operation, git.kind, git.provider);
+                    if let Some(output) = git.exec.and_then(exec_failure) {
+                        failure = failure.with_output(output);
                     }
+                    return Error::Git(failure);
                 }
             }
             "io" => {
@@ -557,6 +597,47 @@ mod tests {
         assert_eq!(failure.exit_code(), Some(3));
         assert_eq!(failure.stdout(), b"out");
         assert_eq!(failure.duration(), Some(Duration::from_millis(1500)));
+
+        let error = Error::Git(GitFailure::from_command(
+            "git clone",
+            ExecFailure::new(
+                "git fetch",
+                Termination::Exited,
+                Some(128),
+                Vec::new(),
+                b"fatal: couldn't find remote ref refs/tags/v9".to_vec(),
+            ),
+        ));
+        let wire = WireError::from_error(&error);
+        assert_eq!(
+            wire.data.as_ref().map(|data| data.report.kind.as_str()),
+            Some("git")
+        );
+        let Error::Git(failure) = wire.into_error() else {
+            panic!("expected git failure");
+        };
+        assert_eq!(failure.operation(), "git clone");
+        assert_eq!(failure.kind(), GitFailureKind::RefNotFound);
+        let output = failure.output().expect("command output crosses");
+        assert_eq!(output.exit_code(), Some(128));
+        assert!(String::from_utf8_lossy(output.stderr()).contains("refs/tags/v9"));
+
+        let mut native = ProviderError::new(provider.clone(), "authentication failed");
+        native.code = Some("auth".into());
+        let error = Error::Git(GitFailure::classified(
+            "git clone",
+            GitFailureKind::AuthRejected,
+            Some(native),
+        ));
+        let Error::Git(failure) = WireError::from_error(&error).into_error() else {
+            panic!("expected git failure");
+        };
+        assert_eq!(failure.kind(), GitFailureKind::AuthRejected);
+        assert!(failure.output().is_none());
+        assert_eq!(
+            failure.provider().and_then(|p| p.code.as_deref()),
+            Some("auth")
+        );
 
         // duration_ms is additive: a v1 peer that omits it must decode
         // to a duration-less failure, not an error.

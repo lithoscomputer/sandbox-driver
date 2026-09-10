@@ -76,7 +76,8 @@ pub use capabilities::{
 pub use capture::OutputCaptureBuffer;
 pub use derived::{DerivedFs, DerivedGit, DerivedSearch, DerivedServices};
 pub use error::{
-    AuthError, Error, ExecFailure, ProviderError, ResourceKind, Result, TransportError,
+    AuthError, Error, ExecFailure, GitFailure, GitFailureKind, ProviderError, ResourceKind, Result,
+    TransportError,
 };
 pub use event::{
     Action, CorrelationId, ErrorReport, Event, EventBody, EventContext, EventEmitter, EventId,
