@@ -40,7 +40,7 @@ pub trait Git: Send + Sync {
 
     async fn branches(&self, repo_path: &str) -> Result<GitBranches>;
 
-    async fn checkout(&self, repo_path: &str, branch: &str, create: bool) -> Result<()>;
+    async fn checkout(&self, repo_path: &str, options: &GitCheckoutOptions) -> Result<()>;
 }
 
 /// A sandbox's normalized git facet.
@@ -114,10 +114,8 @@ impl Git for GitFacet<'_> {
         self.implementation().branches(repo_path).await
     }
 
-    async fn checkout(&self, repo_path: &str, branch: &str, create: bool) -> Result<()> {
-        self.implementation()
-            .checkout(repo_path, branch, create)
-            .await
+    async fn checkout(&self, repo_path: &str, options: &GitCheckoutOptions) -> Result<()> {
+        self.implementation().checkout(repo_path, options).await
     }
 }
 
@@ -216,6 +214,31 @@ pub(crate) fn validate_branch_name(branch: &str) -> Result<(), crate::Error> {
     validate_ref_name("branch", branch)
 }
 
+/// Rejects a push refspec git would misread: each side of `<src>:<dst>`
+/// must be a reference name (or `HEAD`), and the whole must not begin
+/// with `-`. An optional leading `+` forces the update. A refspec with an
+/// empty source deletes the destination and is refused: deletion is not
+/// a push.
+fn validate_refspec(refspec: &str) -> Result<(), crate::Error> {
+    let body = refspec.strip_prefix('+').unwrap_or(refspec);
+    let (source, destination) = match body.split_once(':') {
+        Some((source, destination)) => (source, Some(destination)),
+        None => (body, None),
+    };
+    if source.is_empty() {
+        return Err(crate::Error::invalid_spec(
+            "refspec",
+            "must name a source; a deletion is not a push",
+        ));
+    }
+    for side in [Some(source), destination].into_iter().flatten() {
+        if side != "HEAD" {
+            validate_ref_name("refspec", side)?;
+        }
+    }
+    Ok(())
+}
+
 /// Rejects a short ref name (a branch or tag) git itself would refuse,
 /// before it can be read as a flag or escape its namespace: empty,
 /// beginning with `-`, or containing a path component git forbids.
@@ -274,15 +297,113 @@ impl GitCommitOptions {
 #[non_exhaustive]
 pub struct GitPushOptions {
     pub remote:       Option<String>,
+    /// The branch to push, by its short name.
     pub branch:       Option<String>,
+    /// Sets the pushed branch's upstream; requires `branch`.
     pub set_upstream: bool,
+    /// An explicit refspec to push instead of a branch: `<src>:<dst>` with
+    /// an optional leading `+`, or a single ref. Lets a caller push a
+    /// commit to a differently named remote branch or to a ref outside
+    /// `refs/heads`. Cannot be combined with `branch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refspec:      Option<String>,
     pub credentials:  Option<GitCredentials>,
+}
+
+impl GitPushOptions {
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        if let Some(branch) = &self.branch {
+            validate_branch_name(branch)?;
+        }
+        if let Some(refspec) = &self.refspec {
+            if self.branch.is_some() {
+                return Err(crate::Error::invalid_spec(
+                    "refspec",
+                    "cannot be combined with branch",
+                ));
+            }
+            validate_refspec(refspec)?;
+        }
+        if self.set_upstream && self.branch.is_none() {
+            return Err(crate::Error::invalid_spec(
+                "set_upstream",
+                "requires a branch",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Which branch a checkout attaches to, and how it comes to exist.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct GitCheckoutOptions {
+    pub branch:      String,
+    /// Creates the branch (`-b`) instead of requiring it to exist.
+    pub create:      bool,
+    /// With `create`, moves the branch to the start point when it already
+    /// exists (`-B`) instead of failing.
+    pub reset:       bool,
+    /// The revision a created branch starts at: a commit, a branch, or a
+    /// fully qualified ref. `HEAD` when absent. Requires `create`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_point: Option<String>,
+}
+
+impl GitCheckoutOptions {
+    /// Attaches to an existing `branch`.
+    pub fn new(branch: impl Into<String>) -> Self {
+        Self {
+            branch:      branch.into(),
+            create:      false,
+            reset:       false,
+            start_point: None,
+        }
+    }
+
+    /// Creates `branch` (`-b`), at `HEAD` unless a start point is set.
+    #[must_use]
+    pub fn create(mut self) -> Self {
+        self.create = true;
+        self
+    }
+
+    /// Creates `branch`, or moves it when it exists (`-B`).
+    #[must_use]
+    pub fn create_or_reset(mut self) -> Self {
+        self.create = true;
+        self.reset = true;
+        self
+    }
+
+    #[must_use]
+    pub fn start_point(mut self, revision: impl Into<String>) -> Self {
+        self.start_point = Some(revision.into());
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        validate_branch_name(&self.branch)?;
+        if self.reset && !self.create {
+            return Err(crate::Error::invalid_spec("reset", "requires create"));
+        }
+        if let Some(start_point) = &self.start_point {
+            if !self.create {
+                return Err(crate::Error::invalid_spec("start_point", "requires create"));
+            }
+            validate_ref_name("start_point", start_point)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct GitStatus {
     pub current_branch: Option<String>,
+    /// The commit `HEAD` points at; `None` on an unborn branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head:           Option<String>,
     pub detached:       bool,
     pub ahead:          u32,
     pub behind:         u32,

@@ -12,8 +12,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use daytona_sdk::GitCloneOptions as DaytonaGitCloneOptions;
 use sandbox_driver::{
-    DerivedGit, Error, Git, GitBranches, GitCloneOptions, GitCommitOptions, GitCredentials,
-    GitFailure, GitFailureKind, GitPushOptions, GitStatus, ProviderError, Result,
+    DerivedGit, Error, Git, GitBranches, GitCheckoutOptions, GitCloneOptions, GitCommitOptions,
+    GitCredentials, GitFailure, GitFailureKind, GitPushOptions, GitStatus, ProviderError, Result,
 };
 
 use crate::exec::DaytonaExec;
@@ -208,8 +208,8 @@ impl Git for DaytonaGit {
         self.derived().branches(repo_path).await
     }
 
-    async fn checkout(&self, repo_path: &str, branch: &str, create: bool) -> Result<()> {
-        self.derived().checkout(repo_path, branch, create).await
+    async fn checkout(&self, repo_path: &str, options: &GitCheckoutOptions) -> Result<()> {
+        self.derived().checkout(repo_path, options).await
     }
 }
 

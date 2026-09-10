@@ -30,11 +30,12 @@ use std::{fmt, process};
 use async_trait::async_trait;
 use sandbox_driver::{
     Action, Capability, Error, Event, EventBody, EventContext, EventObserver, ExecControls,
-    ExecSpec, Git, GitCloneOptions, GitCommitOptions, GitFailureKind, GitPushOptions, GrepOptions,
-    HealthStatus, LogSink, LogSource, NetworkPolicy, OneShotSpec, OutputSanitization, OutputStream,
-    PtyOptions, PtySize, Resources, Sandbox, SandboxFilter, SandboxId, SandboxProvider,
-    SandboxSpec, SandboxState, Search, ServiceSpec, Services, SnapshotMode, SpawnSpec, StdinSource,
-    Termination, VolumeId, VolumeMount, WaitOptions, activate, wait_for_state,
+    ExecSpec, Git, GitCheckoutOptions, GitCloneOptions, GitCommitOptions, GitFailureKind,
+    GitPushOptions, GrepOptions, HealthStatus, LogSink, LogSource, NetworkPolicy, OneShotSpec,
+    OutputSanitization, OutputStream, PtyOptions, PtySize, Resources, Sandbox, SandboxFilter,
+    SandboxId, SandboxProvider, SandboxSpec, SandboxState, Search, ServiceSpec, Services,
+    SnapshotMode, SpawnSpec, StdinSource, Termination, VolumeId, VolumeMount, WaitOptions,
+    activate, wait_for_state,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -2243,7 +2244,7 @@ async fn git_round_trip(ctx: &Conformance) -> CheckOutcome {
             return fail(format!("initial clone status is wrong: {status:?}"));
         }
 
-        git.checkout(repo, "feature", true)
+        git.checkout(repo, &GitCheckoutOptions::new("feature").create())
             .await
             .map_err(|error| format!("create feature branch failed: {error}"))?;
         sandbox
@@ -2273,6 +2274,16 @@ async fn git_round_trip(ctx: &Conformance) -> CheckOutcome {
             .map_err(|error| format!("commit failed: {error}"))?;
         if sha.len() != 40 {
             return fail(format!("commit returned an invalid SHA: {sha:?}"));
+        }
+        let status = git
+            .status(repo)
+            .await
+            .map_err(|error| format!("status after commit failed: {error}"))?;
+        if status.head.as_deref() != Some(sha.as_str()) {
+            return fail(format!(
+                "status head {:?} does not name the commit {sha}",
+                status.head
+            ));
         }
 
         let branches = git
@@ -2311,7 +2322,54 @@ async fn git_round_trip(ctx: &Conformance) -> CheckOutcome {
             ));
         }
 
-        git.checkout(repo, "main", false)
+        // A refspec pushes the same commit under another remote name, and a
+        // reset checkout starts a branch at a chosen revision.
+        let mut by_refspec = GitPushOptions::default();
+        by_refspec.remote = Some("origin".to_owned());
+        by_refspec.refspec = Some("HEAD:refs/heads/from-refspec".to_owned());
+        git.push(repo, &by_refspec)
+            .await
+            .map_err(|error| format!("refspec push failed: {error}"))?;
+        let remote_refspec = sandbox
+            .exec()
+            .run(
+                &ExecSpec::new("git")
+                    .args([
+                        "--git-dir=remote.git",
+                        "rev-parse",
+                        "refs/heads/from-refspec",
+                    ])
+                    .working_dir("conformance-git")
+                    .timeout(Duration::from_secs(30)),
+            )
+            .await
+            .map_err(|error| format!("remote refspec check failed: {error}"))?;
+        if !remote_refspec.success() || remote_refspec.stdout_lossy().trim() != sha {
+            return fail(format!(
+                "remote from-refspec is wrong: stdout={:?}, stderr={:?}",
+                remote_refspec.stdout_lossy(),
+                remote_refspec.stderr_lossy()
+            ));
+        }
+        git.checkout(
+            repo,
+            &GitCheckoutOptions::new("hotfix")
+                .create_or_reset()
+                .start_point("main"),
+        )
+        .await
+        .map_err(|error| format!("checkout hotfix at main failed: {error}"))?;
+        let hotfix = git
+            .status(repo)
+            .await
+            .map_err(|error| format!("hotfix status failed: {error}"))?;
+        if hotfix.current_branch.as_deref() != Some("hotfix")
+            || hotfix.head.as_deref() == Some(sha.as_str())
+        {
+            return fail(format!("hotfix did not start at main: {hotfix:?}"));
+        }
+
+        git.checkout(repo, &GitCheckoutOptions::new("main"))
             .await
             .map_err(|error| format!("checkout main failed: {error}"))?;
         let upstream = sandbox

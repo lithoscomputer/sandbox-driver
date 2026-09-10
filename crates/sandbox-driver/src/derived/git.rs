@@ -7,8 +7,8 @@ use crate::derived::shell_quote;
 use crate::error::{Error, ExecFailure, GitFailure, Result};
 use crate::exec::{Exec, ExecResult, ExecSpec};
 use crate::git::{
-    Git, GitBranches, GitCloneOptions, GitCommitOptions, GitCredentials, GitPushOptions, GitStatus,
-    validate_branch_name,
+    Git, GitBranches, GitCheckoutOptions, GitCloneOptions, GitCommitOptions, GitCredentials,
+    GitPushOptions, GitStatus, validate_branch_name,
 };
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -384,6 +384,7 @@ impl Git for DerivedGit<'_> {
     }
 
     async fn push(&self, repo_path: &str, options: &GitPushOptions) -> Result<()> {
+        options.validate()?;
         let remote = options.remote.as_deref().unwrap_or("origin");
         let mut args: Vec<String> = Vec::new();
         if let Some(rewrite) = self
@@ -398,8 +399,8 @@ impl Git for DerivedGit<'_> {
             args.push("--set-upstream".into());
         }
         args.push(remote.to_owned());
-        if let Some(branch) = &options.branch {
-            args.push(branch.clone());
+        if let Some(target) = options.refspec.as_ref().or(options.branch.as_ref()) {
+            args.push(target.clone());
         }
         self.run("git push", Some(repo_path), &args, NETWORK_TIMEOUT)
             .await?;
@@ -454,13 +455,16 @@ impl Git for DerivedGit<'_> {
         })
     }
 
-    async fn checkout(&self, repo_path: &str, branch: &str, create: bool) -> Result<()> {
-        validate_branch_name(branch)?;
+    async fn checkout(&self, repo_path: &str, options: &GitCheckoutOptions) -> Result<()> {
+        options.validate()?;
         let mut args: Vec<String> = vec!["checkout".into()];
-        if create {
-            args.push("-b".into());
+        if options.create {
+            args.push(if options.reset { "-B" } else { "-b" }.into());
         }
-        args.push(branch.to_owned());
+        args.push(options.branch.clone());
+        if let Some(start_point) = &options.start_point {
+            args.push(start_point.clone());
+        }
         // Forces branch interpretation: a branch that also matches a
         // path would otherwise restore the file instead.
         args.push("--".into());
@@ -476,6 +480,7 @@ impl Git for DerivedGit<'_> {
 fn parse_status_v2(output: &str) -> GitStatus {
     let mut status = GitStatus {
         current_branch: None,
+        head:           None,
         detached:       false,
         ahead:          0,
         behind:         0,
@@ -483,7 +488,9 @@ fn parse_status_v2(output: &str) -> GitStatus {
     };
     let mut entries = output.split('\0');
     while let Some(entry) = entries.next() {
-        if let Some(head) = entry.strip_prefix("# branch.head ") {
+        if let Some(oid) = entry.strip_prefix("# branch.oid ") {
+            status.head = (oid != "(initial)").then(|| oid.to_owned());
+        } else if let Some(head) = entry.strip_prefix("# branch.head ") {
             if head == "(detached)" {
                 status.detached = true;
             } else {
@@ -569,6 +576,7 @@ mod tests {
             "? na\u{ef}ve notes.txt\0",
         ));
         assert_eq!(status.current_branch.as_deref(), Some("main"));
+        assert_eq!(status.head.as_deref(), Some("1234"));
         assert!(!status.detached);
         assert_eq!(status.ahead, 2);
         assert_eq!(status.behind, 1);
@@ -578,6 +586,13 @@ mod tests {
             "conflicted.rs".to_owned(),
             "na\u{ef}ve notes.txt".to_owned(),
         ]);
+    }
+
+    #[test]
+    fn an_unborn_branch_has_no_head() {
+        let status = parse_status_v2("# branch.oid (initial)\0# branch.head main\0");
+        assert_eq!(status.head, None);
+        assert_eq!(status.current_branch.as_deref(), Some("main"));
     }
 
     #[tokio::test]
@@ -591,6 +606,7 @@ mod tests {
             remote:       None,
             branch:       Some("main".to_owned()),
             set_upstream: true,
+            refspec:      None,
             credentials:  Some(GitCredentials::new("user", "pass")),
         };
         git.push("/repo", &options).await.expect("push succeeds");
@@ -610,6 +626,95 @@ mod tests {
         assert!(
             push.contains("'push' '--set-upstream' 'origin' 'main'"),
             "push: {push}"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_sends_a_refspec_in_place_of_a_branch() {
+        let exec = ScriptedExec::new(vec![ScriptedExec::ok("")]);
+        let git = DerivedGit::new(&exec);
+        let options = GitPushOptions {
+            refspec: Some("+HEAD:refs/heads/run/42".to_owned()),
+            ..GitPushOptions::default()
+        };
+        git.push("/repo", &options).await.expect("push succeeds");
+        assert!(
+            exec.commands()[0].contains("'push' 'origin' '+HEAD:refs/heads/run/42'"),
+            "push: {}",
+            exec.commands()[0]
+        );
+
+        let both = GitPushOptions {
+            branch: Some("main".to_owned()),
+            refspec: Some("HEAD:refs/heads/main".to_owned()),
+            ..GitPushOptions::default()
+        };
+        assert!(both.validate().is_err(), "branch and refspec together");
+        let deletion = GitPushOptions {
+            refspec: Some(":refs/heads/main".to_owned()),
+            ..GitPushOptions::default()
+        };
+        assert!(deletion.validate().is_err(), "a deletion is not a push");
+        let flag = GitPushOptions {
+            refspec: Some("--force".to_owned()),
+            ..GitPushOptions::default()
+        };
+        assert!(flag.validate().is_err(), "a refspec cannot be a flag");
+        let upstream = GitPushOptions {
+            set_upstream: true,
+            ..GitPushOptions::default()
+        };
+        assert!(upstream.validate().is_err(), "set_upstream needs a branch");
+    }
+
+    #[tokio::test]
+    async fn checkout_creates_or_resets_at_a_start_point() {
+        let exec = ScriptedExec::new(vec![ScriptedExec::ok(""), ScriptedExec::ok("")]);
+        let git = DerivedGit::new(&exec);
+        git.checkout(
+            "/repo",
+            &GitCheckoutOptions::new("run/42")
+                .create_or_reset()
+                .start_point("0123456789abcdef0123456789abcdef01234567"),
+        )
+        .await
+        .expect("checkout succeeds");
+        git.checkout("/repo", &GitCheckoutOptions::new("main"))
+            .await
+            .expect("plain checkout succeeds");
+        let commands = exec.commands();
+        assert!(
+            commands[0].contains(
+                "'checkout' '-B' 'run/42' '0123456789abcdef0123456789abcdef01234567' '--'"
+            ),
+            "checkout: {}",
+            commands[0]
+        );
+        assert!(
+            commands[1].contains("'checkout' 'main' '--'"),
+            "checkout: {}",
+            commands[1]
+        );
+
+        assert!(
+            GitCheckoutOptions::new("main")
+                .start_point("HEAD~1")
+                .validate()
+                .is_err(),
+            "a start point needs create"
+        );
+        let reset_only = GitCheckoutOptions {
+            reset: true,
+            ..GitCheckoutOptions::new("main")
+        };
+        assert!(reset_only.validate().is_err(), "reset needs create");
+        assert!(
+            GitCheckoutOptions::new("main")
+                .create()
+                .start_point("--detach")
+                .validate()
+                .is_err(),
+            "a start point cannot be a flag"
         );
     }
 
@@ -934,7 +1039,7 @@ mod tests {
         let exec = ScriptedExec::new(vec![]);
         let git = DerivedGit::new(&exec);
         let error = git
-            .checkout("/repo", "-q", false)
+            .checkout("/repo", &GitCheckoutOptions::new("-q"))
             .await
             .expect_err("flag-shaped branch is rejected");
         assert!(matches!(error, Error::InvalidSpec { .. }), "{error}");
