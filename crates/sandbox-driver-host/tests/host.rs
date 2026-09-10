@@ -10,9 +10,10 @@ use std::{env, process};
 use async_trait::async_trait;
 use sandbox_driver::{
     Action, Capability, Error, Event, EventBody, EventContext, EventObserver, ExecControls,
-    ExecSpec, Git, GitCommitOptions, GrepOptions, NetworkPolicy, OutputStream, SandboxFilter,
-    SandboxId, SandboxProvider, SandboxSource, SandboxSpec, Search, SpawnSpec, StdioProcessHandle,
-    Termination, WaitOptions, WalkOptions, WorkspaceOwnership, activate,
+    ExecSpec, Git, GitCommitOptions, GrepOptions, NetworkPolicy, OutputStream, OwnedProvider,
+    Ownership, SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec, Search,
+    SpawnSpec, StdioProcessHandle, Termination, WaitOptions, WalkOptions, WorkspaceOwnership,
+    activate,
 };
 use sandbox_driver_host::HostProvider;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -35,6 +36,84 @@ impl EventObserver for RecordingEventObserver {
 
 fn host_spec() -> SandboxSpec {
     SandboxSpec::new(SandboxSource::HostDirectory)
+}
+
+#[tokio::test]
+async fn owned_provider_scopes_create_list_attach_and_delete() {
+    let plain: Arc<dyn SandboxProvider> = Arc::new(HostProvider::new());
+    // A key no other test uses, so the shared registry cannot leak
+    // sandboxes into the owned listing.
+    let ownership = Ownership::label("sh.test.owned-scope", "true");
+    let owned = OwnedProvider::new(Arc::clone(&plain), ownership.clone());
+
+    // A sandbox created through the scope carries the labels, whatever
+    // the caller put under the same key.
+    let mut spec = host_spec();
+    spec.labels
+        .insert("sh.test.owned-scope".to_owned(), "false".to_owned());
+    spec.labels.insert("team".to_owned(), "platform".to_owned());
+    let mine = owned.create(&spec, None).await.expect("owned create");
+    let status = mine.describe().await.expect("describe");
+    assert!(
+        ownership.owns(&status.labels),
+        "labels: {:?}",
+        status.labels
+    );
+    assert_eq!(
+        status.labels.get("team").map(String::as_str),
+        Some("platform")
+    );
+
+    // A sandbox created outside the scope is invisible to it.
+    let foreign = plain
+        .create(&host_spec(), None)
+        .await
+        .expect("plain create");
+    let listed = owned
+        .list(&SandboxFilter::default())
+        .await
+        .expect("owned list");
+    assert_eq!(listed.len(), 1, "listed: {listed:?}");
+    assert_eq!(listed[0].id, *mine.id());
+
+    let refused = owned
+        .attach(foreign.id(), None)
+        .await
+        .map(|_| ())
+        .expect_err("foreign attach is refused");
+    assert!(
+        matches!(&refused, Error::NotOwned { id, .. } if id == foreign.id().as_str()),
+        "{refused}"
+    );
+    let refused = owned
+        .delete(foreign.id(), None)
+        .await
+        .expect_err("foreign delete is refused");
+    assert!(matches!(refused, Error::NotOwned { .. }), "{refused}");
+    assert!(
+        plain.attach(foreign.id(), None).await.is_ok(),
+        "the refused delete left the foreign sandbox alone"
+    );
+
+    // Owned operations go through, and an unknown id stays idempotent.
+    owned.attach(mine.id(), None).await.expect("owned attach");
+    owned.delete(mine.id(), None).await.expect("owned delete");
+    owned
+        .delete(
+            &SandboxId::try_new("host-never-existed").expect("valid id"),
+            None,
+        )
+        .await
+        .expect("unknown id deletes idempotently");
+    assert!(
+        owned
+            .list(&SandboxFilter::default())
+            .await
+            .expect("list")
+            .is_empty()
+    );
+
+    foreign.delete().await.expect("cleanup");
 }
 
 #[tokio::test]

@@ -46,6 +46,16 @@ pub enum Error {
         id:       String,
     },
 
+    /// The resource exists but does not carry the labels that mark it as
+    /// the caller's; see [`crate::OwnedProvider`]. Distinct from
+    /// `NotFound` so a reconciler does not read a foreign sandbox as
+    /// already gone.
+    #[error("{resource:?} {id:?} is not owned by this consumer")]
+    NotOwned {
+        resource: ResourceKind,
+        id:       String,
+    },
+
     /// The provider does not support this capability. Machine-readable so
     /// callers can preflight against [`crate::Capabilities`] instead.
     #[error("capability {capability} is not supported by this provider")]

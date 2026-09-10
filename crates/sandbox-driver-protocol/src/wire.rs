@@ -290,7 +290,7 @@ impl WireError {
                 detail.max_bytes = Some(*max_bytes);
             }
             Error::Unsupported { capability } => detail.capability = Some(*capability),
-            Error::NotFound { resource, id } => {
+            Error::NotFound { resource, id } | Error::NotOwned { resource, id } => {
                 detail.resource = Some(*resource);
                 detail.id = Some(id.clone());
             }
@@ -375,6 +375,11 @@ impl WireError {
             "not_found" => {
                 if let (Some(resource), Some(id)) = (detail.resource, detail.id) {
                     return Error::NotFound { resource, id };
+                }
+            }
+            "not_owned" => {
+                if let (Some(resource), Some(id)) = (detail.resource, detail.id) {
+                    return Error::NotOwned { resource, id };
                 }
             }
             "invalid_spec" => {
@@ -511,6 +516,15 @@ mod tests {
         };
         let back = WireError::from_error(&error).into_error();
         assert!(matches!(back, Error::NotFound { .. }));
+
+        let error = Error::NotOwned {
+            resource: ResourceKind::Sandbox,
+            id:       "sb-2".into(),
+        };
+        let back = WireError::from_error(&error).into_error();
+        assert!(
+            matches!(back, Error::NotOwned { resource: ResourceKind::Sandbox, id } if id == "sb-2")
+        );
 
         let error = Error::InvalidState {
             current: SandboxState::Paused,

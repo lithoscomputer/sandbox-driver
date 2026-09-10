@@ -52,6 +52,7 @@ mod grace;
 mod id;
 mod logs;
 mod one_shot;
+mod owned;
 mod probe;
 mod provider;
 mod pty;
@@ -99,6 +100,7 @@ pub use grace::run_with_stop_grace;
 pub use id::{InvalidIdError, ProviderKind, SandboxId, ServiceId, SnapshotId, VolumeId};
 pub use logs::{LogSink, LogSource, Logs};
 pub use one_shot::{OneShot, OneShotImage, OneShotSpec};
+pub use owned::{OwnedProvider, Ownership};
 pub use probe::{BASH_PROBE_SCRIPT, activate, run_bash_probe};
 pub use provider::{
     HealthStatus, ProviderHealth, SandboxFilter, SandboxProvider, SnapshotFilter, SnapshotProvider,
