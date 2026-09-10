@@ -48,8 +48,10 @@ impl ScriptedSearch {
         self
     }
 
-    /// The files every walk returns, instead of the memory filesystem's,
-    /// before any filtering the caller applies.
+    /// The files walks enumerate instead of the memory filesystem's, as
+    /// paths relative to the working directory (or absolute). Each walk
+    /// returns the ones below its base, relative to that base, with the
+    /// directories the options exclude pruned — as a provider's walk would.
     pub fn set_walk(&self, files: Vec<WalkedFile>) -> &Self {
         *self.walk.lock().unwrap_or_else(PoisonError::into_inner) = Some(files);
         self
@@ -113,8 +115,29 @@ impl Search for ScriptedSearch {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
         {
-            return Ok(files);
+            return Ok(self.narrow(files, base, options));
         }
         Ok(self.fs.walk(base, options))
+    }
+}
+
+impl ScriptedSearch {
+    /// The canned files below `base`, relative to it, excluded directories
+    /// pruned.
+    fn narrow(&self, files: Vec<WalkedFile>, base: &str, options: &WalkOptions) -> Vec<WalkedFile> {
+        let base = self.fs.resolve(base);
+        let prefix = format!("{}/", base.trim_end_matches('/'));
+        files
+            .into_iter()
+            .filter_map(|file| {
+                let absolute = self.fs.resolve(&file.path);
+                let relative = absolute.strip_prefix(&prefix)?;
+                let mut segments = relative.split('/');
+                let file_name = segments.next_back()?;
+                let excluded = segments.any(|dir| options.exclude_dirs.iter().any(|x| x == dir));
+                (!excluded && !file_name.is_empty())
+                    .then(|| WalkedFile::new(relative.to_owned(), file.size))
+            })
+            .collect()
     }
 }

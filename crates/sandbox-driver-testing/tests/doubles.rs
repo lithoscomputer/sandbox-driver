@@ -275,16 +275,30 @@ async fn walks_and_globs_read_the_memory_filesystem_unless_canned() {
 #[tokio::test]
 async fn search_returns_canned_results_through_the_facet() {
     let sandbox = ScriptedSandbox::new();
-    sandbox
-        .scripted_search()
-        .set_walk(vec![WalkedFile::new("a.rs", Some(1))]);
+    sandbox.scripted_search().set_walk(vec![
+        WalkedFile::new("a.rs", Some(1)),
+        WalkedFile::new("docs/guide.md", Some(2)),
+        WalkedFile::new("docs/target/out.md", Some(3)),
+    ]);
     let search = sandbox.search().expect("search facet");
     let files = search
         .walk(".", &WalkOptions::default())
         .await
         .expect("walk");
-    assert_eq!(files.len(), 1);
-    assert_eq!(sandbox.scripted_search().walk_calls(), 1);
+    assert_eq!(files.len(), 3);
+    // A walk below a base sees only the canned files under it, relative to
+    // it, with excluded directories pruned.
+    let mut options = WalkOptions::default();
+    options.exclude_dirs = vec!["target".to_owned()];
+    let below: Vec<(String, Option<u64>)> = search
+        .walk("docs", &options)
+        .await
+        .expect("walk docs")
+        .into_iter()
+        .map(|file| (file.path, file.size))
+        .collect();
+    assert_eq!(below, [("guide.md".to_owned(), Some(2))]);
+    assert_eq!(sandbox.scripted_search().walk_calls(), 2);
     sandbox.scripted_search().set_walk_error("no walker");
     assert!(search.walk(".", &WalkOptions::default()).await.is_err());
 }
