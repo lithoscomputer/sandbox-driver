@@ -1,6 +1,6 @@
 //! Discovery and trust mechanics against the real plugin binary:
 //! checksum enforcement, environment scrubbing observed from inside a
-//! sandbox, and the post-handshake identity check.
+//! sandbox, and the configured kind naming the plugin.
 
 use std::path::Path;
 use std::time::Duration;
@@ -77,18 +77,19 @@ async fn unpinned_without_dev_refuses_and_dev_launches_unverified() {
     launch.provider.shutdown().await.expect("shutdown");
 }
 
+/// The embedder may serve one executable under a name of its own; the
+/// plugin's declared kind is information, not a gate.
 #[tokio::test(flavor = "multi_thread")]
-async fn kind_mismatch_is_refused_after_handshake() {
-    let config = PluginConfig::new(ProviderKind::try_new("docker").expect("kind"))
+async fn configured_kind_may_differ_from_the_declared_kind() {
+    let config = PluginConfig::new(ProviderKind::try_new("host-alias").expect("kind"))
         .path(binary())
         .dev(true)
         .inherit_env_var("PATH");
-    let Err(error) = launch_plugin("unused-prefix", &config).await else {
-        panic!("kind mismatch must be refused");
-    };
-    let message = error.to_string();
-    assert!(message.contains("declares kind host"), "{message}");
-    assert!(matches!(error, Error::InvalidSpec { .. }));
+    let launch = launch_plugin("unused-prefix", &config)
+        .await
+        .expect("an aliased plugin launches");
+    assert_eq!(launch.provider.kind().as_str(), "host");
+    launch.provider.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread")]
