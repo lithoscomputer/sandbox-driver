@@ -11,8 +11,8 @@ use std::time::Duration;
 use std::{env, process};
 
 use sandbox_driver::{
-    Capability, Error, ExecSpec, Git, GitCloneOptions, GitCredentials, Sandbox, SandboxKind,
-    SandboxProvider, SandboxSource, SandboxSpec, SnapshotId,
+    Capability, Error, ExecSpec, Git, GitCloneOptions, GitCredentials, GitFailureKind, Sandbox,
+    SandboxKind, SandboxProvider, SandboxSource, SandboxSpec, SnapshotId,
 };
 use sandbox_driver_daytona::DaytonaProvider;
 use sandbox_driver_protocol::{PluginProvider, serve};
@@ -152,7 +152,7 @@ async fn clone_contract(sandbox: &dyn Sandbox, transport: &str) -> Result<(), St
                  never reached the remote"
             ));
         }
-        Err(Error::Auth(_)) => {}
+        Err(Error::Git(failure)) if failure.kind() == GitFailureKind::AuthRejected => {}
         Err(error) => {
             return Err(format!(
                 "{transport}: bogus credential failed with an unexpected kind: {error}"
@@ -170,7 +170,7 @@ async fn clone_contract(sandbox: &dyn Sandbox, transport: &str) -> Result<(), St
                 "{transport}: a clone pinned to an unavailable commit succeeded"
             ));
         }
-        Err(Error::Provider(_) | Error::Exec(_)) => {}
+        Err(Error::Git(failure)) if failure.kind() == GitFailureKind::RefNotFound => {}
         Err(error) => {
             return Err(format!(
                 "{transport}: unavailable commit failed with an unexpected kind: {error}"

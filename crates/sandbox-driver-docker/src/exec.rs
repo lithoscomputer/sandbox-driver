@@ -15,7 +15,7 @@ use sandbox_driver::{
     BASH_ENV_VAR, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
     OutputCaptureBuffer, OutputSanitization, OutputSanitizer, OutputSink, OutputStream,
     ProviderError, ProviderKind, Result, SpawnSpec, StderrTail, StdioProcess, StdioProcessHandle,
-    Termination, feed_stdin, stop_signal,
+    Termination, feed_stdin, run_with_stop_grace, stop_signal,
 };
 use tokio::io::{AsyncWriteExt, duplex};
 use tokio::time;
@@ -472,6 +472,25 @@ impl Exec for DockerExec {
         spec: &ExecSpec,
         controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
+        run_with_stop_grace(spec, controls, |spec, controls| async move {
+            self.run_signals(&spec, controls).await
+        })
+        .await
+    }
+
+    async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
+        self.spawn_stdio_raw(spec).await
+    }
+}
+
+impl DockerExec {
+    /// Runs the command under raw stop signals; the trait method wraps
+    /// this in the spec's stop grace.
+    async fn run_signals(
+        &self,
+        spec: &ExecSpec,
+        controls: ExecControls,
+    ) -> Result<ExecStreamingResult> {
         let started = Instant::now();
         let (stop_file, pid_file) = self.control_paths();
         let stdin_reader = controls.stdin_reader(spec);
@@ -597,7 +616,7 @@ impl Exec for DockerExec {
         fields(provider_kind = "docker", sandbox_id = %self.container_id),
         err
     )]
-    async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
+    async fn spawn_stdio_raw(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
         let (stop_file, pid_file) = self.control_paths();
         let wrapper = Self::command_wrapper(&stop_file, &pid_file, true);
         let working_dir = self.resolve_dir(spec.working_dir.as_deref());

@@ -396,8 +396,8 @@ method, `-32000` application failure. Application failures carry `data`:
 ```
 
 `report.kind` is the stable machine-readable classification:
-`not_found`, `unsupported`, `invalid_state`, `invalid_spec`, `timeout`,
-`auth`, `rate_limited`, `overloaded`, `limit_exceeded`, `exec`, `provider`, `transport`, `incomplete`, `io`.
+`not_found`, `not_owned`, `unsupported`, `invalid_state`, `invalid_spec`, `timeout`,
+`auth`, `rate_limited`, `overloaded`, `limit_exceeded`, `exec`, `git`, `provider`, `transport`, `incomplete`, `io`.
 `report.causes` is a bounded rendered source chain. A receiver restores
 these rendered causes as an opaque remote source chain. `detail` carries
 kind-specific fields for faithful reconstruction:
@@ -406,6 +406,7 @@ kind-specific fields for faithful reconstruction:
 | --- | --- |
 | `unsupported` | `capability` (dotted path, e.g. `"exec.stdio_process"`) |
 | `not_found` | `resource` (`sandbox`/`snapshot`/`volume`/`plugin`), `id` |
+| `not_owned` | `resource`, `id` — the resource exists but lacks the labels a host-side ownership scope requires |
 | `invalid_spec` | `field`, `reason` |
 | `invalid_state` | `current`, `action` |
 | `timeout` | `operation`, `elapsed` |
@@ -416,11 +417,12 @@ kind-specific fields for faithful reconstruction:
 | `incomplete` | `operation`, `output_abandoned`, `stop_acknowledged`, `termination_confirmed`, `cleanup_confirmed` |
 | `provider` | `provider` object: `{provider, code, message, retryable, detail}` |
 | `exec` | `exec` object: `{label, termination, exit_code, stdout_b64, stderr_b64, duration_ms?}` (`duration_ms` is additive: senders may omit it, receivers must tolerate its absence) |
+| `git` | `git` object: `{operation, kind, exec?, provider?}` — `kind` is one of `auth_rejected`, `remote_unavailable`, `ref_not_found`, `access_denied`, `target_exists`, `unclassified`; `exec` (same shape as the `exec` detail) is present when git ran inside the sandbox, `provider` (same shape as the `provider` detail) when a native operation ran it. `report.retryable` is true only for `remote_unavailable`. |
 | `transport` | `transport_context` |
 | `io` | `io_context` |
 
-Raw command output appears only inside the `exec` detail — never in
-`message` or `report`. Secret redaction is the host's responsibility.
+Raw command output appears only inside the `exec` detail and the `exec`
+member of the `git` detail — never in `message` or `report`. Secret redaction is the host's responsibility.
 
 ## 8. Method catalog
 
@@ -571,10 +573,16 @@ on `PATH` to serve them.
 The exec spec DTO:
 
 ```json
-{"program":"echo","args":["hi"],"timeout_ms":30000,"working_dir":null,"env":{},"output_sanitization":"strip_ansi"}
+{"program":"echo","args":["hi"],"timeout_ms":30000,"stop_grace_ms":5000,"working_dir":null,"env":{},"output_sanitization":"strip_ansi"}
 ```
 
-`args` may be omitted and means `[]`. Standard input is not in the spec:
+`args` may be omitted and means `[]`. `stop_grace_ms` is optional and
+additive: absent, stops are raw (the timeout kills, a `term` is one
+signal); present, the plugin runs the TERM, grace, KILL ladder itself for
+the timeout, a failing sink, and the host's `term`, while `kill` stays
+immediate. A command the ladder ended for the timeout reports
+`timed_out` whichever signal finally stopped it. A plugin built before
+the field ignores it and keeps raw stops. Standard input is not in the spec:
 a request whose `stdin` is true feeds the command from the channel's
 `stdin` frames (§9), and a plugin whose provider takes only fixed stdin
 collects those frames to their `eof` first.
@@ -684,18 +692,24 @@ exec-derived on the host and has no wire method.
 
 | method | params | result |
 | --- | --- | --- |
-| `git/clone` | `{sandbox_id, url, target_path, options:{branch?, commit?, depth?, credentials?:{username,password}}}` | `{}` |
+| `git/clone` | `{sandbox_id, url, target_path, options:{branch?, commit?, tag?, depth?, credentials?:{username,password}}}` | `{}` |
 
 `target_path` resolves against the sandbox working directory when
 relative. `commit`, when present, must be a full 40-hex SHA; the clone
 is pinned to it whatever `depth` says, and with `branch` also present the
-checkout ends attached to that branch at the pinned commit. An
-unavailable commit fails with the provider's error; the plugin must not
-fall back to the branch head. `credentials` are applied to this one
-network operation and never written into the repository configuration.
-The method is additive within version 2: a host that receives `-32601`
-from an older plugin runs the exec-derived clone it ran before the
-method existed.
+checkout ends attached to that branch at the pinned commit. `tag` names
+a tag without its `refs/tags/` prefix and pins the clone the same way,
+at the tagged commit; the plugin fetches it by its fully qualified ref so
+a branch of the same name is never selected. `commit` and `tag` are
+alternative pins and must not both be present. An unavailable commit or
+tag fails with the provider's error; the plugin must not fall back to
+the branch head. `credentials` are applied to this one network operation
+and never written into the repository configuration. The method is
+additive within version 2: a host that receives `-32601` from an older
+plugin runs the exec-derived clone it ran before the method existed. A
+plugin built before `tag` existed ignores the unknown field and clones
+the branch head, so a host that pins tags must run a plugin at least as
+new as itself.
 
 ### 8.7 Snapshots and volumes
 

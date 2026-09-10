@@ -113,6 +113,7 @@ Deliberate merges:
 - **Fork has one meaning.** The source and result are Running. The clone preserves filesystem state, memory, running processes, and process IDs. There is no disk-only fork option.
 - **Sandbox snapshots have explicit modes.** `Filesystem` captures persistent files without live process state. `LiveProcessState` also captures memory, running processes, and process IDs. Daytona maps these modes to its cold (`includeMemory: false`, source Stopped) and hot (`includeMemory: true`, source Running) snapshots.
 - **Checkpoint and in-place restore are not public operations.** They are Boxd-only today. They can be added when Boxd work starts and a consumer needs them.
+- **Consumer ownership is a wrapper, not a provider concern.** A provider's backend is shared with every other application, so a consumer that persists ids needs proof that a sandbox is still its own before stopping or deleting it. `OwnedProvider` wraps any provider — in-process or plugin — with an `Ownership` label set: it stamps the labels on every create, narrows every list to sandboxes carrying them, and refuses `attach`, `undelete`, and `delete` with `NotOwned` otherwise. A consumer widens the label set to narrow the scope (one label for everything it manages, one more for a single run). Providers store and filter labels; they never know which labels mean ownership.
 - **Host workspace ownership.** A Host sandbox is either a **designated** caller-owned directory or a **managed** temporary workspace the library created; the distinction is set in the spec and visible in `SandboxStatus`. `delete` removes managed workspaces only — on a designated directory it releases the handle and never touches caller data.
 
 ### Timers
@@ -324,7 +325,7 @@ This replaced fabro's rule that every command is Bash source. That rule made the
 
 A relative working dir resolves against the sandbox working directory on every provider — a conformance case pins it. Process-local control objects travel separately in `ExecControls`: the `term` and `kill` stop tokens, the async output sink, and the retention cap (head+tail with `omitted_bytes` accounting — fabro's `OutputCaptureBuffer` moves here). On the wire, controls map to negotiated IDs — a host-generated `execId` routes `exec/output` notifications and `exec/stop` — never to serialized fields, and buffered `run` carries no streaming controls at all.
 
-Control contracts, normative: **stops are signals, not a policy.** `term` sends SIGTERM to the command's process group once and the call keeps waiting; the command may exit (`termination: Cancelled`) or ignore it until `kill` sends SIGKILL (`termination: Killed`). The escalation ladder — TERM, a grace so traps run and locks release (a killed `git` otherwise leaves `.git/index.lock`), then KILL — belongs to the caller, who knows how long to wait; the library used to run one of its own under a `cancel` token, which made the primary consumer's ladder and the provider's race each other. The provider's own stops (`spec.timeout`, a failing sink) have no caller present to escalate, so they kill. A provider that cannot deliver a signal (Daytona ends a command by deleting its session) ends the command on either token and reports the level it received. A provider that does not support stdin or stops rejects a call that supplies them with `Unsupported` (`exec.stdin` / `exec.stop`) — never runs the command with the input silently dropped. The output sink is awaited per chunk — a slow consumer backpressures the read loop rather than growing an unbounded buffer; output beyond the retention cap is still drained (and counted in `omitted_bytes`), never left to block the process. A sink that returns an error cancels the exec and reports it as such. `ExecResult` keeps `streams_separated` and `live_streaming` honesty flags — Daytona's combined-output and log-polling degradations are *reported*, not hidden.
+Control contracts, normative: **stops are signals, not a policy.** `term` sends SIGTERM to the command's process group once and the call keeps waiting; the command may exit (`termination: Cancelled`) or ignore it until `kill` sends SIGKILL (`termination: Killed`). The escalation ladder — TERM, a grace so traps run and locks release (a killed `git` otherwise leaves `.git/index.lock`), then KILL — runs only when the caller asks for it with `ExecSpec::stop_grace`, which names how long to wait; the provider then runs one ladder for the timeout, a failing sink, and the caller's `term` (`run_with_stop_grace`), so the consumer's ladder and the provider's never race each other. Without a grace the provider's own stops (`spec.timeout`, a failing sink) kill outright. A provider that cannot deliver a signal (Daytona ends a command by deleting its session) ends the command on either token and reports the level it received. A provider that does not support stdin or stops rejects a call that supplies them with `Unsupported` (`exec.stdin` / `exec.stop`) — never runs the command with the input silently dropped. The output sink is awaited per chunk — a slow consumer backpressures the read loop rather than growing an unbounded buffer; output beyond the retention cap is still drained (and counted in `omitted_bytes`), never left to block the process. A sink that returns an error cancels the exec and reports it as such. `ExecResult` keeps `streams_separated` and `live_streaming` honesty flags — Daytona's combined-output and log-polling degradations are *reported*, not hidden.
 
 `StdioProcess` keeps fabro's shape: `AsyncWrite` stdin, `AsyncRead` stdout, bounded stderr tail collector, and a handle with `terminate()`/`wait()`. This is the facet the JSON-RPC side-channel transport exists for.
 
@@ -362,6 +363,12 @@ pub trait SnapshotProvider: Send + Sync {
     // for two weeks; content-addressed reuse needs a way back.
     async fn activate(&self, id: &SnapshotId) -> Result<(), Error>;
     async fn deactivate(&self, id: &SnapshotId) -> Result<(), Error>;
+    // Default, composed from the methods above: look the named snapshot
+    // up, activate or create it as needed, and wait within `budget` for
+    // it to become active. Every consumer wants exactly this sequence
+    // before creating a sandbox from a content-addressed snapshot, and it
+    // works over the wire without a method of its own.
+    async fn ensure(&self, spec: &SnapshotSpec, budget: Duration) -> Result<SnapshotId, Error>;
 }
 
 pub struct SnapshotSpec {
@@ -502,6 +509,7 @@ pub enum Error {
     Auth(AuthError),
     RateLimited { retry_after: Option<Duration> },
     Exec(ExecError),                                    // bounded, classified; raw output behind accessors
+    Git(GitFailure),                                    // a git operation classified by what the remote said
     Provider(ProviderError),                            // structured provider detail, serializable
     Transport(TransportError),                          // out-of-process provider communication
     Io { context: String, source: io::Error },          // local filesystem and process I/O
@@ -509,6 +517,8 @@ pub enum Error {
 ```
 
 The `Exec` variant preserves fabro's redaction boundary: `Display` shows bounded classified metadata only; raw stdout/stderr is available through explicit accessors so callers control exposure. Redaction hooks stay caller-side (fabro keeps `fabro_redact`).
+
+The `Git` variant classifies a failed git operation once, in this crate, from the command's output or the provider's native failure: the remote rejected the credential, the remote is unavailable, the revision does not exist, access is denied, the target exists, or unclassified. Every provider and both transports produce the same class for the same failure, so a consumer decides about retries by matching the class and never parses git output. Whether a rejected credential is worth retrying depends on the credential's provenance, which only the consumer knows.
 
 Provider adapters retain SDK errors as opaque sources on `AuthError` and
 `ProviderError`. The protocol adapter classifies framing, encoding, and
@@ -559,7 +569,7 @@ Each of these is implementable over `Exec`/`Git`/core — the fabro survey confi
 4. **The bash health probe is a library helper** run by the `activate` convenience, not a trait method. Providers implement exec; the probe is a contract test over it.
 5. **Command sessions**: capability name reserved in the schema; no trait in v1.
 6. **`Logs` is follow-style streams only** in v1; historical querying is a later capability.
-7. **Workspace layout**: nine packages: `sandbox-driver` (core types, traits, derived implementations, and helpers), `sandbox-driver-protocol`, `sandbox-driver-conformance`, `sandbox-driver-cli`, `sandbox-driver-{docker,daytona}-config`, and `sandbox-driver-{host,docker,daytona}`. Each provider package contains a library with a supported public API for in-process embedding and a plugin executable serving the same provider over JSON-RPC. Both are supported application boundaries; third-party providers use JSON-RPC only.
+7. **Workspace layout**: ten packages: `sandbox-driver` (core types, traits, derived implementations, and helpers), `sandbox-driver-protocol`, `sandbox-driver-conformance`, `sandbox-driver-testing` (scripted in-memory `Sandbox` and `SandboxProvider` doubles for consumers' unit tests, so no consumer writes its own fake of the traits), `sandbox-driver-cli`, `sandbox-driver-{docker,daytona}-config`, and `sandbox-driver-{host,docker,daytona}`. Each provider package contains a library with a supported public API for in-process embedding and a plugin executable serving the same provider over JSON-RPC. Both are supported application boundaries; third-party providers use JSON-RPC only.
 8. **VNC v1 returns browser connection information.** VPN clients are
    guest software managed through exec.
 9. **The Docker image contract requires `setsid`** alongside bash, `stat`, `find`, and `base64` — reliable kill semantics need a separate session, and an image without it fails every exec with a clear message rather than degrading silently.

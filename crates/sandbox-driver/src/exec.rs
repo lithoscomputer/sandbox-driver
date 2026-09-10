@@ -63,8 +63,10 @@ pub trait Exec: Send + Sync {
     /// The provider's own stops have no caller present to escalate, so
     /// they are hard: `spec.timeout` and a failing sink SIGKILL the
     /// command, resolving with [`Termination::TimedOut`] and
-    /// [`Termination::Cancelled`]. A caller who wants a graceful deadline
-    /// runs its own timer over `term` and `kill`.
+    /// [`Termination::Cancelled`]. A caller who wants the ladder run
+    /// for it — TERM, a grace, then KILL, for the timeout and for its
+    /// own `term` alike — sets [`ExecSpec::stop_grace`], and the
+    /// provider runs the ladder through [`crate::run_with_stop_grace`].
     ///
     /// The sink is awaited per chunk — a slow consumer backpressures the
     /// read loop. Output beyond `controls.retained_output_limit` is still
@@ -114,6 +116,14 @@ pub struct ExecSpec {
     /// [`ExecSpec::DEFAULT_TIMEOUT`]; opt out with
     /// [`ExecSpec::no_timeout`].
     pub timeout:             Option<Duration>,
+    /// How long a stop waits after SIGTERM before SIGKILL. `None`, the
+    /// default, keeps stops raw: the timeout and a failing sink kill
+    /// outright and a caller's `term` is one signal. With a grace, the
+    /// provider runs the ladder for the timeout, a failing sink, and the
+    /// caller's `term`; the caller's `kill` stays immediate. A provider
+    /// that cannot deliver a signal ends the command on the TERM.
+    #[serde(default)]
+    pub stop_grace:          Option<Duration>,
     pub working_dir:         Option<String>,
     pub env:                 BTreeMap<String, String>,
     /// Written to the process then closed for EOF. A broken pipe while
@@ -139,6 +149,7 @@ impl ExecSpec {
             program:             program.into(),
             args:                Vec::new(),
             timeout:             Some(Self::DEFAULT_TIMEOUT),
+            stop_grace:          None,
             working_dir:         None,
             env:                 BTreeMap::new(),
             stdin:               None,
@@ -188,6 +199,14 @@ impl ExecSpec {
         self
     }
 
+    /// Asks the provider to stop the command gracefully: SIGTERM, then
+    /// SIGKILL once `grace` has passed. See [`ExecSpec::stop_grace`].
+    #[must_use]
+    pub fn stop_grace(mut self, grace: Duration) -> Self {
+        self.stop_grace = Some(grace);
+        self
+    }
+
     #[must_use]
     pub fn working_dir(mut self, dir: impl Into<String>) -> Self {
         self.working_dir = Some(dir.into());
@@ -219,6 +238,7 @@ impl fmt::Debug for ExecSpec {
             .field("program", &self.program)
             .field("args", &"<redacted>")
             .field("timeout", &self.timeout)
+            .field("stop_grace", &self.stop_grace)
             .field("working_dir", &self.working_dir)
             .field("env_keys", &self.env.keys().collect::<Vec<_>>())
             .field("stdin_bytes", &self.stdin.as_ref().map(Vec::len))

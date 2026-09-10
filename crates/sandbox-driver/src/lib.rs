@@ -48,9 +48,11 @@ mod event;
 mod exec;
 mod fs;
 mod git;
+mod grace;
 mod id;
 mod logs;
 mod one_shot;
+mod owned;
 mod probe;
 mod provider;
 mod pty;
@@ -76,7 +78,8 @@ pub use capabilities::{
 pub use capture::OutputCaptureBuffer;
 pub use derived::{DerivedFs, DerivedGit, DerivedSearch, DerivedServices};
 pub use error::{
-    AuthError, Error, ExecFailure, ProviderError, ResourceKind, Result, TransportError,
+    AuthError, Error, ExecFailure, GitFailure, GitFailureKind, ProviderError, ResourceKind, Result,
+    TransportError,
 };
 pub use event::{
     Action, CorrelationId, ErrorReport, Event, EventBody, EventContext, EventEmitter, EventId,
@@ -93,9 +96,11 @@ pub use git::{
     Git, GitBranches, GitCloneOptions, GitCommitOptions, GitCredentials, GitFacet, GitPushOptions,
     GitStatus,
 };
+pub use grace::run_with_stop_grace;
 pub use id::{InvalidIdError, ProviderKind, SandboxId, ServiceId, SnapshotId, VolumeId};
 pub use logs::{LogSink, LogSource, Logs};
 pub use one_shot::{OneShot, OneShotImage, OneShotSpec};
+pub use owned::{OwnedProvider, Ownership};
 pub use probe::{BASH_PROBE_SCRIPT, activate, run_bash_probe};
 pub use provider::{
     HealthStatus, ProviderHealth, SandboxFilter, SandboxProvider, SnapshotFilter, SnapshotProvider,

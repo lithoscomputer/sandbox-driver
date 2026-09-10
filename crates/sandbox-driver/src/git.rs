@@ -167,22 +167,39 @@ pub struct GitCloneOptions {
     /// the branch head; `branch` names no constraint on which revision
     /// is fetched.
     pub commit:      Option<String>,
+    /// Tag to pin the checkout to, named without the `refs/tags/`
+    /// prefix. The tag is fetched by its fully qualified ref, so a
+    /// branch of the same name is never selected by mistake, and the
+    /// checkout behaves as a `commit` pin at the tagged commit: attached
+    /// to `branch` when one is set, detached otherwise. `tag` and
+    /// `commit` are alternative pins; setting both is invalid.
+    pub tag:         Option<String>,
     pub depth:       Option<u32>,
     pub credentials: Option<GitCredentials>,
 }
 
 impl GitCloneOptions {
     /// Checks the options' own invariants: a pinned commit must be a
-    /// full 40-hex SHA, and a branch cannot be flag-shaped.
-    /// Implementations call this before running anything, so a bad pin
-    /// fails immediately instead of after the network operation — and a
-    /// flag-shaped value can never be read as an option.
+    /// full 40-hex SHA, a tag or branch cannot be flag-shaped, and at
+    /// most one pin is set. Implementations call this before running
+    /// anything, so a bad pin fails immediately instead of after the
+    /// network operation — and a flag-shaped value can never be read as
+    /// an option.
     pub fn validate(&self) -> Result<(), crate::Error> {
         if let Some(commit) = &self.commit {
             if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 return Err(crate::Error::invalid_spec(
                     "commit",
                     "must be a full 40-character hex commit SHA",
+                ));
+            }
+        }
+        if let Some(tag) = &self.tag {
+            validate_ref_name("tag", tag)?;
+            if self.commit.is_some() {
+                return Err(crate::Error::invalid_spec(
+                    "tag",
+                    "cannot be combined with commit; a clone has one pin",
                 ));
             }
         }
@@ -196,10 +213,34 @@ impl GitCloneOptions {
 /// Rejects branch names git itself would refuse, before they can be
 /// read as flags: empty, or beginning with `-` (never a valid ref).
 pub(crate) fn validate_branch_name(branch: &str) -> Result<(), crate::Error> {
-    if branch.is_empty() || branch.starts_with('-') {
+    validate_ref_name("branch", branch)
+}
+
+/// Rejects a short ref name (a branch or tag) git itself would refuse,
+/// before it can be read as a flag or escape its namespace: empty,
+/// beginning with `-`, or containing a path component git forbids.
+fn validate_ref_name(field: &'static str, name: &str) -> Result<(), crate::Error> {
+    if name.is_empty() || name.starts_with('-') {
         return Err(crate::Error::invalid_spec(
-            "branch",
+            field,
             "must not be empty or begin with '-'",
+        ));
+    }
+    if name.split('/').any(|component| {
+        component.is_empty()
+            || component == "."
+            || component == ".."
+            || component.strip_suffix(".lock").is_some()
+    }) || name.ends_with('.')
+        || name.contains("..")
+        || name.contains("@{")
+        || name
+            .chars()
+            .any(|c| c.is_ascii_control() || " ~^:?*[\\".contains(c))
+    {
+        return Err(crate::Error::invalid_spec(
+            field,
+            "is not a valid git reference name",
         ));
     }
     Ok(())

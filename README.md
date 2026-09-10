@@ -27,6 +27,7 @@ construction and to the wire mask in `docs/protocol.md` §5.
 | `sandbox-driver-daytona-config` | Typed Daytona and nested Docker configuration for plugin clients |
 | `sandbox-driver-protocol` | JSON-RPC plugin protocol (version 2, with per-operation data channels): serve any provider, adapt any plugin |
 | `sandbox-driver-conformance` | Black-box conformance suite every provider must pass |
+| `sandbox-driver-testing` | Scripted in-memory sandbox and provider doubles for consumers' unit tests |
 | `sandbox-driver-cli` | `lithos-sandbox` command for provider diagnostics and sandbox operations |
 
 Each provider package is a library with a supported public API for in-process

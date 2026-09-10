@@ -10,9 +10,10 @@ use std::{env, process};
 use async_trait::async_trait;
 use sandbox_driver::{
     Action, Capability, Error, Event, EventBody, EventContext, EventObserver, ExecControls,
-    ExecSpec, Git, GitCommitOptions, GrepOptions, NetworkPolicy, OutputStream, SandboxFilter,
-    SandboxId, SandboxProvider, SandboxSource, SandboxSpec, Search, SpawnSpec, StdioProcessHandle,
-    Termination, WaitOptions, WalkOptions, WorkspaceOwnership, activate,
+    ExecSpec, Git, GitCommitOptions, GrepOptions, NetworkPolicy, OutputStream, OwnedProvider,
+    Ownership, SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec, Search,
+    SpawnSpec, StdioProcessHandle, Termination, WaitOptions, WalkOptions, WorkspaceOwnership,
+    activate,
 };
 use sandbox_driver_host::HostProvider;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -35,6 +36,84 @@ impl EventObserver for RecordingEventObserver {
 
 fn host_spec() -> SandboxSpec {
     SandboxSpec::new(SandboxSource::HostDirectory)
+}
+
+#[tokio::test]
+async fn owned_provider_scopes_create_list_attach_and_delete() {
+    let plain: Arc<dyn SandboxProvider> = Arc::new(HostProvider::new());
+    // A key no other test uses, so the shared registry cannot leak
+    // sandboxes into the owned listing.
+    let ownership = Ownership::label("sh.test.owned-scope", "true");
+    let owned = OwnedProvider::new(Arc::clone(&plain), ownership.clone());
+
+    // A sandbox created through the scope carries the labels, whatever
+    // the caller put under the same key.
+    let mut spec = host_spec();
+    spec.labels
+        .insert("sh.test.owned-scope".to_owned(), "false".to_owned());
+    spec.labels.insert("team".to_owned(), "platform".to_owned());
+    let mine = owned.create(&spec, None).await.expect("owned create");
+    let status = mine.describe().await.expect("describe");
+    assert!(
+        ownership.owns(&status.labels),
+        "labels: {:?}",
+        status.labels
+    );
+    assert_eq!(
+        status.labels.get("team").map(String::as_str),
+        Some("platform")
+    );
+
+    // A sandbox created outside the scope is invisible to it.
+    let foreign = plain
+        .create(&host_spec(), None)
+        .await
+        .expect("plain create");
+    let listed = owned
+        .list(&SandboxFilter::default())
+        .await
+        .expect("owned list");
+    assert_eq!(listed.len(), 1, "listed: {listed:?}");
+    assert_eq!(listed[0].id, *mine.id());
+
+    let refused = owned
+        .attach(foreign.id(), None)
+        .await
+        .map(|_| ())
+        .expect_err("foreign attach is refused");
+    assert!(
+        matches!(&refused, Error::NotOwned { id, .. } if id == foreign.id().as_str()),
+        "{refused}"
+    );
+    let refused = owned
+        .delete(foreign.id(), None)
+        .await
+        .expect_err("foreign delete is refused");
+    assert!(matches!(refused, Error::NotOwned { .. }), "{refused}");
+    assert!(
+        plain.attach(foreign.id(), None).await.is_ok(),
+        "the refused delete left the foreign sandbox alone"
+    );
+
+    // Owned operations go through, and an unknown id stays idempotent.
+    owned.attach(mine.id(), None).await.expect("owned attach");
+    owned.delete(mine.id(), None).await.expect("owned delete");
+    owned
+        .delete(
+            &SandboxId::try_new("host-never-existed").expect("valid id"),
+            None,
+        )
+        .await
+        .expect("unknown id deletes idempotently");
+    assert!(
+        owned
+            .list(&SandboxFilter::default())
+            .await
+            .expect("list")
+            .is_empty()
+    );
+
+    foreign.delete().await.expect("cleanup");
 }
 
 #[tokio::test]
@@ -698,6 +777,79 @@ async fn pinned_clone_attaches_the_admitted_branch() {
         .await
         .expect("rev-parse");
     assert_eq!(head.stdout_lossy().trim(), pinned);
+
+    sandbox.delete().await.expect("delete");
+}
+
+#[tokio::test]
+async fn tag_pinned_clone_attaches_the_admitted_branch() {
+    let provider = HostProvider::new();
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+    let exec = sandbox.exec();
+    let workspace = sandbox.working_directory().to_owned();
+
+    // A source repo whose main advanced past the tagged commit, with a
+    // branch that shares the tag's name so a short-name lookup would
+    // pick the wrong revision.
+    let setup = ExecSpec::bash(
+        "git init -q -b main src && cd src && \
+         git -c user.name=T -c user.email=t@example.com commit -q --allow-empty -m one && \
+         git tag -a -m release v1.0.0 && \
+         git rev-parse HEAD^{commit} && \
+         git -c user.name=T -c user.email=t@example.com commit -q --allow-empty -m two && \
+         git branch v1.0.0 HEAD",
+    )
+    .timeout(Duration::from_secs(30));
+    let result = exec.run(&setup).await.expect("source repo setup");
+    assert!(result.success(), "stderr: {}", result.stderr_lossy());
+    let tagged = result.stdout_lossy().trim().to_owned();
+    assert_eq!(tagged.len(), 40, "sha: {tagged}");
+
+    let git = sandbox.git().expect("git facet");
+    let mut options = sandbox_driver::GitCloneOptions::default();
+    options.branch = Some("main".to_owned());
+    options.tag = Some("v1.0.0".to_owned());
+    options.depth = Some(1);
+    git.clone_repo(&format!("file://{workspace}/src"), "dst", &options)
+        .await
+        .expect("tag clone");
+
+    let repo = format!("{workspace}/dst");
+    let status = git.status(&repo).await.expect("git status");
+    assert_eq!(status.current_branch.as_deref(), Some("main"));
+    assert!(!status.detached);
+    let head = exec
+        .run(
+            &ExecSpec::new("git")
+                .args(["-C", &repo, "rev-parse", "HEAD"])
+                .timeout(Duration::from_secs(10)),
+        )
+        .await
+        .expect("rev-parse");
+    assert_eq!(head.stdout_lossy().trim(), tagged);
+
+    // A missing tag fails instead of leaving a branch-head checkout.
+    let mut missing = sandbox_driver::GitCloneOptions::default();
+    missing.branch = Some("main".to_owned());
+    missing.tag = Some("v9.9.9".to_owned());
+    git.clone_repo(&format!("file://{workspace}/src"), "missing", &missing)
+        .await
+        .expect_err("missing tag fails");
+    let leftover = exec
+        .run(
+            &ExecSpec::new("git")
+                .args([
+                    "-C",
+                    &format!("{workspace}/missing"),
+                    "rev-parse",
+                    "--verify",
+                    "HEAD",
+                ])
+                .timeout(Duration::from_secs(10)),
+        )
+        .await
+        .expect("rev-parse");
+    assert!(!leftover.success(), "a failed tag clone left a checkout");
 
     sandbox.delete().await.expect("delete");
 }

@@ -4,7 +4,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::derived::shell_quote;
-use crate::error::{Error, ExecFailure, Result};
+use crate::error::{Error, ExecFailure, GitFailure, Result};
 use crate::exec::{Exec, ExecResult, ExecSpec};
 use crate::git::{
     Git, GitBranches, GitCloneOptions, GitCommitOptions, GitCredentials, GitPushOptions, GitStatus,
@@ -54,7 +54,11 @@ impl<'e> DerivedGit<'e> {
         if result.success() {
             return Ok(result);
         }
-        Err(Error::Exec(
+        // A command that ran and failed is a git failure, classified from
+        // its output; a failure to run it at all (transport, timeout)
+        // passed through above unchanged.
+        Err(Error::Git(GitFailure::from_command(
+            label,
             ExecFailure::new(
                 label,
                 result.termination,
@@ -63,7 +67,7 @@ impl<'e> DerivedGit<'e> {
                 result.stderr,
             )
             .with_duration(result.duration),
-        ))
+        )))
     }
 
     /// A per-call config value (`url.<authed>.insteadOf=<plain>`) that
@@ -95,22 +99,50 @@ impl<'e> DerivedGit<'e> {
     }
 }
 
+/// The revision a clone is pinned to: a commit SHA or a tag.
+#[derive(Clone, Copy)]
+enum Pin<'a> {
+    Commit(&'a str),
+    Tag(&'a str),
+}
+
+impl Pin<'_> {
+    /// What `git fetch` is asked for. A commit is fetched by SHA; a tag
+    /// by its fully qualified ref into the same local ref, so a branch
+    /// of the same name is never selected and the tag remains
+    /// resolvable in the checkout.
+    fn fetch_refspec(&self) -> String {
+        match self {
+            Self::Commit(commit) => (*commit).to_owned(),
+            Self::Tag(tag) => format!("+refs/tags/{tag}:refs/tags/{tag}"),
+        }
+    }
+
+    /// The revision the checkout attaches to or detaches at.
+    fn revision(&self) -> String {
+        match self {
+            Self::Commit(commit) => (*commit).to_owned(),
+            Self::Tag(tag) => format!("refs/tags/{tag}"),
+        }
+    }
+}
+
 impl DerivedGit<'_> {
-    /// Pinned-commit clone: init, add the remote, fetch the commit SHA
-    /// directly, and detach at it.
+    /// Pinned clone: init, add the remote, fetch the pinned revision
+    /// directly, and check it out.
     ///
     /// A plain clone only fetches the tip of one branch under
     /// `--depth`/`--single-branch`, so a pinned commit outside that
     /// window was never fetched and the checkout fails. Fetching the
-    /// SHA itself keeps the pin independent of both depth and branch;
-    /// an unavailable commit fails rather than falling back to the
-    /// branch head.
+    /// SHA or tag itself keeps the pin independent of both depth and
+    /// branch; an unavailable revision fails rather than falling back to
+    /// the branch head.
     async fn clone_pinned(
         &self,
         url: &str,
         target_path: &str,
         options: &GitCloneOptions,
-        commit: &str,
+        pin: Pin<'_>,
         rewrite: Option<&str>,
     ) -> Result<()> {
         self.run(
@@ -147,12 +179,15 @@ impl DerivedGit<'_> {
         args.push("--no-tags".into());
         args.push("origin".into());
         args.push("--".into());
-        args.push(commit.to_owned());
+        args.push(pin.fetch_refspec());
         self.run("git fetch", Some(target_path), &args, CLONE_TIMEOUT)
             .await?;
 
+        let revision = pin.revision();
         if let Some(branch) = &options.branch {
-            return self.attach_pinned_branch(target_path, branch, commit).await;
+            return self
+                .attach_pinned_branch(target_path, branch, &revision)
+                .await;
         }
         self.run(
             "git checkout",
@@ -160,7 +195,7 @@ impl DerivedGit<'_> {
             &[
                 "checkout".into(),
                 "--detach".into(),
-                commit.to_owned(),
+                revision,
                 // Forces revision interpretation: a bare name that also
                 // matches a path would otherwise be ambiguous.
                 "--".into(),
@@ -171,17 +206,17 @@ impl DerivedGit<'_> {
         Ok(())
     }
 
-    /// Points `branch` at `commit` and attaches HEAD to it
-    /// (`checkout -B`), so callers that read the current branch back out
-    /// of the workspace see the requested name instead of a detached
-    /// HEAD — and a later push of that branch carries the work done
-    /// since the clone. fabro attached pinned checkouts on every
-    /// provider for exactly this reason.
+    /// Points `branch` at `revision` (a commit SHA or a fully qualified
+    /// ref) and attaches HEAD to it (`checkout -B`), so callers that
+    /// read the current branch back out of the workspace see the
+    /// requested name instead of a detached HEAD — and a later push of
+    /// that branch carries the work done since the clone. fabro attached
+    /// pinned checkouts on every provider for exactly this reason.
     pub async fn attach_pinned_branch(
         &self,
         repo_path: &str,
         branch: &str,
-        commit: &str,
+        revision: &str,
     ) -> Result<()> {
         validate_branch_name(branch)?;
         self.run(
@@ -191,7 +226,7 @@ impl DerivedGit<'_> {
                 "checkout".into(),
                 "-B".into(),
                 branch.to_owned(),
-                commit.to_owned(),
+                revision.to_owned(),
                 "--".into(),
             ],
             GIT_TIMEOUT,
@@ -255,9 +290,14 @@ impl Git for DerivedGit<'_> {
             .and_then(|credentials| authed_url(url, credentials))
             .map(|authed| format!("url.{authed}.insteadOf={url}"));
 
-        if let Some(commit) = &options.commit {
+        let pin = match (&options.commit, &options.tag) {
+            (Some(commit), _) => Some(Pin::Commit(commit)),
+            (None, Some(tag)) => Some(Pin::Tag(tag)),
+            (None, None) => None,
+        };
+        if let Some(pin) = pin {
             return self
-                .clone_pinned(url, target_path, options, commit, rewrite.as_deref())
+                .clone_pinned(url, target_path, options, pin, rewrite.as_deref())
                 .await;
         }
 
@@ -485,6 +525,7 @@ fn parse_status_v2(output: &str) -> GitStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::GitFailureKind;
     use crate::test_exec::ScriptedExec;
 
     #[test]
@@ -579,6 +620,7 @@ mod tests {
         let options = GitCloneOptions {
             branch:      Some("main".to_owned()),
             commit:      None,
+            tag:         None,
             depth:       None,
             credentials: None,
         };
@@ -608,6 +650,7 @@ mod tests {
         let options = GitCloneOptions {
             branch:      Some("main".to_owned()),
             commit:      Some(sha.to_owned()),
+            tag:         None,
             depth:       Some(1),
             credentials: Some(GitCredentials::new("user", "pass")),
         };
@@ -665,6 +708,7 @@ mod tests {
         let options = GitCloneOptions {
             branch:      None,
             commit:      Some(sha.to_owned()),
+            tag:         None,
             depth:       None,
             credentials: None,
         };
@@ -680,6 +724,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tag_clone_fetches_the_qualified_tag_ref_and_attaches_the_branch() {
+        let exec = ScriptedExec::new(vec![
+            ScriptedExec::ok(""),
+            ScriptedExec::ok(""),
+            ScriptedExec::ok(""),
+            ScriptedExec::ok(""),
+        ]);
+        let git = DerivedGit::new(&exec);
+        let options = GitCloneOptions {
+            branch:      Some("main".to_owned()),
+            commit:      None,
+            tag:         Some("v1.2.0".to_owned()),
+            depth:       Some(1),
+            credentials: None,
+        };
+        git.clone_repo("https://github.com/org/repo.git", "/dst", &options)
+            .await
+            .expect("tag clone succeeds");
+
+        let commands = exec.commands();
+        assert!(
+            commands[0].contains("'init' '--' '/dst'"),
+            "{}",
+            commands[0]
+        );
+        // The tag is fetched by its fully qualified ref into the same
+        // local ref: a branch named v1.2.0 can never be selected, and
+        // the tag stays resolvable in the checkout.
+        assert!(
+            commands[2].contains(
+                "'fetch' '--depth' '1' '--no-tags' 'origin' '--' '+refs/tags/v1.2.0:refs/tags/v1.2.0'"
+            ),
+            "{}",
+            commands[2]
+        );
+        assert!(
+            commands[3].contains("'checkout' '-B' 'main' 'refs/tags/v1.2.0' '--'"),
+            "{}",
+            commands[3]
+        );
+    }
+
+    #[tokio::test]
+    async fn tag_clone_without_a_branch_stays_detached() {
+        let exec = ScriptedExec::new(vec![
+            ScriptedExec::ok(""),
+            ScriptedExec::ok(""),
+            ScriptedExec::ok(""),
+            ScriptedExec::ok(""),
+        ]);
+        let git = DerivedGit::new(&exec);
+        let options = GitCloneOptions {
+            branch:      None,
+            commit:      None,
+            tag:         Some("v1".to_owned()),
+            depth:       None,
+            credentials: None,
+        };
+        git.clone_repo("https://github.com/org/repo.git", "/dst", &options)
+            .await
+            .expect("tag clone succeeds");
+        let commands = exec.commands();
+        assert!(
+            commands[3].contains("'checkout' '--detach' 'refs/tags/v1' '--'"),
+            "{}",
+            commands[3]
+        );
+    }
+
+    #[tokio::test]
+    async fn clone_rejects_a_tag_combined_with_a_commit() {
+        let exec = ScriptedExec::new(vec![]);
+        let git = DerivedGit::new(&exec);
+        let options = GitCloneOptions {
+            branch:      None,
+            commit:      Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            tag:         Some("v1".to_owned()),
+            depth:       None,
+            credentials: None,
+        };
+        let error = git
+            .clone_repo("https://github.com/org/repo.git", "/dst", &options)
+            .await
+            .expect_err("two pins are rejected");
+        assert!(matches!(error, Error::InvalidSpec { .. }), "{error}");
+        assert!(exec.commands().is_empty(), "no command may run");
+    }
+
+    #[tokio::test]
+    async fn clone_rejects_a_malformed_tag_before_any_command() {
+        let exec = ScriptedExec::new(vec![]);
+        let git = DerivedGit::new(&exec);
+        for tag in [
+            "-q",
+            "",
+            "a..b",
+            "release/",
+            "v1.lock",
+            "has space",
+            "v1^{}",
+        ] {
+            let options = GitCloneOptions {
+                branch:      None,
+                commit:      None,
+                tag:         Some(tag.to_owned()),
+                depth:       None,
+                credentials: None,
+            };
+            let error = git
+                .clone_repo("https://github.com/org/repo.git", "/dst", &options)
+                .await
+                .expect_err("malformed tag is rejected");
+            assert!(
+                matches!(error, Error::InvalidSpec { .. }),
+                "{tag:?}: {error}"
+            );
+        }
+        assert!(exec.commands().is_empty(), "no command may run");
+    }
+
+    #[tokio::test]
+    async fn failed_commands_surface_as_classified_git_failures() {
+        let exec = ScriptedExec::new(vec![ScriptedExec::failed_with_stderr(
+            128,
+            "remote: Repository not found.\nfatal: repository 'https://github.com/o/r.git/' not found",
+        )]);
+        let git = DerivedGit::new(&exec);
+        let options = GitCloneOptions {
+            branch:      Some("main".to_owned()),
+            commit:      None,
+            tag:         None,
+            depth:       Some(1),
+            credentials: None,
+        };
+        let error = git
+            .clone_repo("https://github.com/o/r.git", "/dst", &options)
+            .await
+            .expect_err("clone fails");
+        let Error::Git(failure) = error else {
+            panic!("expected a git failure, got {error}");
+        };
+        assert_eq!(failure.operation(), "git clone");
+        assert_eq!(failure.kind(), GitFailureKind::AuthRejected);
+        let output = failure.output().expect("command output is attached");
+        assert_eq!(output.exit_code(), Some(128));
+        assert!(
+            String::from_utf8_lossy(output.stderr()).contains("Repository not found"),
+            "raw stderr is reachable through the accessor"
+        );
+        assert!(
+            !failure.to_string().contains("github.com"),
+            "display never carries raw output: {failure}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_tag_is_a_ref_not_found_failure() {
+        let exec = ScriptedExec::new(vec![
+            ScriptedExec::ok(""),
+            ScriptedExec::ok(""),
+            ScriptedExec::failed_with_stderr(
+                128,
+                "fatal: couldn't find remote ref refs/tags/v9.9.9",
+            ),
+        ]);
+        let git = DerivedGit::new(&exec);
+        let options = GitCloneOptions {
+            branch:      None,
+            commit:      None,
+            tag:         Some("v9.9.9".to_owned()),
+            depth:       None,
+            credentials: None,
+        };
+        let error = git
+            .clone_repo("https://github.com/o/r.git", "/dst", &options)
+            .await
+            .expect_err("clone fails");
+        assert!(
+            matches!(&error, Error::Git(failure)
+                if failure.kind() == GitFailureKind::RefNotFound && failure.operation() == "git fetch"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
     async fn clone_rejects_a_flag_shaped_commit_before_any_command() {
         let exec = ScriptedExec::new(vec![]);
         let git = DerivedGit::new(&exec);
@@ -688,6 +917,7 @@ mod tests {
             // Parsed as a flag by the old code: `checkout --detach -q`
             // exited 0 at the branch tip while pinning nothing.
             commit:      Some("-q".to_owned()),
+            tag:         None,
             depth:       None,
             credentials: None,
         };
@@ -718,6 +948,7 @@ mod tests {
         let options = GitCloneOptions {
             branch:      None,
             commit:      None,
+            tag:         None,
             depth:       None,
             credentials: Some(GitCredentials::new("user", "pass")),
         };

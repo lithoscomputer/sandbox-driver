@@ -69,6 +69,7 @@ fn encoded_spec(spec: &ExecSpec) -> ExecSpec {
     encoded.args.push(spec.program.clone());
     encoded.args.extend(spec.args.iter().cloned());
     encoded.timeout = spec.timeout;
+    encoded.stop_grace = spec.stop_grace;
     encoded.working_dir.clone_from(&spec.working_dir);
     encoded.stdin.clone_from(&spec.stdin);
     encoded

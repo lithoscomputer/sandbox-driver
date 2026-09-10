@@ -1,16 +1,19 @@
 //! Hybrid git operations for Daytona sandboxes.
 //!
 //! Clone uses Daytona's toolbox git API, matching Fabro's established path.
-//! The remaining operations use the shared exec-derived implementation, which
-//! preserves Fabro's command semantics and per-call credential handling.
+//! The toolbox selects a branch (`refs/heads/<name>`) or a commit and has no
+//! tag selector, so a clone pinned to a tag runs the shared exec-derived
+//! pinned clone instead. The remaining operations use the shared
+//! exec-derived implementation, which preserves Fabro's command semantics
+//! and per-call credential handling.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use daytona_sdk::GitCloneOptions as DaytonaGitCloneOptions;
 use sandbox_driver::{
-    DerivedGit, Git, GitBranches, GitCloneOptions, GitCommitOptions, GitCredentials,
-    GitPushOptions, GitStatus, Result,
+    DerivedGit, Error, Git, GitBranches, GitCloneOptions, GitCommitOptions, GitCredentials,
+    GitFailure, GitFailureKind, GitPushOptions, GitStatus, ProviderError, Result,
 };
 
 use crate::exec::DaytonaExec;
@@ -71,6 +74,32 @@ impl DaytonaGit {
     }
 }
 
+/// Turns the toolbox clone's failure into the classified git failure the
+/// derived clone produces, so both transports and every provider report
+/// a rejected credential or a missing revision the same way. The
+/// toolbox answers a rejected git credential with an authentication
+/// status, which [`daytona_error`] maps to [`Error::Auth`]; the remote
+/// rejected the git credential, not Daytona the API key, so that becomes
+/// [`GitFailureKind::AuthRejected`]. Rate limits, timeouts, and
+/// transport failures are not git outcomes and pass through.
+fn classify_native_clone(error: Error) -> Error {
+    match error {
+        Error::Auth(auth) => {
+            let mut provider = ProviderError::new(auth.provider.clone(), auth.reason.clone());
+            provider.code = Some("auth".to_owned());
+            Error::Git(GitFailure::classified(
+                "git clone",
+                GitFailureKind::AuthRejected,
+                Some(provider),
+            ))
+        }
+        Error::Provider(provider) if provider.code.as_deref() != Some("timeout") => {
+            Error::Git(GitFailure::from_provider("git clone", provider))
+        }
+        other => other,
+    }
+}
+
 fn clone_options(options: &GitCloneOptions) -> Result<DaytonaGitCloneOptions> {
     let depth = options
         .depth
@@ -117,6 +146,11 @@ impl Git for DaytonaGit {
         options: &GitCloneOptions,
     ) -> Result<()> {
         options.validate()?;
+        if options.tag.is_some() {
+            // The toolbox has no tag selector; the derived pinned clone
+            // fetches the qualified tag ref and attaches the branch.
+            return self.derived().clone_repo(url, target_path, options).await;
+        }
         let sandbox = self
             .client
             .get(&self.sandbox_id)
@@ -130,7 +164,7 @@ impl Git for DaytonaGit {
         let cloned = git
             .clone(url, &repo_path, clone_options(options)?)
             .await
-            .map_err(|error| daytona_error("cloning git repository", error));
+            .map_err(|error| classify_native_clone(daytona_error("cloning git repository", error)));
         if let Err(error) = cloned {
             // The toolbox clones the branch first and pins afterwards, so a
             // failed pin leaves a checkout at the branch head. The contract
@@ -197,6 +231,37 @@ mod tests {
         assert_eq!(mapped.username.as_deref(), Some("user"));
         assert_eq!(mapped.password.as_deref(), Some("secret"));
         assert_eq!(mapped.insecure_skip_tls, None);
+    }
+
+    #[test]
+    fn native_clone_failures_are_classified_git_failures() {
+        let kind = sandbox_driver::ProviderKind::try_new("daytona").expect("static kind");
+        let auth = Error::Auth(sandbox_driver::AuthError::new(kind.clone(), "cloning"));
+        assert!(matches!(
+            classify_native_clone(auth),
+            Error::Git(failure) if failure.kind() == GitFailureKind::AuthRejected
+        ));
+
+        let mut not_found = ProviderError::new(kind.clone(), "reference not found");
+        not_found.code = Some("400".to_owned());
+        let Error::Git(failure) = classify_native_clone(Error::Provider(not_found)) else {
+            panic!("expected a git failure");
+        };
+        assert_eq!(failure.kind(), GitFailureKind::Unclassified);
+        assert_eq!(
+            failure.provider().and_then(|p| p.code.as_deref()),
+            Some("400")
+        );
+
+        let mut timeout = ProviderError::new(kind, "cloning git repository");
+        timeout.code = Some("timeout".to_owned());
+        assert!(
+            matches!(
+                classify_native_clone(Error::Provider(timeout)),
+                Error::Provider(_)
+            ),
+            "an unknown outcome is not a git classification"
+        );
     }
 
     #[test]

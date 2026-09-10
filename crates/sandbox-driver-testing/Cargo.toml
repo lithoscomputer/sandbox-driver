@@ -1,0 +1,19 @@
+[package]
+name = "sandbox-driver-testing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Scripted in-memory sandbox and provider for testing sandbox-driver consumers"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+sandbox-driver.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tokio-util.workspace = true
