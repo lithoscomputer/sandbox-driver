@@ -16,7 +16,7 @@ use nix::sys::signal::Signal;
 use sandbox_driver::{
     Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputCaptureBuffer,
     OutputSanitization, OutputSanitizer, OutputSink, OutputStream, Result, SpawnSpec, StderrTail,
-    StdioProcess, StdioProcessHandle, Termination, feed_stdin, stop_signal,
+    StdioProcess, StdioProcessHandle, Termination, feed_stdin, run_with_stop_grace, stop_signal,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -357,6 +357,25 @@ impl Exec for HostExec {
         spec: &ExecSpec,
         controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
+        run_with_stop_grace(spec, controls, |spec, controls| async move {
+            self.run_signals(&spec, controls).await
+        })
+        .await
+    }
+
+    async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
+        self.spawn_stdio_raw(spec).await
+    }
+}
+
+impl HostExec {
+    /// Runs the command under raw stop signals; the trait method wraps
+    /// this in the spec's stop grace.
+    async fn run_signals(
+        &self,
+        spec: &ExecSpec,
+        controls: ExecControls,
+    ) -> Result<ExecStreamingResult> {
         let started = Instant::now();
         let stdin_reader = controls.stdin_reader(spec);
         let mut child = self
@@ -585,7 +604,7 @@ impl Exec for HostExec {
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "host"), err)]
-    async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
+    async fn spawn_stdio_raw(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
         let mut child = self
             .spawn_command(
                 &spec.program,

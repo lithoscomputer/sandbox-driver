@@ -48,6 +48,7 @@ mod event;
 mod exec;
 mod fs;
 mod git;
+mod grace;
 mod id;
 mod logs;
 mod one_shot;
@@ -94,6 +95,7 @@ pub use git::{
     Git, GitBranches, GitCloneOptions, GitCommitOptions, GitCredentials, GitFacet, GitPushOptions,
     GitStatus,
 };
+pub use grace::run_with_stop_grace;
 pub use id::{InvalidIdError, ProviderKind, SandboxId, ServiceId, SnapshotId, VolumeId};
 pub use logs::{LogSink, LogSource, Logs};
 pub use one_shot::{OneShot, OneShotImage, OneShotSpec};

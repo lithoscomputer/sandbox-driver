@@ -572,10 +572,16 @@ on `PATH` to serve them.
 The exec spec DTO:
 
 ```json
-{"program":"echo","args":["hi"],"timeout_ms":30000,"working_dir":null,"env":{},"output_sanitization":"strip_ansi"}
+{"program":"echo","args":["hi"],"timeout_ms":30000,"stop_grace_ms":5000,"working_dir":null,"env":{},"output_sanitization":"strip_ansi"}
 ```
 
-`args` may be omitted and means `[]`. Standard input is not in the spec:
+`args` may be omitted and means `[]`. `stop_grace_ms` is optional and
+additive: absent, stops are raw (the timeout kills, a `term` is one
+signal); present, the plugin runs the TERM, grace, KILL ladder itself for
+the timeout, a failing sink, and the host's `term`, while `kill` stays
+immediate. A command the ladder ended for the timeout reports
+`timed_out` whichever signal finally stopped it. A plugin built before
+the field ignores it and keeps raw stops. Standard input is not in the spec:
 a request whose `stdin` is true feeds the command from the channel's
 `stdin` frames (§9), and a plugin whose provider takes only fixed stdin
 collects those frames to their `eof` first.

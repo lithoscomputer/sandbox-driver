@@ -409,6 +409,9 @@ pub struct ExecSpecDto {
     #[serde(default)]
     pub args:                Vec<String>,
     pub timeout_ms:          Option<u64>,
+    /// Additive: absent from and ignored by peers built before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_grace_ms:       Option<u64>,
     pub working_dir:         Option<String>,
     pub env:                 BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "output_sanitization_is_raw")]
@@ -423,6 +426,9 @@ impl ExecSpecDto {
             timeout_ms:          spec
                 .timeout
                 .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+            stop_grace_ms:       spec
+                .stop_grace
+                .map(|grace| u64::try_from(grace.as_millis()).unwrap_or(u64::MAX)),
             working_dir:         spec.working_dir.clone(),
             env:                 spec.env.clone(),
             output_sanitization: spec.output_sanitization,
@@ -434,6 +440,7 @@ impl ExecSpecDto {
         // Wire semantics are authoritative: an absent timeout means
         // unbounded, so the constructor's default must not leak in.
         spec.timeout = self.timeout_ms.map(Duration::from_millis);
+        spec.stop_grace = self.stop_grace_ms.map(Duration::from_millis);
         if let Some(dir) = self.working_dir {
             spec = spec.working_dir(dir);
         }

@@ -9,7 +9,7 @@ use daytona_sdk::{DaytonaError, FileSystemService};
 use sandbox_driver::{
     Capability, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
     OutputCaptureBuffer, OutputSanitizer, OutputSink, OutputStream, Result, SpawnSpec,
-    StdioProcess, Termination,
+    StdioProcess, Termination, run_with_stop_grace,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -262,6 +262,25 @@ impl Exec for DaytonaTransport {
         spec: &ExecSpec,
         controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
+        run_with_stop_grace(spec, controls, |spec, controls| async move {
+            self.run_signals(&spec, controls).await
+        })
+        .await
+    }
+
+    async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
+        self.spawn_stdio_raw(spec).await
+    }
+}
+
+impl DaytonaTransport {
+    /// Runs the command under raw stop signals; the trait method wraps
+    /// this in the spec's stop grace.
+    async fn run_signals(
+        &self,
+        spec: &ExecSpec,
+        controls: ExecControls,
+    ) -> Result<ExecStreamingResult> {
         if controls.stdin.is_some() {
             return Err(Error::unsupported(Capability::ExecStdinStream));
         }
@@ -282,7 +301,7 @@ impl Exec for DaytonaTransport {
         fields(provider_kind = "daytona", sandbox_id = %self.sandbox_id),
         err
     )]
-    async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
+    async fn spawn_stdio_raw(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
         stdio::spawn(
             &self.client,
             &self.sandbox_id,

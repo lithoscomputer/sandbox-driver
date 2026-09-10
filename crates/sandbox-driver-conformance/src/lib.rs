@@ -227,6 +227,12 @@ impl Conformance {
             ("exec_term_does_not_escalate", |ctx| {
                 Box::pin(exec_term_does_not_escalate(ctx))
             }),
+            ("exec_stop_grace_escalates_a_timeout", |ctx| {
+                Box::pin(exec_stop_grace_escalates_a_timeout(ctx))
+            }),
+            ("exec_stop_grace_escalates_a_term", |ctx| {
+                Box::pin(exec_stop_grace_escalates_a_term(ctx))
+            }),
             ("exec_reports_a_foreign_signal", |ctx| {
                 Box::pin(exec_reports_a_foreign_signal(ctx))
             }),
@@ -1092,6 +1098,122 @@ async fn exec_term_does_not_escalate(ctx: &Conformance) -> CheckOutcome {
                 if started.elapsed() < Duration::from_secs(4) {
                     return fail(format!(
                         "the command was killed {:?} after start, before the caller's kill",
+                        started.elapsed()
+                    ));
+                }
+                if let Some(signal) = streaming.result.signal {
+                    if signal != SIGKILL {
+                        return fail(format!("expected signal {SIGKILL}, got {signal}"));
+                    }
+                }
+            }
+            Termination::Cancelled if streaming.result.signal.is_none() => {
+                // A provider without signal delivery: the term ended it.
+            }
+            other => {
+                return fail(format!(
+                    "expected Killed (or Cancelled without a signal), got {other:?} with signal {:?}",
+                    streaming.result.signal
+                ));
+            }
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+/// With a stop grace, the provider's own timeout runs the ladder: TERM
+/// first, then KILL once the grace has passed. A command that traps TERM
+/// therefore lives through the grace and ends on the KILL, and the
+/// result still says it timed out. A provider that cannot deliver a
+/// signal ends the command on the TERM; that is honest too.
+async fn exec_stop_grace_escalates_a_timeout(ctx: &Conformance) -> CheckOutcome {
+    if !ctx.caps().exec.stop {
+        return Ok(Some("capability exec.stop not declared".to_owned()));
+    }
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let started = Instant::now();
+        let spec = ExecSpec::bash("trap '' TERM; sleep 300")
+            .timeout(Duration::from_secs(2))
+            .stop_grace(Duration::from_secs(3));
+        let result = sandbox
+            .exec()
+            .run_streaming(&spec, ExecControls::buffered())
+            .await
+            .map_err(|error| format!("exec failed: {error}"))?;
+        if result.result.termination != Termination::TimedOut {
+            return fail(format!(
+                "expected TimedOut, got {:?}",
+                result.result.termination
+            ));
+        }
+        match result.result.signal {
+            Some(SIGKILL) => {
+                if started.elapsed() < Duration::from_secs(5) {
+                    return fail(format!(
+                        "the command was killed {:?} after start, before the grace passed",
+                        started.elapsed()
+                    ));
+                }
+            }
+            None => {
+                // A provider without signal delivery ended it on the TERM.
+            }
+            Some(signal) => {
+                return fail(format!(
+                    "expected signal {SIGKILL} after the grace, got {signal} (code {:?})",
+                    result.result.exit_code
+                ));
+            }
+        }
+        if started.elapsed() > Duration::from_secs(60) {
+            return fail("graceful timeout enforcement took over a minute");
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+/// With a stop grace, a caller's `term` is the first rung of the ladder:
+/// the provider KILLs on its own once the grace has passed, with no
+/// caller `kill`, and the result names the kill.
+async fn exec_stop_grace_escalates_a_term(ctx: &Conformance) -> CheckOutcome {
+    if !ctx.caps().exec.stop {
+        return Ok(Some("capability exec.stop not declared".to_owned()));
+    }
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        let term = CancellationToken::new();
+        let term_after = term.clone();
+        tokio::spawn(async move {
+            time::sleep(Duration::from_millis(500)).await;
+            term_after.cancel();
+        });
+        let controls = ExecControls {
+            term: Some(term),
+            ..ExecControls::buffered()
+        };
+        let started = Instant::now();
+        let streaming = sandbox
+            .exec()
+            .run_streaming(
+                &ExecSpec::bash("trap '' TERM; sleep 300")
+                    .timeout(Duration::from_secs(60))
+                    .stop_grace(Duration::from_secs(2)),
+                controls,
+            )
+            .await
+            .map_err(|error| format!("exec failed: {error}"))?;
+        match streaming.result.termination {
+            Termination::Killed => {
+                if started.elapsed() < Duration::from_millis(2500) {
+                    return fail(format!(
+                        "the command was killed {:?} after start, before the grace passed",
                         started.elapsed()
                     ));
                 }

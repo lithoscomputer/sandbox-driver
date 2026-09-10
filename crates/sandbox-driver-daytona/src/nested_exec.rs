@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use sandbox_driver::{
     BASH_ENV_VAR, Capability, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
     OutputSink, Pty, PtyOptions, PtySession, PtySize, Result, SpawnSpec, StdioProcess,
-    StdioProcessHandle, StopLevel, Termination, stop_signal,
+    StdioProcessHandle, StopLevel, Termination, run_with_stop_grace, stop_signal,
 };
 use sandbox_driver_docker::DockerExec;
 use tokio::runtime::Handle;
@@ -158,6 +158,25 @@ impl Exec for NestedExec {
         spec: &ExecSpec,
         controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
+        run_with_stop_grace(spec, controls, |spec, controls| async move {
+            self.run_signals(&spec, controls).await
+        })
+        .await
+    }
+
+    async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
+        self.spawn_stdio_raw(spec).await
+    }
+}
+
+impl NestedExec {
+    /// Runs the command under raw stop signals; the trait method wraps
+    /// this in the spec's stop grace.
+    async fn run_signals(
+        &self,
+        spec: &ExecSpec,
+        controls: ExecControls,
+    ) -> Result<ExecStreamingResult> {
         if controls.stdin.is_some() {
             return Err(Error::unsupported(Capability::ExecStdinStream));
         }
@@ -278,7 +297,7 @@ impl Exec for NestedExec {
         }
     }
 
-    async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
+    async fn spawn_stdio_raw(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
         let job = Job::new(Arc::clone(&self.cli));
         let mut command = ExecSpec::new(&spec.program).args(spec.args.clone());
         command.env.clone_from(&spec.env);
