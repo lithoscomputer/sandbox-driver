@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use sandbox_driver::{
@@ -21,8 +21,9 @@ use crate::search::ScriptedSearch;
 /// and [`ScriptedSandbox::scripted_search`] for scripting and assertions.
 ///
 /// Capabilities default to a stop-capable exec with stdin, streamed
-/// stdin, and stdio processes, native search (the canned results), and
-/// derived git (over the scripted exec). Every optional lifecycle
+/// stdin, and stdio processes, native search (walks and globs over the
+/// memory filesystem, canned grep), and derived git (over the scripted
+/// exec). Every optional lifecycle
 /// operation stays unsupported unless the test sets capabilities that
 /// declare it — the doubles only count `start`, `stop`, and `delete`.
 pub struct ScriptedSandbox {
@@ -35,7 +36,7 @@ pub struct ScriptedSandbox {
     state:        Mutex<SandboxState>,
     start_error:  Option<String>,
     exec:         ScriptedExec,
-    fs:           MemoryFs,
+    fs:           Arc<MemoryFs>,
     search:       ScriptedSearch,
     starts:       AtomicU32,
     stops:        AtomicU32,
@@ -56,6 +57,7 @@ impl ScriptedSandbox {
     }
 
     pub fn with_id_and_working_dir(id: &str, working_dir: &str) -> Self {
+        let fs = Arc::new(MemoryFs::new(working_dir));
         Self {
             id:           SandboxId::try_new(id).expect("scripted sandbox id is valid"),
             capabilities: Self::default_capabilities(),
@@ -66,8 +68,8 @@ impl ScriptedSandbox {
             state:        Mutex::new(SandboxState::Running),
             start_error:  None,
             exec:         ScriptedExec::new(),
-            fs:           MemoryFs::new(working_dir),
-            search:       ScriptedSearch::new(),
+            fs:           Arc::clone(&fs),
+            search:       ScriptedSearch::new(fs),
             starts:       AtomicU32::new(0),
             stops:        AtomicU32::new(0),
             deletes:      AtomicU32::new(0),
@@ -226,7 +228,7 @@ impl Sandbox for ScriptedSandbox {
     }
 
     fn fs(&self) -> &dyn Filesystem {
-        &self.fs
+        self.fs.as_ref()
     }
 
     fn provider_search(&self) -> Option<&dyn Search> {

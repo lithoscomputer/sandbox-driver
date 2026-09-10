@@ -174,6 +174,50 @@ async fn memory_fs_round_trips_relative_paths_and_records_writes() {
 }
 
 #[tokio::test]
+async fn walks_and_globs_read_the_memory_filesystem_unless_canned() {
+    let sandbox = ScriptedSandbox::new()
+        .file("skills/commit/SKILL.md", "commit")
+        .file("skills/review/SKILL.md", "review")
+        .file("skills/README.md", "readme")
+        .file("target/junk.md", "junk");
+    let search = sandbox.search().expect("search facet");
+    let mut walked: Vec<String> = search
+        .walk("skills", &WalkOptions::default())
+        .await
+        .expect("walk")
+        .into_iter()
+        .map(|file| file.path)
+        .collect();
+    walked.sort();
+    assert_eq!(walked, ["README.md", "commit/SKILL.md", "review/SKILL.md"]);
+    let mut options = WalkOptions::default();
+    options.exclude_dirs = vec!["target".to_owned()];
+    let everything = search.walk(".", &options).await.expect("walk all");
+    assert!(
+        everything
+            .iter()
+            .all(|file| !file.path.starts_with("target/"))
+    );
+    assert_eq!(everything.len(), 3);
+
+    let mut globbed = search
+        .glob("*/SKILL.md", "/work/skills")
+        .await
+        .expect("glob");
+    globbed.sort();
+    assert_eq!(globbed, [
+        "/work/skills/commit/SKILL.md",
+        "/work/skills/review/SKILL.md"
+    ]);
+    let deep = search.glob("**/*.md", ".").await.expect("glob deep");
+    assert_eq!(deep.len(), 4);
+    sandbox
+        .scripted_search()
+        .set_glob(vec!["canned".to_owned()]);
+    assert_eq!(search.glob("*", ".").await.expect("canned"), ["canned"]);
+}
+
+#[tokio::test]
 async fn search_returns_canned_results_through_the_facet() {
     let sandbox = ScriptedSandbox::new();
     sandbox

@@ -1,24 +1,38 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use sandbox_driver::{
     Error, GrepMatch, GrepOptions, Result, Search, TransportError, WalkOptions, WalkedFile,
 };
 
-/// A [`Search`] that returns canned results and counts calls.
-#[derive(Default)]
+use crate::fs::MemoryFs;
+
+/// A [`Search`] over the in-memory filesystem, with canned results on top.
+///
+/// A walk enumerates the files below the requested base in the memory
+/// filesystem unless the test canned a listing; a glob matches the memory
+/// filesystem's paths unless the test canned one; grep is canned only,
+/// since nothing here evaluates patterns. Walks are counted.
 pub struct ScriptedSearch {
+    fs:         Arc<MemoryFs>,
     grep:       Mutex<Vec<GrepMatch>>,
-    glob:       Mutex<Vec<String>>,
-    walk:       Mutex<Vec<WalkedFile>>,
+    glob:       Mutex<Option<Vec<String>>>,
+    walk:       Mutex<Option<Vec<WalkedFile>>>,
     walk_error: Mutex<Option<String>>,
     walk_calls: AtomicUsize,
 }
 
 impl ScriptedSearch {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(fs: Arc<MemoryFs>) -> Self {
+        Self {
+            fs,
+            grep: Mutex::new(Vec::new()),
+            glob: Mutex::new(None),
+            walk: Mutex::new(None),
+            walk_error: Mutex::new(None),
+            walk_calls: AtomicUsize::new(0),
+        }
     }
 
     /// The matches every grep returns.
@@ -27,16 +41,17 @@ impl ScriptedSearch {
         self
     }
 
-    /// The paths every glob returns.
+    /// The paths every glob returns, instead of matching the memory
+    /// filesystem.
     pub fn set_glob(&self, paths: Vec<String>) -> &Self {
-        *self.glob.lock().unwrap_or_else(PoisonError::into_inner) = paths;
+        *self.glob.lock().unwrap_or_else(PoisonError::into_inner) = Some(paths);
         self
     }
 
-    /// The files every walk returns, before any filtering the caller
-    /// applies.
+    /// The files every walk returns, instead of the memory filesystem's,
+    /// before any filtering the caller applies.
     pub fn set_walk(&self, files: Vec<WalkedFile>) -> &Self {
-        *self.walk.lock().unwrap_or_else(PoisonError::into_inner) = files;
+        *self.walk.lock().unwrap_or_else(PoisonError::into_inner) = Some(files);
         self
     }
 
@@ -70,15 +85,19 @@ impl Search for ScriptedSearch {
             .clone())
     }
 
-    async fn glob(&self, _pattern: &str, _base: &str) -> Result<Vec<String>> {
-        Ok(self
+    async fn glob(&self, pattern: &str, base: &str) -> Result<Vec<String>> {
+        if let Some(paths) = self
             .glob
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone())
+            .clone()
+        {
+            return Ok(paths);
+        }
+        Ok(self.fs.glob(pattern, base))
     }
 
-    async fn walk(&self, _base: &str, _options: &WalkOptions) -> Result<Vec<WalkedFile>> {
+    async fn walk(&self, base: &str, options: &WalkOptions) -> Result<Vec<WalkedFile>> {
         self.walk_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(message) = self
             .walk_error
@@ -88,10 +107,14 @@ impl Search for ScriptedSearch {
         {
             return Err(Error::Transport(TransportError::new(message)));
         }
-        Ok(self
+        if let Some(files) = self
             .walk
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone())
+            .clone()
+        {
+            return Ok(files);
+        }
+        Ok(self.fs.walk(base, options))
     }
 }

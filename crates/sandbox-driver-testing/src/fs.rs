@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, PoisonError};
 
 use async_trait::async_trait;
-use sandbox_driver::{DirEntry, Error, FileKind, FileMetadata, Filesystem, ResourceKind, Result};
+use sandbox_driver::{
+    DirEntry, Error, FileKind, FileMetadata, Filesystem, ResourceKind, Result, WalkOptions,
+    WalkedFile,
+};
 
 /// An in-memory [`Filesystem`].
 ///
@@ -62,6 +65,43 @@ impl MemoryFs {
             .cloned()
     }
 
+    /// The regular files below `base`, as paths relative to it with their
+    /// sizes, pruning any directory `options.exclude_dirs` names.
+    pub fn walk(&self, base: &str, options: &WalkOptions) -> Vec<WalkedFile> {
+        let base = self.resolve(base);
+        let prefix = format!("{}/", base.trim_end_matches('/'));
+        let files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut walked: Vec<WalkedFile> = files
+            .iter()
+            .filter_map(|(path, content)| {
+                let relative = path.strip_prefix(&prefix)?;
+                let mut segments = relative.split('/');
+                let file_name = segments.next_back()?;
+                let excluded = segments.any(|dir| options.exclude_dirs.iter().any(|x| x == dir));
+                (!excluded && !file_name.is_empty()).then(|| {
+                    WalkedFile::new(
+                        relative.to_owned(),
+                        Some(u64::try_from(content.len()).unwrap_or(u64::MAX)),
+                    )
+                })
+            })
+            .collect();
+        walked.sort_by(|a, b| a.path.cmp(&b.path));
+        walked
+    }
+
+    /// The files below `base` whose base-relative path matches `pattern`,
+    /// as absolute paths. `*` matches within a segment and `**` across
+    /// segments.
+    pub fn glob(&self, pattern: &str, base: &str) -> Vec<String> {
+        let base = self.resolve(base);
+        self.walk(&base, &WalkOptions::default())
+            .into_iter()
+            .filter(|file| glob_matches(pattern, &file.path))
+            .map(|file| format!("{}/{}", base.trim_end_matches('/'), file.path))
+            .collect()
+    }
+
     /// Every write so far as (absolute path, content), in order.
     pub fn writes(&self) -> Vec<(String, Vec<u8>)> {
         self.writes
@@ -95,6 +135,42 @@ impl MemoryFs {
             id:       path.to_owned(),
         }
     }
+}
+
+/// A small glob: `**` spans segments, `*` and `?` stay within one, and
+/// everything else is literal. Enough for a test's `*/SKILL.md` or
+/// `**/*.md`.
+fn glob_matches(pattern: &str, path: &str) -> bool {
+    fn segments(pattern: &[&str], path: &[&str]) -> bool {
+        match pattern.split_first() {
+            None => path.is_empty(),
+            Some((&"**", rest)) => (0..=path.len()).any(|skip| segments(rest, &path[skip..])),
+            Some((head, rest)) => match path.split_first() {
+                Some((segment, path_rest)) => {
+                    segment_matches(head, segment) && segments(rest, path_rest)
+                }
+                None => false,
+            },
+        }
+    }
+    fn segment_matches(pattern: &str, segment: &str) -> bool {
+        fn go(pattern: &[char], segment: &[char]) -> bool {
+            match pattern.split_first() {
+                None => segment.is_empty(),
+                Some(('*', rest)) => (0..=segment.len()).any(|skip| go(rest, &segment[skip..])),
+                Some(('?', rest)) => segment.split_first().is_some_and(|(_, s)| go(rest, s)),
+                Some((c, rest)) => segment
+                    .split_first()
+                    .is_some_and(|(s, tail)| s == c && go(rest, tail)),
+            }
+        }
+        let pattern: Vec<char> = pattern.chars().collect();
+        let segment: Vec<char> = segment.chars().collect();
+        go(&pattern, &segment)
+    }
+    let pattern: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
+    let path: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    segments(&pattern, &path)
 }
 
 fn normalize(path: &str) -> String {
