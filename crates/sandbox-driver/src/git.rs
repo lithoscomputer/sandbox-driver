@@ -313,7 +313,11 @@ pub struct GitCredentials {
     /// replicates; [`crate::retry_git`] retries a rejection only while the
     /// credential is that fresh. `None` is a fixed credential, which
     /// waiting cannot make valid.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::wire_time::option"
+    )]
     pub minted_at: Option<SystemTime>,
 }
 

@@ -422,6 +422,7 @@ impl EventBody {
 #[non_exhaustive]
 pub struct Event {
     pub id:             EventId,
+    #[serde(with = "crate::wire_time")]
     pub occurred_at:    SystemTime,
     pub provider:       ProviderKind,
     pub subject:        EventSubject,

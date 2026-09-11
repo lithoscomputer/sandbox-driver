@@ -66,6 +66,7 @@ mod state;
 #[cfg(test)]
 mod test_exec;
 mod wait;
+mod wire_time;
 
 pub use access::{
     PreviewUrl, PreviewUrls, ShellCommand, SshAccess, SshAccessInfo, Vnc, VncConnection,

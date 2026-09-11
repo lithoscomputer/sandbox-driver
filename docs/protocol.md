@@ -362,9 +362,11 @@ Rules:
   `sandbox/create` are not applicable — exec uses `timeout_ms`). Both
   forms are covered by encoding tests; neither may change within
   version 1.
-- **Timestamps** use the structural form
-  `{"secs_since_epoch":…,"nanos_since_epoch":…}` where present
-  (`created_at`, `expires_at`); they are informational.
+- **Timestamps** are RFC 3339 strings in UTC (`"2026-08-31T20:00:00.250Z"`)
+  where present (`created_at`, `updated_at`, `modified_at`, `expires_at`,
+  `occurred_at`); they are informational. Readers also accept the
+  structural form `{"secs_since_epoch":…,"nanos_since_epoch":…}` that
+  peers wrote before this encoding.
 - **Identifiers** (`sandbox_id`, `snapshot_id`, `volume_id`) are non-empty
   strings up to 256 bytes with no
   whitespace or control characters. They are opaque to the host and
@@ -939,7 +941,7 @@ chunks, and logs use their data channels and never use this event feed.
   "route_id":"event-7",
   "event":{
     "id":{"source_id":"9b2f…","sequence":4},
-    "occurred_at":{"secs_since_epoch":1788206400,"nanos_since_epoch":0},
+    "occurred_at":"2026-08-31T20:00:00Z",
     "provider":"daytona",
     "subject":{"type":"sandbox","id":"sb-1"},
     "operation_id":"58a1…",

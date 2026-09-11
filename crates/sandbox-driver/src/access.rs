@@ -40,7 +40,7 @@ pub struct PreviewUrl {
     pub url:        String,
     #[serde(default)]
     pub headers:    BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, with = "crate::wire_time::option")]
     pub expires_at: Option<SystemTime>,
 }
 
@@ -80,7 +80,7 @@ pub struct SshAccessInfo {
     pub command:    String,
     #[serde(default)]
     pub token:      Option<String>,
-    #[serde(default)]
+    #[serde(default, with = "crate::wire_time::option")]
     pub expires_at: Option<SystemTime>,
 }
 

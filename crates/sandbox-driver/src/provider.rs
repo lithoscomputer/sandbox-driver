@@ -431,7 +431,7 @@ pub struct SnapshotStatus {
     pub error_reason: Option<String>,
     #[serde(default)]
     pub size_bytes:   Option<u64>,
-    #[serde(default)]
+    #[serde(default, with = "crate::wire_time::option")]
     pub created_at:   Option<SystemTime>,
 }
 
@@ -516,7 +516,7 @@ pub struct VolumeStatus {
     pub state:        VolumeState,
     #[serde(default)]
     pub error_reason: Option<String>,
-    #[serde(default)]
+    #[serde(default, with = "crate::wire_time::option")]
     pub created_at:   Option<SystemTime>,
 }
 

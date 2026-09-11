@@ -212,7 +212,7 @@ pub struct FileMetadata {
     pub size:        u64,
     #[serde(default)]
     pub mode:        Option<u32>,
-    #[serde(default)]
+    #[serde(default, with = "crate::wire_time::option")]
     pub modified_at: Option<SystemTime>,
 }
 

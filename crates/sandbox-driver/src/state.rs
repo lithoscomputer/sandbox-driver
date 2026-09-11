@@ -96,9 +96,9 @@ pub struct SandboxStatus {
     /// Provider console page for this sandbox, when the provider has one.
     #[serde(default)]
     pub web_url:             Option<String>,
-    #[serde(default)]
+    #[serde(default, with = "crate::wire_time::option")]
     pub created_at:          Option<SystemTime>,
-    #[serde(default)]
+    #[serde(default, with = "crate::wire_time::option")]
     pub updated_at:          Option<SystemTime>,
 }
 
