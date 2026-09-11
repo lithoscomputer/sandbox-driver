@@ -309,6 +309,9 @@ impl Conformance {
             ("services_match_capabilities", |ctx| {
                 Box::pin(services_match_capabilities(ctx))
             }),
+            ("services_wait_for_ports_and_list_them", |ctx| {
+                Box::pin(services_wait_for_ports_and_list_them(ctx))
+            }),
             ("ssh_access_matches_capabilities", |ctx| {
                 Box::pin(ssh_access_matches_capabilities(ctx))
             }),
@@ -3464,6 +3467,76 @@ async fn services_match_capabilities(ctx: &Conformance) -> CheckOutcome {
     } else {
         fail(wrong.join("; "))
     }
+}
+
+/// A service that listens on a port is awaited by that port and shows up
+/// in the listening-port list; once stopped, the port wait times out. The
+/// listener is whatever the image offers, python3 or nc; without either
+/// the check is skipped.
+async fn services_wait_for_ports_and_list_them(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        if !sandbox.capabilities().supports(Capability::Services) {
+            return Ok(Some("capability services not declared".to_owned()));
+        }
+        let Some(services) = sandbox.services() else {
+            return fail("services are declared but the facet is absent");
+        };
+        let probe = sandbox
+            .exec()
+            .run(
+                &ExecSpec::bash(
+                    "if command -v python3 >/dev/null 2>&1; then echo python3; \
+                     elif command -v nc >/dev/null 2>&1; then echo nc; else echo none; fi",
+                )
+                .timeout(Duration::from_secs(30)),
+            )
+            .await
+            .map_err(|error| format!("listener probe failed: {error}"))?;
+        let port: u16 = 38_471;
+        let command = match probe.stdout_lossy().trim() {
+            "python3" => format!("exec python3 -m http.server {port} --bind 127.0.0.1"),
+            "nc" => format!("while true; do nc -l 127.0.0.1 {port} < /dev/null; done"),
+            _ => return Ok(Some("no listener program in the image".to_owned())),
+        };
+        let id = services
+            .spawn(&ServiceSpec::new(command))
+            .await
+            .map_err(|error| format!("spawn failed: {error}"))?;
+        let result = async {
+            services
+                .wait_for_port(port, Duration::from_secs(30))
+                .await
+                .map_err(|error| format!("wait_for_port failed: {error}"))?;
+            let ports = services
+                .listening_ports()
+                .await
+                .map_err(|error| format!("listening_ports failed: {error}"))?;
+            if !ports.iter().any(|entry| entry.port == port) {
+                return fail(format!("port {port} is not listed: {ports:?}"));
+            }
+            services
+                .stop(&id)
+                .await
+                .map_err(|error| format!("stop failed: {error}"))?;
+            match services.wait_for_port(port, Duration::from_secs(2)).await {
+                Err(Error::Timeout { .. }) => {}
+                Ok(()) => return fail("the port still answered after stop"),
+                Err(error) => {
+                    return fail(format!(
+                        "wait_for_port after stop failed unexpectedly: {error}"
+                    ));
+                }
+            }
+            PASS
+        }
+        .await;
+        let _ = services.stop(&id).await;
+        result
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
 }
 
 async fn ssh_access_matches_capabilities(ctx: &Conformance) -> CheckOutcome {

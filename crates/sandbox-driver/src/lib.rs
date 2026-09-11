@@ -117,7 +117,7 @@ pub use pty::{Pty, PtyOptions, PtySession, PtySize};
 pub use sandbox::{ForkOptions, Sandbox, SandboxSnapshotOptions, SnapshotMode, WorkspaceOwnership};
 pub use sanitize::{OutputSanitization, OutputSanitizer};
 pub use search::{GrepMatch, GrepOptions, Search, SearchFacet, WalkOptions, WalkedFile};
-pub use service::{ServiceSpec, ServiceStatus, Services, ServicesFacet};
+pub use service::{ListeningPort, ServiceSpec, ServiceStatus, Services, ServicesFacet};
 pub use spec::{
     LifecycleTimers, NetworkPolicy, PlatformInfo, Resources, SandboxKind, SandboxSource,
     SandboxSpec, VolumeMount,
