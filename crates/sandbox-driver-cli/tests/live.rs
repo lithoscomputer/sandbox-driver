@@ -300,11 +300,19 @@ fn assert_sandbox_status(cli: &CliRunner, provider: &str, id: &str, name: &str, 
     assert_eq!(status["name"], name);
     assert_eq!(status["state"], state);
     assert_eq!(status["sandbox_kind"], "container");
-    assert_eq!(status["source"], match provider {
-        "docker" => TEST_IMAGE,
-        "daytona" => TEST_SNAPSHOT,
+    // The status names what the sandbox runs from: Docker its image,
+    // Daytona its snapshot.
+    match provider {
+        "docker" => {
+            assert_eq!(status["image"], TEST_IMAGE);
+            assert_eq!(status["snapshot"], Value::Null);
+        }
+        "daytona" => {
+            assert_eq!(status["snapshot"], TEST_SNAPSHOT);
+            assert_eq!(status["image"], Value::Null);
+        }
         _ => panic!("unexpected provider {provider}"),
-    });
+    }
 
     let mut table = cli.command();
     table.args(["--provider", provider, "sandbox", "inspect", id]);
