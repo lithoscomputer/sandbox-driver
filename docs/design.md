@@ -344,10 +344,13 @@ bounded owned cleanup. `PluginProvider::cleanup_error()` reports cleanup
 failures, which retain admission without closing unrelated channels.
 Daytona whole-response fallbacks stop collecting at 16 MiB; its file downloads
 stream. A failed final-log fetch cannot establish complete output.
-Old handles remain tied to a failed connection. `PluginSupervisor::current()`
-serializes replacement for new work under a fixed configuration and frozen
-credential environment. It never replays an uncertain call. Applications bound
-the number of supervisors and reconstruct handles for the new generation.
+Old handles remain tied to a failed connection. `PluginSupervisor` is the
+provider an application holds for a plugin: it implements `SandboxProvider`
+(and the snapshot and volume services the plugin declares) by forwarding
+each call to the live generation, and `current()` serializes replacement for
+new work under a fixed configuration and frozen credential environment. It
+never replays an uncertain call. Applications bound the number of
+supervisors and reconstruct handles for the new generation.
 
 ### Snapshots and volumes
 

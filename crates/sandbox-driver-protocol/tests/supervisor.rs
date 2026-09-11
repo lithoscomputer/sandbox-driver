@@ -26,13 +26,19 @@ async fn dead_plugin_fails_old_work_and_concurrent_requests_share_one_replacemen
         binary.exists(),
         "build provider binaries with mise run plugins:build first"
     );
-    let supervisor = Arc::new(PluginSupervisor::new(
-        "sandbox-driver",
-        PluginConfig::new(ProviderKind::try_new("host").expect("kind"))
-            .path(binary)
-            .dev(true)
-            .inherit_env_var("PATH"),
-    ));
+    let supervisor = Arc::new(
+        PluginSupervisor::launch(
+            "sandbox-driver",
+            PluginConfig::new(ProviderKind::try_new("host").expect("kind"))
+                .path(binary)
+                .dev(true)
+                .inherit_env_var("PATH"),
+        )
+        .await
+        .expect("first plugin launches"),
+    );
+    assert_eq!(supervisor.kind().as_str(), "host");
+    assert!(supervisor.capabilities().git.supported);
     let first = supervisor.current().await.expect("first plugin");
     let sandbox = first
         .create(&SandboxSpec::new(SandboxSource::HostDirectory), None)
@@ -115,6 +121,20 @@ async fn dead_plugin_fails_old_work_and_concurrent_requests_share_one_replacemen
         "old handles remain invalid"
     );
     replacement.health().await.expect("new work succeeds");
+    // The supervisor is the provider: trait calls reach the live generation.
+    let provider: &dyn SandboxProvider = supervisor.as_ref();
+    provider
+        .health()
+        .await
+        .expect("the supervisor serves the provider trait");
+    let listed = provider
+        .list(&sandbox_driver::SandboxFilter::default())
+        .await
+        .expect("list through the supervisor");
+    assert!(
+        listed.iter().all(|status| status.id != *sandbox.id()),
+        "a replacement generation starts without the dead one's registry"
+    );
     supervisor.shutdown().await.expect("shutdown");
     // Abrupt plugin death does not prove provider cleanup. The test owns its
     // local workspace and removes it explicitly after observing that failure.
