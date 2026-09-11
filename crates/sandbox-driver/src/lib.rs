@@ -94,8 +94,9 @@ pub use exec::{
 };
 pub use fs::{DirEntry, FileKind, FileMetadata, Filesystem};
 pub use git::{
-    Git, GitBranches, GitCheckoutOptions, GitCloneOptions, GitCommitOptions, GitCredentials,
-    GitFacet, GitPushOptions, GitStatus,
+    Git, GitBranches, GitChange, GitCheckoutOptions, GitCloneOptions, GitCommit, GitCommitOptions,
+    GitCredentials, GitDiffEntry, GitDiffOptions, GitFacet, GitFetchOptions, GitIdentity,
+    GitLogOptions, GitNumstat, GitPushOptions, GitRevisionRange, GitStatus,
 };
 pub use git_retry::{
     GitAttempt, GitBackoff, GitRetryError, GitRetryPolicy, GitRetryReason, GitRetryReport,
