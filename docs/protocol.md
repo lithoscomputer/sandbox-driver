@@ -794,12 +794,17 @@ is reachable and its credential accepted, for host preflight and
 diagnostics:
 
 ```json
-{"health":{"status":"ok","message":null,"missing_permissions":[]}}
+{"health":{"status":"ok","message":null,"missing_permissions":[],"required_permissions":[]}}
 ```
 
 `status` ∈ `ok unreachable unauthorized unknown` (readers map unknown
-values to `unknown`). `missing_permissions` names credential scopes the
-provider knows are absent (e.g. Daytona API-key scopes). An unhealthy
+values to `unknown`). `required_permissions` names every credential
+scope the provider's operations need, in the order an operator should
+read them (e.g. Daytona API-key scopes), and `missing_permissions` the
+ones the provider knows are absent, in the same order; both are empty
+when the provider cannot enumerate them. `required_permissions` is
+additive: senders may omit it and receivers read an absent list as
+empty. An unhealthy
 provider is a **successful** response with a non-`ok` status — errors
 are reserved for failures of the check itself. Hosts must treat a
 `-32601` reply (a plugin predating this method) as

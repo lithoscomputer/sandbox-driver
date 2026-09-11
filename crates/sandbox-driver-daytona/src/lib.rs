@@ -198,13 +198,33 @@ fn stored_labels(
 }
 
 /// Scopes every sandbox-driver Daytona operation may need, paired with
-/// their wire names for [`ProviderHealth::missing_permissions`].
+/// their wire names, in the order an operator reads them when regenerating
+/// a key: snapshots are built before sandboxes are created from them.
+/// [`ProviderHealth::required_permissions`] and
+/// [`ProviderHealth::missing_permissions`] follow this order.
 const REQUIRED_PERMISSIONS: &[(Permissions, &str)] = &[
-    (Permissions::WRITE_SANDBOXES, "write:sandboxes"),
-    (Permissions::DELETE_SANDBOXES, "delete:sandboxes"),
     (Permissions::WRITE_SNAPSHOTS, "write:snapshots"),
     (Permissions::DELETE_SNAPSHOTS, "delete:snapshots"),
+    (Permissions::WRITE_SANDBOXES, "write:sandboxes"),
+    (Permissions::DELETE_SANDBOXES, "delete:sandboxes"),
 ];
+
+/// The wire names of every required permission, in documented order.
+fn required_permission_names() -> Vec<String> {
+    REQUIRED_PERMISSIONS
+        .iter()
+        .map(|(_, name)| (*name).to_owned())
+        .collect()
+}
+
+/// The required permissions `granted` lacks, in documented order.
+fn missing_permission_names(granted: &[Permissions]) -> Vec<String> {
+    REQUIRED_PERMISSIONS
+        .iter()
+        .filter(|(permission, _)| !granted.contains(permission))
+        .map(|(_, name)| (*name).to_owned())
+        .collect()
+}
 
 pub(crate) type DaytonaClient = Arc<Client>;
 
@@ -1365,18 +1385,19 @@ impl SandboxProvider for DaytonaProvider {
             if let Some(organization) = key.organization_id.filter(|id| !id.is_empty()) {
                 health.identity = Some(format!("organization:{organization}"));
             }
-            health.missing_permissions = REQUIRED_PERMISSIONS
-                .iter()
-                .filter(|(permission, _)| !key.permissions.contains(permission))
-                .map(|(_, name)| (*name).to_owned())
-                .collect();
+            health.required_permissions = required_permission_names();
+            health.missing_permissions = missing_permission_names(&key.permissions);
             if !health.missing_permissions.is_empty() {
                 tracing::warn!(
                     missing_permission_count = health.missing_permissions.len(),
                     "daytona credentials lack required permissions"
                 );
                 health.status = HealthStatus::Unauthorized;
-                health.message = Some(format!("API key {:?} is missing required scopes", key.name));
+                health.message = Some(format!(
+                    "API key {:?} is missing required scopes: {}",
+                    key.name,
+                    health.missing_permissions.join(", ")
+                ));
             }
         }
         Ok(health)
@@ -2636,6 +2657,31 @@ mod tests {
             "https://daytona.example/api"
         );
         assert_eq!(provider.client.organization_id(), Some("org-1"));
+    }
+
+    #[test]
+    fn missing_permissions_follow_the_documented_order() {
+        assert_eq!(required_permission_names(), [
+            "write:snapshots",
+            "delete:snapshots",
+            "write:sandboxes",
+            "delete:sandboxes"
+        ]);
+        // Granted out of order and partial: the report keeps the documented order.
+        let granted = [Permissions::DELETE_SANDBOXES, Permissions::WRITE_SNAPSHOTS];
+        assert_eq!(missing_permission_names(&granted), [
+            "delete:snapshots",
+            "write:sandboxes"
+        ]);
+        assert!(
+            missing_permission_names(&[
+                Permissions::WRITE_SNAPSHOTS,
+                Permissions::DELETE_SNAPSHOTS,
+                Permissions::WRITE_SANDBOXES,
+                Permissions::DELETE_SANDBOXES,
+            ])
+            .is_empty()
+        );
     }
 
     #[test]
