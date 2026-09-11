@@ -2373,7 +2373,9 @@ async fn git_verbs_report_typed_results(ctx: &Conformance) -> CheckOutcome {
         };
 
         // Two commits on main: the first adds seed.txt, the second changes
-        // it and adds added.txt. The fixture prints both commit ids.
+        // it and adds added.txt. The fixture prints both commit ids and
+        // clones the bare remote itself: a provider's native clone may not
+        // reach a file transport, and clone has its own checks.
         let setup = sandbox
             .exec()
             .run(
@@ -2399,7 +2401,9 @@ async fn git_verbs_report_typed_results(ctx: &Conformance) -> CheckOutcome {
                      git rev-parse HEAD && \
                      git remote add origin ../remote.git && \
                      git push -q origin refs/heads/main && \
-                     git --git-dir=../remote.git symbolic-ref HEAD refs/heads/main",
+                     git --git-dir=../remote.git symbolic-ref HEAD refs/heads/main && \
+                     cd .. && \
+                     git clone -q -b main remote.git clone",
                 )
                 .timeout(Duration::from_secs(60)),
             )
@@ -2419,12 +2423,7 @@ async fn git_verbs_report_typed_results(ctx: &Conformance) -> CheckOutcome {
         };
         let (base, head) = (base.to_owned(), head.to_owned());
 
-        let root = sandbox.working_directory().trim_end_matches('/');
-        let remote_url = format!("file://{root}/conformance-verbs/remote.git");
         let repo = "conformance-verbs/clone";
-        git.clone_repo(&remote_url, repo, &GitCloneOptions::default())
-            .await
-            .map_err(|error| format!("verbs clone failed: {error}"))?;
 
         let resolved = git
             .rev_parse(repo, "HEAD")
@@ -3493,7 +3492,9 @@ async fn services_wait_for_ports_and_list_them(ctx: &Conformance) -> CheckOutcom
             )
             .await
             .map_err(|error| format!("listener probe failed: {error}"))?;
-        let port: u16 = 38_471;
+        // Conformance runs for Host-backed providers share this machine's
+        // ports with every other run in flight, so the port is per process.
+        let port: u16 = 30_000 + u16::try_from(process::id() % 20_000).unwrap_or(0);
         let command = match probe.stdout_lossy().trim() {
             "python3" => format!("exec python3 -m http.server {port} --bind 127.0.0.1"),
             "nc" => format!("while true; do nc -l 127.0.0.1 {port} < /dev/null; done"),
@@ -3519,13 +3520,20 @@ async fn services_wait_for_ports_and_list_them(ctx: &Conformance) -> CheckOutcom
                 .stop(&id)
                 .await
                 .map_err(|error| format!("stop failed: {error}"))?;
-            match services.wait_for_port(port, Duration::from_secs(2)).await {
-                Err(Error::Timeout { .. }) => {}
-                Ok(()) => return fail("the port still answered after stop"),
-                Err(error) => {
-                    return fail(format!(
-                        "wait_for_port after stop failed unexpectedly: {error}"
-                    ));
+            // The listener may take a moment to let go of the port.
+            let closed_by = Instant::now() + Duration::from_secs(10);
+            loop {
+                match services.wait_for_port(port, Duration::from_secs(1)).await {
+                    Err(Error::Timeout { .. }) => break,
+                    Ok(()) if Instant::now() < closed_by => {
+                        time::sleep(Duration::from_millis(250)).await;
+                    }
+                    Ok(()) => return fail("the port still answered after stop"),
+                    Err(error) => {
+                        return fail(format!(
+                            "wait_for_port after stop failed unexpectedly: {error}"
+                        ));
+                    }
                 }
             }
             PASS
