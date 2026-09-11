@@ -358,7 +358,14 @@ pub enum GitFailureKind {
     AccessDenied,
     /// The clone target already exists.
     TargetExists,
-    /// The output matched no known class.
+    /// The sandbox has no usable `git` executable: the command could not
+    /// be found (exit 127) or could not run (exit 126). The environment
+    /// does not meet the facet's prerequisite; no retry or credential
+    /// helps.
+    GitUnavailable,
+    /// The output matched no known class. Also what an older peer reads
+    /// a class it does not know as.
+    #[serde(other)]
     Unclassified,
 }
 
@@ -466,6 +473,7 @@ impl GitFailureKind {
             Self::RefNotFound => "the requested revision does not exist at the remote",
             Self::AccessDenied => "access was denied",
             Self::TargetExists => "the clone target already exists",
+            Self::GitUnavailable => "the sandbox has no usable git executable",
             Self::Unclassified => "unclassified failure",
         }
     }
@@ -507,13 +515,19 @@ impl StdError for GitFailure {
 
 impl GitFailure {
     /// A git command that ran inside the sandbox and failed; the class is
-    /// read from its output.
+    /// read from its output. Exit codes 127 and 126 are the shell saying
+    /// `git` itself could not be found or run, so they classify before
+    /// the output is read.
     pub fn from_command(operation: impl Into<String>, output: ExecFailure) -> Self {
+        let kind = match output.exit_code() {
+            Some(126 | 127) => GitFailureKind::GitUnavailable,
+            _ => GitFailureKind::from_output(output.stderr(), output.stdout()),
+        };
         Self {
             operation: operation.into(),
-            kind:      GitFailureKind::from_output(output.stderr(), output.stdout()),
-            output:    Some(Box::new(output)),
-            provider:  None,
+            kind,
+            output: Some(Box::new(output)),
+            provider: None,
         }
     }
 
@@ -794,6 +808,51 @@ mod tests {
             ),
         );
         assert_eq!(failure.kind(), GitFailureKind::AuthRejected);
+    }
+
+    #[test]
+    fn a_missing_git_executable_is_its_own_class() {
+        for (code, stderr) in [
+            (127, "bash: line 1: git: command not found"),
+            (126, "bash: line 1: git: Permission denied"),
+        ] {
+            let failure = GitFailure::from_command(
+                "git clone",
+                ExecFailure::new(
+                    "git clone",
+                    Termination::Exited,
+                    Some(code),
+                    Vec::new(),
+                    stderr.as_bytes().to_vec(),
+                ),
+            );
+            assert_eq!(failure.kind(), GitFailureKind::GitUnavailable, "{stderr}");
+            assert!(!failure.kind().is_transient());
+        }
+        // A permission-denied remote is still access denied; only the
+        // shell's own codes name a missing executable.
+        let failure = GitFailure::from_command(
+            "git push",
+            ExecFailure::new(
+                "git push",
+                Termination::Exited,
+                Some(128),
+                Vec::new(),
+                b"remote: Permission to o/r.git denied to user.".to_vec(),
+            ),
+        );
+        assert_eq!(failure.kind(), GitFailureKind::AccessDenied);
+    }
+
+    #[test]
+    fn an_unknown_wire_class_reads_as_unclassified() {
+        let kind: GitFailureKind =
+            serde_json::from_str("\"a_class_from_the_future\"").expect("tolerated");
+        assert_eq!(kind, GitFailureKind::Unclassified);
+        assert_eq!(
+            serde_json::to_string(&GitFailureKind::GitUnavailable).expect("serializes"),
+            "\"git_unavailable\""
+        );
     }
 
     #[test]

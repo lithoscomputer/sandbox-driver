@@ -417,7 +417,7 @@ kind-specific fields for faithful reconstruction:
 | `incomplete` | `operation`, `output_abandoned`, `stop_acknowledged`, `termination_confirmed`, `cleanup_confirmed` |
 | `provider` | `provider` object: `{provider, code, message, retryable, detail}` |
 | `exec` | `exec` object: `{label, termination, exit_code, stdout_b64, stderr_b64, duration_ms?}` (`duration_ms` is additive: senders may omit it, receivers must tolerate its absence) |
-| `git` | `git` object: `{operation, kind, exec?, provider?}` — `kind` is one of `auth_rejected`, `remote_unavailable`, `ref_not_found`, `access_denied`, `target_exists`, `unclassified`; `exec` (same shape as the `exec` detail) is present when git ran inside the sandbox, `provider` (same shape as the `provider` detail) when a native operation ran it. `report.retryable` is true only for `remote_unavailable`. |
+| `git` | `git` object: `{operation, kind, exec?, provider?}` — `kind` is one of `auth_rejected`, `remote_unavailable`, `ref_not_found`, `access_denied`, `target_exists`, `git_unavailable`, `unclassified`; a receiver reads a kind it does not know as `unclassified`. `exec` (same shape as the `exec` detail) is present when git ran inside the sandbox, `provider` (same shape as the `provider` detail) when a native operation ran it. `report.retryable` is true only for `remote_unavailable`. |
 | `transport` | `transport_context` |
 | `io` | `io_context` |
 
