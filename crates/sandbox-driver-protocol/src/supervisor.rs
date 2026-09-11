@@ -38,10 +38,13 @@ pub struct PluginSupervisor {
 
 impl PluginSupervisor {
     /// Launches the first generation now, so a misconfigured plugin fails
-    /// here rather than on first use, and the provider's kind and
-    /// capabilities are known for preflight. Freezes forwarded environment
-    /// values so replacements cannot inherit a different credential
-    /// context from later environment changes.
+    /// here rather than on first use, and the capabilities are known for
+    /// preflight. The supervisor's kind is the configured one: the name
+    /// the host launched the executable under, which its records and
+    /// errors speak of; the kind the plugin declares for itself is on the
+    /// generation ([`Self::current`]). Freezes forwarded environment values
+    /// so replacements cannot inherit a different credential context from
+    /// later environment changes.
     pub async fn launch(prefix: impl Into<String>, mut config: PluginConfig) -> Result<Self> {
         for key in mem::take(&mut config.inherit_env) {
             if let Entry::Vacant(entry) = config.env.entry(key) {
@@ -55,8 +58,8 @@ impl PluginSupervisor {
         let provider = Arc::new(launched.provider);
         Ok(Self {
             prefix,
+            kind: config.kind.clone(),
             config,
-            kind: provider.kind().clone(),
             capabilities: provider.capabilities().clone(),
             current: Mutex::new(Some(provider)),
         })

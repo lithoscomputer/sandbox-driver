@@ -142,3 +142,34 @@ async fn dead_plugin_fails_old_work_and_concurrent_requests_share_one_replacemen
         .await
         .expect("remove test workspace");
 }
+
+/// The supervisor answers to the kind it was configured under, whatever the
+/// executable declares for itself: a host that aliases a plugin keeps one
+/// name for it in records and errors.
+#[tokio::test]
+async fn the_supervisor_keeps_the_configured_kind() {
+    let binary = env::current_exe()
+        .expect("test binary")
+        .parent()
+        .expect("deps directory")
+        .parent()
+        .expect("profile directory")
+        .join("sandbox-driver-host");
+    assert!(
+        binary.exists(),
+        "build provider binaries with mise run plugins:build first"
+    );
+    let supervisor = PluginSupervisor::launch(
+        "sandbox-driver",
+        PluginConfig::new(ProviderKind::try_new("host-alias").expect("kind"))
+            .path(binary)
+            .dev(true)
+            .inherit_env_var("PATH"),
+    )
+    .await
+    .expect("an aliased plugin launches");
+    assert_eq!(supervisor.kind().as_str(), "host-alias");
+    let generation = supervisor.current().await.expect("current generation");
+    assert_eq!(generation.kind().as_str(), "host");
+    supervisor.shutdown().await.expect("shutdown");
+}
