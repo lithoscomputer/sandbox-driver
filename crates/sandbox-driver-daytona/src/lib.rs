@@ -77,7 +77,7 @@ mod toolbox;
 
 use std::collections::{BTreeMap, HashMap};
 use std::env;
-use std::fmt::Debug;
+use std::fmt::{Debug, Write as _};
 use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -95,7 +95,7 @@ use daytona_api_client::models::{
 pub use daytona_sdk::DaytonaConfig;
 use daytona_sdk::{
     Client, CreateParams, CreateSandboxOptions, CreateSnapshotParams, DaytonaError, DockerImage,
-    ImageParams, ImageSource, SandboxBaseParams, SetFilePermissionsOptions, SnapshotParams,
+    ImageSource, SandboxBaseParams, SetFilePermissionsOptions, SnapshotParams,
 };
 use sandbox_driver::{
     Action, AuthError, Capabilities, Capability, Error, EventContext, EventEmitter, EventSubject,
@@ -392,6 +392,44 @@ fn map_state(state: Option<daytona_sdk::SandboxState>) -> SandboxState {
             Ds::Unknown | Ds::UnknownDefaultOpenApi => SandboxState::Unknown,
         },
     }
+}
+
+/// The name of the snapshot an image or Dockerfile builds into, for the
+/// given resources and kind: `sandbox-driver-` and 32 hex digits of an
+/// HMAC over the inputs, keyed by the credential so a rotated key never
+/// collides with another tenant's snapshots. The manifest carries a
+/// version; changing it renames every existing snapshot.
+fn cached_snapshot_name(
+    secret: &str,
+    source: &SnapshotSource,
+    resources: &Resources,
+    kind: Option<SandboxKind>,
+) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
+    let source_line = match source {
+        SnapshotSource::Image { reference } => format!("image {reference}"),
+        SnapshotSource::Dockerfile { content } => {
+            format!("dockerfile {:x}", Sha256::digest(content.as_bytes()))
+        }
+        _ => "other".to_owned(),
+    };
+    let manifest = format!(
+        "sandbox-driver snapshot v1\n{kind:?}\n{source_line}\ncpu {:?}\nmemory_gb {:?}\ndisk_gb {:?}\ngpu {:?}\n",
+        resources.cpu_cores,
+        resources.memory_mb.map(gigabytes),
+        resources.disk_mb.map(gigabytes),
+        resources.gpus,
+    );
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .expect("HMAC-SHA256 accepts keys of any length");
+    mac.update(manifest.as_bytes());
+    let digest = mac.finalize().into_bytes();
+    let mut name = String::from("sandbox-driver-");
+    for byte in &digest[..16] {
+        let _ = write!(name, "{byte:02x}");
+    }
+    name
 }
 
 fn generated_snapshot_name() -> String {
@@ -833,6 +871,44 @@ impl DaytonaProvider {
         build_handle(&self.client, &self.capabilities, sdk, events).await
     }
 
+    /// The snapshot `spec`'s image or Dockerfile source builds into, made
+    /// active: found, reactivated, built, or waited for, with the work
+    /// reported through `events`. The name is derived from the source and
+    /// resources under the credential, so the same inputs reuse one
+    /// snapshot and two tenants never share a name.
+    async fn cached_snapshot(
+        &self,
+        spec: &SandboxSpec,
+        events: Option<EventContext>,
+    ) -> Result<SnapshotId> {
+        let source = match &spec.source {
+            SandboxSource::Image { reference } => SnapshotSource::Image {
+                reference: reference.clone(),
+            },
+            SandboxSource::Dockerfile { content } => SnapshotSource::Dockerfile {
+                content: content.clone(),
+            },
+            _ => return Err(Error::invalid_spec("source", "not an image or Dockerfile")),
+        };
+        let secret = self
+            .client
+            .api_configuration()
+            .bearer_access_token
+            .clone()
+            .unwrap_or_default();
+        let name = cached_snapshot_name(&secret, &source, &spec.resources, spec.sandbox_kind);
+        let mut snapshot = SnapshotSpec::new(source).name(name);
+        snapshot.sandbox_kind = spec.sandbox_kind.or(Some(SandboxKind::Container));
+        snapshot.region.clone_from(&spec.region);
+        snapshot.resources = spec.resources;
+        let budget = if matches!(spec.source, SandboxSource::Dockerfile { .. }) {
+            DOCKERFILE_CREATE_TIMEOUT
+        } else {
+            CREATE_TIMEOUT
+        };
+        self.snapshots.ensure(&snapshot, budget, events).await
+    }
+
     async fn ensure_snapshot_kind(
         &self,
         id: &SnapshotId,
@@ -1182,30 +1258,20 @@ impl SandboxProvider for DaytonaProvider {
         let base = base_params(spec)?;
         let nested_docker = provider_config(&spec.provider_config)?.docker;
         let params = match &spec.source {
-            SandboxSource::Image { reference } => {
+            SandboxSource::Image { .. } | SandboxSource::Dockerfile { .. } => {
                 if spec.sandbox_kind == Some(SandboxKind::VirtualMachine) {
                     return Err(Error::invalid_spec(
                         "sandbox_kind",
                         "Daytona virtual machines must be created from a virtual-machine snapshot",
                     ));
                 }
-                CreateParams::Image(ImageParams {
+                // An image or Dockerfile is built once into a snapshot named
+                // by its inputs, and every later create with the same inputs
+                // reuses it; the resources size the snapshot.
+                let snapshot = self.cached_snapshot(spec, events.clone()).await?;
+                CreateParams::Snapshot(SnapshotParams {
                     base,
-                    image: ImageSource::Name(reference.clone()),
-                    resources: sdk_resources(&spec.resources),
-                })
-            }
-            SandboxSource::Dockerfile { content } => {
-                if spec.sandbox_kind == Some(SandboxKind::VirtualMachine) {
-                    return Err(Error::invalid_spec(
-                        "sandbox_kind",
-                        "Daytona virtual machines must be created from a virtual-machine snapshot",
-                    ));
-                }
-                CreateParams::Image(ImageParams {
-                    base,
-                    image: ImageSource::Custom(DockerImage::from_dockerfile(content)),
-                    resources: sdk_resources(&spec.resources),
+                    snapshot: snapshot.as_str().to_owned(),
                 })
             }
             SandboxSource::Snapshot { id } => {
@@ -3093,5 +3159,43 @@ mod tests {
         assert_eq!(gigabytes(1), 1);
         assert_eq!(gigabytes(1024), 1);
         assert_eq!(gigabytes(1025), 2);
+    }
+
+    #[test]
+    fn cached_snapshot_names_are_stable_per_tenant_and_input() {
+        let image = SnapshotSource::Image {
+            reference: "ubuntu:24.04".to_owned(),
+        };
+        let mut resources = Resources::default();
+        resources.cpu_cores = Some(2);
+        resources.memory_mb = Some(4096);
+        let name = cached_snapshot_name("key-a", &image, &resources, None);
+        assert!(name.starts_with("sandbox-driver-"), "{name}");
+        assert_eq!(name.len(), "sandbox-driver-".len() + 32, "{name}");
+        assert_eq!(
+            name,
+            cached_snapshot_name("key-a", &image, &resources, None),
+            "the same inputs name the same snapshot"
+        );
+        assert_ne!(
+            name,
+            cached_snapshot_name("key-b", &image, &resources, None),
+            "another credential never shares a name"
+        );
+        let mut larger = resources;
+        larger.memory_mb = Some(8192);
+        assert_ne!(name, cached_snapshot_name("key-a", &image, &larger, None));
+        let dockerfile = SnapshotSource::Dockerfile {
+            content: "FROM ubuntu:24.04".to_owned(),
+        };
+        assert_ne!(
+            name,
+            cached_snapshot_name("key-a", &dockerfile, &resources, None)
+        );
+        // Sizing rounds to whole gigabytes, so two requests inside one
+        // gigabyte share a snapshot.
+        let mut rounded = resources;
+        rounded.memory_mb = Some(3900);
+        assert_eq!(name, cached_snapshot_name("key-a", &image, &rounded, None));
     }
 }
