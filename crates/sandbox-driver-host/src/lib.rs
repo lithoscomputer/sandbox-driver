@@ -89,6 +89,15 @@ pub struct HostProvider {
 }
 
 impl HostProvider {
+    /// The id a designated directory attaches by, from any provider
+    /// instance: canonicalizes `path` and derives the `host-dir-<hex>` id.
+    /// `None` when the path does not resolve or the id would exceed the
+    /// id length limit.
+    pub async fn directory_id(path: &Path) -> Option<SandboxId> {
+        let canonical = canonical_directory(path).await.ok()?;
+        directory_id(&canonical)
+    }
+
     pub fn new() -> Self {
         Self::at(
             env::temp_dir()
@@ -212,6 +221,10 @@ const DIRECTORY_ID_PREFIX: &str = "host-dir-";
 /// set and the path can be read back. `None` when the encoded id would
 /// exceed the id length limit; such a directory gets a fresh id and a
 /// record instead.
+///
+/// A consumer that recorded only the directory can derive the id to
+/// attach by; the path must already be canonical (see
+/// [`HostProvider::directory_id`]).
 fn directory_id(path: &Path) -> Option<SandboxId> {
     use std::fmt::Write as _;
     let mut id = String::from(DIRECTORY_ID_PREFIX);

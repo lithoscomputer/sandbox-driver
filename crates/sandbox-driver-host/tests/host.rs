@@ -1030,6 +1030,11 @@ async fn designated_directories_attach_by_a_path_derived_id_from_any_provider() 
         .await
         .expect("same directory again");
     assert_eq!(again.id(), created.id(), "the same directory has one id");
+    assert_eq!(
+        HostProvider::directory_id(&dir).await.as_ref(),
+        Some(created.id()),
+        "a consumer derives the same id from the directory alone"
+    );
 
     let other = HostProvider::new();
     let attached = other
