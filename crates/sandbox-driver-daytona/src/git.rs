@@ -1,11 +1,14 @@
 //! Hybrid git operations for Daytona sandboxes.
 //!
-//! Clone uses Daytona's toolbox git API, matching Fabro's established path.
-//! The toolbox selects a branch (`refs/heads/<name>`) or a commit and has no
-//! tag selector, so a clone pinned to a tag runs the shared exec-derived
-//! pinned clone instead. The remaining operations use the shared
-//! exec-derived implementation, which preserves Fabro's command semantics
-//! and per-call credential handling.
+//! A branch clone uses Daytona's toolbox git API, matching Fabro's
+//! established path. A clone pinned to a commit or a tag runs the shared
+//! exec-derived pinned clone instead: the toolbox has no tag selector, and
+//! its commit pin clones the branch first and checks the commit out
+//! afterwards, so a pin outside a shallow window fails after a checkout
+//! at the branch head exists — and it fails outright for a local remote.
+//! The derived clone fetches the pin itself, whatever the depth. The
+//! remaining operations use the shared exec-derived implementation, which
+//! preserves Fabro's command semantics and per-call credential handling.
 
 use std::sync::Arc;
 
@@ -51,26 +54,6 @@ impl DaytonaGit {
 
     fn derived(&self) -> DerivedGit<'_> {
         DerivedGit::new(&self.derived_exec).with_runtime_directory(crate::RUNTIME_DIRECTORY)
-    }
-
-    /// Best-effort removal of a clone target after the clone failed. The
-    /// clone error is what the caller sees; a cleanup failure is logged
-    /// because it leaves a partial checkout that a retry would trip over.
-    async fn remove_failed_clone(&self, sandbox: &daytona_sdk::Sandbox, repo_path: &str) {
-        let fs = match sandbox.fs().await {
-            Ok(fs) => fs,
-            Err(error) => {
-                tracing::warn!(error = %error, "failed clone cleanup could not reach the toolbox");
-                return;
-            }
-        };
-        match fs.delete_file(repo_path, true).await {
-            Ok(()) => {}
-            Err(error) if crate::is_not_found(&error) => {}
-            Err(error) => {
-                tracing::warn!(error = %error, "failed clone left a partial checkout behind");
-            }
-        }
     }
 }
 
@@ -124,7 +107,8 @@ fn clone_options(options: &GitCloneOptions) -> Result<DaytonaGitCloneOptions> {
         .unwrap_or_default();
     Ok(DaytonaGitCloneOptions {
         branch: options.branch.clone(),
-        commit_id: options.commit.clone(),
+        // Pinned clones never reach the toolbox; see the module docs.
+        commit_id: None,
         username,
         password,
         insecure_skip_tls: None,
@@ -146,9 +130,10 @@ impl Git for DaytonaGit {
         options: &GitCloneOptions,
     ) -> Result<()> {
         options.validate()?;
-        if options.tag.is_some() {
-            // The toolbox has no tag selector; the derived pinned clone
-            // fetches the qualified tag ref and attaches the branch.
+        if options.tag.is_some() || options.commit.is_some() {
+            // The derived pinned clone fetches the commit or the qualified
+            // tag ref directly and attaches the branch; see the module
+            // docs for why the toolbox's pin is not used.
             return self.derived().clone_repo(url, target_path, options).await;
         }
         let sandbox = self
@@ -161,26 +146,11 @@ impl Git for DaytonaGit {
             .await
             .map_err(|error| daytona_error("connecting to the git toolbox", error))?;
         let repo_path = self.resolve_path(target_path);
-        let cloned = git
-            .clone(url, &repo_path, clone_options(options)?)
+        git.clone(url, &repo_path, clone_options(options)?)
             .await
-            .map_err(|error| classify_native_clone(daytona_error("cloning git repository", error)));
-        if let Err(error) = cloned {
-            // The toolbox clones the branch first and pins afterwards, so a
-            // failed pin leaves a checkout at the branch head. The contract
-            // says an unavailable commit fails outright, never substitutes
-            // the head, so remove whatever the failed clone wrote.
-            self.remove_failed_clone(&sandbox, &repo_path).await;
-            return Err(error);
-        }
-        // The toolbox leaves a pinned clone detached; attach the
-        // requested branch for cross-provider consistency (fabro ran
-        // the same step after every native pinned clone).
-        if let (Some(branch), Some(commit)) = (&options.branch, &options.commit) {
-            self.derived()
-                .attach_pinned_branch(&repo_path, branch, commit)
-                .await?;
-        }
+            .map_err(|error| {
+                classify_native_clone(daytona_error("cloning git repository", error))
+            })?;
         Ok(())
     }
 
@@ -228,15 +198,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_clone_options_preserve_branch_commit_depth_and_credentials() {
+    fn native_clone_options_preserve_branch_depth_and_credentials() {
         let mut options = GitCloneOptions::default();
         options.branch = Some("main".to_owned());
-        options.commit = Some("abc123".to_owned());
         options.depth = Some(7);
         options.credentials = Some(GitCredentials::new("user", "secret"));
         let mapped = clone_options(&options).expect("options map");
         assert_eq!(mapped.branch.as_deref(), Some("main"));
-        assert_eq!(mapped.commit_id.as_deref(), Some("abc123"));
+        assert_eq!(mapped.commit_id, None);
         assert_eq!(mapped.depth, Some(7));
         assert_eq!(mapped.username.as_deref(), Some("user"));
         assert_eq!(mapped.password.as_deref(), Some("secret"));
