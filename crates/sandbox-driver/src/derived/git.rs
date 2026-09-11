@@ -1,22 +1,41 @@
 use std::fmt::Write as _;
 use std::time::Duration;
+use std::{fmt, io};
 
 use async_trait::async_trait;
 
 use crate::derived::shell_quote;
 use crate::error::{Error, ExecFailure, GitFailure, Result};
-use crate::exec::{Exec, ExecResult, ExecSpec};
+use crate::exec::{Exec, ExecResult, ExecSpec, Termination};
 use crate::git::{
-    Git, GitBranches, GitCheckoutOptions, GitCloneOptions, GitCommitOptions, GitCredentials,
-    GitPushOptions, GitStatus, validate_branch_name,
+    Git, GitBranches, GitChange, GitCheckoutOptions, GitCloneOptions, GitCommit, GitCommitOptions,
+    GitCredentials, GitDiffEntry, GitDiffOptions, GitFetchOptions, GitIdentity, GitLogOptions,
+    GitNumstat, GitPushOptions, GitStatus, validate_argument, validate_branch_name,
+    validate_config_key, validate_object_name,
 };
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 const CLONE_TIMEOUT: Duration = Duration::from_secs(600);
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Internal git calls disable background maintenance, as fabro does.
-const GIT: &str = "git -c maintenance.auto=0 -c gc.auto=0";
+/// Every derived git call runs hardened: no background maintenance, no
+/// repository hooks, no fsmonitor daemon, paths unquoted, and no commit
+/// or tag signing. The environment also disables terminal prompts
+/// ([`GIT_ENV`]), and the diff verbs pass `--no-ext-diff` so a configured
+/// external diff driver never runs.
+const GIT: &str = "git -c maintenance.auto=0 -c gc.auto=0 -c core.hooksPath=/dev/null \
+                   -c core.fsmonitor=false -c core.quotePath=false -c commit.gpgsign=false \
+                   -c tag.gpgsign=false";
+/// Read verbs additionally refuse the file transport, so a diff or log
+/// can never fetch through a local path.
+const GIT_READ: &str = "git -c maintenance.auto=0 -c gc.auto=0 -c core.hooksPath=/dev/null \
+                        -c core.fsmonitor=false -c core.quotePath=false -c commit.gpgsign=false \
+                        -c tag.gpgsign=false -c protocol.file.allow=never";
+/// Environment every derived git call runs with: never a terminal prompt.
+const GIT_ENV: &[(&str, &str)] = &[("GIT_TERMINAL_PROMPT", "0")];
+/// Git's separator format for one commit of a log: unit separator between
+/// fields, record separator between commits.
+const LOG_FORMAT: &str = "%H%x1f%T%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%cn%x1f%ce%x1f%cI%x1f%B%x1e";
 
 /// Exec-derived [`Git`]: plumbing over the `git` CLI.
 ///
@@ -55,12 +74,31 @@ impl<'e> DerivedGit<'e> {
         args: &[String],
         timeout: Duration,
     ) -> Result<ExecResult> {
-        let mut command = String::from(GIT);
-        for arg in args {
-            command.push(' ');
-            command.push_str(&shell_quote(arg));
-        }
-        self.run_script(label, repo, command, None, timeout).await
+        self.run_prefixed(GIT, label, repo, args, timeout).await
+    }
+
+    /// A read-only command, which also refuses the file transport.
+    async fn run_read(
+        &self,
+        label: &str,
+        repo: Option<&str>,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<ExecResult> {
+        self.run_prefixed(GIT_READ, label, repo, args, timeout)
+            .await
+    }
+
+    async fn run_prefixed(
+        &self,
+        prefix: &str,
+        label: &str,
+        repo: Option<&str>,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<ExecResult> {
+        self.run_script(label, repo, git_command(prefix, args), None, timeout)
+            .await
     }
 
     /// Runs a Bash script and reports a failed one as a classified git
@@ -74,31 +112,14 @@ impl<'e> DerivedGit<'e> {
         secret: Option<(&str, &str)>,
         timeout: Duration,
     ) -> Result<ExecResult> {
-        let mut spec = ExecSpec::bash(script).timeout(timeout);
-        if let Some(repo) = repo {
-            spec = spec.working_dir(repo.to_owned());
-        }
-        if let Some((key, value)) = secret {
-            spec = spec.env_var(key, value);
-        }
-        let result = self.exec.run(&spec).await?;
+        let result = self
+            .exec
+            .run(&git_spec(script, repo, secret, timeout))
+            .await?;
         if result.success() {
             return Ok(result);
         }
-        // A command that ran and failed is a git failure, classified from
-        // its output; a failure to run it at all (transport, timeout)
-        // passed through above unchanged.
-        Err(Error::Git(GitFailure::from_command(
-            label,
-            ExecFailure::new(
-                label,
-                result.termination,
-                result.exit_code,
-                result.stdout,
-                result.stderr,
-            )
-            .with_duration(result.duration),
-        )))
+        Err(git_failure(label, result))
     }
 
     /// A per-call config value (`url.<authed>.insteadOf=<plain>`) that
@@ -392,6 +413,301 @@ fn encode_userinfo(value: &str) -> String {
     encoded
 }
 
+/// The shell command for `prefix` and quoted `args`.
+fn git_command(prefix: &str, args: &[String]) -> String {
+    let mut command = String::from(prefix);
+    for arg in args {
+        command.push(' ');
+        command.push_str(&shell_quote(arg));
+    }
+    command
+}
+
+/// The spec every derived git script runs as: the Bash helper, the git
+/// environment, the repository as working directory, and an optional
+/// secret in the environment.
+fn git_spec(
+    script: String,
+    repo: Option<&str>,
+    secret: Option<(&str, &str)>,
+    timeout: Duration,
+) -> ExecSpec {
+    let mut spec = ExecSpec::bash(script).timeout(timeout);
+    for (key, value) in GIT_ENV {
+        spec = spec.env_var(*key, *value);
+    }
+    if let Some(repo) = repo {
+        spec = spec.working_dir(repo.to_owned());
+    }
+    if let Some((key, value)) = secret {
+        spec = spec.env_var(key, value);
+    }
+    spec
+}
+
+/// A command that ran and failed, classified from its output. A failure
+/// to run it at all (transport, timeout) is passed through by the caller
+/// unchanged.
+fn git_failure(label: &str, result: ExecResult) -> Error {
+    Error::Git(GitFailure::from_command(
+        label,
+        ExecFailure::new(
+            label,
+            result.termination,
+            result.exit_code,
+            result.stdout,
+            result.stderr,
+        )
+        .with_duration(result.duration),
+    ))
+}
+
+/// Output that git could not be trusted to have produced whole, or that
+/// does not parse: an internal failure of the derived implementation, not
+/// a classified git outcome.
+fn malformed(what: &str, detail: impl fmt::Display) -> Error {
+    Error::io(
+        format!("parsing {what}"),
+        io::Error::other(detail.to_string()),
+    )
+}
+
+fn lossy(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// `--find-renames=<n>%`, when rename detection was asked for.
+fn rename_flag(options: &GitDiffOptions) -> Option<String> {
+    options
+        .find_renames
+        .map(|percent| format!("--find-renames={percent}%"))
+}
+
+/// A blob or mode git prints as all zeros is absent on that side.
+fn present(value: &str) -> Option<String> {
+    (!value.is_empty() && !value.bytes().all(|byte| byte == b'0')).then(|| value.to_owned())
+}
+
+/// Parses `git diff --raw -z` output: per entry a header
+/// `:<old mode> <new mode> <old blob> <new blob> <status>` and one path, or
+/// two for a rename or copy, each NUL-terminated.
+fn parse_raw_diff(output: &[u8]) -> Result<Vec<GitDiffEntry>> {
+    let mut entries = Vec::new();
+    let mut fields = output.split(|byte| *byte == 0).peekable();
+    while let Some(header) = fields.next() {
+        if header.is_empty() {
+            continue;
+        }
+        let header = lossy(header);
+        let Some(rest) = header.strip_prefix(':') else {
+            return Err(malformed(
+                "git diff --raw",
+                format!("unexpected entry {header:?}"),
+            ));
+        };
+        let parts: Vec<&str> = rest.split(' ').collect();
+        let [old_mode, new_mode, old_blob, new_blob, status] = parts[..] else {
+            return Err(malformed(
+                "git diff --raw",
+                format!("short header {header:?}"),
+            ));
+        };
+        let mut letters = status.chars();
+        let (change, similarity) = match letters.next() {
+            Some('A') => (GitChange::Added, None),
+            Some('C') => (GitChange::Copied, letters.as_str().parse().ok()),
+            Some('D') => (GitChange::Deleted, None),
+            Some('M') => (GitChange::Modified, None),
+            Some('R') => (GitChange::Renamed, letters.as_str().parse().ok()),
+            Some('T') => (GitChange::TypeChanged, None),
+            Some('U') => (GitChange::Unmerged, None),
+            _ => (GitChange::Unknown, None),
+        };
+        let first = fields
+            .next()
+            .ok_or_else(|| malformed("git diff --raw", "entry without a path"))?;
+        let (old_path, path) = if matches!(change, GitChange::Renamed | GitChange::Copied) {
+            let second = fields
+                .next()
+                .ok_or_else(|| malformed("git diff --raw", "rename without a new path"))?;
+            (Some(lossy(first)), lossy(second))
+        } else {
+            (None, lossy(first))
+        };
+        entries.push(GitDiffEntry {
+            change,
+            path,
+            old_path,
+            old_mode: present(old_mode),
+            new_mode: present(new_mode),
+            old_blob: present(old_blob),
+            new_blob: present(new_blob),
+            similarity,
+        });
+    }
+    Ok(entries)
+}
+
+/// Parses `git diff --numstat -z` output: `<added>\t<removed>\t<path>` per
+/// entry, `-` for both counts on a binary path, and for a rename an empty
+/// path followed by the old and new paths as their own fields.
+fn parse_numstat(output: &[u8]) -> Result<Vec<GitNumstat>> {
+    let mut entries = Vec::new();
+    let mut fields = output.split(|byte| *byte == 0);
+    while let Some(entry) = fields.next() {
+        if entry.is_empty() {
+            continue;
+        }
+        let entry = lossy(entry);
+        let mut parts = entry.splitn(3, '\t');
+        let (Some(added), Some(removed), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return Err(malformed(
+                "git diff --numstat",
+                format!("short entry {entry:?}"),
+            ));
+        };
+        let count = |text: &str| -> Result<Option<u64>> {
+            if text == "-" {
+                return Ok(None);
+            }
+            text.parse()
+                .map(Some)
+                .map_err(|_| malformed("git diff --numstat", format!("bad count {text:?}")))
+        };
+        let (old_path, path) = if path.is_empty() {
+            let old = fields
+                .next()
+                .ok_or_else(|| malformed("git diff --numstat", "rename without an old path"))?;
+            let new = fields
+                .next()
+                .ok_or_else(|| malformed("git diff --numstat", "rename without a new path"))?;
+            (Some(lossy(old)), lossy(new))
+        } else {
+            (None, path.to_owned())
+        };
+        entries.push(GitNumstat {
+            path,
+            old_path,
+            additions: count(added)?,
+            deletions: count(removed)?,
+        });
+    }
+    Ok(entries)
+}
+
+/// Parses a log in [`LOG_FORMAT`].
+fn parse_log(output: &str) -> Result<Vec<GitCommit>> {
+    let mut commits = Vec::new();
+    for record in output.split('\x1e') {
+        let record = record.trim_start_matches('\n');
+        if record.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = record.splitn(10, '\x1f').collect();
+        let [
+            sha,
+            tree,
+            parents,
+            author_name,
+            author_email,
+            author_date,
+            committer_name,
+            committer_email,
+            committer_date,
+            message,
+        ] = fields[..]
+        else {
+            return Err(malformed("git log", format!("short record {record:?}")));
+        };
+        commits.push(GitCommit {
+            sha:       sha.to_owned(),
+            tree:      tree.to_owned(),
+            parents:   parents.split_whitespace().map(str::to_owned).collect(),
+            author:    GitIdentity {
+                name:  author_name.to_owned(),
+                email: author_email.to_owned(),
+                date:  author_date.to_owned(),
+            },
+            committer: GitIdentity {
+                name:  committer_name.to_owned(),
+                email: committer_email.to_owned(),
+                date:  committer_date.to_owned(),
+            },
+            message:   message.trim_end_matches('\n').to_owned(),
+        });
+    }
+    Ok(commits)
+}
+
+/// The header of one `cat-file --batch` or `--batch-check` entry: the
+/// size when the object exists, `None` when git says `missing`.
+fn batch_header(line: &str) -> Result<Option<usize>> {
+    let mut parts = line.split(' ');
+    let _name = parts.next();
+    match (parts.next(), parts.next()) {
+        (Some("missing"), None) => Ok(None),
+        (Some(_kind), Some(size)) => size
+            .parse()
+            .map(Some)
+            .map_err(|_| malformed("git cat-file", format!("bad size in {line:?}"))),
+        _ => Err(malformed("git cat-file", format!("bad header {line:?}"))),
+    }
+}
+
+/// Parses `git cat-file --batch` output: a header line, the object's
+/// bytes, and a newline, per requested object, in request order.
+fn parse_batch(output: &[u8], count: usize, max_bytes: u64) -> Result<Vec<Option<Vec<u8>>>> {
+    let mut blobs = Vec::with_capacity(count);
+    let mut position = 0;
+    while position < output.len() && blobs.len() < count {
+        let Some(newline) = output[position..].iter().position(|byte| *byte == b'\n') else {
+            break;
+        };
+        let header = lossy(&output[position..position + newline]);
+        position += newline + 1;
+        let Some(size) = batch_header(&header)? else {
+            blobs.push(None);
+            continue;
+        };
+        let end = position + size;
+        if end > output.len() {
+            return Err(malformed(
+                "git cat-file",
+                format!(
+                    "stream ends {} bytes into a {size} byte object",
+                    output.len() - position
+                ),
+            ));
+        }
+        blobs.push(
+            (u64::try_from(size).unwrap_or(u64::MAX) <= max_bytes)
+                .then(|| output[position..end].to_vec()),
+        );
+        position = end;
+        if output.get(position) == Some(&b'\n') {
+            position += 1;
+        }
+    }
+    if blobs.len() != count {
+        return Err(malformed(
+            "git cat-file",
+            format!("{} objects answered for {count} requested", blobs.len()),
+        ));
+    }
+    Ok(blobs)
+}
+
+/// The `printf` that feeds object names to a batch command.
+fn feed_object_names(names: &[String]) -> String {
+    let mut command = String::from("printf '%s\\n'");
+    for name in names {
+        command.push(' ');
+        command.push_str(&shell_quote(name));
+    }
+    command
+}
+
 #[async_trait]
 impl Git for DerivedGit<'_> {
     async fn clone_repo(
@@ -641,6 +957,286 @@ impl Git for DerivedGit<'_> {
                 .await?;
             }
         }
+        Ok(())
+    }
+
+    async fn fetch(&self, repo_path: &str, options: &GitFetchOptions) -> Result<()> {
+        options.validate()?;
+        let remote = options.remote.as_deref().unwrap_or("origin");
+        let mut args: Vec<String> = Vec::new();
+        if let Some(rewrite) = self
+            .credential_rewrite(repo_path, remote, options.credentials.as_ref())
+            .await?
+        {
+            args.push("-c".into());
+            args.push(rewrite);
+        }
+        args.push("fetch".into());
+        if let Some(depth) = options.depth {
+            args.push("--depth".into());
+            args.push(depth.to_string());
+        }
+        args.push(remote.to_owned());
+        args.extend(options.refspecs.iter().cloned());
+        self.run(
+            "git fetch",
+            Some(repo_path),
+            &args,
+            options.timeout.unwrap_or(NETWORK_TIMEOUT),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn rev_parse(&self, repo_path: &str, revision: &str) -> Result<String> {
+        validate_argument("revision", revision)?;
+        let output = self
+            .run_read(
+                "git rev-parse",
+                Some(repo_path),
+                &[
+                    "rev-parse".into(),
+                    "--verify".into(),
+                    "--end-of-options".into(),
+                    revision.to_owned(),
+                ],
+                GIT_TIMEOUT,
+            )
+            .await?
+            .stdout_lossy();
+        Ok(output.trim().to_owned())
+    }
+
+    async fn is_ancestor(&self, repo_path: &str, ancestor: &str, descendant: &str) -> Result<bool> {
+        validate_argument("ancestor", ancestor)?;
+        validate_argument("descendant", descendant)?;
+        // Exit 0 and 1 are the two answers; anything else is a failure.
+        let script = git_command(GIT_READ, &[
+            "merge-base".into(),
+            "--is-ancestor".into(),
+            ancestor.to_owned(),
+            descendant.to_owned(),
+        ]);
+        let result = self
+            .exec
+            .run(&git_spec(script, Some(repo_path), None, GIT_TIMEOUT))
+            .await?;
+        match result.exit_code {
+            Some(0) if result.termination == Termination::Exited => Ok(true),
+            Some(1) if result.termination == Termination::Exited => Ok(false),
+            _ => Err(git_failure("git merge-base", result)),
+        }
+    }
+
+    async fn diff_entries(
+        &self,
+        repo_path: &str,
+        options: &GitDiffOptions,
+    ) -> Result<Vec<GitDiffEntry>> {
+        options.validate()?;
+        let mut args: Vec<String> = vec![
+            "diff".into(),
+            "--no-ext-diff".into(),
+            "--raw".into(),
+            // Full blob names, so a caller can hand them straight back to the
+            // blob verbs.
+            "--no-abbrev".into(),
+            "-z".into(),
+        ];
+        args.extend(rename_flag(options));
+        args.push(options.range.spec(None));
+        let result = self
+            .run_read(
+                "git diff --raw",
+                Some(repo_path),
+                &args,
+                options.timeout.unwrap_or(GIT_TIMEOUT),
+            )
+            .await?;
+        parse_raw_diff(&result.stdout)
+    }
+
+    async fn diff_numstat(
+        &self,
+        repo_path: &str,
+        options: &GitDiffOptions,
+    ) -> Result<Vec<GitNumstat>> {
+        options.validate()?;
+        let mut args: Vec<String> = vec![
+            "diff".into(),
+            "--no-ext-diff".into(),
+            "--numstat".into(),
+            "-z".into(),
+        ];
+        args.extend(rename_flag(options));
+        args.push(options.range.spec(None));
+        let result = self
+            .run_read(
+                "git diff --numstat",
+                Some(repo_path),
+                &args,
+                options.timeout.unwrap_or(GIT_TIMEOUT),
+            )
+            .await?;
+        parse_numstat(&result.stdout)
+    }
+
+    async fn diff_patch(&self, repo_path: &str, options: &GitDiffOptions) -> Result<String> {
+        options.validate()?;
+        let mut args: Vec<String> =
+            vec!["diff".into(), "--no-ext-diff".into(), "--no-color".into()];
+        args.extend(rename_flag(options));
+        args.push(options.range.spec(None));
+        let result = self
+            .run_read(
+                "git diff",
+                Some(repo_path),
+                &args,
+                options.timeout.unwrap_or(GIT_TIMEOUT),
+            )
+            .await?;
+        Ok(result.stdout_lossy())
+    }
+
+    async fn log(&self, repo_path: &str, options: &GitLogOptions) -> Result<Vec<GitCommit>> {
+        options.validate()?;
+        let mut args: Vec<String> = vec!["log".into(), format!("--format={LOG_FORMAT}")];
+        if options.first_parent {
+            args.push("--first-parent".into());
+        }
+        if options.reverse {
+            args.push("--reverse".into());
+        }
+        if let Some(count) = options.max_count {
+            args.push(format!("--max-count={count}"));
+        }
+        args.push(options.range.spec(Some("HEAD")));
+        let result = self
+            .run_read(
+                "git log",
+                Some(repo_path),
+                &args,
+                options.timeout.unwrap_or(GIT_TIMEOUT),
+            )
+            .await?;
+        parse_log(&result.stdout_lossy())
+    }
+
+    async fn blob_sizes(&self, repo_path: &str, blobs: &[String]) -> Result<Vec<Option<u64>>> {
+        if blobs.is_empty() {
+            return Ok(Vec::new());
+        }
+        for blob in blobs {
+            validate_object_name("blobs", blob)?;
+        }
+        let script = format!(
+            "{} | {GIT_READ} cat-file --batch-check",
+            feed_object_names(blobs)
+        );
+        let result = self
+            .run_script(
+                "git cat-file --batch-check",
+                Some(repo_path),
+                script,
+                None,
+                GIT_TIMEOUT,
+            )
+            .await?;
+        let sizes = result
+            .stdout_lossy()
+            .lines()
+            .map(|line| {
+                batch_header(line)
+                    .map(|size| size.map(|size| u64::try_from(size).unwrap_or(u64::MAX)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if sizes.len() != blobs.len() {
+            return Err(malformed(
+                "git cat-file --batch-check",
+                format!(
+                    "{} objects answered for {} requested",
+                    sizes.len(),
+                    blobs.len()
+                ),
+            ));
+        }
+        Ok(sizes)
+    }
+
+    async fn blobs(
+        &self,
+        repo_path: &str,
+        blobs: &[String],
+        max_bytes: u64,
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        if blobs.is_empty() {
+            return Ok(Vec::new());
+        }
+        for blob in blobs {
+            validate_object_name("blobs", blob)?;
+        }
+        let script = format!("{} | {GIT_READ} cat-file --batch", feed_object_names(blobs));
+        let result = self
+            .run_script(
+                "git cat-file --batch",
+                Some(repo_path),
+                script,
+                None,
+                GIT_TIMEOUT,
+            )
+            .await?;
+        parse_batch(&result.stdout, blobs.len(), max_bytes)
+    }
+
+    async fn config_set(&self, repo_path: &str, key: &str, value: &str) -> Result<()> {
+        validate_config_key(key)?;
+        self.run(
+            "git config",
+            Some(repo_path),
+            &[
+                "config".into(),
+                "--local".into(),
+                "--".into(),
+                key.to_owned(),
+                value.to_owned(),
+            ],
+            GIT_TIMEOUT,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn untracked_files(&self, repo_path: &str) -> Result<Vec<String>> {
+        let result = self
+            .run_read(
+                "git ls-files",
+                Some(repo_path),
+                &[
+                    "ls-files".into(),
+                    "--others".into(),
+                    "--exclude-standard".into(),
+                    "-z".into(),
+                ],
+                GIT_TIMEOUT,
+            )
+            .await?;
+        Ok(result
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(lossy)
+            .collect())
+    }
+
+    async fn add_all(&self, repo_path: &str, pathspecs: &[String]) -> Result<()> {
+        let mut args: Vec<String> = vec!["add".into(), "-A".into(), "--".into()];
+        if pathspecs.is_empty() {
+            args.push(".".into());
+        } else {
+            args.extend(pathspecs.iter().cloned());
+        }
+        self.run("git add", Some(repo_path), &args, GIT_TIMEOUT)
+            .await?;
         Ok(())
     }
 
@@ -1462,5 +2058,186 @@ mod tests {
         assert!(commands[0].contains("'user.name=Author'"));
         assert!(commands[0].contains("'commit' '-m' 'msg'"));
         assert!(commands[1].contains("'rev-parse' 'HEAD'"));
+    }
+
+    #[test]
+    fn raw_diff_entries_parse_every_status_and_zero_sides() {
+        let output = concat!(
+            ":000000 100644 0000000000000000000000000000000000000000 ",
+            "1111111111111111111111111111111111111111 A\0added.txt\0",
+            ":100644 100644 2222222222222222222222222222222222222222 ",
+            "3333333333333333333333333333333333333333 M\0changed.txt\0",
+            ":100644 100644 4444444444444444444444444444444444444444 ",
+            "4444444444444444444444444444444444444444 R087\0old/name.rs\0new/name.rs\0",
+            ":100644 000000 5555555555555555555555555555555555555555 ",
+            "0000000000000000000000000000000000000000 D\0gone.txt\0",
+        );
+        let entries = parse_raw_diff(output.as_bytes()).expect("parses");
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].change, GitChange::Added);
+        assert_eq!(entries[0].path, "added.txt");
+        assert_eq!(entries[0].old_mode, None);
+        assert_eq!(entries[0].new_mode.as_deref(), Some("100644"));
+        assert_eq!(entries[0].old_blob, None);
+        assert_eq!(entries[1].change, GitChange::Modified);
+        assert_eq!(entries[2].change, GitChange::Renamed);
+        assert_eq!(entries[2].old_path.as_deref(), Some("old/name.rs"));
+        assert_eq!(entries[2].path, "new/name.rs");
+        assert_eq!(entries[2].similarity, Some(87));
+        assert_eq!(entries[3].change, GitChange::Deleted);
+        assert_eq!(entries[3].new_blob, None);
+        assert!(parse_raw_diff(b"garbage\0").is_err());
+    }
+
+    #[test]
+    fn numstat_parses_counts_binaries_and_renames() {
+        let output = "3\t1\tsrc/lib.rs\0-\t-\timage.png\x002\t0\t\0old.rs\0new.rs\0";
+        let entries = parse_numstat(output.as_bytes()).expect("parses");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].additions, Some(3));
+        assert_eq!(entries[0].deletions, Some(1));
+        assert_eq!(entries[1].additions, None);
+        assert_eq!(entries[1].deletions, None);
+        assert_eq!(entries[2].old_path.as_deref(), Some("old.rs"));
+        assert_eq!(entries[2].path, "new.rs");
+    }
+
+    #[test]
+    fn logs_parse_separator_records_with_multiline_messages() {
+        let output = concat!(
+            "aaaa\x1ftttt\x1fpppp qqqq\x1fAda\x1fada@example.com\x1f2026-01-01T00:00:00+00:00",
+            "\x1fBob\x1fbob@example.com\x1f2026-01-02T00:00:00+00:00\x1fsubject\n\nbody line\n\x1e\n",
+            "bbbb\x1fuuuu\x1f\x1fAda\x1fada@example.com\x1f2026-01-03T00:00:00+00:00",
+            "\x1fAda\x1fada@example.com\x1f2026-01-03T00:00:00+00:00\x1froot\n\x1e\n",
+        );
+        let commits = parse_log(output).expect("parses");
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].sha, "aaaa");
+        assert_eq!(commits[0].parents, ["pppp", "qqqq"]);
+        assert_eq!(commits[0].author.name, "Ada");
+        assert_eq!(commits[0].committer.email, "bob@example.com");
+        assert_eq!(commits[0].message, "subject\n\nbody line");
+        assert!(commits[1].parents.is_empty());
+        assert_eq!(commits[1].message, "root");
+    }
+
+    #[test]
+    fn batch_output_yields_bytes_missing_and_capped_objects() {
+        let output = b"1111111111111111111111111111111111111111 blob 6\nhello\n\n\
+                       2222222222222222222222222222222222222222 missing\n\
+                       3333333333333333333333333333333333333333 blob 3\nbig\n";
+        let blobs = parse_batch(output, 3, 4).expect("parses");
+        assert_eq!(blobs[0], None, "over the cap");
+        assert_eq!(blobs[1], None, "missing");
+        assert_eq!(blobs[2].as_deref(), Some(&b"big"[..]));
+        let blobs = parse_batch(output, 3, 100).expect("parses");
+        assert_eq!(blobs[0].as_deref(), Some(&b"hello\n"[..]));
+        assert!(
+            parse_batch(output, 4, 100).is_err(),
+            "fewer answers than requests"
+        );
+        assert!(
+            parse_batch(
+                b"1111111111111111111111111111111111111111 blob 9\nshort\n",
+                1,
+                100
+            )
+            .is_err(),
+            "a truncated stream is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_verbs_run_hardened_and_refuse_the_file_transport() {
+        let exec = ScriptedExec::new(vec![ScriptedExec::ok("abc\n")]);
+        let git = DerivedGit::new(&exec);
+        assert_eq!(
+            git.rev_parse("/repo", "HEAD").await.expect("rev-parse"),
+            "abc"
+        );
+        let command = &exec.commands()[0];
+        assert!(command.starts_with(GIT_READ), "{command}");
+        assert!(command.contains("core.hooksPath=/dev/null"), "{command}");
+        assert!(command.contains("protocol.file.allow=never"), "{command}");
+        assert!(
+            command.contains("'rev-parse' '--verify' '--end-of-options' 'HEAD'"),
+            "{command}"
+        );
+        let env = &exec.envs()[0];
+        assert_eq!(
+            env.get("GIT_TERMINAL_PROMPT").map(String::as_str),
+            Some("0")
+        );
+        assert!(
+            git.rev_parse("/repo", "--output=/etc/passwd")
+                .await
+                .is_err(),
+            "flag-shaped revisions are refused before any command"
+        );
+        assert_eq!(exec.commands().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mutating_verbs_run_hardened_without_refusing_the_file_transport() {
+        let exec = ScriptedExec::new(vec![
+            ScriptedExec::ok(""),
+            ScriptedExec::ok(""),
+            ScriptedExec::ok(""),
+        ]);
+        let git = DerivedGit::new(&exec);
+        git.fetch("/repo", &GitFetchOptions {
+            refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".into()],
+            ..GitFetchOptions::default()
+        })
+        .await
+        .expect("fetch");
+        git.config_set("/repo", "user.name", "Fabro Bot")
+            .await
+            .expect("config");
+        git.add_all("/repo", &[]).await.expect("add");
+        let commands = exec.commands();
+        assert!(commands[0].starts_with(GIT), "{}", commands[0]);
+        assert!(
+            !commands[0].contains("protocol.file.allow"),
+            "{}",
+            commands[0]
+        );
+        assert!(
+            commands[0].contains("'fetch' 'origin' '+refs/heads/main:refs/remotes/origin/main'"),
+            "{}",
+            commands[0]
+        );
+        assert!(
+            commands[1].contains("'config' '--local' '--' 'user.name' 'Fabro Bot'"),
+            "{}",
+            commands[1]
+        );
+        assert!(
+            commands[2].contains("'add' '-A' '--' '.'"),
+            "{}",
+            commands[2]
+        );
+        assert!(
+            git.config_set("/repo", "--file=/etc/x", "y").await.is_err(),
+            "a flag-shaped key is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn is_ancestor_reads_both_answers_and_fails_otherwise() {
+        let exec = ScriptedExec::new(vec![
+            ScriptedExec::ok(""),
+            ScriptedExec::failed(1),
+            ScriptedExec::failed_with_stderr(128, "fatal: Not a valid object name nope"),
+        ]);
+        let git = DerivedGit::new(&exec);
+        assert!(git.is_ancestor("/repo", "base", "head").await.expect("yes"));
+        assert!(!git.is_ancestor("/repo", "head", "base").await.expect("no"));
+        assert!(git.is_ancestor("/repo", "nope", "head").await.is_err());
+        assert!(
+            exec.commands()[0].contains("'merge-base' '--is-ancestor' 'base' 'head'"),
+            "{}",
+            exec.commands()[0]
+        );
     }
 }

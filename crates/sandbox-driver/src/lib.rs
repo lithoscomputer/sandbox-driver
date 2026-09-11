@@ -48,6 +48,7 @@ mod event;
 mod exec;
 mod fs;
 mod git;
+mod git_retry;
 mod grace;
 mod id;
 mod logs;
@@ -65,6 +66,7 @@ mod state;
 #[cfg(test)]
 mod test_exec;
 mod wait;
+mod wire_time;
 
 pub use access::{
     PreviewUrl, PreviewUrls, ShellCommand, SshAccess, SshAccessInfo, Vnc, VncConnection,
@@ -93,8 +95,13 @@ pub use exec::{
 };
 pub use fs::{DirEntry, FileKind, FileMetadata, Filesystem};
 pub use git::{
-    Git, GitBranches, GitCheckoutOptions, GitCloneOptions, GitCommitOptions, GitCredentials,
-    GitFacet, GitPushOptions, GitStatus,
+    Git, GitBranches, GitChange, GitCheckoutOptions, GitCloneOptions, GitCommit, GitCommitOptions,
+    GitCredentials, GitDiffEntry, GitDiffOptions, GitFacet, GitFetchOptions, GitIdentity,
+    GitLogOptions, GitNumstat, GitPushOptions, GitRevisionRange, GitStatus,
+};
+pub use git_retry::{
+    GitAttempt, GitBackoff, GitRetryError, GitRetryPolicy, GitRetryReason, GitRetryReport,
+    REPLICATION_HORIZON, retry_git, retry_reason,
 };
 pub use grace::run_with_stop_grace;
 pub use id::{InvalidIdError, ProviderKind, SandboxId, ServiceId, SnapshotId, VolumeId};
@@ -111,7 +118,7 @@ pub use pty::{Pty, PtyOptions, PtySession, PtySize};
 pub use sandbox::{ForkOptions, Sandbox, SandboxSnapshotOptions, SnapshotMode, WorkspaceOwnership};
 pub use sanitize::{OutputSanitization, OutputSanitizer};
 pub use search::{GrepMatch, GrepOptions, Search, SearchFacet, WalkOptions, WalkedFile};
-pub use service::{ServiceSpec, ServiceStatus, Services, ServicesFacet};
+pub use service::{ListeningPort, ServiceSpec, ServiceStatus, Services, ServicesFacet};
 pub use spec::{
     LifecycleTimers, NetworkPolicy, PlatformInfo, Resources, SandboxKind, SandboxSource,
     SandboxSpec, VolumeMount,

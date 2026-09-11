@@ -22,7 +22,8 @@ use async_trait::async_trait;
 use sandbox_driver::{
     Capabilities, Capability, DerivedGit, DirEntry, Error, EventContext, EventSubject, Exec,
     ExecControls, ExecResult, ExecSpec, ExecStreamingResult, FileMetadata, Filesystem, ForkOptions,
-    Git, GitBranches, GitCheckoutOptions, GitCloneOptions, GitCommitOptions, GitCredentials,
+    Git, GitBranches, GitCheckoutOptions, GitCloneOptions, GitCommit, GitCommitOptions,
+    GitCredentials, GitDiffEntry, GitDiffOptions, GitFetchOptions, GitLogOptions, GitNumstat,
     GitPushOptions, GitStatus, HealthStatus, IncompleteOperation, LifecycleTimers, LogSink,
     LogSource, Logs, NetworkPolicy, OneShot, OneShotSpec, OutputCaptureBuffer, OutputStream,
     PlatformInfo, PreviewUrl, PreviewUrls, ProviderHealth, ProviderKind, Pty, PtyOptions,
@@ -1982,6 +1983,69 @@ impl Git for SandboxGit {
         self.derived()
             .set_ambient_credentials(repo_path, credentials)
             .await
+    }
+
+    async fn fetch(&self, repo_path: &str, options: &GitFetchOptions) -> Result<()> {
+        self.derived().fetch(repo_path, options).await
+    }
+
+    async fn rev_parse(&self, repo_path: &str, revision: &str) -> Result<String> {
+        self.derived().rev_parse(repo_path, revision).await
+    }
+
+    async fn is_ancestor(&self, repo_path: &str, ancestor: &str, descendant: &str) -> Result<bool> {
+        self.derived()
+            .is_ancestor(repo_path, ancestor, descendant)
+            .await
+    }
+
+    async fn diff_entries(
+        &self,
+        repo_path: &str,
+        options: &GitDiffOptions,
+    ) -> Result<Vec<GitDiffEntry>> {
+        self.derived().diff_entries(repo_path, options).await
+    }
+
+    async fn diff_numstat(
+        &self,
+        repo_path: &str,
+        options: &GitDiffOptions,
+    ) -> Result<Vec<GitNumstat>> {
+        self.derived().diff_numstat(repo_path, options).await
+    }
+
+    async fn diff_patch(&self, repo_path: &str, options: &GitDiffOptions) -> Result<String> {
+        self.derived().diff_patch(repo_path, options).await
+    }
+
+    async fn log(&self, repo_path: &str, options: &GitLogOptions) -> Result<Vec<GitCommit>> {
+        self.derived().log(repo_path, options).await
+    }
+
+    async fn blob_sizes(&self, repo_path: &str, blobs: &[String]) -> Result<Vec<Option<u64>>> {
+        self.derived().blob_sizes(repo_path, blobs).await
+    }
+
+    async fn blobs(
+        &self,
+        repo_path: &str,
+        blobs: &[String],
+        max_bytes: u64,
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        self.derived().blobs(repo_path, blobs, max_bytes).await
+    }
+
+    async fn config_set(&self, repo_path: &str, key: &str, value: &str) -> Result<()> {
+        self.derived().config_set(repo_path, key, value).await
+    }
+
+    async fn untracked_files(&self, repo_path: &str) -> Result<Vec<String>> {
+        self.derived().untracked_files(repo_path).await
+    }
+
+    async fn add_all(&self, repo_path: &str, pathspecs: &[String]) -> Result<()> {
+        self.derived().add_all(repo_path, pathspecs).await
     }
 }
 

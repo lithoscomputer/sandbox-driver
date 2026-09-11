@@ -362,9 +362,11 @@ Rules:
   `sandbox/create` are not applicable — exec uses `timeout_ms`). Both
   forms are covered by encoding tests; neither may change within
   version 1.
-- **Timestamps** use the structural form
-  `{"secs_since_epoch":…,"nanos_since_epoch":…}` where present
-  (`created_at`, `expires_at`); they are informational.
+- **Timestamps** are RFC 3339 strings in UTC (`"2026-08-31T20:00:00.250Z"`)
+  where present (`created_at`, `updated_at`, `modified_at`, `expires_at`,
+  `occurred_at`); they are informational. Readers also accept the
+  structural form `{"secs_since_epoch":…,"nanos_since_epoch":…}` that
+  peers wrote before this encoding.
 - **Identifiers** (`sandbox_id`, `snapshot_id`, `volume_id`) are non-empty
   strings up to 256 bytes with no
   whitespace or control characters. They are opaque to the host and
@@ -439,7 +441,7 @@ to operate a sandbox without further negotiation:
   "status": {"id":"sb-1","name":"demo","state":"running","provider_state":"started",
               "error_reason":null,"resources":{"...":"…"},
               "sandbox_kind":"container","region":"eu","labels":{},
-              "source":null,"workspace_ownership":null,
+              "image":null,"snapshot":null,"network":null,"workspace_ownership":null,
               "created_at":null,"updated_at":null},
   "capabilities": {"...":"per-sandbox set, §5"},
   "working_directory": "/workspace",
@@ -687,9 +689,10 @@ A host sends it when the sandbox declares `git.native`; for a sandbox
 that does not, the host's exec-derived clone is the same implementation
 the plugin would run, so the host runs it locally through `exec/stream`.
 Both transports therefore select one implementation. Every other git
-operation (status, add, commit, push, pull, branches, checkout, and the
-ambient credential store) is exec-derived on the host and has no wire
-method; the host places a sandbox's credential store under the
+operation (fetch, status, add, add_all, commit, push, pull, branches,
+checkout, rev_parse, is_ancestor, the diff views, log, blob sizes and
+contents, config_set, untracked_files, and the ambient credential store)
+is exec-derived on the host and has no wire method; the host places a sandbox's credential store under the
 `runtime_directory` the plugin reported at create or attach.
 
 | method | params | result |
@@ -794,12 +797,17 @@ is reachable and its credential accepted, for host preflight and
 diagnostics:
 
 ```json
-{"health":{"status":"ok","message":null,"missing_permissions":[]}}
+{"health":{"status":"ok","message":null,"missing_permissions":[],"required_permissions":[]}}
 ```
 
 `status` ∈ `ok unreachable unauthorized unknown` (readers map unknown
-values to `unknown`). `missing_permissions` names credential scopes the
-provider knows are absent (e.g. Daytona API-key scopes). An unhealthy
+values to `unknown`). `required_permissions` names every credential
+scope the provider's operations need, in the order an operator should
+read them (e.g. Daytona API-key scopes), and `missing_permissions` the
+ones the provider knows are absent, in the same order; both are empty
+when the provider cannot enumerate them. `required_permissions` is
+additive: senders may omit it and receivers read an absent list as
+empty. An unhealthy
 provider is a **successful** response with a non-`ok` status — errors
 are reserved for failures of the check itself. Hosts must treat a
 `-32601` reply (a plugin predating this method) as
@@ -933,7 +941,7 @@ chunks, and logs use their data channels and never use this event feed.
   "route_id":"event-7",
   "event":{
     "id":{"source_id":"9b2f…","sequence":4},
-    "occurred_at":{"secs_since_epoch":1788206400,"nanos_since_epoch":0},
+    "occurred_at":"2026-08-31T20:00:00Z",
     "provider":"daytona",
     "subject":{"type":"sandbox","id":"sb-1"},
     "operation_id":"58a1…",

@@ -52,7 +52,7 @@ const MAX_CAUSE_CHARS: usize = 500;
 /// The stable `kind` and `retryable` fields let consumers make decisions
 /// without parsing the display message. Raw command output never enters the
 /// report.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ErrorReport {
     /// Stable snake_case error kind, for example `"unsupported"` or
@@ -372,7 +372,7 @@ pub enum ResourceState {
 }
 
 /// Typed event payload.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum EventBody {
@@ -418,10 +418,11 @@ impl EventBody {
 ///
 /// Exec output, PTY bytes, file-transfer chunks, and logs use their own
 /// streaming APIs and never enter this event feed.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Event {
     pub id:             EventId,
+    #[serde(with = "crate::wire_time")]
     pub occurred_at:    SystemTime,
     pub provider:       ProviderKind,
     pub subject:        EventSubject,

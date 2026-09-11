@@ -111,6 +111,7 @@ Deliberate merges:
 - **`restore` from archive is implicit in `start`** (Daytona's model); no separate verb.
 - **Ephemeral is a first-class spec flag**, not `auto_delete_interval == 0` — Daytona's encoding leaks into every wait loop (`stop` tolerating NotFound); we translate the flag per provider instead.
 - **Fork has one meaning.** The source and result are Running. The clone preserves filesystem state, memory, running processes, and process IDs. There is no disk-only fork option.
+- **Daytona builds images and Dockerfiles into cached snapshots.** A Daytona create from an image or Dockerfile first ensures a snapshot named by the source, resources, and kind under the credential (`sandbox-driver-<hex>`), reporting the build through the create's events, then creates from that snapshot; the same inputs reuse it. The resources on such a create size the snapshot.
 - **Sandbox snapshots have explicit modes.** `Filesystem` captures persistent files without live process state. `LiveProcessState` also captures memory, running processes, and process IDs. Daytona maps these modes to its cold (`includeMemory: false`, source Stopped) and hot (`includeMemory: true`, source Running) snapshots.
 - **Checkpoint and in-place restore are not public operations.** They are Boxd-only today. They can be added when Boxd work starts and a consumer needs them.
 - **Consumer ownership is a wrapper, not a provider concern.** A provider's backend is shared with every other application, so a consumer that persists ids needs proof that a sandbox is still its own before stopping or deleting it. `OwnedProvider` wraps any provider — in-process or plugin — with an `Ownership` label set: it stamps the labels on every create, narrows every list to sandboxes carrying them, and refuses `attach`, `undelete`, and `delete` with `NotOwned` otherwise. A consumer widens the label set to narrow the scope (one label for everything it manages, one more for a single run). Providers store and filter labels; they never know which labels mean ownership.
@@ -140,8 +141,8 @@ Per-sandbox functionality is grouped into small **facet traits** (per the style 
 | `StdioProcess` | Spawn long-lived bidirectional process (ACP backends) | ✔ | ✔ | ✔ (command sessions; UTF-8 payloads only — the ACP case) | ? |
 | `Filesystem` (core) | read/write/delete/exists/stat/list/move/mkdir/permissions, upload/download (binary-safe, chunked) | native | native | native (toolbox FS) | ✔ |
 | `Search` (core, derived) | grep, glob, walk — default impl derived from `Exec` (rg with grep/find fallback); provider may override | derived | derived | derived (native find/replace exists) | derived |
-| `Git` | clone, status, add, commit, push, pull, branches, checkout, set_ambient_credentials — low-level plumbing only; providers hide native, derived, or hybrid selection; per-call credentials for the facet's own network operations, a credential store for the workload's git commands; over the wire, clone is the plugin's own (`git/clone`) and the rest derive on the host | derived | derived | hybrid: native branch clone, derived pinned clone and remainder | derived |
-| `Services` (derived) | Background processes that outlive their exec (MCP servers, dev servers): spawn / status / logs / stop — default impl derived from `Exec` (`setsid` + pidfile, fabro's proven pattern); state is per-boot | derived | derived | derived | derived |
+| `Git` | clone, fetch, status, add, add_all, commit, push, pull, branches, checkout, rev_parse, is_ancestor, diff (entries, numstat, patch), log, blob sizes and contents, config_set, untracked_files, set_ambient_credentials — low-level plumbing only, hardened by default (no hooks, fsmonitor, path quoting, or signing; read verbs refuse the file transport); providers hide native, derived, or hybrid selection; per-call credentials for the facet's own network operations, a credential store for the workload's git commands; over the wire, clone is the plugin's own (`git/clone`) and the rest derive on the host | derived | derived | hybrid: native branch clone, derived pinned clone and remainder | derived |
+| `Services` (derived) | Background processes that outlive their exec (MCP servers, dev servers): spawn / status / logs / stop, plus wait_for_port (readiness of a listener) and listening_ports (what listens where) — default impl derived from `Exec` (`setsid` + pidfile, fabro's proven pattern); state is per-boot | derived | derived | derived | derived |
 | `Pty` | create/resize/kill + bidirectional byte stream (fabro's `TerminalSession`) | ✔ | ✔ (exec+tty) | ✔ (websocket) | ✔ (console) |
 | `Logs` | Provider-side logs: build/provision logs, entrypoint output, sandbox event log; streaming follow | — | ✔ (container logs) | ✔ | ? |
 | `OneShot` | Ephemeral containers in the sandbox's world: same workspace, same network namespace, own image (registry or built from the workspace); stream, term/kill, timeout; ended by the sandbox's `stop`/`delete` | — | ✔ (workspace volume, `container:` network) | ✔ (with nested Docker configured) | — |
@@ -158,6 +159,7 @@ Notes:
 
 - **Services hide native-versus-derived selection.** `Sandbox::services()` returns one normalized facet or `None`. Host, Docker, and Daytona use the shared exec-derived `setsid`/pidfile implementation; a provider with native service management can override it. Derived services require `bash`, `mktemp`, `basename`, `cat`, `tail`, `seq`, and `sleep`; `setsid` is optional. Service state is per-boot, and ids from before a sandbox restart report not running.
 - **Search and Git hide implementation selection.** `Sandbox::search()` and `Sandbox::git()` return normalized facets or `None`; callers never construct a fallback. Host, Docker, and Daytona derive Search through `Exec`. Search requires `find`, `grep`, and `head`; `rg` is optional acceleration. Daytona follows Fabro's battle-tested Git hybrid: native toolbox clone for a branch, then exec-derived status, add, commit, push, pull, branch, and checkout operations. A clone pinned to a commit or tag is exec-derived on Daytona too: the toolbox clones the branch and checks the pin out afterwards, which cannot honor a pin outside a shallow window and fails outright for a local remote, while the derived clone fetches the pin itself. Host and Docker derive every Git operation.
+- **Derived git is hardened by default.** Every derived git call disables background maintenance, repository hooks, the fsmonitor daemon, path quoting, and commit and tag signing, and runs with terminal prompts and external diff drivers off; the read verbs (`rev_parse`, `is_ancestor`, the diffs, `log`, the blob reads, `untracked_files`) also refuse the file transport. A consumer that wants a hook to run runs it itself.
 - **Git is a sandbox environment prerequisite.** When `git.supported` is true, the image, snapshot, or Host environment must provide a `git` executable on `PATH`. Providers do not probe for it. Daytona also requires it because only clone is native; the remaining operations use the executable. A missing executable is a non-conforming environment, not a reason for callers to choose another implementation; a command that fails because of it is classified `GitFailureKind::GitUnavailable` so the caller can say so.
 - **Ambient credentials are a store file, never a URL.** `Git::set_ambient_credentials` is how a workload's own git commands authenticate: the facet writes one git-credential-store line under the sandbox's runtime directory (inside the repository's git directory when the sandbox has none) and points the repository's local `credential.helper` at it. Rotation rewrites the file; removal deletes it and the helper entry. The remote URL is never rewritten, so no secret shows in `git remote -v` or the repository configuration. Which credential, and when to rotate it, stays with the consumer.
 - **Git here is plumbing only.** Fabro's credential machinery (`refresh_push_credentials`, `push_token_source`, `git_push_ref` retry/lease engine, `setup_git` intent, clone orchestration and repo layout) stays in fabro, layered on `Exec` + `Git`. Those 6 of fabro's 34 methods do not move into this crate.
@@ -344,10 +346,13 @@ bounded owned cleanup. `PluginProvider::cleanup_error()` reports cleanup
 failures, which retain admission without closing unrelated channels.
 Daytona whole-response fallbacks stop collecting at 16 MiB; its file downloads
 stream. A failed final-log fetch cannot establish complete output.
-Old handles remain tied to a failed connection. `PluginSupervisor::current()`
-serializes replacement for new work under a fixed configuration and frozen
-credential environment. It never replays an uncertain call. Applications bound
-the number of supervisors and reconstruct handles for the new generation.
+Old handles remain tied to a failed connection. `PluginSupervisor` is the
+provider an application holds for a plugin: it implements `SandboxProvider`
+(and the snapshot and volume services the plugin declares) by forwarding
+each call to the live generation, and `current()` serializes replacement for
+new work under a fixed configuration and frozen credential environment. It
+never replays an uncertain call. Applications bound the number of
+supervisors and reconstruct handles for the new generation.
 
 ### Snapshots and volumes
 
@@ -546,7 +551,7 @@ Each of these is implementable over `Exec`/`Git`/core — the fabro survey confi
 | exec\_command / exec\_command\_streaming / spawn\_stdio\_process | `Exec` facet |
 | initialize / activate / start / stop / delete / cleanup | core lifecycle + `activate` convenience + probe helper |
 | working\_directory / runtime\_directory / platform / os\_version / sandbox\_info | handle metadata + `describe()` / `platform_info()` |
-| snapshot\_info | `SandboxStatus` (source snapshot field) |
+| snapshot\_info | `SandboxStatus` (`snapshot` field) |
 | set\_autostop\_interval | `set_timers` |
 | ssh\_access\_command | `Access` facet (`SshAccess` / `ShellCommand`, now distinguishable) |
 | get\_preview\_url | `Access` facet (`PreviewUrls`) |

@@ -52,7 +52,7 @@ pub struct Resources {
 ///
 /// The default is the provider's own default (Docker: bridge; Daytona:
 /// allow-all) — a closed sandbox requires an explicit `Block`.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum NetworkPolicy {

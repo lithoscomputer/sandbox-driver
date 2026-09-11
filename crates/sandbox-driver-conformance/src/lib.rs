@@ -30,12 +30,13 @@ use std::{fmt, process};
 use async_trait::async_trait;
 use sandbox_driver::{
     Action, Capability, Error, Event, EventBody, EventContext, EventObserver, ExecControls,
-    ExecSpec, Git, GitCheckoutOptions, GitCloneOptions, GitCommitOptions, GitCredentials,
-    GitFailureKind, GitPushOptions, GrepOptions, HealthStatus, LogSink, LogSource, NetworkPolicy,
-    OneShotSpec, OutputSanitization, OutputStream, PtyOptions, PtySize, Resources, Sandbox,
-    SandboxFilter, SandboxId, SandboxProvider, SandboxSpec, SandboxState, Search, ServiceSpec,
-    Services, SnapshotMode, SpawnSpec, StdinSource, Termination, VolumeId, VolumeMount,
-    WaitOptions, activate, wait_for_state,
+    ExecSpec, Git, GitChange, GitCheckoutOptions, GitCloneOptions, GitCommitOptions,
+    GitCredentials, GitDiffOptions, GitFailureKind, GitFetchOptions, GitLogOptions, GitPushOptions,
+    GitRevisionRange, GrepOptions, HealthStatus, LogSink, LogSource, NetworkPolicy, OneShotSpec,
+    OutputSanitization, OutputStream, PtyOptions, PtySize, Resources, Sandbox, SandboxFilter,
+    SandboxId, SandboxProvider, SandboxSpec, SandboxState, Search, ServiceSpec, Services,
+    SnapshotMode, SpawnSpec, StdinSource, Termination, VolumeId, VolumeMount, WaitOptions,
+    activate, wait_for_state,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -204,6 +205,9 @@ impl Conformance {
             ("exec_env_vars_apply", |ctx| {
                 Box::pin(exec_env_vars_apply(ctx))
             }),
+            ("bash_helper_ignores_a_caller_bash_env", |ctx| {
+                Box::pin(bash_helper_ignores_a_caller_bash_env(ctx))
+            }),
             ("exec_argv_is_literal", |ctx| {
                 Box::pin(exec_argv_is_literal(ctx))
             }),
@@ -272,6 +276,9 @@ impl Conformance {
             ("git_ambient_credentials_apply", |ctx| {
                 Box::pin(git_ambient_credentials_apply(ctx))
             }),
+            ("git_verbs_report_typed_results", |ctx| {
+                Box::pin(git_verbs_report_typed_results(ctx))
+            }),
             ("unsupported_actions_say_so", |ctx| {
                 Box::pin(unsupported_actions_say_so(ctx))
             }),
@@ -301,6 +308,9 @@ impl Conformance {
             }),
             ("services_match_capabilities", |ctx| {
                 Box::pin(services_match_capabilities(ctx))
+            }),
+            ("services_wait_for_ports_and_list_them", |ctx| {
+                Box::pin(services_wait_for_ports_and_list_them(ctx))
             }),
             ("ssh_access_matches_capabilities", |ctx| {
                 Box::pin(ssh_access_matches_capabilities(ctx))
@@ -833,6 +843,45 @@ async fn exec_env_vars_apply(ctx: &Conformance) -> CheckOutcome {
 
 /// The exec contract: arguments reach the program unchanged. A provider
 /// that routes argv through a shell must quote it so nothing expands.
+/// The Bash helper's `BASH_ENV` blank wins over a caller's value: a startup
+/// file named in the spec env never runs ahead of a `bash -c` script, on
+/// every provider, however the provider composes the environment.
+async fn bash_helper_ignores_a_caller_bash_env(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        sandbox
+            .fs()
+            .write("conformance-startup.sh", b"echo INJECTED\n")
+            .await
+            .map_err(|error| format!("writing the startup file failed: {error}"))?;
+        let root = sandbox.working_directory().trim_end_matches('/');
+        let spec = ExecSpec::bash("echo ran")
+            .env_var("BASH_ENV", format!("{root}/conformance-startup.sh"))
+            .timeout(Duration::from_secs(30));
+        let result = sandbox
+            .exec()
+            .run(&spec)
+            .await
+            .map_err(|error| format!("exec failed: {error}"))?;
+        let stdout = result.stdout_lossy();
+        if !result.success() || !stdout.contains("ran") {
+            return fail(format!(
+                "the helper did not run: exit {:?}, stdout {stdout:?}",
+                result.exit_code
+            ));
+        }
+        if stdout.contains("INJECTED") {
+            return fail(format!(
+                "a caller-supplied BASH_ENV ran ahead of the script: {stdout:?}"
+            ));
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
 async fn exec_argv_is_literal(ctx: &Conformance) -> CheckOutcome {
     let sandbox = ctx.ready().await?;
     let outcome = async {
@@ -2309,6 +2358,261 @@ async fn git_ambient_credentials_apply(ctx: &Conformance) -> CheckOutcome {
     outcome
 }
 
+/// The read and plumbing verbs report typed results that agree with git's
+/// own answers: revisions, ancestry, the three diff views, the log, blob
+/// sizes and contents, configuration, untracked paths, staging, and a
+/// fetch, over a sandbox-local remote.
+async fn git_verbs_report_typed_results(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        if !sandbox.capabilities().supports(Capability::Git) {
+            return Ok(Some("capability git not declared".to_owned()));
+        }
+        let Some(git) = sandbox.git() else {
+            return fail("git is declared but the facet is absent");
+        };
+
+        // Two commits on main: the first adds seed.txt, the second changes
+        // it and adds added.txt. The fixture prints both commit ids and
+        // clones the bare remote itself: a provider's native clone may not
+        // reach a file transport, and clone has its own checks.
+        let setup = sandbox
+            .exec()
+            .run(
+                &ExecSpec::bash(
+                    "rm -rf conformance-verbs && \
+                     mkdir conformance-verbs && \
+                     cd conformance-verbs && \
+                     git init -q --bare remote.git && \
+                     git init -q -b main seed && \
+                     cd seed && \
+                     printf 'seed\\n' > seed.txt && \
+                     git add -- seed.txt && \
+                     git -c user.name=Conformance \
+                         -c user.email=conformance@example.com \
+                         commit -q -m first && \
+                     git rev-parse HEAD && \
+                     printf 'seed\\nmore\\n' > seed.txt && \
+                     printf 'added\\n' > added.txt && \
+                     git add -- seed.txt added.txt && \
+                     git -c user.name=Conformance \
+                         -c user.email=conformance@example.com \
+                         commit -q -m 'second\n\nbody' && \
+                     git rev-parse HEAD && \
+                     git remote add origin ../remote.git && \
+                     git push -q origin refs/heads/main && \
+                     git --git-dir=../remote.git symbolic-ref HEAD refs/heads/main && \
+                     cd .. && \
+                     git clone -q -b main remote.git clone",
+                )
+                .timeout(Duration::from_secs(60)),
+            )
+            .await
+            .map_err(|error| format!("verbs fixture setup failed: {error}"))?;
+        if !setup.success() {
+            return fail(format!(
+                "verbs fixture setup exited {:?}: {}",
+                setup.exit_code,
+                setup.stderr_lossy()
+            ));
+        }
+        let stdout = setup.stdout_lossy();
+        let mut ids = stdout.lines().map(str::trim);
+        let (Some(base), Some(head)) = (ids.next(), ids.next()) else {
+            return fail(format!("verbs fixture printed no commit ids: {stdout:?}"));
+        };
+        let (base, head) = (base.to_owned(), head.to_owned());
+
+        let repo = "conformance-verbs/clone";
+
+        let resolved = git
+            .rev_parse(repo, "HEAD")
+            .await
+            .map_err(|error| format!("rev_parse failed: {error}"))?;
+        if resolved != head {
+            return fail(format!("rev_parse HEAD gave {resolved}, not {head}"));
+        }
+        let parent = git
+            .rev_parse(repo, "HEAD~1")
+            .await
+            .map_err(|error| format!("rev_parse HEAD~1 failed: {error}"))?;
+        if parent != base {
+            return fail(format!("rev_parse HEAD~1 gave {parent}, not {base}"));
+        }
+        if git.rev_parse(repo, "no-such-revision").await.is_ok() {
+            return fail("rev_parse of an unknown revision succeeded");
+        }
+
+        match (
+            git.is_ancestor(repo, &base, &head).await,
+            git.is_ancestor(repo, &head, &base).await,
+        ) {
+            (Ok(true), Ok(false)) => {}
+            (forward, backward) => {
+                return fail(format!("is_ancestor answered {forward:?} and {backward:?}"));
+            }
+        }
+
+        let range = GitRevisionRange::new(base.clone()).to(head.clone());
+        let options = GitDiffOptions::new(range.clone()).find_renames(50);
+        let entries = git
+            .diff_entries(repo, &options)
+            .await
+            .map_err(|error| format!("diff_entries failed: {error}"))?;
+        let added = entries
+            .iter()
+            .find(|entry| entry.path == "added.txt")
+            .ok_or_else(|| format!("diff_entries lacks added.txt: {entries:?}"))?;
+        if added.change != GitChange::Added
+            || added.old_blob.is_some()
+            || added.new_blob.is_none()
+            || added.new_mode.as_deref() != Some("100644")
+        {
+            return fail(format!("added.txt entry is wrong: {added:?}"));
+        }
+        let changed = entries
+            .iter()
+            .find(|entry| entry.path == "seed.txt")
+            .ok_or_else(|| format!("diff_entries lacks seed.txt: {entries:?}"))?;
+        if changed.change != GitChange::Modified || changed.old_blob == changed.new_blob {
+            return fail(format!("seed.txt entry is wrong: {changed:?}"));
+        }
+        let added_blob = added.new_blob.clone().expect("checked above");
+
+        let numstat = git
+            .diff_numstat(repo, &options)
+            .await
+            .map_err(|error| format!("diff_numstat failed: {error}"))?;
+        let added_stat = numstat
+            .iter()
+            .find(|entry| entry.path == "added.txt")
+            .ok_or_else(|| format!("diff_numstat lacks added.txt: {numstat:?}"))?;
+        if added_stat.additions != Some(1) || added_stat.deletions != Some(0) {
+            return fail(format!("added.txt numstat is wrong: {added_stat:?}"));
+        }
+
+        let patch = git
+            .diff_patch(repo, &options)
+            .await
+            .map_err(|error| format!("diff_patch failed: {error}"))?;
+        if !patch.contains("diff --git a/added.txt b/added.txt") || !patch.contains("\n+added") {
+            return fail(format!("diff_patch is wrong: {patch:?}"));
+        }
+
+        let commits = git
+            .log(repo, &GitLogOptions::new(range.clone()).first_parent())
+            .await
+            .map_err(|error| format!("log failed: {error}"))?;
+        let [commit] = commits.as_slice() else {
+            return fail(format!("log of one commit gave {commits:?}"));
+        };
+        if commit.sha != head
+            || commit.parents != [base.clone()]
+            || commit.author.name != "Conformance"
+            || commit.author.email != "conformance@example.com"
+            || commit.message != "second\n\nbody"
+            || !commit.author.date.starts_with("20")
+        {
+            return fail(format!("log commit is wrong: {commit:?}"));
+        }
+
+        let zero = "0".repeat(40);
+        let sizes = git
+            .blob_sizes(repo, &[added_blob.clone(), zero.clone()])
+            .await
+            .map_err(|error| format!("blob_sizes failed: {error}"))?;
+        if sizes != [Some(6), None] {
+            return fail(format!("blob_sizes gave {sizes:?}"));
+        }
+        let contents = git
+            .blobs(repo, &[added_blob.clone(), zero.clone()], 1024)
+            .await
+            .map_err(|error| format!("blobs failed: {error}"))?;
+        if contents != [Some(b"added\n".to_vec()), None] {
+            return fail(format!("blobs gave {contents:?}"));
+        }
+        let only_added = [added_blob.clone()];
+        let capped = git
+            .blobs(repo, &only_added, 2)
+            .await
+            .map_err(|error| format!("capped blobs failed: {error}"))?;
+        if capped != [None] {
+            return fail(format!("a blob over the cap was returned: {capped:?}"));
+        }
+
+        git.config_set(repo, "user.name", "Verbs Conformance")
+            .await
+            .map_err(|error| format!("config_set failed: {error}"))?;
+        let name = sandbox
+            .exec()
+            .run(
+                &ExecSpec::new("git")
+                    .args(["config", "--local", "--get", "user.name"])
+                    .working_dir(repo)
+                    .timeout(Duration::from_secs(30)),
+            )
+            .await
+            .map_err(|error| format!("reading user.name failed: {error}"))?;
+        if name.stdout_lossy().trim() != "Verbs Conformance" {
+            return fail(format!(
+                "config_set did not land: {:?}",
+                name.stdout_lossy()
+            ));
+        }
+
+        sandbox
+            .fs()
+            .write("conformance-verbs/clone/untracked.txt", b"new\n")
+            .await
+            .map_err(|error| format!("writing the untracked file failed: {error}"))?;
+        let untracked = git
+            .untracked_files(repo)
+            .await
+            .map_err(|error| format!("untracked_files failed: {error}"))?;
+        if untracked != ["untracked.txt"] {
+            return fail(format!("untracked_files gave {untracked:?}"));
+        }
+        git.add_all(repo, &[])
+            .await
+            .map_err(|error| format!("add_all failed: {error}"))?;
+        let untracked = git
+            .untracked_files(repo)
+            .await
+            .map_err(|error| format!("untracked_files after add failed: {error}"))?;
+        if !untracked.is_empty() {
+            return fail(format!("add_all left {untracked:?} untracked"));
+        }
+        let status = git
+            .status(repo)
+            .await
+            .map_err(|error| format!("status after add failed: {error}"))?;
+        if !status
+            .dirty_paths
+            .iter()
+            .any(|path| path == "untracked.txt")
+        {
+            return fail(format!("add_all did not stage the file: {status:?}"));
+        }
+
+        let mut fetch = GitFetchOptions::default();
+        fetch.refspecs = vec!["+refs/heads/main:refs/remotes/origin/verbs".to_owned()];
+        git.fetch(repo, &fetch)
+            .await
+            .map_err(|error| format!("fetch failed: {error}"))?;
+        let fetched = git
+            .rev_parse(repo, "refs/remotes/origin/verbs")
+            .await
+            .map_err(|error| format!("rev_parse of the fetched ref failed: {error}"))?;
+        if fetched != head {
+            return fail(format!("fetch landed {fetched}, not {head}"));
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
 /// Git uses a sandbox-local bare remote so every operation can run without
 /// external credentials or network access. Providers still choose their
 /// native, derived, or hybrid implementation behind the normalized facet.
@@ -3162,6 +3466,85 @@ async fn services_match_capabilities(ctx: &Conformance) -> CheckOutcome {
     } else {
         fail(wrong.join("; "))
     }
+}
+
+/// A service that listens on a port is awaited by that port and shows up
+/// in the listening-port list; once stopped, the port wait times out. The
+/// listener is whatever the image offers, python3 or nc; without either
+/// the check is skipped.
+async fn services_wait_for_ports_and_list_them(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        if !sandbox.capabilities().supports(Capability::Services) {
+            return Ok(Some("capability services not declared".to_owned()));
+        }
+        let Some(services) = sandbox.services() else {
+            return fail("services are declared but the facet is absent");
+        };
+        let probe = sandbox
+            .exec()
+            .run(
+                &ExecSpec::bash(
+                    "if command -v python3 >/dev/null 2>&1; then echo python3; \
+                     elif command -v nc >/dev/null 2>&1; then echo nc; else echo none; fi",
+                )
+                .timeout(Duration::from_secs(30)),
+            )
+            .await
+            .map_err(|error| format!("listener probe failed: {error}"))?;
+        // Conformance runs for Host-backed providers share this machine's
+        // ports with every other run in flight, so the port is per process.
+        let port: u16 = 30_000 + u16::try_from(process::id() % 20_000).unwrap_or(0);
+        let command = match probe.stdout_lossy().trim() {
+            "python3" => format!("exec python3 -m http.server {port} --bind 127.0.0.1"),
+            "nc" => format!("while true; do nc -l 127.0.0.1 {port} < /dev/null; done"),
+            _ => return Ok(Some("no listener program in the image".to_owned())),
+        };
+        let id = services
+            .spawn(&ServiceSpec::new(command))
+            .await
+            .map_err(|error| format!("spawn failed: {error}"))?;
+        let result = async {
+            services
+                .wait_for_port(port, Duration::from_secs(30))
+                .await
+                .map_err(|error| format!("wait_for_port failed: {error}"))?;
+            let ports = services
+                .listening_ports()
+                .await
+                .map_err(|error| format!("listening_ports failed: {error}"))?;
+            if !ports.iter().any(|entry| entry.port == port) {
+                return fail(format!("port {port} is not listed: {ports:?}"));
+            }
+            services
+                .stop(&id)
+                .await
+                .map_err(|error| format!("stop failed: {error}"))?;
+            // The listener may take a moment to let go of the port.
+            let closed_by = Instant::now() + Duration::from_secs(10);
+            loop {
+                match services.wait_for_port(port, Duration::from_secs(1)).await {
+                    Err(Error::Timeout { .. }) => break,
+                    Ok(()) if Instant::now() < closed_by => {
+                        time::sleep(Duration::from_millis(250)).await;
+                    }
+                    Ok(()) => return fail("the port still answered after stop"),
+                    Err(error) => {
+                        return fail(format!(
+                            "wait_for_port after stop failed unexpectedly: {error}"
+                        ));
+                    }
+                }
+            }
+            PASS
+        }
+        .await;
+        let _ = services.stop(&id).await;
+        result
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
 }
 
 async fn ssh_access_matches_capabilities(ctx: &Conformance) -> CheckOutcome {

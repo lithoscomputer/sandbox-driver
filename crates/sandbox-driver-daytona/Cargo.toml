@@ -19,6 +19,7 @@ async-trait.workspace = true
 base64.workspace = true
 daytona-api-client.workspace = true
 daytona-sdk.workspace = true
+hmac.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 sandbox-driver.workspace = true
@@ -28,6 +29,7 @@ sandbox-driver-docker.workspace = true
 sandbox-driver-docker-config.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 tokio-util.workspace = true
 tracing.workspace = true

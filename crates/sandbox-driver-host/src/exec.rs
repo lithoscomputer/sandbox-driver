@@ -383,7 +383,7 @@ impl HostExec {
                 &spec.program,
                 &spec.args,
                 spec.working_dir.as_deref(),
-                &spec.env,
+                &spec.launch_env(),
                 if stdin_reader.is_some() {
                     Stdio::piped()
                 } else {
@@ -610,7 +610,7 @@ impl HostExec {
                 &spec.program,
                 &spec.args,
                 spec.working_dir.as_deref(),
-                &spec.env,
+                &spec.launch_env(),
                 Stdio::piped(),
             )
             .await?;

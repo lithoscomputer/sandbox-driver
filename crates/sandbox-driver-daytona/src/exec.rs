@@ -230,7 +230,7 @@ impl DaytonaTransport {
         // image's BASH_ENV into a `bash -c` the caller sends. The spec
         // env applies afterwards, as given.
         let mut program = String::from("unset BASH_ENV\n");
-        program.push_str(&exec_line(&spec.env, &spec.program, &spec.args));
+        program.push_str(&exec_line(&spec.launch_env(), &spec.program, &spec.args));
         // Write-then-EOF as a file redirection on the program.
         if let Some(path) = stdin_path {
             program.push_str(" < ");
@@ -429,7 +429,7 @@ impl DaytonaTransport {
             None => None,
         };
 
-        let mut command = exec_line(&spec.env, &spec.program, &spec.args);
+        let mut command = exec_line(&spec.launch_env(), &spec.program, &spec.args);
         if let Some(file) = &stdin_file {
             command.push_str(" < ");
             command.push_str(&shell_quote(&file.path));

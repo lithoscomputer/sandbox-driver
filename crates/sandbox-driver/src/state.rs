@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::id::SandboxId;
 use crate::sandbox::WorkspaceOwnership;
-use crate::spec::{Resources, SandboxKind};
+use crate::spec::{NetworkPolicy, Resources, SandboxKind};
 
 /// Typed sandbox state for logic. The provider's raw state string travels
 /// alongside in [`SandboxStatus::provider_state`] for display and debugging.
@@ -54,7 +54,7 @@ impl SandboxState {
 /// Constructed with [`SandboxStatus::new`]; optional fields are set by
 /// mutating the public fields. The struct is `#[non_exhaustive]` so fields
 /// can be added compatibly.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct SandboxStatus {
     pub id:                  SandboxId,
@@ -77,18 +77,28 @@ pub struct SandboxStatus {
     pub region:              Option<String>,
     #[serde(default)]
     pub labels:              BTreeMap<String, String>,
-    /// Snapshot or image the sandbox was created from, when known.
+    /// The image the sandbox runs, when the provider knows it: a Docker
+    /// container's image reference.
     #[serde(default)]
-    pub source:              Option<String>,
+    pub image:               Option<String>,
+    /// The snapshot the sandbox was created from, when the provider knows
+    /// it: a Daytona snapshot name.
+    #[serde(default)]
+    pub snapshot:            Option<String>,
+    /// The network policy in force, when the provider can read it back.
+    /// `None` when the provider cannot tell (a Docker container on a
+    /// sidecar network, a Host sandbox).
+    #[serde(default)]
+    pub network:             Option<NetworkPolicy>,
     /// Host provider only: who owns the workspace directory.
     #[serde(default)]
     pub workspace_ownership: Option<WorkspaceOwnership>,
     /// Provider console page for this sandbox, when the provider has one.
     #[serde(default)]
     pub web_url:             Option<String>,
-    #[serde(default)]
+    #[serde(default, with = "crate::wire_time::option")]
     pub created_at:          Option<SystemTime>,
-    #[serde(default)]
+    #[serde(default, with = "crate::wire_time::option")]
     pub updated_at:          Option<SystemTime>,
 }
 
@@ -105,7 +115,9 @@ impl SandboxStatus {
             sandbox_kind: None,
             region: None,
             labels: BTreeMap::new(),
-            source: None,
+            image: None,
+            snapshot: None,
+            network: None,
             workspace_ownership: None,
             web_url: None,
             created_at: None,

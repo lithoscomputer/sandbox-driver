@@ -1,5 +1,5 @@
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -78,6 +78,60 @@ pub trait Git: Send + Sync {
         repo_path: &str,
         credentials: Option<&GitCredentials>,
     ) -> Result<()>;
+
+    /// Fetches from a remote, with per-call credentials.
+    async fn fetch(&self, repo_path: &str, options: &GitFetchOptions) -> Result<()>;
+
+    /// The full object name `revision` resolves to.
+    async fn rev_parse(&self, repo_path: &str, revision: &str) -> Result<String>;
+
+    /// Whether `ancestor` is reachable from `descendant`. Both revisions
+    /// must exist; an unknown one is an error, not `false`.
+    async fn is_ancestor(&self, repo_path: &str, ancestor: &str, descendant: &str) -> Result<bool>;
+
+    /// The paths a range changed, one entry per path, with modes and blobs.
+    async fn diff_entries(
+        &self,
+        repo_path: &str,
+        options: &GitDiffOptions,
+    ) -> Result<Vec<GitDiffEntry>>;
+
+    /// Lines added and removed per path over a range; binary paths report
+    /// neither.
+    async fn diff_numstat(
+        &self,
+        repo_path: &str,
+        options: &GitDiffOptions,
+    ) -> Result<Vec<GitNumstat>>;
+
+    /// The unified diff of a range, with paths unquoted.
+    async fn diff_patch(&self, repo_path: &str, options: &GitDiffOptions) -> Result<String>;
+
+    /// The commits of a range.
+    async fn log(&self, repo_path: &str, options: &GitLogOptions) -> Result<Vec<GitCommit>>;
+
+    /// The size of each blob, in the order given; `None` for a blob the
+    /// repository does not have.
+    async fn blob_sizes(&self, repo_path: &str, blobs: &[String]) -> Result<Vec<Option<u64>>>;
+
+    /// The contents of each blob, in the order given; `None` for a blob the
+    /// repository does not have or one larger than `max_bytes`.
+    async fn blobs(
+        &self,
+        repo_path: &str,
+        blobs: &[String],
+        max_bytes: u64,
+    ) -> Result<Vec<Option<Vec<u8>>>>;
+
+    /// Sets one value in the repository's local configuration.
+    async fn config_set(&self, repo_path: &str, key: &str, value: &str) -> Result<()>;
+
+    /// Paths in the working tree that git neither tracks nor ignores.
+    async fn untracked_files(&self, repo_path: &str) -> Result<Vec<String>>;
+
+    /// Stages every change under `pathspecs` (the whole tree when empty),
+    /// including deletions and untracked files.
+    async fn add_all(&self, repo_path: &str, pathspecs: &[String]) -> Result<()>;
 }
 
 /// A sandbox's normalized git facet.
@@ -170,6 +224,73 @@ impl Git for GitFacet<'_> {
             .set_ambient_credentials(repo_path, credentials)
             .await
     }
+
+    async fn fetch(&self, repo_path: &str, options: &GitFetchOptions) -> Result<()> {
+        self.implementation().fetch(repo_path, options).await
+    }
+
+    async fn rev_parse(&self, repo_path: &str, revision: &str) -> Result<String> {
+        self.implementation().rev_parse(repo_path, revision).await
+    }
+
+    async fn is_ancestor(&self, repo_path: &str, ancestor: &str, descendant: &str) -> Result<bool> {
+        self.implementation()
+            .is_ancestor(repo_path, ancestor, descendant)
+            .await
+    }
+
+    async fn diff_entries(
+        &self,
+        repo_path: &str,
+        options: &GitDiffOptions,
+    ) -> Result<Vec<GitDiffEntry>> {
+        self.implementation().diff_entries(repo_path, options).await
+    }
+
+    async fn diff_numstat(
+        &self,
+        repo_path: &str,
+        options: &GitDiffOptions,
+    ) -> Result<Vec<GitNumstat>> {
+        self.implementation().diff_numstat(repo_path, options).await
+    }
+
+    async fn diff_patch(&self, repo_path: &str, options: &GitDiffOptions) -> Result<String> {
+        self.implementation().diff_patch(repo_path, options).await
+    }
+
+    async fn log(&self, repo_path: &str, options: &GitLogOptions) -> Result<Vec<GitCommit>> {
+        self.implementation().log(repo_path, options).await
+    }
+
+    async fn blob_sizes(&self, repo_path: &str, blobs: &[String]) -> Result<Vec<Option<u64>>> {
+        self.implementation().blob_sizes(repo_path, blobs).await
+    }
+
+    async fn blobs(
+        &self,
+        repo_path: &str,
+        blobs: &[String],
+        max_bytes: u64,
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        self.implementation()
+            .blobs(repo_path, blobs, max_bytes)
+            .await
+    }
+
+    async fn config_set(&self, repo_path: &str, key: &str, value: &str) -> Result<()> {
+        self.implementation()
+            .config_set(repo_path, key, value)
+            .await
+    }
+
+    async fn untracked_files(&self, repo_path: &str) -> Result<Vec<String>> {
+        self.implementation().untracked_files(repo_path).await
+    }
+
+    async fn add_all(&self, repo_path: &str, pathspecs: &[String]) -> Result<()> {
+        self.implementation().add_all(repo_path, pathspecs).await
+    }
 }
 
 /// Per-call git credentials (a PAT travels as the password).
@@ -185,16 +306,35 @@ impl Git for GitFacet<'_> {
 #[derive(Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct GitCredentials {
-    pub username: String,
-    pub password: String,
+    pub username:  String,
+    pub password:  String,
+    /// When the credential was minted, for a short-lived token. A remote
+    /// can reject a token for a few seconds after its mint while it
+    /// replicates; [`crate::retry_git`] retries a rejection only while the
+    /// credential is that fresh. `None` is a fixed credential, which
+    /// waiting cannot make valid.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::wire_time::option"
+    )]
+    pub minted_at: Option<SystemTime>,
 }
 
 impl GitCredentials {
     pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
         Self {
-            username: username.into(),
-            password: password.into(),
+            username:  username.into(),
+            password:  password.into(),
+            minted_at: None,
         }
+    }
+
+    /// Records when a short-lived token was minted; see the field.
+    #[must_use]
+    pub fn minted_at(mut self, minted_at: SystemTime) -> Self {
+        self.minted_at = Some(minted_at);
+        self
     }
 }
 
@@ -203,6 +343,7 @@ impl fmt::Debug for GitCredentials {
         f.debug_struct("GitCredentials")
             .field("username", &self.username)
             .field("password", &"<redacted>")
+            .field("minted_at", &self.minted_at)
             .finish()
     }
 }
@@ -467,6 +608,298 @@ pub struct GitStatus {
     pub behind:         u32,
     /// Paths with uncommitted changes.
     pub dirty_paths:    Vec<String>,
+}
+
+/// Options for [`Git::fetch`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct GitFetchOptions {
+    /// The remote to fetch from; `origin` when absent.
+    pub remote:      Option<String>,
+    /// Refspecs to fetch; the remote's configured refspecs when empty.
+    pub refspecs:    Vec<String>,
+    pub depth:       Option<u32>,
+    pub credentials: Option<GitCredentials>,
+    /// Cap on the whole fetch; the implementation's network timeout when
+    /// absent.
+    pub timeout:     Option<Duration>,
+}
+
+impl GitFetchOptions {
+    /// Checks that no remote name or refspec is flag-shaped, so nothing a
+    /// caller passes can be read as an option.
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        if let Some(remote) = &self.remote {
+            validate_argument("remote", remote)?;
+        }
+        for refspec in &self.refspecs {
+            validate_argument("refspecs", refspec.trim_start_matches('+'))?;
+        }
+        Ok(())
+    }
+}
+
+/// The revisions a diff or log spans, from `base` to `head`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct GitRevisionRange {
+    pub base: String,
+    /// The end of the range. A diff without one compares `base` with the
+    /// working tree; a log without one ends at `HEAD`.
+    pub head: Option<String>,
+}
+
+impl GitRevisionRange {
+    pub fn new(base: impl Into<String>) -> Self {
+        Self {
+            base: base.into(),
+            head: None,
+        }
+    }
+
+    #[must_use]
+    pub fn to(mut self, head: impl Into<String>) -> Self {
+        self.head = Some(head.into());
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        validate_argument("base", &self.base)?;
+        if let Some(head) = &self.head {
+            validate_argument("head", head)?;
+        }
+        Ok(())
+    }
+
+    /// The range as git reads it, `base..head`, ending at `default_head`
+    /// when the range names no head and one is given.
+    #[must_use]
+    pub fn spec(&self, default_head: Option<&str>) -> String {
+        match self.head.as_deref().or(default_head) {
+            Some(head) => format!("{}..{head}", self.base),
+            None => self.base.clone(),
+        }
+    }
+}
+
+/// Options for [`Git::diff_entries`], [`Git::diff_numstat`], and
+/// [`Git::diff_patch`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct GitDiffOptions {
+    pub range:        GitRevisionRange,
+    /// Rename detection threshold in percent; renames are reported as a
+    /// delete and an add when absent.
+    pub find_renames: Option<u8>,
+    /// Cap on the command; the implementation's default when absent.
+    pub timeout:      Option<Duration>,
+}
+
+impl GitDiffOptions {
+    pub fn new(range: GitRevisionRange) -> Self {
+        Self {
+            range,
+            find_renames: None,
+            timeout: None,
+        }
+    }
+
+    #[must_use]
+    pub fn find_renames(mut self, percent: u8) -> Self {
+        self.find_renames = Some(percent);
+        self
+    }
+
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        self.range.validate()?;
+        if self.find_renames.is_some_and(|percent| percent > 100) {
+            return Err(crate::Error::invalid_spec(
+                "find_renames",
+                "is a percentage",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// What happened to a path in a diff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum GitChange {
+    Added,
+    Copied,
+    Deleted,
+    Modified,
+    Renamed,
+    /// The path changed kind: file, symlink, or submodule.
+    TypeChanged,
+    Unmerged,
+    /// A status this crate does not know.
+    #[serde(other)]
+    Unknown,
+}
+
+/// One path of a diff, as `git diff --raw` reports it. Modes are git's
+/// octal strings (`100644`, `100755`, `120000` for a symlink, `160000` for
+/// a submodule); a mode or blob absent on one side is `None`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct GitDiffEntry {
+    pub change:     GitChange,
+    /// The path after the change: the new path of a rename or copy.
+    pub path:       String,
+    /// The path before a rename or copy.
+    pub old_path:   Option<String>,
+    pub old_mode:   Option<String>,
+    pub new_mode:   Option<String>,
+    pub old_blob:   Option<String>,
+    pub new_blob:   Option<String>,
+    /// Similarity of a rename or copy, in percent.
+    pub similarity: Option<u8>,
+}
+
+/// Lines added and removed on one path, as `git diff --numstat` reports
+/// them; both `None` for a binary path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct GitNumstat {
+    /// The path after the change.
+    pub path:      String,
+    /// The path before a rename.
+    pub old_path:  Option<String>,
+    pub additions: Option<u64>,
+    pub deletions: Option<u64>,
+}
+
+/// Options for [`Git::log`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct GitLogOptions {
+    pub range:        GitRevisionRange,
+    /// Follow only the first parent of a merge.
+    pub first_parent: bool,
+    /// Oldest first.
+    pub reverse:      bool,
+    pub max_count:    Option<u64>,
+    /// Cap on the command; the implementation's default when absent.
+    pub timeout:      Option<Duration>,
+}
+
+impl GitLogOptions {
+    pub fn new(range: GitRevisionRange) -> Self {
+        Self {
+            range,
+            first_parent: false,
+            reverse: false,
+            max_count: None,
+            timeout: None,
+        }
+    }
+
+    #[must_use]
+    pub fn first_parent(mut self) -> Self {
+        self.first_parent = true;
+        self
+    }
+
+    #[must_use]
+    pub fn reverse(mut self) -> Self {
+        self.reverse = true;
+        self
+    }
+
+    #[must_use]
+    pub fn max_count(mut self, count: u64) -> Self {
+        self.max_count = Some(count);
+        self
+    }
+
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        self.range.validate()
+    }
+}
+
+/// Who wrote or committed a commit, and when (ISO 8601, as git's `%aI`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct GitIdentity {
+    pub name:  String,
+    pub email: String,
+    pub date:  String,
+}
+
+/// One commit of a log.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct GitCommit {
+    pub sha:       String,
+    pub tree:      String,
+    pub parents:   Vec<String>,
+    pub author:    GitIdentity,
+    pub committer: GitIdentity,
+    /// The full message, subject and body, as git stores it.
+    pub message:   String,
+}
+
+/// Rejects an empty or flag-shaped argument, so a value a caller supplies
+/// can never be read as an option.
+pub(crate) fn validate_argument(field: &'static str, value: &str) -> Result<(), crate::Error> {
+    if value.is_empty() || value.starts_with('-') {
+        return Err(crate::Error::invalid_spec(
+            field,
+            "must not be empty or begin with '-'",
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(crate::Error::invalid_spec(
+            field,
+            "must not contain control characters",
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects anything but a full object name: 40 (SHA-1) or 64 (SHA-256)
+/// hex digits.
+pub(crate) fn validate_object_name(field: &'static str, value: &str) -> Result<(), crate::Error> {
+    if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(crate::Error::invalid_spec(
+            field,
+            "must be a full hex object name",
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects a configuration key git would not accept: it needs a section
+/// and a name, and only letters, digits, `.`, and `-`.
+pub(crate) fn validate_config_key(key: &str) -> Result<(), crate::Error> {
+    let shape = key.contains('.')
+        && !key.starts_with(['.', '-'])
+        && !key.ends_with('.')
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    if !shape {
+        return Err(crate::Error::invalid_spec(
+            "key",
+            "is not a git configuration key",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

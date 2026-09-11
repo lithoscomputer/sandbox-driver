@@ -14,7 +14,8 @@ stdout = """
 {
   "status": "ok",
   "message": null,
-  "missing_permissions": []
+  "missing_permissions": [],
+  "required_permissions": []
 }
 """
 stderr = ""

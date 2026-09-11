@@ -996,3 +996,87 @@ async fn exec_and_stdio_preserve_high_exit_codes() {
     }
     sandbox.delete().await.expect("cleanup");
 }
+
+/// A designated directory is its own identity: its id is derived from the
+/// canonical path, so a provider instance that never created it, in this
+/// process or another, attaches to it by id and works in it.
+#[tokio::test]
+async fn designated_directories_attach_by_a_path_derived_id_from_any_provider() {
+    use std::fmt::Write as _;
+
+    let dir = env::temp_dir().join(format!("sd-designated-attach-{}", process::id()));
+    tokio_fs::create_dir_all(&dir).await.expect("scratch dir");
+    let workspace = tokio_fs::canonicalize(&dir).await.expect("canonical");
+    let creator = HostProvider::new();
+    let created = creator
+        .create(
+            &SandboxSpec::new(SandboxSource::HostDirectory)
+                .working_directory(workspace.display().to_string()),
+            None,
+        )
+        .await
+        .expect("designated sandbox");
+    assert!(
+        created.id().as_str().starts_with("host-dir-"),
+        "{}",
+        created.id()
+    );
+    let again = creator
+        .create(
+            &SandboxSpec::new(SandboxSource::HostDirectory)
+                .working_directory(dir.display().to_string()),
+            None,
+        )
+        .await
+        .expect("same directory again");
+    assert_eq!(again.id(), created.id(), "the same directory has one id");
+    assert_eq!(
+        HostProvider::directory_id(&dir).await.as_ref(),
+        Some(created.id()),
+        "a consumer derives the same id from the directory alone"
+    );
+
+    let other = HostProvider::new();
+    let attached = other
+        .attach(created.id(), None)
+        .await
+        .expect("attach by directory id without a record");
+    assert_eq!(
+        attached.working_directory(),
+        workspace.to_str().expect("utf-8")
+    );
+    let result = attached
+        .exec()
+        .run(&ExecSpec::bash("printf '%s' \"$PWD\""))
+        .await
+        .expect("exec in the adopted directory");
+    assert_eq!(result.stdout_lossy(), workspace.to_str().expect("utf-8"));
+    let listed = other.list(&SandboxFilter::default()).await.expect("list");
+    assert!(
+        listed.iter().any(|status| status.id == *created.id()),
+        "the adopted directory is recorded in the adopting registry"
+    );
+
+    // A managed workspace keeps a fresh id: nothing derives from its path.
+    let managed = other
+        .create(&SandboxSpec::new(SandboxSource::HostDirectory), None)
+        .await
+        .expect("managed sandbox");
+    assert!(!managed.id().as_str().starts_with("host-dir-"));
+
+    // A directory id for a path that does not exist is not found.
+    let missing = workspace.join("missing");
+    let mut hex = String::from("host-dir-");
+    for byte in missing.to_str().expect("utf-8").bytes() {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    let error = other
+        .attach(&SandboxId::try_new(hex).expect("valid id"), None)
+        .await
+        .err()
+        .expect("a missing directory is not found");
+    assert!(matches!(error, Error::NotFound { .. }), "{error}");
+    created.delete().await.expect("delete designated");
+    managed.delete().await.expect("delete managed");
+    let _ = tokio_fs::remove_dir_all(&dir).await;
+}

@@ -57,7 +57,11 @@ impl Job {
             DockerExec::command_wrapper(&self.stop_file, &self.pid_file, spec.stdin.is_some()),
             "sandbox-driver".to_owned(),
         ]);
-        args.extend(spec.env.iter().map(|(key, value)| format!("{key}={value}")));
+        args.extend(
+            spec.launch_env()
+                .iter()
+                .map(|(key, value)| format!("{key}={value}")),
+        );
         args.push(spec.program.clone());
         args.extend(spec.args.iter().cloned());
         let mut command = DockerCli::command(args).no_timeout();
@@ -300,7 +304,7 @@ impl NestedExec {
     async fn spawn_stdio_raw(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
         let job = Job::new(Arc::clone(&self.cli));
         let mut command = ExecSpec::new(&spec.program).args(spec.args.clone());
-        command.env.clone_from(&spec.env);
+        command.env = spec.launch_env().into_owned();
         command.working_dir.clone_from(&spec.working_dir);
         // The wrapper must preserve the interactive stdin descriptor.
         command.stdin = Some(Vec::new());

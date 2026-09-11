@@ -497,11 +497,33 @@ pub struct GitFailure {
 
 impl fmt::Display for GitFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} failed: {}", self.operation, self.kind.describe())?;
-        if let Some(output) = &self.output {
-            write!(f, " (exit code {:?})", output.exit_code())?;
+        let ended_early = self.output.as_ref().and_then(|output| {
+            let how = match output.termination() {
+                Termination::TimedOut => "timed out",
+                Termination::Cancelled => "was cancelled",
+                Termination::Killed => "was killed",
+                _ => return None,
+            };
+            Some((how, output.duration()))
+        });
+        match ended_early {
+            Some((how, Some(duration))) => {
+                write!(
+                    f,
+                    "{} {how} after {}ms",
+                    self.operation,
+                    duration.as_millis()
+                )
+            }
+            Some((how, None)) => write!(f, "{} {how}", self.operation),
+            None => {
+                write!(f, "{} failed: {}", self.operation, self.kind.describe())?;
+                if let Some(output) = &self.output {
+                    write!(f, " (exit code {:?})", output.exit_code())?;
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 }
 

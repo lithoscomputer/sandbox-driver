@@ -7,7 +7,7 @@
 //! additive field is the compatible evolution path and must not fail a
 //! test (see "change-detector tests").
 
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use sandbox_driver::{
     Action, Capabilities, Capability, Error, ErrorReport, Event, EventBody, EventSubject,
@@ -227,6 +227,18 @@ fn state_enums_tolerate_unknown_wire_values() {
     assert_eq!(git_kind, GitFailureKind::Unclassified);
 }
 
+/// `source` merged the image and the snapshot; it is gone, and a status
+/// from a plugin that still sends it decodes with both new fields absent.
+#[test]
+fn a_status_with_the_retired_source_field_still_decodes() {
+    let status: SandboxStatus =
+        serde_json::from_str(r#"{"id":"sb-1","state":"running","source":"ubuntu:24.04"}"#)
+            .expect("decodes");
+    assert_eq!(status.image, None);
+    assert_eq!(status.snapshot, None);
+    assert!(status.network.is_none());
+}
+
 #[test]
 fn unknown_object_fields_are_ignored() {
     let json = r#"{
@@ -254,6 +266,31 @@ fn unknown_event_and_subject_kinds_are_tolerated() {
     .expect("unknown event kinds decode");
     assert!(matches!(event.subject, EventSubject::Unknown));
     assert!(matches!(event.body, EventBody::Unknown));
+}
+
+#[test]
+fn timestamps_cross_as_rfc_3339_and_the_structural_form_still_decodes() {
+    let mut status = SandboxStatus::new(
+        sandbox_driver::SandboxId::try_new("sb-1").expect("id"),
+        SandboxState::Running,
+    );
+    status.created_at = Some(UNIX_EPOCH + Duration::from_secs(1_788_206_400));
+    let encoded = serde_json::to_value(&status).expect("encode status");
+    assert_eq!(encoded["created_at"], "2026-08-31T20:00:00Z");
+    assert_eq!(encoded["updated_at"], serde_json::Value::Null);
+
+    let legacy: SandboxStatus = serde_json::from_value(serde_json::json!({
+        "id": "sb-1",
+        "state": "running",
+        "created_at": {"secs_since_epoch": 1_788_206_400, "nanos_since_epoch": 0},
+        "updated_at": "2026-08-31T20:00:01.5Z"
+    }))
+    .expect("both timestamp forms decode");
+    assert_eq!(legacy.created_at, status.created_at);
+    assert_eq!(
+        legacy.updated_at,
+        Some(UNIX_EPOCH + Duration::from_millis(1_788_206_401_500))
+    );
 }
 
 #[test]

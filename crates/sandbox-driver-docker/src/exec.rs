@@ -504,7 +504,7 @@ impl DockerExec {
             tty: Some(false),
             cmd: Some(Self::wrapped_cmd(
                 wrapper,
-                self.env_entries(&spec.env),
+                self.env_entries(&spec.launch_env()),
                 &spec.program,
                 &spec.args,
             )),
@@ -627,7 +627,7 @@ impl DockerExec {
             tty: Some(false),
             cmd: Some(Self::wrapped_cmd(
                 wrapper,
-                self.env_entries(&spec.env),
+                self.env_entries(&spec.launch_env()),
                 &spec.program,
                 &spec.args,
             )),

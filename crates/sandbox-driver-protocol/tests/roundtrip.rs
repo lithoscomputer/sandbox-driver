@@ -734,6 +734,103 @@ impl Git for RecordingGit {
             .set_ambient_credentials(repo_path, credentials)
             .await
     }
+
+    async fn fetch(
+        &self,
+        repo_path: &str,
+        options: &sandbox_driver::GitFetchOptions,
+    ) -> Result<()> {
+        DerivedGit::new(self.inner.exec())
+            .fetch(repo_path, options)
+            .await
+    }
+
+    async fn rev_parse(&self, repo_path: &str, revision: &str) -> Result<String> {
+        DerivedGit::new(self.inner.exec())
+            .rev_parse(repo_path, revision)
+            .await
+    }
+
+    async fn is_ancestor(&self, repo_path: &str, ancestor: &str, descendant: &str) -> Result<bool> {
+        DerivedGit::new(self.inner.exec())
+            .is_ancestor(repo_path, ancestor, descendant)
+            .await
+    }
+
+    async fn diff_entries(
+        &self,
+        repo_path: &str,
+        options: &sandbox_driver::GitDiffOptions,
+    ) -> Result<Vec<sandbox_driver::GitDiffEntry>> {
+        DerivedGit::new(self.inner.exec())
+            .diff_entries(repo_path, options)
+            .await
+    }
+
+    async fn diff_numstat(
+        &self,
+        repo_path: &str,
+        options: &sandbox_driver::GitDiffOptions,
+    ) -> Result<Vec<sandbox_driver::GitNumstat>> {
+        DerivedGit::new(self.inner.exec())
+            .diff_numstat(repo_path, options)
+            .await
+    }
+
+    async fn diff_patch(
+        &self,
+        repo_path: &str,
+        options: &sandbox_driver::GitDiffOptions,
+    ) -> Result<String> {
+        DerivedGit::new(self.inner.exec())
+            .diff_patch(repo_path, options)
+            .await
+    }
+
+    async fn log(
+        &self,
+        repo_path: &str,
+        options: &sandbox_driver::GitLogOptions,
+    ) -> Result<Vec<sandbox_driver::GitCommit>> {
+        DerivedGit::new(self.inner.exec())
+            .log(repo_path, options)
+            .await
+    }
+
+    async fn blob_sizes(&self, repo_path: &str, blobs: &[String]) -> Result<Vec<Option<u64>>> {
+        DerivedGit::new(self.inner.exec())
+            .blob_sizes(repo_path, blobs)
+            .await
+    }
+
+    async fn blobs(
+        &self,
+        repo_path: &str,
+        blobs: &[String],
+        max_bytes: u64,
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        DerivedGit::new(self.inner.exec())
+            .blobs(repo_path, blobs, max_bytes)
+            .await
+    }
+
+    async fn config_set(&self, repo_path: &str, key: &str, value: &str) -> Result<()> {
+        DerivedGit::new(self.inner.exec())
+            .config_set(repo_path, key, value)
+            .await
+    }
+
+    async fn untracked_files(&self, repo_path: &str) -> Result<Vec<String>> {
+        DerivedGit::new(self.inner.exec())
+            .untracked_files(repo_path)
+            .await
+    }
+
+    async fn add_all(&self, repo_path: &str, pathspecs: &[String]) -> Result<()> {
+        DerivedGit::new(self.inner.exec())
+            .add_all(repo_path, pathspecs)
+            .await
+    }
 }
 
 #[tokio::test]

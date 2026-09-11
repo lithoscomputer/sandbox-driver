@@ -33,6 +33,12 @@
 //! fence writes markers and observes process death without signalling saved
 //! ids. Other platforms retain direct process execution and do not offer this
 //! crash fence.
+//!
+//! A designated directory needs no record to come back: its sandbox id is
+//! derived from the canonical path (`host-dir-<hex>`), so any provider
+//! instance, in any process, attaches to it by id and adopts it into its own
+//! registry. Creating a sandbox on the same directory twice yields the same
+//! id.
 //! Temporary providers end owned process groups when their last owner drops.
 //! Caller-owned registries retain groups for explicit stop or recovery.
 
@@ -83,6 +89,15 @@ pub struct HostProvider {
 }
 
 impl HostProvider {
+    /// The id a designated directory attaches by, from any provider
+    /// instance: canonicalizes `path` and derives the `host-dir-<hex>` id.
+    /// `None` when the path does not resolve or the id would exceed the
+    /// id length limit.
+    pub async fn directory_id(path: &Path) -> Option<SandboxId> {
+        let canonical = canonical_directory(path).await.ok()?;
+        directory_id(&canonical)
+    }
+
     pub fn new() -> Self {
         Self::at(
             env::temp_dir()
@@ -132,6 +147,108 @@ impl HostProvider {
         registry.insert(id.clone(), sandbox.clone());
         Ok(sandbox)
     }
+
+    /// A designated directory named by a path-derived id, with no record in
+    /// this registry: another process created it, or none did. The
+    /// directory must exist; the sandbox is recorded here from now on with
+    /// the identity a fresh create would give it.
+    async fn adopt_directory(&self, id: &SandboxId) -> Result<Arc<HostSandbox>> {
+        let Some(path) = directory_from_id(id) else {
+            return Err(registry::missing(id));
+        };
+        let Ok(workspace) = canonical_directory(&path).await else {
+            return Err(registry::missing(id));
+        };
+        if directory_id(&workspace).as_ref() != Some(id) {
+            // A symlink or a non-canonical spelling: the id names another
+            // path than the one it resolves to.
+            return Err(registry::missing(id));
+        }
+        registry::private_directory(&self.root).await?;
+        let record = Record {
+            version: 1,
+            id: id.clone(),
+            name: None,
+            workspace,
+            ownership: WorkspaceOwnership::Designated,
+            env: BTreeMap::new(),
+            labels: BTreeMap::new(),
+            state: SandboxState::Running,
+            created_at: SystemTime::now(),
+        };
+        registry::write(&self.root, &record).await?;
+        let mut registry = self.registry.lock().await;
+        let sandbox = Arc::new(HostSandbox::new(
+            record,
+            self.root.clone(),
+            self.capabilities.clone(),
+            EventEmitter::new(self.kind.clone(), None),
+            self.cleanup_on_drop,
+            Arc::downgrade(&self.registry),
+        )?);
+        registry.insert(id.clone(), sandbox.clone());
+        Ok(sandbox)
+    }
+}
+
+/// The canonical path of an existing directory.
+async fn canonical_directory(path: &Path) -> Result<PathBuf> {
+    let metadata = tokio_fs::metadata(path).await.map_err(|error| {
+        Error::io(
+            format!("designated directory {} is not usable", path.display()),
+            error,
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(Error::invalid_spec(
+            "working_directory",
+            "designated path is not a directory",
+        ));
+    }
+    tokio_fs::canonicalize(path).await.map_err(|error| {
+        Error::io(
+            format!("resolving designated directory {}", path.display()),
+            error,
+        )
+    })
+}
+
+/// Prefix of a sandbox id derived from a designated directory's path.
+const DIRECTORY_ID_PREFIX: &str = "host-dir-";
+
+/// The id a designated directory at canonical `path` is known by: the
+/// path's bytes in hex, so the id stays inside the registry's character
+/// set and the path can be read back. `None` when the encoded id would
+/// exceed the id length limit; such a directory gets a fresh id and a
+/// record instead.
+///
+/// A consumer that recorded only the directory can derive the id to
+/// attach by; the path must already be canonical (see
+/// [`HostProvider::directory_id`]).
+fn directory_id(path: &Path) -> Option<SandboxId> {
+    use std::fmt::Write as _;
+    let mut id = String::from(DIRECTORY_ID_PREFIX);
+    for byte in path.as_os_str().as_encoded_bytes() {
+        let _ = write!(id, "{byte:02x}");
+    }
+    SandboxId::try_new(id).ok()
+}
+
+/// The directory a path-derived id names, when `id` has that shape.
+fn directory_from_id(id: &SandboxId) -> Option<PathBuf> {
+    let hex = id.as_str().strip_prefix(DIRECTORY_ID_PREFIX)?;
+    if hex.is_empty() || hex.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = (0..hex.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    // SAFETY-free decode: the bytes came from `as_encoded_bytes` of a real
+    // path on this platform, and a non-UTF-8 path is rejected rather than
+    // reinterpreted.
+    let text = String::from_utf8(bytes).ok()?;
+    Some(PathBuf::from(text))
 }
 
 impl Default for HostProvider {
@@ -260,8 +377,32 @@ impl SandboxProvider for HostProvider {
         }
 
         let emitter = EventEmitter::new(self.kind.clone(), events);
-        let id = SandboxId::try_new(format!("host-{}", registry::fresh_id()))
-            .expect("generated id is valid");
+        let designated = match &spec.working_directory {
+            Some(path)
+                if spec
+                    .workspace_ownership
+                    .unwrap_or(WorkspaceOwnership::Designated)
+                    == WorkspaceOwnership::Designated =>
+            {
+                // A path that does not resolve keeps a fresh id here and
+                // fails inside the create operation below, where the
+                // failure is reported through the events.
+                canonical_directory(Path::new(path)).await.ok()
+            }
+            _ => None,
+        };
+        // A designated directory is its own identity: the id is derived from
+        // the path, so a later process attaches to it without a record.
+        let id = designated
+            .as_deref()
+            .and_then(directory_id)
+            .unwrap_or_else(|| {
+                SandboxId::try_new(format!("host-{}", registry::fresh_id()))
+                    .expect("generated id is valid")
+            });
+        if let Some(existing) = self.registry.lock().await.get(&id) {
+            return Ok(Arc::clone(existing) as Arc<dyn Sandbox>);
+        }
         let subject = EventSubject::Sandbox {
             id:   Some(id.clone()),
             name: spec.name.clone(),
@@ -364,7 +505,11 @@ impl SandboxProvider for HostProvider {
                 EventSubject::sandbox(Some(id.clone())),
                 Action::Attach,
                 |_| async move {
-                    let sandbox = self.load(id).await?;
+                    let sandbox = match self.load(id).await {
+                        Ok(sandbox) => sandbox,
+                        Err(Error::NotFound { .. }) => self.adopt_directory(id).await?,
+                        Err(error) => return Err(error),
+                    };
                     if *sandbox.state.lock().await == SandboxState::Deleted {
                         return Err(registry::missing(id));
                     }

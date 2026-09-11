@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,38 @@ pub trait Services: Send + Sync {
     /// grace period, then KILL. Idempotent — stopping an unknown or
     /// already-stopped service succeeds.
     async fn stop(&self, id: &ServiceId) -> Result<()>;
+
+    /// Waits until something inside the sandbox accepts a TCP connection
+    /// on `port` at the loopback address, or `timeout` passes
+    /// ([`crate::Error::Timeout`]). The readiness signal a service that
+    /// listens on a port gives.
+    async fn wait_for_port(&self, port: u16, timeout: Duration) -> Result<()>;
+
+    /// The TCP ports processes inside the sandbox are listening on.
+    async fn listening_ports(&self) -> Result<Vec<ListeningPort>>;
+}
+
+/// A TCP port a process inside the sandbox listens on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ListeningPort {
+    pub port:    u16,
+    /// The local address as the sandbox reports it (`0.0.0.0:8080`,
+    /// `[::]:8080`, `127.0.0.1:3000`).
+    pub address: String,
+    /// The listening process, when the sandbox can name it
+    /// (`node`, `python3`, or `pid=1234`).
+    pub process: Option<String>,
+}
+
+impl ListeningPort {
+    pub fn new(port: u16, address: impl Into<String>) -> Self {
+        Self {
+            port,
+            address: address.into(),
+            process: None,
+        }
+    }
 }
 
 /// A sandbox's normalized background-services facet.
@@ -97,6 +130,14 @@ impl Services for ServicesFacet<'_> {
 
     async fn stop(&self, id: &ServiceId) -> Result<()> {
         self.implementation().stop(id).await
+    }
+
+    async fn wait_for_port(&self, port: u16, timeout: Duration) -> Result<()> {
+        self.implementation().wait_for_port(port, timeout).await
+    }
+
+    async fn listening_ports(&self) -> Result<Vec<ListeningPort>> {
+        self.implementation().listening_ports().await
     }
 }
 
