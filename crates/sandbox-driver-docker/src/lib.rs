@@ -399,9 +399,27 @@ fn status_from_inspect(id: SandboxId, inspect: &ContainerInspectResponse) -> San
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
         }
-        status.source.clone_from(&config.image);
+        status.image.clone_from(&config.image);
     }
+    status.network = network_of(inspect);
     status
+}
+
+/// The network policy an inspected container runs under, read back from
+/// its network mode: `none` is blocked, the default bridge and host
+/// networking are unrestricted. A sandbox on a managed sidecar network, or
+/// any other mode, reports nothing rather than guess.
+fn network_of(inspect: &ContainerInspectResponse) -> Option<NetworkPolicy> {
+    let mode = inspect
+        .host_config
+        .as_ref()
+        .and_then(|host| host.network_mode.as_deref())
+        .unwrap_or("default");
+    match mode {
+        "none" => Some(NetworkPolicy::Block),
+        "default" | "bridge" | "host" => Some(NetworkPolicy::AllowAll),
+        _ => None,
+    }
 }
 
 /// Whether an inspected container is one this provider created. Anything
@@ -1397,5 +1415,30 @@ mod tests {
         spec.resources.cpu_cores = Some(2);
         spec.resources.memory_mb = Some(4096);
         validate_supported_creation_fields(&spec).expect("CPU and memory are supported");
+    }
+
+    #[test]
+    fn the_network_policy_is_read_back_from_the_network_mode() {
+        use bollard::models::HostConfig;
+        let inspect = |mode: Option<&str>| ContainerInspectResponse {
+            host_config: Some(HostConfig {
+                network_mode: mode.map(str::to_owned),
+                ..HostConfig::default()
+            }),
+            ..ContainerInspectResponse::default()
+        };
+        assert!(matches!(
+            network_of(&inspect(Some("none"))),
+            Some(NetworkPolicy::Block)
+        ));
+        assert!(matches!(
+            network_of(&inspect(Some("bridge"))),
+            Some(NetworkPolicy::AllowAll)
+        ));
+        assert!(matches!(
+            network_of(&inspect(None)),
+            Some(NetworkPolicy::AllowAll)
+        ));
+        assert!(network_of(&inspect(Some("demo-net"))).is_none());
     }
 }

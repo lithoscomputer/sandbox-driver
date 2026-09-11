@@ -439,7 +439,7 @@ to operate a sandbox without further negotiation:
   "status": {"id":"sb-1","name":"demo","state":"running","provider_state":"started",
               "error_reason":null,"resources":{"...":"…"},
               "sandbox_kind":"container","region":"eu","labels":{},
-              "source":null,"workspace_ownership":null,
+              "image":null,"snapshot":null,"network":null,"workspace_ownership":null,
               "created_at":null,"updated_at":null},
   "capabilities": {"...":"per-sandbox set, §5"},
   "working_directory": "/workspace",

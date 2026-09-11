@@ -227,6 +227,18 @@ fn state_enums_tolerate_unknown_wire_values() {
     assert_eq!(git_kind, GitFailureKind::Unclassified);
 }
 
+/// `source` merged the image and the snapshot; it is gone, and a status
+/// from a plugin that still sends it decodes with both new fields absent.
+#[test]
+fn a_status_with_the_retired_source_field_still_decodes() {
+    let status: SandboxStatus =
+        serde_json::from_str(r#"{"id":"sb-1","state":"running","source":"ubuntu:24.04"}"#)
+            .expect("decodes");
+    assert_eq!(status.image, None);
+    assert_eq!(status.snapshot, None);
+    assert!(status.network.is_none());
+}
+
 #[test]
 fn unknown_object_fields_are_ignored() {
     let json = r#"{

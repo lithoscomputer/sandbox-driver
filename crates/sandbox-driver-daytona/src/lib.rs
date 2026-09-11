@@ -549,7 +549,8 @@ fn status_from_sdk(
         .filter(|(key, _)| !is_internal_label(key))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    status.source.clone_from(&sdk.snapshot);
+    status.snapshot.clone_from(&sdk.snapshot);
+    status.network = Some(network_of(sdk));
     status.web_url = dashboard_url(client);
     let mut resources = Resources::default();
     resources.cpu_cores = to_u64(sdk.cpu)
@@ -562,6 +563,28 @@ fn status_from_sdk(
         .filter(|gpu| *gpu > 0);
     status.resources = Some(resources);
     Ok(status)
+}
+
+/// The network policy a Daytona sandbox runs under, read back from its
+/// settings: blocked, an allow list of CIDRs, or unrestricted.
+fn network_of(sdk: &daytona_sdk::Sandbox) -> NetworkPolicy {
+    if sdk.network_block_all {
+        return NetworkPolicy::Block;
+    }
+    let cidrs: Vec<String> = sdk
+        .network_allow_list
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|cidr| !cidr.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if cidrs.is_empty() {
+        NetworkPolicy::AllowAll
+    } else {
+        NetworkPolicy::CidrAllowList { cidrs }
+    }
 }
 
 /// Converts a non-negative float to `u64`, `None` when out of range.

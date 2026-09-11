@@ -550,7 +550,7 @@ Each of these is implementable over `Exec`/`Git`/core — the fabro survey confi
 | exec\_command / exec\_command\_streaming / spawn\_stdio\_process | `Exec` facet |
 | initialize / activate / start / stop / delete / cleanup | core lifecycle + `activate` convenience + probe helper |
 | working\_directory / runtime\_directory / platform / os\_version / sandbox\_info | handle metadata + `describe()` / `platform_info()` |
-| snapshot\_info | `SandboxStatus` (source snapshot field) |
+| snapshot\_info | `SandboxStatus` (`snapshot` field) |
 | set\_autostop\_interval | `set_timers` |
 | ssh\_access\_command | `Access` facet (`SshAccess` / `ShellCommand`, now distinguishable) |
 | get\_preview\_url | `Access` facet (`PreviewUrls`) |
