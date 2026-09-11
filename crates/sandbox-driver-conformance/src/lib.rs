@@ -204,6 +204,9 @@ impl Conformance {
             ("exec_env_vars_apply", |ctx| {
                 Box::pin(exec_env_vars_apply(ctx))
             }),
+            ("bash_helper_ignores_a_caller_bash_env", |ctx| {
+                Box::pin(bash_helper_ignores_a_caller_bash_env(ctx))
+            }),
             ("exec_argv_is_literal", |ctx| {
                 Box::pin(exec_argv_is_literal(ctx))
             }),
@@ -833,6 +836,45 @@ async fn exec_env_vars_apply(ctx: &Conformance) -> CheckOutcome {
 
 /// The exec contract: arguments reach the program unchanged. A provider
 /// that routes argv through a shell must quote it so nothing expands.
+/// The Bash helper's `BASH_ENV` blank wins over a caller's value: a startup
+/// file named in the spec env never runs ahead of a `bash -c` script, on
+/// every provider, however the provider composes the environment.
+async fn bash_helper_ignores_a_caller_bash_env(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        sandbox
+            .fs()
+            .write("conformance-startup.sh", b"echo INJECTED\n")
+            .await
+            .map_err(|error| format!("writing the startup file failed: {error}"))?;
+        let root = sandbox.working_directory().trim_end_matches('/');
+        let spec = ExecSpec::bash("echo ran")
+            .env_var("BASH_ENV", format!("{root}/conformance-startup.sh"))
+            .timeout(Duration::from_secs(30));
+        let result = sandbox
+            .exec()
+            .run(&spec)
+            .await
+            .map_err(|error| format!("exec failed: {error}"))?;
+        let stdout = result.stdout_lossy();
+        if !result.success() || !stdout.contains("ran") {
+            return fail(format!(
+                "the helper did not run: exit {:?}, stdout {stdout:?}",
+                result.exit_code
+            ));
+        }
+        if stdout.contains("INJECTED") {
+            return fail(format!(
+                "a caller-supplied BASH_ENV ran ahead of the script: {stdout:?}"
+            ));
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
 async fn exec_argv_is_literal(ctx: &Conformance) -> CheckOutcome {
     let sandbox = ctx.ready().await?;
     let outcome = async {

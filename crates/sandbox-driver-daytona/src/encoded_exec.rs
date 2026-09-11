@@ -63,9 +63,11 @@ fn encoded_spec(spec: &ExecSpec) -> ExecSpec {
         ExecSpec::new("/bin/bash").args(["-c", ENCODE_OUTPUT, "sandbox-driver-output", "env"]);
     // Apply caller variables to its program, after the encoder's Bash.
     // Bash itself drops environment names that are not shell identifiers.
-    encoded
-        .args
-        .extend(spec.env.iter().map(|(key, value)| format!("{key}={value}")));
+    encoded.args.extend(
+        spec.launch_env()
+            .iter()
+            .map(|(key, value)| format!("{key}={value}")),
+    );
     encoded.args.push(spec.program.clone());
     encoded.args.extend(spec.args.iter().cloned());
     encoded.timeout = spec.timeout;

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::io::Cursor;
@@ -19,6 +20,21 @@ use crate::sanitize::OutputSanitization;
 /// (NixOS has no `/bin/bash`).
 const BASH: &str = "bash";
 const BASH_COMMAND_FLAG: &str = "-c";
+
+/// The env a Bash helper launches with: `env` with `BASH_ENV` blank. Any
+/// other spec launches with `env` as given.
+fn launch_env(
+    bash_helper: bool,
+    env: &BTreeMap<String, String>,
+) -> Cow<'_, BTreeMap<String, String>> {
+    if bash_helper && env.get(BASH_ENV_VAR).is_none_or(|value| !value.is_empty()) {
+        let mut env = env.clone();
+        env.insert(BASH_ENV_VAR.to_owned(), String::new());
+        Cow::Owned(env)
+    } else {
+        Cow::Borrowed(env)
+    }
+}
 /// Bash sources this file before running `-c` source; the helper blanks
 /// it so a sandbox environment cannot run code ahead of the script.
 pub const BASH_ENV_VAR: &str = "BASH_ENV";
@@ -159,15 +175,35 @@ impl ExecSpec {
 
     /// A spec that evaluates `script` as Bash source: the argv
     /// `bash -c <script>`, non-login, with Bash's options untouched (no
-    /// `errexit`, no `pipefail`, no POSIX mode) and `BASH_ENV` blanked in
-    /// the spec env so no startup file runs first. A script wanting other
-    /// options sets them itself. This is the Bash contract; it holds
-    /// wherever the sandbox has `bash` on `PATH`, which
-    /// [`crate::run_bash_probe`] verifies.
+    /// `errexit`, no `pipefail`, no POSIX mode) and `BASH_ENV` blanked so
+    /// no startup file runs first. A script wanting other options sets
+    /// them itself. This is the Bash contract; it holds wherever the
+    /// sandbox has `bash` on `PATH`, which [`crate::run_bash_probe`]
+    /// verifies. The blank wins: providers launch the helper with
+    /// [`Self::launch_env`], which restores it over any `BASH_ENV` a caller
+    /// sets later, so no embedder has to remember it.
     pub fn bash(script: impl Into<String>) -> Self {
         Self::new(BASH)
             .args([BASH_COMMAND_FLAG, &script.into()])
             .env_var(BASH_ENV_VAR, "")
+    }
+
+    /// Whether this spec is the Bash helper's argv, `bash -c <script>`.
+    #[must_use]
+    pub fn is_bash_helper(&self) -> bool {
+        self.program == BASH
+            && self
+                .args
+                .first()
+                .is_some_and(|flag| flag == BASH_COMMAND_FLAG)
+    }
+
+    /// The environment a provider launches the command with: the spec's
+    /// env, with `BASH_ENV` blanked for the Bash helper whatever the caller
+    /// set, so a startup file never runs ahead of a `bash -c` script.
+    #[must_use]
+    pub fn launch_env(&self) -> Cow<'_, BTreeMap<String, String>> {
+        launch_env(self.is_bash_helper(), &self.env)
     }
 
     #[must_use]
@@ -650,6 +686,23 @@ impl SpawnSpec {
         spec
     }
 
+    /// Whether this spec is the Bash helper's argv, `bash -c <script>`.
+    #[must_use]
+    pub fn is_bash_helper(&self) -> bool {
+        self.program == BASH
+            && self
+                .args
+                .first()
+                .is_some_and(|flag| flag == BASH_COMMAND_FLAG)
+    }
+
+    /// The environment a provider spawns the process with; see
+    /// [`ExecSpec::launch_env`].
+    #[must_use]
+    pub fn launch_env(&self) -> Cow<'_, BTreeMap<String, String>> {
+        launch_env(self.is_bash_helper(), &self.env)
+    }
+
     #[must_use]
     pub fn arg(mut self, arg: impl Into<String>) -> Self {
         self.args.push(arg.into());
@@ -871,5 +924,50 @@ mod tests {
         assert!(ok.success());
         let cancelled = ExecResult::new(Termination::Cancelled, Some(0), Duration::from_millis(1));
         assert!(!cancelled.success());
+    }
+
+    #[test]
+    fn the_bash_helpers_blank_bash_env_wins_at_launch() {
+        // A later env_var overrides the blank in the spec, as any map insert
+        // would; the launch env restores it for the helper only.
+        let helper = ExecSpec::bash("echo hi").env_var("BASH_ENV", "/etc/startup.sh");
+        assert!(helper.is_bash_helper());
+        assert_eq!(
+            helper.env.get("BASH_ENV").map(String::as_str),
+            Some("/etc/startup.sh")
+        );
+        let env = helper.launch_env();
+        assert_eq!(env.get("BASH_ENV").map(String::as_str), Some(""));
+        assert!(matches!(env, Cow::Owned(_)));
+
+        // Already blank: nothing to restore, so the env is borrowed as is.
+        assert!(matches!(
+            ExecSpec::bash("true").launch_env(),
+            Cow::Borrowed(_)
+        ));
+
+        // A caller that removed the blank altogether still launches blank.
+        let mut stripped = ExecSpec::bash("true");
+        stripped.env.clear();
+        assert_eq!(
+            stripped.launch_env().get("BASH_ENV").map(String::as_str),
+            Some("")
+        );
+
+        // Any other program keeps the caller's BASH_ENV: it is not the helper.
+        let program = ExecSpec::new("sh")
+            .args(["-c", "true"])
+            .env_var("BASH_ENV", "/etc/startup.sh");
+        assert!(!program.is_bash_helper());
+        assert_eq!(
+            program.launch_env().get("BASH_ENV").map(String::as_str),
+            Some("/etc/startup.sh")
+        );
+
+        let spawn = SpawnSpec::bash("cat").env_var("BASH_ENV", "/etc/startup.sh");
+        assert_eq!(
+            spawn.launch_env().get("BASH_ENV").map(String::as_str),
+            Some("")
+        );
     }
 }
