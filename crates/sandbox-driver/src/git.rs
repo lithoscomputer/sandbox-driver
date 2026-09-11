@@ -15,10 +15,19 @@ use crate::exec::Exec;
 /// Providers own the choice of transport. They can use their native API,
 /// [`DerivedGit`], or a hybrid of both without exposing that choice to callers.
 ///
+/// Credentials reach a repository two ways. Every network operation takes
+/// them per call and applies them to that one command. A workload that
+/// runs its own git commands inside the sandbox gets them through
+/// [`Git::set_ambient_credentials`], which installs a credential store the
+/// repository's helper configuration points at. Neither path writes a
+/// credential into a remote URL.
+///
 /// When a sandbox declares `Capabilities::git.supported`, its image, snapshot,
 /// or host environment must provide a `git` executable on `PATH`. Providers do
 /// not probe for it. This prerequisite also applies to hybrid providers because
 /// any operation they derive through [`crate::Exec`] invokes that executable.
+/// A command that fails because the executable is missing is classified as
+/// [`crate::GitFailureKind::GitUnavailable`].
 #[async_trait]
 pub trait Git: Send + Sync {
     async fn clone_repo(
@@ -42,6 +51,33 @@ pub trait Git: Send + Sync {
     async fn branches(&self, repo_path: &str) -> Result<GitBranches>;
 
     async fn checkout(&self, repo_path: &str, options: &GitCheckoutOptions) -> Result<()>;
+
+    /// Installs credentials that every git command run inside the sandbox
+    /// picks up for the repository's `origin` remote, or removes them.
+    ///
+    /// The credentials are written to a git credential store file — under
+    /// the sandbox's runtime directory when it has one, otherwise inside
+    /// the repository's git directory — and the repository's local
+    /// `credential.helper` points at it. The remote URL is never rewritten,
+    /// so `git remote -v` and the repository configuration stay free of
+    /// secrets. Calling again replaces the stored credentials in place;
+    /// git reads the store at each network operation, so an operation
+    /// already running is not disturbed. `None` removes the file and the
+    /// helper entry and leaves any other configured helper alone.
+    ///
+    /// Use the same `repo_path` spelling to install and to remove: the
+    /// store file's name is derived from it.
+    ///
+    /// # Errors
+    ///
+    /// `Some` credentials for a repository whose `origin` is not an
+    /// http(s) URL fail with [`crate::Error::InvalidSpec`]; ambient
+    /// credentials apply to http(s) remotes only.
+    async fn set_ambient_credentials(
+        &self,
+        repo_path: &str,
+        credentials: Option<&GitCredentials>,
+    ) -> Result<()>;
 }
 
 /// A sandbox's normalized git facet.
@@ -64,9 +100,15 @@ impl<'a> GitFacet<'a> {
         }
     }
 
-    pub(crate) fn derived(exec: &'a dyn Exec) -> Self {
+    /// The shared exec-derived implementation. `runtime_directory` is the
+    /// sandbox's, when it has one; ambient credential stores live there.
+    pub(crate) fn derived(exec: &'a dyn Exec, runtime_directory: Option<&'a str>) -> Self {
+        let mut git = DerivedGit::new(exec);
+        if let Some(runtime_directory) = runtime_directory {
+            git = git.with_runtime_directory(runtime_directory);
+        }
         Self {
-            implementation: GitImplementation::Derived(DerivedGit::new(exec)),
+            implementation: GitImplementation::Derived(git),
         }
     }
 
@@ -117,6 +159,16 @@ impl Git for GitFacet<'_> {
 
     async fn checkout(&self, repo_path: &str, options: &GitCheckoutOptions) -> Result<()> {
         self.implementation().checkout(repo_path, options).await
+    }
+
+    async fn set_ambient_credentials(
+        &self,
+        repo_path: &str,
+        credentials: Option<&GitCredentials>,
+    ) -> Result<()> {
+        self.implementation()
+            .set_ambient_credentials(repo_path, credentials)
+            .await
     }
 }
 

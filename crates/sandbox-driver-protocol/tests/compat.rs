@@ -11,9 +11,9 @@ use std::time::Duration;
 
 use sandbox_driver::{
     Action, Capabilities, Capability, Error, ErrorReport, Event, EventBody, EventSubject,
-    ForkOptions, ResourceKind, SandboxKind, SandboxSnapshotOptions, SandboxSource, SandboxSpec,
-    SandboxState, SandboxStatus, SearchCaps, ServiceCaps, SnapshotId, SnapshotMode, SnapshotSource,
-    SnapshotSpec, Termination,
+    ForkOptions, GitFailureKind, ResourceKind, SandboxKind, SandboxSnapshotOptions, SandboxSource,
+    SandboxSpec, SandboxState, SandboxStatus, SearchCaps, ServiceCaps, SnapshotId, SnapshotMode,
+    SnapshotSource, SnapshotSpec, Termination,
 };
 use sandbox_driver_protocol::methods::{
     ForkOptionsDto, FsWriteParams, GitCloneParams, HealthResult, SandboxSnapshotOptionsDto,
@@ -222,6 +222,9 @@ fn state_enums_tolerate_unknown_wire_values() {
     let resource: ResourceKind =
         serde_json::from_str("\"checkpoint\"").expect("legacy resource kind");
     assert_eq!(resource, ResourceKind::Unknown);
+    let git_kind: GitFailureKind =
+        serde_json::from_str("\"a_git_class_from_the_future\"").expect("git failure kind");
+    assert_eq!(git_kind, GitFailureKind::Unclassified);
 }
 
 #[test]

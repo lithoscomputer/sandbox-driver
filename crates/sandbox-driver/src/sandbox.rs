@@ -205,7 +205,7 @@ pub trait Sandbox: Send + Sync {
         }
         Some(match self.provider_git() {
             Some(git) => GitFacet::provider(git),
-            None => GitFacet::derived(self.exec()),
+            None => GitFacet::derived(self.exec(), self.runtime_directory()),
         })
     }
 
