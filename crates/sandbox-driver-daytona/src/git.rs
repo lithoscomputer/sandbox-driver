@@ -50,7 +50,7 @@ impl DaytonaGit {
     }
 
     fn derived(&self) -> DerivedGit<'_> {
-        DerivedGit::new(&self.derived_exec)
+        DerivedGit::new(&self.derived_exec).with_runtime_directory(crate::RUNTIME_DIRECTORY)
     }
 
     /// Best-effort removal of a clone target after the clone failed. The
@@ -210,6 +210,16 @@ impl Git for DaytonaGit {
 
     async fn checkout(&self, repo_path: &str, options: &GitCheckoutOptions) -> Result<()> {
         self.derived().checkout(repo_path, options).await
+    }
+
+    async fn set_ambient_credentials(
+        &self,
+        repo_path: &str,
+        credentials: Option<&GitCredentials>,
+    ) -> Result<()> {
+        self.derived()
+            .set_ambient_credentials(repo_path, credentials)
+            .await
     }
 }
 

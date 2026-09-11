@@ -30,12 +30,12 @@ use std::{fmt, process};
 use async_trait::async_trait;
 use sandbox_driver::{
     Action, Capability, Error, Event, EventBody, EventContext, EventObserver, ExecControls,
-    ExecSpec, Git, GitCheckoutOptions, GitCloneOptions, GitCommitOptions, GitFailureKind,
-    GitPushOptions, GrepOptions, HealthStatus, LogSink, LogSource, NetworkPolicy, OneShotSpec,
-    OutputSanitization, OutputStream, PtyOptions, PtySize, Resources, Sandbox, SandboxFilter,
-    SandboxId, SandboxProvider, SandboxSpec, SandboxState, Search, ServiceSpec, Services,
-    SnapshotMode, SpawnSpec, StdinSource, Termination, VolumeId, VolumeMount, WaitOptions,
-    activate, wait_for_state,
+    ExecSpec, Git, GitCheckoutOptions, GitCloneOptions, GitCommitOptions, GitCredentials,
+    GitFailureKind, GitPushOptions, GrepOptions, HealthStatus, LogSink, LogSource, NetworkPolicy,
+    OneShotSpec, OutputSanitization, OutputStream, PtyOptions, PtySize, Resources, Sandbox,
+    SandboxFilter, SandboxId, SandboxProvider, SandboxSpec, SandboxState, Search, ServiceSpec,
+    Services, SnapshotMode, SpawnSpec, StdinSource, Termination, VolumeId, VolumeMount,
+    WaitOptions, activate, wait_for_state,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -268,6 +268,9 @@ impl Conformance {
             ("git_round_trip", |ctx| Box::pin(git_round_trip(ctx))),
             ("git_clone_pins_a_tag", |ctx| {
                 Box::pin(git_clone_pins_a_tag(ctx))
+            }),
+            ("git_ambient_credentials_apply", |ctx| {
+                Box::pin(git_ambient_credentials_apply(ctx))
             }),
             ("unsupported_actions_say_so", |ctx| {
                 Box::pin(unsupported_actions_say_so(ctx))
@@ -2141,6 +2144,163 @@ async fn git_clone_pins_a_tag(ctx: &Conformance) -> CheckOutcome {
             .await;
         if leftover.is_ok_and(|result| result.success()) {
             return fail("a failed tag clone left a checkout at the branch head");
+        }
+        PASS
+    }
+    .await;
+    cleanup(&sandbox).await;
+    outcome
+}
+
+/// What `git credential fill` answers for the fixture's origin host when
+/// only the repository's own configuration is consulted: the helper
+/// output, or nothing when no helper answers and prompting is off.
+async fn credential_fill(exec: &dyn sandbox_driver::Exec, repo: &str) -> Result<String, String> {
+    let result = exec
+        .run(
+            &ExecSpec::bash(
+                "printf 'protocol=https\\nhost=git.example.invalid\\n\\n' | git credential fill",
+            )
+            .working_dir(repo)
+            .env_var("GIT_TERMINAL_PROMPT", "0")
+            .env_var("GIT_CONFIG_NOSYSTEM", "1")
+            .env_var("GIT_CONFIG_GLOBAL", "/dev/null")
+            .timeout(Duration::from_secs(30)),
+        )
+        .await
+        .map_err(|error| format!("credential fill failed to run: {error}"))?;
+    Ok(result.stdout_lossy())
+}
+
+/// Ambient credentials reach a workload's own git commands through a
+/// credential store, never through the remote URL. After installation
+/// `git credential fill` answers for the origin host with only the
+/// repository's configuration consulted, the origin URL is unchanged, and
+/// the store is private and lives under the runtime directory when the
+/// sandbox has one. Rotation replaces the secret in place; removal leaves
+/// nothing for `fill` to answer with.
+async fn git_ambient_credentials_apply(ctx: &Conformance) -> CheckOutcome {
+    let sandbox = ctx.ready().await?;
+    let outcome = async {
+        if !sandbox.capabilities().supports(Capability::Git) {
+            return Ok(Some("capability git not declared".to_owned()));
+        }
+        let Some(git) = sandbox.git() else {
+            return fail("git is declared but the facet is absent");
+        };
+
+        let repo = "conformance-credentials";
+        let origin = "https://git.example.invalid/org/repo.git";
+        let setup = sandbox
+            .exec()
+            .run(
+                &ExecSpec::bash(
+                    "rm -rf conformance-credentials && \
+                     git init -q conformance-credentials && \
+                     cd conformance-credentials && \
+                     git remote add origin \"$CONFORMANCE_ORIGIN\"",
+                )
+                .env_var("CONFORMANCE_ORIGIN", origin)
+                .timeout(Duration::from_secs(30)),
+            )
+            .await
+            .map_err(|error| format!("credential fixture setup failed: {error}"))?;
+        if !setup.success() {
+            return fail(format!(
+                "credential fixture setup exited {:?}: {}",
+                setup.exit_code,
+                setup.stderr_lossy()
+            ));
+        }
+
+        let first = GitCredentials::new("x-access-token", "first-secret/1=");
+        git.set_ambient_credentials(repo, Some(&first))
+            .await
+            .map_err(|error| format!("installing ambient credentials failed: {error}"))?;
+        let filled = credential_fill(sandbox.exec(), repo).await?;
+        if !filled.contains("username=x-access-token\n")
+            || !filled.contains("password=first-secret/1=\n")
+        {
+            return fail(format!(
+                "git did not pick up the ambient credentials: {filled:?}"
+            ));
+        }
+
+        let remote = sandbox
+            .exec()
+            .run(
+                &ExecSpec::new("git")
+                    .args(["remote", "get-url", "origin"])
+                    .working_dir(repo)
+                    .timeout(Duration::from_secs(30)),
+            )
+            .await
+            .map_err(|error| format!("remote get-url failed: {error}"))?;
+        if remote.stdout_lossy().trim() != origin {
+            return fail(format!(
+                "the origin URL changed: {:?}",
+                remote.stdout_lossy().trim()
+            ));
+        }
+
+        let helpers = sandbox
+            .exec()
+            .run(
+                &ExecSpec::new("git")
+                    .args(["config", "--local", "--get-all", "credential.helper"])
+                    .working_dir(repo)
+                    .timeout(Duration::from_secs(30)),
+            )
+            .await
+            .map_err(|error| format!("reading credential.helper failed: {error}"))?
+            .stdout_lossy();
+        let Some(store) = helpers
+            .lines()
+            .find_map(|line| line.strip_prefix("store --file="))
+        else {
+            return fail(format!("no store helper is configured: {helpers:?}"));
+        };
+        let store = store.trim().trim_matches('\'').to_owned();
+        if let Some(runtime_directory) = sandbox.runtime_directory() {
+            let prefix = format!("{}/", runtime_directory.trim_end_matches('/'));
+            if !store.starts_with(&prefix) {
+                return fail(format!(
+                    "store {store:?} is not under the runtime directory {runtime_directory:?}"
+                ));
+            }
+        }
+        let metadata = sandbox
+            .fs()
+            .metadata(&store)
+            .await
+            .map_err(|error| format!("store metadata failed: {error}"))?;
+        if metadata.mode.map(|mode| mode & 0o777) != Some(0o600) {
+            return fail(format!("store mode is {:?}, expected 0600", metadata.mode));
+        }
+
+        let second = GitCredentials::new("x-access-token", "second-secret");
+        git.set_ambient_credentials(repo, Some(&second))
+            .await
+            .map_err(|error| format!("rotating ambient credentials failed: {error}"))?;
+        let filled = credential_fill(sandbox.exec(), repo).await?;
+        if !filled.contains("password=second-secret\n") || filled.contains("first-secret") {
+            return fail(format!("rotation did not replace the secret: {filled:?}"));
+        }
+
+        git.set_ambient_credentials(repo, None)
+            .await
+            .map_err(|error| format!("removing ambient credentials failed: {error}"))?;
+        let filled = credential_fill(sandbox.exec(), repo).await?;
+        if filled.contains("password=") {
+            return fail(format!("removal left credentials behind: {filled:?}"));
+        }
+        let exists = sandbox
+            .fs()
+            .exists(&store)
+            .await
+            .map_err(|error| format!("store exists check failed: {error}"))?;
+        if exists {
+            return fail(format!("removal left the store file {store:?} behind"));
         }
         PASS
     }

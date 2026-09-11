@@ -1618,12 +1618,13 @@ impl SandboxHandle {
                 sandbox_id: id.clone(),
             },
             git: SandboxGit {
-                client:     Arc::clone(&client),
-                sandbox_id: id.clone(),
-                exec:       SandboxExec {
+                client:            Arc::clone(&client),
+                sandbox_id:        id.clone(),
+                exec:              SandboxExec {
                     client:     Arc::clone(&client),
                     sandbox_id: id.clone(),
                 },
+                runtime_directory: runtime_directory.clone(),
             },
             one_shot: SandboxOneShot {
                 client:     Arc::clone(&client),
@@ -1899,14 +1900,19 @@ impl Sandbox for SandboxHandle {
 /// its native clone (Daytona's toolbox clone, say), and every other
 /// operation is exec-derived here.
 struct SandboxGit {
-    client:     Arc<Client>,
-    sandbox_id: SandboxId,
-    exec:       SandboxExec,
+    client:            Arc<Client>,
+    sandbox_id:        SandboxId,
+    exec:              SandboxExec,
+    runtime_directory: Option<String>,
 }
 
 impl SandboxGit {
     fn derived(&self) -> DerivedGit<'_> {
-        DerivedGit::new(&self.exec)
+        let git = DerivedGit::new(&self.exec);
+        match self.runtime_directory.as_deref() {
+            Some(runtime_directory) => git.with_runtime_directory(runtime_directory),
+            None => git,
+        }
     }
 }
 
@@ -1966,6 +1972,16 @@ impl Git for SandboxGit {
 
     async fn checkout(&self, repo_path: &str, options: &GitCheckoutOptions) -> Result<()> {
         self.derived().checkout(repo_path, options).await
+    }
+
+    async fn set_ambient_credentials(
+        &self,
+        repo_path: &str,
+        credentials: Option<&GitCredentials>,
+    ) -> Result<()> {
+        self.derived()
+            .set_ambient_credentials(repo_path, credentials)
+            .await
     }
 }
 

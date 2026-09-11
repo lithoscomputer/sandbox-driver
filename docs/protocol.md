@@ -687,8 +687,10 @@ A host sends it when the sandbox declares `git.native`; for a sandbox
 that does not, the host's exec-derived clone is the same implementation
 the plugin would run, so the host runs it locally through `exec/stream`.
 Both transports therefore select one implementation. Every other git
-operation (status, add, commit, push, pull, branches, checkout) is
-exec-derived on the host and has no wire method.
+operation (status, add, commit, push, pull, branches, checkout, and the
+ambient credential store) is exec-derived on the host and has no wire
+method; the host places a sandbox's credential store under the
+`runtime_directory` the plugin reported at create or attach.
 
 | method | params | result |
 | --- | --- | --- |

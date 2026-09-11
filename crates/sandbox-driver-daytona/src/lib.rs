@@ -126,7 +126,7 @@ const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
 const WORKING_DIRECTORY_LABEL: &str = "sh.sandbox-driver.working-directory";
 const FALLBACK_WORKING_DIR: &str = "/home/daytona";
 const RUNTIME_DIRECTORY_PARENT: &str = "/tmp/sandbox-driver";
-const RUNTIME_DIRECTORY: &str = "/tmp/sandbox-driver/runtime";
+pub(crate) const RUNTIME_DIRECTORY: &str = "/tmp/sandbox-driver/runtime";
 const CREATE_TIMEOUT: Duration = Duration::from_secs(600);
 /// Dockerfile sources build the image during create; real builds exceed
 /// shorter budgets (fabro-sandbox landed on 30 minutes).

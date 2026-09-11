@@ -724,6 +724,16 @@ impl Git for RecordingGit {
             .checkout(repo_path, options)
             .await
     }
+
+    async fn set_ambient_credentials(
+        &self,
+        repo_path: &str,
+        credentials: Option<&sandbox_driver::GitCredentials>,
+    ) -> Result<()> {
+        DerivedGit::new(self.inner.exec())
+            .set_ambient_credentials(repo_path, credentials)
+            .await
+    }
 }
 
 #[tokio::test]

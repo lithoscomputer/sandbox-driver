@@ -1,6 +1,6 @@
 //! Scripted [`Exec`] for unit-testing exec-derived implementations.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -18,6 +18,7 @@ pub(crate) struct ScriptedExec {
     responses: Mutex<VecDeque<ExecResult>>,
     commands:  Mutex<Vec<String>>,
     timeouts:  Mutex<Vec<Option<Duration>>>,
+    envs:      Mutex<Vec<BTreeMap<String, String>>>,
 }
 
 impl ScriptedExec {
@@ -26,6 +27,7 @@ impl ScriptedExec {
             responses: Mutex::new(responses.into_iter().collect()),
             commands:  Mutex::new(Vec::new()),
             timeouts:  Mutex::new(Vec::new()),
+            envs:      Mutex::new(Vec::new()),
         }
     }
 
@@ -62,6 +64,11 @@ impl ScriptedExec {
     pub(crate) fn timeouts(&self) -> Vec<Option<Duration>> {
         self.timeouts.lock().expect("timeouts lock").clone()
     }
+
+    /// The environment each command ran with, in order.
+    pub(crate) fn envs(&self) -> Vec<BTreeMap<String, String>> {
+        self.envs.lock().expect("envs lock").clone()
+    }
 }
 
 fn recorded(spec: &ExecSpec) -> String {
@@ -89,6 +96,7 @@ impl Exec for ScriptedExec {
             .lock()
             .expect("timeouts lock")
             .push(spec.timeout);
+        self.envs.lock().expect("envs lock").push(spec.env.clone());
         self.responses
             .lock()
             .expect("responses lock")
