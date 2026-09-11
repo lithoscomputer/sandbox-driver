@@ -20,6 +20,10 @@ const TEST_SNAPSHOT: &str = "daytona-medium";
 const TEST_GIT_REPOSITORY: &str = "https://github.com/octocat/Hello-World.git";
 
 #[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::print_stderr,
+    reason = "the per-check report is the test's evidence"
+)]
 async fn daytona_provider_passes_conformance() {
     if env::var("DAYTONA_API_KEY").is_err() {
         // No credentials; nothing to verify.
@@ -35,7 +39,12 @@ async fn daytona_provider_passes_conformance() {
     let mut conformance = Conformance::new(Arc::new(provider), specs);
     conformance.check_timeout = Duration::from_secs(900);
     conformance.wait.deadline = Some(Duration::from_secs(300));
-    let report = conformance.run().await;
+    // One named check reruns alone while it is being fixed.
+    let report = match env::var("SANDBOX_DRIVER_DAYTONA_CONFORMANCE_CHECK") {
+        Ok(only) => conformance.run_matching(|name| name == only).await,
+        Err(_) => conformance.run().await,
+    };
+    eprintln!("{report}");
     report.assert_pass();
 }
 
