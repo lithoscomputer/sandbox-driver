@@ -48,6 +48,7 @@ mod event;
 mod exec;
 mod fs;
 mod git;
+mod git_retry;
 mod grace;
 mod id;
 mod logs;
@@ -95,6 +96,10 @@ pub use fs::{DirEntry, FileKind, FileMetadata, Filesystem};
 pub use git::{
     Git, GitBranches, GitCheckoutOptions, GitCloneOptions, GitCommitOptions, GitCredentials,
     GitFacet, GitPushOptions, GitStatus,
+};
+pub use git_retry::{
+    GitAttempt, GitBackoff, GitRetryError, GitRetryPolicy, GitRetryReason, GitRetryReport,
+    REPLICATION_HORIZON, retry_git, retry_reason,
 };
 pub use grace::run_with_stop_grace;
 pub use id::{InvalidIdError, ProviderKind, SandboxId, ServiceId, SnapshotId, VolumeId};

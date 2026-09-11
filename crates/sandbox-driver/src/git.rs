@@ -1,5 +1,5 @@
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -185,16 +185,31 @@ impl Git for GitFacet<'_> {
 #[derive(Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct GitCredentials {
-    pub username: String,
-    pub password: String,
+    pub username:  String,
+    pub password:  String,
+    /// When the credential was minted, for a short-lived token. A remote
+    /// can reject a token for a few seconds after its mint while it
+    /// replicates; [`crate::retry_git`] retries a rejection only while the
+    /// credential is that fresh. `None` is a fixed credential, which
+    /// waiting cannot make valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minted_at: Option<SystemTime>,
 }
 
 impl GitCredentials {
     pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
         Self {
-            username: username.into(),
-            password: password.into(),
+            username:  username.into(),
+            password:  password.into(),
+            minted_at: None,
         }
+    }
+
+    /// Records when a short-lived token was minted; see the field.
+    #[must_use]
+    pub fn minted_at(mut self, minted_at: SystemTime) -> Self {
+        self.minted_at = Some(minted_at);
+        self
     }
 }
 
@@ -203,6 +218,7 @@ impl fmt::Debug for GitCredentials {
         f.debug_struct("GitCredentials")
             .field("username", &self.username)
             .field("password", &"<redacted>")
+            .field("minted_at", &self.minted_at)
             .finish()
     }
 }
