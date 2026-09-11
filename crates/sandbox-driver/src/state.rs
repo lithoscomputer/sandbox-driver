@@ -54,7 +54,7 @@ impl SandboxState {
 /// Constructed with [`SandboxStatus::new`]; optional fields are set by
 /// mutating the public fields. The struct is `#[non_exhaustive]` so fields
 /// can be added compatibly.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct SandboxStatus {
     pub id:                  SandboxId,

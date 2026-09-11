@@ -237,18 +237,16 @@ pub struct GitAttempt {
     pub attempt:      u32,
     pub started_at:   SystemTime,
     pub duration:     Duration,
-    /// Why this failed attempt was repeated; `None` for the successful
-    /// attempt and for a final failure.
+    /// The class a failed attempt was retried under, or the class a final
+    /// failure was given; `None` for the successful attempt and for a
+    /// failure the policy never retries.
     pub retry_reason: Option<GitRetryReason>,
-    /// The failure this attempt ended in, for every attempt but the last:
-    /// the last attempt's failure is [`GitRetryError::error`].
+    /// The failure this attempt ended in, for every failed attempt but the
+    /// last: the last attempt's failure is [`GitRetryError::error`], and
+    /// the successful attempt of a [`GitRetryReport`] has none. Whether an
+    /// attempt succeeded is positional: only the last attempt of a report
+    /// did.
     pub failure:      Option<Error>,
-}
-
-impl GitAttempt {
-    pub fn succeeded(&self) -> bool {
-        self.failure.is_none() && self.retry_reason.is_none()
-    }
 }
 
 /// A completed retried operation: the value and how many attempts it took.
@@ -478,7 +476,8 @@ mod tests {
             Some(GitRetryReason::TokenReplication)
         );
         assert!(report.attempts[0].failure.is_some());
-        assert!(report.attempts[2].succeeded());
+        assert!(report.attempts[2].failure.is_none());
+        assert!(report.attempts[2].retry_reason.is_none());
     }
 
     #[tokio::test(start_paused = true)]
