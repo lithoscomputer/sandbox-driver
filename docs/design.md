@@ -351,8 +351,16 @@ provider an application holds for a plugin: it implements `SandboxProvider`
 (and the snapshot and volume services the plugin declares) by forwarding
 each call to the live generation, and `current()` serializes replacement for
 new work under a fixed configuration and frozen credential environment. It
-never replays an uncertain call. Applications bound the number of
-supervisors and reconstruct handles for the new generation.
+never replays an uncertain call. Generations are numbered from 1 in launch
+order (`PluginGeneration::number`), so an application that keeps handles
+records the number each came from and fences a resource once when a later
+call answers from a higher one. Every generation is health-probed before it
+serves — an unreachable backend or a rejected credential ends the launch
+with the probe's report — and a replacement that reports a different
+resource namespace (`ProviderHealth::identity`) than the first generation is
+refused, so recovery never continues into another account. Applications
+bound the number of supervisors and reconstruct handles for the new
+generation.
 
 ### Snapshots and volumes
 
