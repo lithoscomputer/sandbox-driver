@@ -44,5 +44,5 @@ pub use diagnostics::{ClientDiagnostics, ServerDiagnostics, TransportDiagnostics
 pub use discovery::{PluginConfig, PluginLaunch, file_sha256, launch_plugin};
 pub use limits::TransportLimits;
 pub use server::{serve, serve_stdio, serve_with_limits};
-pub use supervisor::PluginSupervisor;
+pub use supervisor::{PluginGeneration, PluginSupervisor};
 pub use wire::{Message, WireError, WireErrorData};
