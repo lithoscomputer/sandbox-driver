@@ -14,10 +14,10 @@ use std::time::Duration;
 use sandbox_driver::{
     Capabilities, CaptureStats, CorrelationId, DirEntry, Error, Event, ExecResult, ExecSpec,
     FileMetadata, ForkOptions, GitCloneOptions, LifecycleTimers, LogSource, NetworkPolicy,
-    OneShotSpec, OutputSanitization, PlatformInfo, ProviderKind, PtyOptions, PtySize, Resources,
-    SandboxFilter, SandboxId, SandboxKind, SandboxSnapshotOptions, SandboxSource, SandboxSpec,
-    SandboxStatus, SnapshotId, SnapshotMode, SnapshotSource, SnapshotSpec, SpawnSpec, StopLevel,
-    Termination, VncConnection, VolumeMount,
+    OneShotSpec, OutputLoss, OutputSanitization, PlatformInfo, ProviderKind, PtyOptions, PtySize,
+    Resources, SandboxFilter, SandboxId, SandboxKind, SandboxSnapshotOptions, SandboxSource,
+    SandboxSpec, SandboxStatus, SnapshotId, SnapshotMode, SnapshotSource, SnapshotSpec, SpawnSpec,
+    StopLevel, Termination, VncConnection, VolumeMount,
 };
 use serde::{Deserialize, Serialize};
 
@@ -518,6 +518,10 @@ pub struct ExecStreamResult {
     pub live_streaming:    bool,
     pub stdout_capture:    CaptureStats,
     pub stderr_capture:    CaptureStats,
+    /// Output the plugin's transport lost before it reached the channel.
+    /// Additive: a plugin from before the field reports zero.
+    #[serde(default)]
+    pub output_loss:       OutputLoss,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

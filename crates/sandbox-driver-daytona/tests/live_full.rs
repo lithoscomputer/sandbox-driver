@@ -11,10 +11,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, process};
 
 use sandbox_driver::{
-    Action, Capability, Error, ExecSpec, Git, GitCheckoutOptions, GitCloneOptions,
-    GitCommitOptions, LifecycleTimers, LogSink, LogSource, NetworkPolicy, Resources, SandboxKind,
-    SandboxProvider, SandboxSnapshotOptions, SandboxSource, SandboxSpec, SandboxState, SnapshotId,
-    SnapshotMode, SnapshotSource, SnapshotSpec, SnapshotState, WaitOptions, wait_for_state,
+    Action, Capability, Error, ExecControls, ExecSpec, ExecStreamingResult, Git,
+    GitCheckoutOptions, GitCloneOptions, GitCommitOptions, LifecycleTimers, LogSink, LogSource,
+    NetworkPolicy, Resources, SandboxKind, SandboxProvider, SandboxSnapshotOptions, SandboxSource,
+    SandboxSpec, SandboxState, SnapshotId, SnapshotMode, SnapshotSource, SnapshotSpec,
+    SnapshotState, WaitOptions, wait_for_state,
 };
 use sandbox_driver_daytona::DaytonaProvider;
 use tokio::time;
@@ -410,6 +411,179 @@ async fn wall_clock_ttl_and_container_auto_pause_behavior() {
 
     sandbox.delete().await.expect("delete");
     outcome.expect("live lifecycle timer behavior");
+}
+
+/// A fast run of small writes — a download's progress meter — is where
+/// the toolbox tears the encoded output stream. The exec must complete
+/// with the command's own exit status either way; whatever the decoder
+/// had to discard is reported on the result, so the test prints the loss
+/// rather than asserting zero (the toolbox decides that, not the driver).
+/// A lossless run must decode exactly, which pins the two-encoder path.
+#[tokio::test(flavor = "multi_thread")]
+#[expect(
+    clippy::print_stderr,
+    reason = "the observed loss per run is the test's evidence"
+)]
+async fn fast_progress_output_completes_and_reports_loss() {
+    if env::var("DAYTONA_API_KEY").is_err() {
+        return;
+    }
+    init_diagnostics();
+    let provider = DaytonaProvider::connect().await.expect("connect");
+    let spec = SandboxSpec::new(SandboxSource::Snapshot {
+        id: SnapshotId::try_new(TEST_SNAPSHOT).expect("valid snapshot id"),
+    })
+    .name(unique("sd-live-progress"))
+    .ephemeral(true);
+    let sandbox = provider.create(&spec, None).await.expect("create");
+
+    let outcome = async {
+        // curl repaints its progress bar on stderr as each chunk lands;
+        // the rate limit keeps it repainting for a dozen seconds. The
+        // byte count on stdout proves the download was the real thing.
+        let download = run_fast(
+            sandbox.as_ref(),
+            "download",
+            "curl -# -f -L --limit-rate 8M -o /dev/null -w '%{size_download}' \
+             'https://ash-speed.hetzner.com/100MB.bin'",
+        )
+        .await?;
+        if !download.result.success() {
+            return Err(format!(
+                "download exited {:?} ({:?}): {}",
+                download.result.exit_code,
+                download.result.termination,
+                download.result.stderr_lossy()
+            ));
+        }
+        if download.result.stdout_lossy().trim() != "104857600" && !download.output_loss.is_lossy() {
+            return Err(format!(
+                "download reported {:?} bytes, expected the whole 100 MiB",
+                download.result.stdout_lossy()
+            ));
+        }
+
+        // A synthetic burst: thirty thousand fifteen-byte writes.
+        let burst = run_fast(
+            sandbox.as_ref(),
+            "burst",
+            "for i in $(seq 1 30000); do printf 'progress %5d\\r' \"$i\"; done; printf 'done\\n'",
+        )
+        .await?;
+        let expected: Vec<u8> = (1..=30000)
+            .flat_map(|i| format!("progress {i:5}\r").into_bytes())
+            .chain(*b"done\n")
+            .collect();
+        check_burst("burst", &burst, &expected, &[])?;
+
+        // Both encoders write records to the one pipe at once.
+        let interleaved = run_fast(
+            sandbox.as_ref(),
+            "interleaved",
+            "for i in $(seq 1 20000); do printf 'out %5d\\r' \"$i\"; printf 'err %5d\\r' \"$i\" >&2; done",
+        )
+        .await?;
+        let expected_out: Vec<u8> = (1..=20000)
+            .flat_map(|i| format!("out {i:5}\r").into_bytes())
+            .collect();
+        let expected_err: Vec<u8> = (1..=20000)
+            .flat_map(|i| format!("err {i:5}\r").into_bytes())
+            .collect();
+        check_burst("interleaved", &interleaved, &expected_out, &expected_err)?;
+
+        // The case that tore in fabro: Playwright's browser download and
+        // its progress bar. Skipped, and said so, where the snapshot has
+        // no npx.
+        let playwright = run_fast(
+            sandbox.as_ref(),
+            "playwright",
+            "if ! command -v npx >/dev/null; then echo 'npx missing' >&2; exit 97; fi; \
+             npx -y playwright install chromium 2>&1",
+        )
+        .await?;
+        match (playwright.result.termination, playwright.result.exit_code) {
+            (sandbox_driver::Termination::Exited, Some(0)) => {}
+            (sandbox_driver::Termination::Exited, Some(97)) => {
+                eprintln!("fast-progress playwright: skipped, the snapshot has no npx");
+            }
+            (termination, code) => {
+                return Err(format!(
+                    "playwright install exited {code:?} ({termination:?}): {}",
+                    playwright.result.stdout_lossy()
+                ));
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    sandbox.delete().await.expect("delete");
+    outcome.expect("live fast progress output");
+}
+
+/// A burst must exit cleanly; a lossless one must decode exactly, and a
+/// lossy one must have fewer bytes than were written, never more.
+fn check_burst(
+    label: &str,
+    result: &ExecStreamingResult,
+    expected_stdout: &[u8],
+    expected_stderr: &[u8],
+) -> Result<(), String> {
+    if !result.result.success() {
+        return Err(format!(
+            "{label} exited {:?} ({:?})",
+            result.result.exit_code, result.result.termination
+        ));
+    }
+    let decoded = result.result.stdout.len() + result.result.stderr.len();
+    let written = expected_stdout.len() + expected_stderr.len();
+    if result.output_loss.is_lossy() {
+        if decoded >= written {
+            return Err(format!(
+                "{label}: a lossy run still decoded {decoded} of {written} bytes"
+            ));
+        }
+    } else if result.result.stdout != expected_stdout || result.result.stderr != expected_stderr {
+        return Err(format!(
+            "{label}: a lossless run decoded {decoded} bytes, expected {written}"
+        ));
+    }
+    Ok(())
+}
+
+/// Runs `script` with buffered retention and reports its exit, sizes,
+/// and decoder loss; a transport tear must surface there, not as an error.
+#[expect(
+    clippy::print_stderr,
+    reason = "the observed loss per run is the test's evidence"
+)]
+async fn run_fast(
+    sandbox: &dyn sandbox_driver::Sandbox,
+    label: &str,
+    script: &str,
+) -> Result<ExecStreamingResult, String> {
+    let started = Instant::now();
+    let result = sandbox
+        .exec()
+        .run_streaming(
+            &ExecSpec::bash(script).timeout(Duration::from_secs(600)),
+            ExecControls::buffered(),
+        )
+        .await
+        .map_err(|error| format!("{label}: {error}"))?;
+    eprintln!(
+        "fast-progress {label}: exit={:?} termination={:?} elapsed={:?} stdout_observed={} \
+         stderr_observed={} truncated={} dropped_frames={} dropped_bytes={}",
+        result.result.exit_code,
+        result.result.termination,
+        started.elapsed(),
+        result.stdout_capture.observed_bytes,
+        result.stderr_capture.observed_bytes,
+        result.stdout_capture.truncated || result.stderr_capture.truncated,
+        result.output_loss.dropped_frames,
+        result.output_loss.dropped_bytes,
+    );
+    Ok(result)
 }
 
 #[tokio::test(flavor = "multi_thread")]

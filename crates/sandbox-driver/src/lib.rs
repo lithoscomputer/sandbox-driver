@@ -90,8 +90,8 @@ pub use event::{
 };
 pub use exec::{
     BASH_ENV_VAR, CaptureStats, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
-    OutputSink, OutputStream, SpawnSpec, StderrTail, StdinReader, StdinSource, StdioProcess,
-    StdioProcessHandle, StopLevel, Termination, feed_stdin, stop_signal,
+    OutputLoss, OutputSink, OutputStream, SpawnSpec, StderrTail, StdinReader, StdinSource,
+    StdioProcess, StdioProcessHandle, StopLevel, Termination, feed_stdin, stop_signal,
 };
 pub use fs::{DirEntry, FileKind, FileMetadata, Filesystem};
 pub use git::{

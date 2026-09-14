@@ -335,8 +335,25 @@ Control contracts, normative: **stops are signals, not a policy.** `term` sends 
 `ExecControls::default()` retains no output copy. `Some(n)` requests finite
 head/tail capture for each stream. `ExecControls::buffered()` requests up to
 16 MiB per stream. `Exec::run` returns a complete value or a limit error;
-`ExecStreamingResult::into_complete()` refuses omitted or abandoned output.
-Omitted capture and failed delivery remain separate accounting facts.
+`ExecStreamingResult::into_complete()` refuses omitted, abandoned, or lost
+output. Omitted capture, failed delivery, and transport loss remain separate
+accounting facts.
+
+**Daytona's encoded exec is lossy, and says so.** The toolbox carries command
+output as text, so a Bash wrapper encodes every chunk of stdout and stderr as
+a bounded ASCII record (`printf '%s%q\n'` with a stream tag, under 512 bytes)
+and the provider decodes the records before sanitization, delivery, and
+retention accounting. Under a fast run of small writes the toolbox tears that
+stream: a record arrives without its tag, two arrive glued, or the output ends
+inside one. The decoder never fails the exec for it. It discards the
+unreadable record through its newline, resyncs on the next record, and counts
+what it threw away in `ExecStreamingResult::output_loss` (`dropped_frames`,
+`dropped_bytes`, encoded bytes); because the lost record's stream is unknown,
+a loss also sets `truncated` on both captures, so `Exec::run` and
+`into_complete()` refuse it while `run_streaming` completes with the command's
+exit status and the report. The report crosses the plugin wire unchanged. A
+tear that leaves a well-formed record is undetectable and decodes to wrong
+bytes; the loss counts are a floor, never silently zero.
 
 Plugin transport limits and their accounting are specified in protocol §2.2.
 A local hard-cancel drain deadline does not prove remote termination or cleanup.

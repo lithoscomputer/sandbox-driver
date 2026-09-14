@@ -16,8 +16,8 @@ use sandbox_driver::{
     SnapshotSource, SnapshotSpec, Termination,
 };
 use sandbox_driver_protocol::methods::{
-    ForkOptionsDto, FsWriteParams, GitCloneParams, HealthResult, SandboxSnapshotOptionsDto,
-    SandboxSpecDto, SnapshotSourceDto, SnapshotSpecDto,
+    ExecStreamResult, ForkOptionsDto, FsWriteParams, GitCloneParams, HealthResult,
+    SandboxSnapshotOptionsDto, SandboxSpecDto, SnapshotSourceDto, SnapshotSpecDto,
 };
 
 #[test]
@@ -304,6 +304,45 @@ fn duration_fields_use_serde_default_encoding_pinned() {
         json.contains("\"auto_stop_after_idle\":{\"secs\":90,\"nanos\":0}"),
         "json: {json}"
     );
+}
+
+/// The exec/stream result before `output_loss` existed. A host must read
+/// it as a lossless run; a plugin that lost output says so in the
+/// additive object, whose fields default to zero on either side.
+#[test]
+fn pre_loss_exec_stream_results_still_decode() {
+    let legacy: ExecStreamResult = serde_json::from_str(
+        r#"{
+        "result": {"exit_code": 0, "termination": "exited", "duration_ms": 5},
+        "streams_separated": true,
+        "live_streaming": true,
+        "stdout_capture": {"observed_bytes": 3, "retained_bytes": 3, "omitted_bytes": 0},
+        "stderr_capture": {"observed_bytes": 0, "retained_bytes": 0, "omitted_bytes": 0}
+    }"#,
+    )
+    .expect("pre-loss exec/stream result");
+    assert!(!legacy.output_loss.is_lossy());
+    assert_eq!(legacy.output_loss.dropped_frames, 0);
+    assert_eq!(legacy.output_loss.dropped_bytes, 0);
+
+    let lossy: ExecStreamResult = serde_json::from_str(
+        r#"{
+        "result": {"exit_code": 0, "termination": "exited", "duration_ms": 5},
+        "streams_separated": true,
+        "live_streaming": true,
+        "stdout_capture": {"observed_bytes": 3, "retained_bytes": 3, "omitted_bytes": 0,
+                           "truncated": true},
+        "stderr_capture": {"observed_bytes": 0, "retained_bytes": 0, "omitted_bytes": 0,
+                           "truncated": true},
+        "output_loss": {"dropped_frames": 2, "dropped_bytes": 391, "future_field": 1}
+    }"#,
+    )
+    .expect("lossy exec/stream result");
+    assert_eq!(lossy.output_loss.dropped_frames, 2);
+    assert_eq!(lossy.output_loss.dropped_bytes, 391);
+    let encoded = serde_json::to_value(&lossy).expect("encode exec/stream result");
+    assert_eq!(encoded["output_loss"]["dropped_frames"], 2);
+    assert_eq!(encoded["output_loss"]["dropped_bytes"], 391);
 }
 
 #[test]
