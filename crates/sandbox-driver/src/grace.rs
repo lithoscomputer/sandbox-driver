@@ -146,7 +146,7 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::exec::{CaptureStats, Exec, ExecResult};
+    use crate::exec::{CaptureStats, Exec, ExecResult, OutputLoss};
 
     /// A command that ignores TERM and ends only on KILL, recording what
     /// it saw.
@@ -190,6 +190,7 @@ mod tests {
                 live_streaming: true,
                 stdout_capture: CaptureStats::default(),
                 stderr_capture: CaptureStats::default(),
+                output_loss: OutputLoss::default(),
             })
         }
     }
@@ -345,6 +346,7 @@ mod tests {
                     live_streaming:    true,
                     stdout_capture:    CaptureStats::default(),
                     stderr_capture:    CaptureStats::default(),
+                    output_loss:       OutputLoss::default(),
                 })
             }
         }

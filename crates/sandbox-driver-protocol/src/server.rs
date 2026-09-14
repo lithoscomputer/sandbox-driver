@@ -895,6 +895,7 @@ fn stream_result(streaming: &ExecStreamingResult) -> m::ExecStreamResult {
         live_streaming:    streaming.live_streaming,
         stdout_capture:    streaming.stdout_capture,
         stderr_capture:    streaming.stderr_capture,
+        output_loss:       streaming.output_loss,
     }
 }
 

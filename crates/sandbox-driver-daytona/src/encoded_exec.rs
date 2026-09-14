@@ -1,13 +1,23 @@
 //! Preserve exact exec bytes through Daytona's text-only command output.
 //! Bash emits bounded, ASCII-only records before bytes reach the toolbox.
 //! Decoding happens before sanitization, delivery, and retention accounting.
+//!
+//! The toolbox is lossy under a fast run of small writes: a record arrives
+//! without its leading tag, two records arrive glued together, or the
+//! output ends inside one. The decoder never fails the exec for that. It
+//! discards the unreadable record through its newline, resyncs on the next
+//! record, and counts every discarded record and byte into
+//! [`ExecStreamingResult::output_loss`]; a loss also marks both captures
+//! truncated, because the torn record's stream is unknown. The loss is
+//! reported, never hidden. A tear that happens to leave a well-formed
+//! record is not detectable and decodes to wrong bytes.
 
-use std::io;
+use std::result::Result as StdResult;
 use std::sync::Arc;
 
 use sandbox_driver::{
     Capability, Error, Exec, ExecControls, ExecSpec, ExecStreamingResult, OutputCaptureBuffer,
-    OutputSanitization, OutputSanitizer, OutputSink, OutputStream, Result,
+    OutputLoss, OutputSanitization, OutputSanitizer, OutputSink, OutputStream, Result,
 };
 use tokio::sync::Mutex;
 
@@ -77,16 +87,10 @@ fn encoded_spec(spec: &ExecSpec) -> ExecSpec {
     encoded
 }
 
-fn invalid_frame(message: &'static str) -> Error {
-    Error::io(
-        "decoding Daytona output",
-        io::Error::new(io::ErrorKind::InvalidData, message),
-    )
-}
-
 /// Decode the ASCII subset emitted by Bash printf %q with LC_ALL=C.
 /// This is data decoding; no shell evaluates returned command output.
-fn decode_quoted(mut input: &[u8]) -> Result<Vec<u8>> {
+/// The error names what made the body unreadable; the caller counts it.
+fn decode_quoted(mut input: &[u8]) -> StdResult<Vec<u8>, &'static str> {
     if input == b"''" {
         return Ok(Vec::new());
     }
@@ -95,7 +99,7 @@ fn decode_quoted(mut input: &[u8]) -> Result<Vec<u8>> {
         input = input
             .strip_prefix(b"$'")
             .and_then(|value| value.strip_suffix(b"'"))
-            .ok_or_else(|| invalid_frame("unterminated quoted output"))?;
+            .ok_or("unterminated quoted output")?;
     }
     let mut decoded = Vec::with_capacity(input.len());
     let mut i = 0;
@@ -104,14 +108,12 @@ fn decode_quoted(mut input: &[u8]) -> Result<Vec<u8>> {
         i += 1;
         if byte != b'\\' {
             if !(0x20..=0x7e).contains(&byte) {
-                return Err(invalid_frame("non-ASCII output frame"));
+                return Err("non-ASCII output frame");
             }
             decoded.push(byte);
             continue;
         }
-        let escaped = *input
-            .get(i)
-            .ok_or_else(|| invalid_frame("incomplete output escape"))?;
+        let escaped = *input.get(i).ok_or("incomplete output escape")?;
         i += 1;
         if !ansi {
             decoded.push(escaped);
@@ -138,33 +140,62 @@ fn decode_quoted(mut input: &[u8]) -> Result<Vec<u8>> {
                         _ => break,
                     }
                 }
-                u8::try_from(value).map_err(|_| invalid_frame("output escape exceeds a byte"))?
+                u8::try_from(value).map_err(|_| "output escape exceeds a byte")?
             }
-            _ => return Err(invalid_frame("unknown output escape")),
+            _ => return Err("unknown output escape"),
         };
         decoded.push(value);
     }
     Ok(decoded)
 }
 
+// Why the decoder discarded a record. The first fault of an exec is
+// logged with its reason; the totals are logged when the exec finishes.
+/// Longer than any record the encoder writes: records glued together.
+const OVERSIZED_FRAME: &str = "output frame is too large";
+/// The leading stream tag is missing: the record's head was lost.
+const MISSING_TAG: &str = "output frame has no stream tag";
+/// The output ended inside a record.
+const UNTERMINATED_FRAME: &str = "output ended inside a frame";
+
 struct FramedOutput {
-    pending: Vec<u8>,
-    streams: [(OutputSanitizer, OutputCaptureBuffer); 2],
-    sink:    Option<OutputSink>,
+    pending:    Vec<u8>,
+    /// A discarded record has not reached its newline yet; the bytes up
+    /// to and including it belong to the same loss.
+    discarding: bool,
+    loss:       OutputLoss,
+    streams:    [(OutputSanitizer, OutputCaptureBuffer); 2],
+    sink:       Option<OutputSink>,
 }
 
 impl FramedOutput {
     fn new(policy: OutputSanitization, controls: &ExecControls) -> Self {
         Self {
-            pending: Vec::new(),
-            streams: [0, 1].map(|_| {
+            pending:    Vec::new(),
+            discarding: false,
+            loss:       OutputLoss::default(),
+            streams:    [0, 1].map(|_| {
                 (
                     OutputSanitizer::new(policy),
                     OutputCaptureBuffer::new(controls.retained_output_limit),
                 )
             }),
-            sink:    controls.sink.clone(),
+            sink:       controls.sink.clone(),
         }
+    }
+
+    /// Counts one discarded record of `bytes` encoded bytes. The exec
+    /// goes on; the loss reaches the result and the log.
+    fn discard(&mut self, reason: &'static str, bytes: usize) {
+        if !self.loss.is_lossy() {
+            tracing::warn!(
+                reason,
+                frame_bytes = bytes,
+                "output frame discarded; decoding resynced at the next newline"
+            );
+        }
+        self.loss.dropped_frames += 1;
+        self.loss.dropped_bytes += u64::try_from(bytes).unwrap_or(u64::MAX);
     }
 
     async fn emit(&mut self, index: usize, raw: &[u8]) -> Result<()> {
@@ -180,6 +211,9 @@ impl FramedOutput {
         Ok(())
     }
 
+    /// Decodes encoded stdout. A record the decoder cannot read is
+    /// discarded through its newline and counted; decoding resumes at
+    /// the next record, so the exec never fails for a torn transport.
     async fn push(&mut self, stream: OutputStream, mut bytes: &[u8]) -> Result<()> {
         if stream == OutputStream::Stderr {
             // Wrapper startup failures remain ordinary stderr diagnostics.
@@ -188,38 +222,55 @@ impl FramedOutput {
         while !bytes.is_empty() {
             let end = bytes.iter().position(|byte| *byte == b'\n');
             let take = end.map_or(bytes.len(), |end| end + 1);
-            if self.pending.len() + take > MAX_FRAME_BYTES {
-                return Err(Error::io(
-                    "decoding Daytona output",
-                    io::Error::new(io::ErrorKind::InvalidData, "output frame is too large"),
-                ));
-            }
-            self.pending.extend_from_slice(&bytes[..take]);
+            let segment = &bytes[..take];
             bytes = &bytes[take..];
-            if end.is_some() {
-                if self.pending == b"\n" {
-                    self.pending.clear();
-                    continue;
-                }
-                let index = match self.pending.first() {
-                    Some(b'O') => 0,
-                    Some(b'E') => 1,
-                    _ => {
-                        return Err(Error::io(
-                            "decoding Daytona output",
-                            io::Error::new(io::ErrorKind::InvalidData, "invalid output frame"),
-                        ));
-                    }
-                };
-                let raw = decode_quoted(&self.pending[1..self.pending.len() - 1])?;
+            if self.discarding {
+                self.loss.dropped_bytes += u64::try_from(take).unwrap_or(u64::MAX);
+                self.discarding = end.is_none();
+                continue;
+            }
+            if self.pending.len() + take > MAX_FRAME_BYTES {
+                self.discard(OVERSIZED_FRAME, self.pending.len() + take);
                 self.pending.clear();
-                self.emit(index, &raw).await?;
+                self.discarding = end.is_none();
+                continue;
+            }
+            self.pending.extend_from_slice(segment);
+            if end.is_none() {
+                continue;
+            }
+            if self.pending == b"\n" {
+                self.pending.clear();
+                continue;
+            }
+            let index = match self.pending.first() {
+                Some(b'O') => Some(0),
+                Some(b'E') => Some(1),
+                _ => None,
+            };
+            let decoded = index.map(|index| {
+                (
+                    index,
+                    decode_quoted(&self.pending[1..self.pending.len() - 1]),
+                )
+            });
+            let record_bytes = self.pending.len();
+            self.pending.clear();
+            match decoded {
+                Some((index, Ok(raw))) => self.emit(index, &raw).await?,
+                Some((_, Err(reason))) => self.discard(reason, record_bytes),
+                None => self.discard(MISSING_TAG, record_bytes),
             }
         }
         Ok(())
     }
 
     async fn finish(&mut self, mut result: ExecStreamingResult) -> Result<ExecStreamingResult> {
+        if !self.pending.is_empty() {
+            let bytes = self.pending.len();
+            self.pending.clear();
+            self.discard(UNTERMINATED_FRAME, bytes);
+        }
         for (index, (sanitizer, capture)) in self.streams.iter_mut().enumerate() {
             let final_bytes = sanitizer.finish();
             capture.push(&final_bytes);
@@ -235,14 +286,23 @@ impl FramedOutput {
         }
         result.result.stdout = self.streams[0].1.to_bytes();
         result.result.stderr = self.streams[1].1.to_bytes();
+        // A discarded record's stream is unknown, so a loss truncates both.
         let truncated = result.stdout_capture.truncated
             || result.stderr_capture.truncated
-            || !self.pending.is_empty();
+            || self.loss.is_lossy();
         result.stdout_capture = self.streams[0].1.stats();
         result.stderr_capture = self.streams[1].1.stats();
         result.stdout_capture.truncated |= truncated;
         result.stderr_capture.truncated |= truncated;
+        result.output_loss = self.loss;
         result.streams_separated = true;
+        if self.loss.is_lossy() {
+            tracing::warn!(
+                dropped_frames = self.loss.dropped_frames,
+                dropped_bytes = self.loss.dropped_bytes,
+                "output decoding lost frames; the captures are marked truncated"
+            );
+        }
         Ok(result)
     }
 }
@@ -515,27 +575,104 @@ sys.exit(7)
         assert_eq!(result.result.stdout, spec.stdin.expect("fixed input"));
     }
 
-    #[tokio::test]
-    async fn incomplete_frames_report_loss_and_oversized_frames_are_bounded() {
+    /// Feeds a scripted encoded stream to a fresh decoder, `chunk` bytes
+    /// per push, and finishes it as a clean exit.
+    async fn decode(stream: &[u8], chunk: usize) -> ExecStreamingResult {
         let mut framed = FramedOutput::new(OutputSanitization::Raw, &ExecControls::buffered());
+        for fragment in stream.chunks(chunk) {
+            framed
+                .push(OutputStream::Stdout, fragment)
+                .await
+                .expect("a torn stream never fails the exec");
+        }
         framed
-            .push(OutputStream::Stdout, b"Ow")
-            .await
-            .expect("partial frame");
-        let result = framed
             .finish(ExecStreamingResult::new(ExecResult::new(
                 Termination::Exited,
                 Some(0),
                 Duration::ZERO,
             )))
             .await
-            .expect("partial capture reports loss");
+            .expect("capture completed")
+    }
+
+    fn assert_loss(result: &ExecStreamingResult, frames: u64, bytes: u64) {
+        assert_eq!(result.output_loss.dropped_frames, frames, "{result:?}");
+        assert_eq!(result.output_loss.dropped_bytes, bytes, "{result:?}");
         assert!(result.stdout_capture.truncated);
+        assert!(result.stderr_capture.truncated);
+        assert!(result.result.success(), "the exec still completes");
         assert!(
-            framed
-                .push(OutputStream::Stdout, &vec![b'A'; MAX_FRAME_BYTES])
-                .await
-                .is_err()
+            result.clone().into_complete().is_err(),
+            "a lossy result is not a complete value"
         );
+    }
+
+    #[tokio::test]
+    async fn a_clean_stream_reports_zero_loss() {
+        for chunk in [1, 2, 7, 64] {
+            let result = decode(b"Oabc\nE$'x\\n'\nOdef\n", chunk).await;
+            assert_eq!(result.result.stdout, b"abcdef", "chunk {chunk}");
+            assert_eq!(result.result.stderr, b"x\n", "chunk {chunk}");
+            assert_eq!(result.output_loss, OutputLoss::default());
+            assert!(!result.output_loss.is_lossy());
+            assert!(!result.stdout_capture.truncated);
+            assert!(!result.stderr_capture.truncated);
+            assert_eq!(result.stdout_capture.observed_bytes, 6);
+            assert_eq!(result.stderr_capture.observed_bytes, 2);
+            result.into_complete().expect("a clean stream is complete");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_record_missing_its_tag_is_dropped_and_decoding_resyncs() {
+        // The toolbox dropped the head of the second record.
+        for chunk in [1, 3, 64] {
+            let result = decode(b"Oabc\nbc'\nOdef\nEerr\n", chunk).await;
+            assert_eq!(result.result.stdout, b"abcdef", "chunk {chunk}");
+            assert_eq!(result.result.stderr, b"err", "chunk {chunk}");
+            assert_loss(&result, 1, 4);
+            assert_eq!(result.stdout_capture.observed_bytes, 6);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_torn_record_glued_to_the_next_is_dropped_once() {
+        // The tail of one record was lost, so the next record's bytes
+        // land inside its quoted body; both are one unreadable line.
+        for chunk in [1, 5, 64] {
+            let result = decode(b"Oabc\nO$'a\\nbOdef\nOghi\n", chunk).await;
+            assert_eq!(result.result.stdout, b"abcghi", "chunk {chunk}");
+            assert_loss(&result, 1, 12);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oversized_line_is_dropped_through_its_newline() {
+        let mut stream = vec![b'A'; MAX_FRAME_BYTES + 88];
+        stream.extend_from_slice(b"\nOend\n");
+        // Fed piecemeal, the line is given up on before its newline
+        // arrives; the rest of it is still counted, never decoded.
+        for chunk in [1, 100, stream.len()] {
+            let result = decode(&stream, chunk).await;
+            assert_eq!(result.result.stdout, b"end", "chunk {chunk}");
+            assert_loss(&result, 1, MAX_FRAME_BYTES as u64 + 89);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_garbled_quoted_body_is_dropped() {
+        // An escape printf %q never writes, then a byte outside ASCII.
+        for chunk in [1, 4, 64] {
+            let result = decode(b"O$'ab\\q'\nO\xff\nOok\n", chunk).await;
+            assert_eq!(result.result.stdout, b"ok", "chunk {chunk}");
+            assert_loss(&result, 2, 12);
+        }
+    }
+
+    #[tokio::test]
+    async fn output_ending_inside_a_record_counts_as_loss() {
+        let result = decode(b"Oabc\nOw", 64).await;
+        assert_eq!(result.result.stdout, b"abc");
+        assert_loss(&result, 1, 2);
     }
 }

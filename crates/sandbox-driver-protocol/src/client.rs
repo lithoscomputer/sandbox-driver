@@ -1489,6 +1489,7 @@ async fn run_channel_exec<P: Serialize>(
     streaming.live_streaming = result.live_streaming;
     streaming.stdout_capture = stdout_stats;
     streaming.stderr_capture = stderr_stats;
+    streaming.output_loss = result.output_loss;
     Ok(streaming)
 }
 
@@ -2858,6 +2859,7 @@ mod tests {
                                 streams_separated: true,
                                 stdout_capture:    result.stdout_capture,
                                 stderr_capture:    result.stderr_capture,
+                                output_loss:       result.output_loss,
                             })
                             .expect("response"),
                         )

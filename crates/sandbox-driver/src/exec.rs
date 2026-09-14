@@ -568,10 +568,11 @@ pub struct CaptureStats {
     pub retained_bytes: usize,
     pub omitted_bytes:  usize,
     /// Bytes were lost *beyond* this accounting: the provider could not
-    /// finish draining the stream (a post-exit drain bound expired), so
-    /// `observed_bytes` and `omitted_bytes` undercount the real output.
-    /// Retention-cap omission is not truncation — `omitted_bytes`
-    /// already counts it.
+    /// finish draining the stream (a post-exit drain bound expired), or
+    /// its transport tore the output and the loss is counted in
+    /// [`ExecStreamingResult::output_loss`], so `observed_bytes` and
+    /// `omitted_bytes` undercount the real output. Retention-cap omission
+    /// is not truncation — `omitted_bytes` already counts it.
     #[serde(default)]
     pub truncated:      bool,
 }
@@ -589,8 +590,33 @@ impl CaptureStats {
     }
 }
 
+/// Output a provider lost between the command and its capture accounting,
+/// counted where the loss was noticed. Daytona carries exec output through
+/// a text-only toolbox that can tear the encoded stream; its decoder
+/// discards each unreadable record, resyncs at the next newline, and
+/// counts what it threw away here. The bytes those records would have
+/// decoded to, and the stream they belonged to, are unknown, so a loss
+/// also sets [`CaptureStats::truncated`] on both streams. Every other
+/// provider reports zero.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(default)]
+pub struct OutputLoss {
+    /// Encoded records the decoder discarded.
+    pub dropped_frames: u64,
+    /// Encoded bytes those records held, their newline included.
+    pub dropped_bytes:  u64,
+}
+
+impl OutputLoss {
+    /// Whether any output was lost.
+    pub fn is_lossy(self) -> bool {
+        self.dropped_frames != 0 || self.dropped_bytes != 0
+    }
+}
+
 /// Result of a streaming run, with honesty flags: degradations (combined
-/// output, buffered replay) are reported, not hidden.
+/// output, buffered replay, a torn transport) are reported, not hidden.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ExecStreamingResult {
@@ -601,13 +627,20 @@ pub struct ExecStreamingResult {
     pub live_streaming:    bool,
     pub stdout_capture:    CaptureStats,
     pub stderr_capture:    CaptureStats,
+    /// Output the provider's transport lost before it could be captured or
+    /// delivered. Additive on the wire: an older peer reports zero.
+    #[serde(default)]
+    pub output_loss:       OutputLoss,
 }
 
 impl ExecStreamingResult {
     /// Converts an explicitly captured result only when every byte is retained
     /// and delivered. Execution may have had effects even when this fails.
     pub fn into_complete(self) -> Result<ExecResult> {
-        if self.stdout_capture.truncated || self.stderr_capture.truncated {
+        if self.stdout_capture.truncated
+            || self.stderr_capture.truncated
+            || self.output_loss.is_lossy()
+        {
             return Err(Error::Transport(crate::TransportError::new(
                 "command output delivery was incomplete",
             )));
@@ -639,6 +672,7 @@ impl ExecStreamingResult {
             live_streaming: false,
             stdout_capture,
             stderr_capture,
+            output_loss: OutputLoss::default(),
         }
     }
 }
