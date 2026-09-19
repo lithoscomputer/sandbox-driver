@@ -8,7 +8,12 @@ use std::process::{self, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use sandbox_driver::{Error, ExecSpec, SandboxFilter, SandboxProvider, SandboxSource, SandboxSpec};
+use nix::errno::Errno;
+use nix::sys::signal::kill;
+use nix::unistd::Pid;
+use sandbox_driver::{
+    Error, ExecSpec, SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec,
+};
 use sandbox_driver_protocol::channel::TrustedPeer;
 use sandbox_driver_protocol::{PluginProvider, TransportLimits};
 use tokio::process::{Child, Command};
@@ -59,6 +64,43 @@ async fn wait_for_file(path: &Path) {
     .expect("workload started");
 }
 
+/// The process-group id the sandbox's single saved generation recorded for
+/// the exec with sequence number `seq`.
+async fn saved_pgid(root: &Path, id: &SandboxId, seq: usize) -> i32 {
+    let mut generations = fs::read_dir(root.join(id.as_str()).join("groups"))
+        .await
+        .expect("generations");
+    let generation = generations
+        .next_entry()
+        .await
+        .expect("entry")
+        .expect("one generation")
+        .path();
+    fs::read_to_string(generation.join(format!("{seq}.group")))
+        .await
+        .expect("saved group id")
+        .trim()
+        .parse()
+        .expect("positive process-group id")
+}
+
+/// Whether the sentinel leading `pgid` still exists. A sentinel is never
+/// reaped while its owner lives, so a vanished pid means its owner is gone and
+/// the sentinel ended and was reaped by init.
+fn sentinel_exists(pgid: i32) -> bool {
+    !matches!(kill(Pid::from_raw(pgid), None), Err(Errno::ESRCH))
+}
+
+async fn wait_for_sentinel_exit(pgid: i32) {
+    time::timeout(Duration::from_secs(10), async {
+        while sentinel_exists(pgid) {
+            time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("an idle sentinel ends once its owner is gone");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_plugin_crash_preserves_identity_and_stop_fences_surviving_work() {
     let root = registry();
@@ -101,10 +143,18 @@ async fn a_plugin_crash_preserves_identity_and_stop_fences_surviving_work() {
     });
     let heartbeat = workspace.join("heartbeat");
     wait_for_file(&heartbeat).await;
+    let running_pgid = saved_pgid(&root, &id, 1).await;
     child
         .kill()
         .await
         .expect("crash plugin and reap its owned child");
+    // A live workload outlives its owner: the sentinel checks its owner only
+    // once its status is written, so two of its one-second polls must pass
+    // without ending this group.
+    let crashed_size = fs::metadata(&heartbeat).await.expect("heartbeat").len();
+    time::sleep(Duration::from_millis(2500)).await;
+    let survived_size = fs::metadata(&heartbeat).await.expect("heartbeat").len();
+    let survived = sentinel_exists(running_pgid);
     let failed = time::timeout(Duration::from_secs(5), pending)
         .await
         .expect("pending call ends")
@@ -152,6 +202,10 @@ async fn a_plugin_crash_preserves_identity_and_stop_fences_surviving_work() {
     fs::remove_dir_all(&root).await.expect("registry cleanup");
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].id, id);
+    assert!(
+        survived && survived_size > crashed_size,
+        "a running workload must survive its owner so recovery can fence it"
+    );
     assert_eq!(
         stopped_size, final_size,
         "stop returned while old work was writing"
@@ -266,4 +320,30 @@ async fn a_prefenced_generation_cannot_start_another_workload() {
         .expect("reap the externally owned plugin child");
     fs::remove_dir_all(root).await.expect("registry cleanup");
     assert!(!started, "work started in a fenced generation");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_sentinel_exits_when_its_owner_dies() {
+    let root = registry();
+    let (provider, mut child) = connect(&root).await;
+    let sandbox = provider
+        .create(&SandboxSpec::new(SandboxSource::HostDirectory), None)
+        .await
+        .expect("create");
+    let done = sandbox
+        .exec()
+        .run(&ExecSpec::bash("exit 0"))
+        .await
+        .expect("completed workload");
+    assert_eq!(done.exit_code, Some(0));
+    let pgid = saved_pgid(&root, sandbox.id(), 0).await;
+    assert!(sentinel_exists(pgid), "the provider pins the idle sentinel");
+    child
+        .kill()
+        .await
+        .expect("crash plugin and reap its owned child");
+    // No new plugin ever fences this generation. The sentinel must notice its
+    // owner is gone and end its own group instead of idling forever.
+    wait_for_sentinel_exit(pgid).await;
+    fs::remove_dir_all(root).await.expect("registry cleanup");
 }
