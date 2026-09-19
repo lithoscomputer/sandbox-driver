@@ -1,11 +1,13 @@
 //! A sentinel pins each process-group id until sandbox stop. Recovery writes
 //! fence markers and only observes process death; it never signals saved ids.
 //! The sentinel publishes its record before checking the marker and spawning
-//! work. Its in-group watcher handles a fence even after the plugin dies.
+//! work. Its in-group watcher handles a fence even after the plugin dies. Once
+//! the work has exited and its status is written, the idle sentinel also ends
+//! its group when its owning provider process is gone.
 
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::ExitStatus;
+use std::process::{self, ExitStatus};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 use std::{fs as sync_fs, io, slice};
@@ -46,7 +48,7 @@ fn sentinel_shell() -> &'static str {
 }
 
 const SENTINEL_SCRIPT: &str = r#"
-sf="$1"; gf="$2"; fence="$3"; shift 3
+sf="$1"; gf="$2"; fence="$3"; owner="$4"; shift 4
 printf '%s\n' "$$" > "$gf.tmp" && /bin/mv "$gf.tmp" "$gf" || exit 125
 if [ -e "$fence" ]; then exit 0; fi
 exec 3<&0
@@ -65,6 +67,7 @@ kill -9 "$watch" 2>/dev/null
 echo "$s" > "$sf.tmp" && /bin/mv "$sf.tmp" "$sf"
 while :; do
   if [ -e "$fence" ]; then kill -KILL -- "-$$" 2>/dev/null || kill -KILL "-$$"; fi
+  kill -0 "$owner" 2>/dev/null || kill -KILL -- "-$$" 2>/dev/null || kill -KILL "-$$"
   /bin/sleep 1
 done
 "#;
@@ -211,6 +214,7 @@ impl ProcessGroups {
             .arg(&status_file)
             .arg(&group_file)
             .arg(&marker)
+            .arg(process::id().to_string())
             .arg(program)
             .args(args);
         configure(&mut command);
