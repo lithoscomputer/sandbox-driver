@@ -13,9 +13,10 @@ use async_trait::async_trait;
 use sandbox_driver::{
     Action, Capabilities, Capability, CorrelationId, DerivedGit, Error, Event, EventBody,
     EventContext, EventEmitter, EventObserver, EventSubject, ExecControls, ExecSpec, Git,
-    GitCloneOptions, GitCommitOptions, GitFailureKind, OutputStream, ProviderKind, Result, Sandbox,
-    SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec, SandboxStatus,
-    SpawnSpec, StdinSource, Termination, WaitOptions, activate,
+    GitCloneOptions, GitCommitOptions, GitFailureKind, LogSink, LogSource, Logs, LogsCaps,
+    OutputStream, ProviderKind, Result, Sandbox, SandboxFilter, SandboxId, SandboxProvider,
+    SandboxSource, SandboxSpec, SandboxStatus, SpawnSpec, StdinSource, Termination, WaitOptions,
+    activate,
 };
 use sandbox_driver_host::HostProvider;
 use sandbox_driver_protocol::channel::TrustedPeer;
@@ -1777,6 +1778,208 @@ async fn cancellation_during_streamed_input_drops_the_source_and_preserves_other
             .expect("unrelated operation")
             .success()
     );
+    sandbox.delete().await.expect("delete");
+    provider.shutdown().await.expect("shutdown");
+}
+
+/// A Host provider whose sandboxes also declare an endless entrypoint log,
+/// so log streams can be driven over the wire without a provider that
+/// really produces logs.
+struct LoggingProvider {
+    host: HostProvider,
+    caps: Capabilities,
+}
+
+struct LoggingSandbox {
+    inner: Arc<dyn Sandbox>,
+    caps:  Capabilities,
+    logs:  EndlessLogs,
+}
+
+/// Emits a line every few milliseconds until the follow is dropped or
+/// the sink refuses a chunk.
+struct EndlessLogs;
+
+#[async_trait]
+impl Logs for EndlessLogs {
+    async fn follow(&self, _: LogSource, sink: LogSink) -> Result<()> {
+        loop {
+            sink(b"tick\n".to_vec()).await?;
+            time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
+impl LoggingProvider {
+    fn new() -> Self {
+        let host = HostProvider::new();
+        let mut caps = host.capabilities().clone();
+        let mut logs = LogsCaps::default();
+        logs.entrypoint = true;
+        caps.logs = Some(logs);
+        Self { host, caps }
+    }
+
+    fn wrap(&self, inner: Arc<dyn Sandbox>) -> Arc<dyn Sandbox> {
+        let mut caps = inner.capabilities().clone();
+        caps.logs.clone_from(&self.caps.logs);
+        Arc::new(LoggingSandbox {
+            inner,
+            caps,
+            logs: EndlessLogs,
+        })
+    }
+}
+
+#[async_trait]
+impl SandboxProvider for LoggingProvider {
+    fn kind(&self) -> &ProviderKind {
+        self.host.kind()
+    }
+
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    async fn create(
+        &self,
+        spec: &SandboxSpec,
+        events: Option<EventContext>,
+    ) -> Result<Arc<dyn Sandbox>> {
+        Ok(self.wrap(self.host.create(spec, events).await?))
+    }
+
+    async fn attach(
+        &self,
+        id: &SandboxId,
+        events: Option<EventContext>,
+    ) -> Result<Arc<dyn Sandbox>> {
+        Ok(self.wrap(self.host.attach(id, events).await?))
+    }
+
+    async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>> {
+        self.host.list(filter).await
+    }
+}
+
+#[async_trait]
+impl Sandbox for LoggingSandbox {
+    fn id(&self) -> &SandboxId {
+        self.inner.id()
+    }
+
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    async fn describe(&self) -> Result<SandboxStatus> {
+        self.inner.describe().await
+    }
+
+    fn working_directory(&self) -> &str {
+        self.inner.working_directory()
+    }
+
+    async fn platform_info(&self) -> Result<sandbox_driver::PlatformInfo> {
+        self.inner.platform_info().await
+    }
+
+    async fn start(&self) -> Result<()> {
+        self.inner.start().await
+    }
+
+    async fn stop(&self) -> Result<()> {
+        self.inner.stop().await
+    }
+
+    async fn delete(&self) -> Result<()> {
+        self.inner.delete().await
+    }
+
+    fn exec(&self) -> &dyn sandbox_driver::Exec {
+        self.inner.exec()
+    }
+
+    fn fs(&self) -> &dyn sandbox_driver::Filesystem {
+        self.inner.fs()
+    }
+
+    fn logs(&self) -> Option<&dyn Logs> {
+        Some(&self.logs)
+    }
+}
+
+/// Dropping a log follow on the host sends `stream/cancel`, which ends
+/// the plugin's follow and releases its stream registration; a sink
+/// error ends the follow and reaches the caller unchanged. Both leave the
+/// connection with no live streams, so a later follow starts clean.
+#[tokio::test]
+async fn log_follow_cancel_and_sink_errors_release_the_server_stream() {
+    let (host_side, plugin_side) = duplex(1024 * 1024);
+    let (host_read, host_write) = split(host_side);
+    let (plugin_read, plugin_write) = split(plugin_side);
+    tokio::spawn(serve(
+        Arc::new(LoggingProvider::new()),
+        plugin_read,
+        plugin_write,
+    ));
+    let provider = PluginProvider::connect(host_read, host_write)
+        .await
+        .expect("handshake succeeds");
+    let sandbox = provider.create(&host_spec(), None).await.expect("sandbox");
+    let logs = sandbox.logs().expect("logs facet crosses the wire");
+
+    for _ in 0..3 {
+        let seen = Arc::new(Mutex::new(0usize));
+        let counting = Arc::clone(&seen);
+        let sink: LogSink = Arc::new(move |chunk| {
+            assert_eq!(chunk, b"tick\n");
+            *counting.lock().expect("seen lock") += 1;
+            Box::pin(async { Ok(()) })
+        });
+        let follow = time::timeout(
+            Duration::from_millis(200),
+            logs.follow(LogSource::Entrypoint, sink),
+        )
+        .await;
+        assert!(follow.is_err(), "an endless follow only ends by cancel");
+        assert!(
+            *seen.lock().expect("seen lock") > 0,
+            "chunks reached the sink"
+        );
+
+        let rejecting: LogSink = Arc::new(|_| {
+            Box::pin(async { Err(Error::invalid_spec("log_sink", "roundtrip sentinel")) })
+        });
+        let outcome = time::timeout(
+            Duration::from_secs(5),
+            logs.follow(LogSource::Entrypoint, rejecting),
+        )
+        .await
+        .expect("a rejected chunk ends the follow");
+        assert!(
+            matches!(outcome, Err(Error::InvalidSpec { ref field, ref reason })
+                if field == "log_sink" && reason == "roundtrip sentinel"),
+            "{outcome:?}"
+        );
+
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                let stats = provider.transport_diagnostics().await.expect("diagnostics");
+                if stats.server.streams == 0
+                    && stats.server.active_io == 0
+                    && stats.client.active_io == 0
+                    && stats.client.cleanup_tasks == 0
+                {
+                    break;
+                }
+                assert_eq!(stats.client.failed_cleanups, 0);
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled and failed follows release their streams");
+    }
     sandbox.delete().await.expect("delete");
     provider.shutdown().await.expect("shutdown");
 }

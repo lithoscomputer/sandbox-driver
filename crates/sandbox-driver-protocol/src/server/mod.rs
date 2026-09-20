@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
 use self::registry::Registry;
+use self::services::StreamRegistration;
 use self::sessions::{ServerPty, ServerStdio};
 use crate::channel::{self, Channel, ChannelRequest, DataTransport};
 use crate::wire::{
@@ -197,21 +198,15 @@ pub async fn serve_with_limits(
         } else {
             None
         };
-        if let Some(stream) = &stream_id {
-            if state
-                .streams
-                .try_insert(stream.clone(), state.exec_shutdown.child_token())
-                .is_err()
-            {
+        // Registered here, before the request's task exists, so a
+        // `stream/cancel` can never overtake its follow.
+        let stream = match stream_id.map(|id| StreamRegistration::register(&state, id)) {
+            None => None,
+            Some(Ok(stream)) => Some(stream),
+            Some(Err(error)) => {
                 if outbound
                     .send(
-                        &Message::error_response(
-                            id,
-                            WireError::from_error(&Error::invalid_spec(
-                                "stream_id",
-                                "duplicate stream id",
-                            )),
-                        ),
+                        &Message::error_response(id, WireError::from_error(&error)),
                         true,
                     )
                     .is_err()
@@ -220,14 +215,14 @@ pub async fn serve_with_limits(
                 }
                 continue;
             }
-        }
+        };
         requests.spawn(handle_request(
             Arc::clone(&state),
             id,
             method,
             message.params.unwrap_or(Value::Null),
             admission,
-            stream_id,
+            stream,
         ));
     };
 
@@ -292,16 +287,13 @@ async fn handle_request(
     method: String,
     params: Value,
     admission: Admission,
-    stream_id: Option<String>,
+    stream: Option<StreamRegistration>,
 ) {
     let _request_permit = admission.request_permit;
-    let reply = match dispatch(&state, &method, params, admission.io_permit).await {
+    let reply = match dispatch(&state, &method, params, admission.io_permit, stream).await {
         Ok(result) => Message::response(id, result),
         Err(error) => Message::error_response(id, error.into_wire(&method)),
     };
-    if let Some(stream) = stream_id {
-        state.streams.remove(&stream);
-    }
     let delivery = state
         .outbound
         .deliver(
@@ -658,6 +650,7 @@ async fn dispatch(
     method: &str,
     params: Value,
     io_permit: Option<Arc<OwnedSemaphorePermit>>,
+    stream: Option<StreamRegistration>,
 ) -> Result<Value, DispatchError> {
     let Some((namespace, _)) = method.split_once('/') else {
         return match method {
@@ -678,7 +671,7 @@ async fn dispatch(
         "fs" => fs::dispatch(state, method, params, io_permit).await,
         "git" | "access" => access::dispatch(state, method, params).await,
         "logs" | "stream" | "snapshot" | "volume" => {
-            services::dispatch(state, method, params, io_permit).await
+            services::dispatch(state, method, params, io_permit, stream).await
         }
         "transport" | "provider" => match method {
             m::TRANSPORT_DIAGNOSTICS => {

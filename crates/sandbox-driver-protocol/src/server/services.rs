@@ -13,21 +13,52 @@ use super::exec::{SharedWriter, finish_channel, log_frame_sink};
 use super::{DispatchError, ServerState, parse, snapshot_id, to_value, volume_id};
 use crate::methods as m;
 
-async fn follow_logs<F>(state: &ServerState, stream_id: &str, follow: F) -> Result<()>
-where
-    F: Future<Output = Result<()>>,
-{
-    // A cancel request can overtake the task that handles the follow
-    // request. Reuse its already-cancelled token.
-    let cancel = state
-        .streams
-        .get_or_insert_with(stream_id.to_owned(), CancellationToken::new);
-    let outcome = tokio::select! {
-        outcome = follow => outcome,
-        () = cancel.cancelled() => Ok(()),
-    };
-    state.streams.remove(stream_id);
-    outcome
+/// A log stream the host can cancel by id. Registering precedes the
+/// follow request's task, so a `stream/cancel` that overtakes the follow
+/// finds the token already there; `Drop` removes the entry on every exit,
+/// including a request that fails before it follows anything.
+pub(super) struct StreamRegistration {
+    state:  Arc<ServerState>,
+    id:     String,
+    cancel: CancellationToken,
+}
+
+impl StreamRegistration {
+    /// Claims `id` for one stream, or rejects a second stream under it.
+    pub(super) fn register(state: &Arc<ServerState>, id: String) -> Result<Self> {
+        let cancel = state.exec_shutdown.child_token();
+        state
+            .streams
+            .try_insert(id.clone(), cancel.clone())
+            .map_err(|_| Error::invalid_spec("stream_id", "duplicate stream id"))?;
+        Ok(Self {
+            state: Arc::clone(state),
+            id,
+            cancel,
+        })
+    }
+
+    /// Runs `follow` until it ends or the host cancels the stream, which
+    /// is not an error.
+    async fn follow<F>(self, follow: F) -> Result<()>
+    where
+        F: Future<Output = Result<()>>,
+    {
+        tokio::select! {
+            outcome = follow => outcome,
+            () = self.cancel.cancelled() => Ok(()),
+        }
+    }
+}
+
+impl Drop for StreamRegistration {
+    fn drop(&mut self) {
+        self.state.streams.remove(&self.id);
+    }
+}
+
+fn registered(stream: Option<StreamRegistration>) -> Result<StreamRegistration> {
+    stream.ok_or_else(|| Error::invalid_spec("stream_id", "missing stream id"))
 }
 
 pub(super) async fn dispatch(
@@ -35,22 +66,21 @@ pub(super) async fn dispatch(
     method: &str,
     params: Value,
     io_permit: Option<Arc<OwnedSemaphorePermit>>,
+    stream: Option<StreamRegistration>,
 ) -> Result<Value, DispatchError> {
     match method {
         m::LOGS_FOLLOW => {
             let request: m::LogsFollowParams = parse(params)?;
+            let stream = registered(stream)?;
             let handle = state.sandbox(&request.sandbox_id).await?;
             let logs = handle
                 .logs()
                 .ok_or_else(|| Error::unsupported(Capability::Logs))?;
             let channel = state.open_channel(&request.channel, io_permit).await?;
             let writer: SharedWriter = Arc::new(AsyncMutex::new(channel.writer));
-            let outcome = follow_logs(
-                state,
-                &request.stream_id,
-                logs.follow(request.source, log_frame_sink(&writer)),
-            )
-            .await;
+            let outcome = stream
+                .follow(logs.follow(request.source, log_frame_sink(&writer)))
+                .await;
             finish_channel(&writer).await?;
             outcome?;
             to_value(&m::Empty)
@@ -87,16 +117,14 @@ pub(super) async fn dispatch(
         }
         m::SNAPSHOT_BUILD_LOGS => {
             let request: m::SnapshotBuildLogsParams = parse(params)?;
+            let stream = registered(stream)?;
             let service = state.snapshots()?;
             let id = snapshot_id(&request.snapshot_id)?;
             let channel = state.open_channel(&request.channel, io_permit).await?;
             let writer: SharedWriter = Arc::new(AsyncMutex::new(channel.writer));
-            let outcome = follow_logs(
-                state,
-                &request.stream_id,
-                service.build_logs(&id, request.follow, log_frame_sink(&writer)),
-            )
-            .await;
+            let outcome = stream
+                .follow(service.build_logs(&id, request.follow, log_frame_sink(&writer)))
+                .await;
             finish_channel(&writer).await?;
             outcome?;
             to_value(&m::Empty)
