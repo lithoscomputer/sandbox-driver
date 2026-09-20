@@ -425,23 +425,15 @@ impl DaytonaTransport {
             command.push_str(&shell_quote(&file.path));
         }
         let cwd = self.resolve_dir(spec.working_dir.as_deref());
-        let program = wrap_session_script(&build_session_script(&cwd, &command));
 
-        let mut session = match Session::create(&self.client, &sandbox).await {
-            Ok(session) => session,
-            Err(error) => {
-                close_stdin(&mut stdin_file).await;
-                return Err(error);
-            }
-        };
-        let session_exec = match session.execute(&program).await {
-            Ok(result) => result,
-            Err(error) => {
-                session.close().await;
-                close_stdin(&mut stdin_file).await;
-                return Err(error);
-            }
-        };
+        let (mut session, session_exec) =
+            match Session::start_command(&self.client, &sandbox, &cwd, &command).await {
+                Ok(started) => started,
+                Err(error) => {
+                    close_stdin(&mut stdin_file).await;
+                    return Err(error);
+                }
+            };
         let command_id = session_exec.cmd_id.clone();
 
         // The stream task needs its own service and 'static state.
@@ -695,28 +687,6 @@ impl StreamSide {
         }
         Ok(())
     }
-}
-
-/// Bash source run inside the session's `/bin/bash -c`: pin the working
-/// directory, blank `BASH_ENV` (sandbox-level hygiene; the command's own
-/// env comes with it, see [`crate::shell::exec_line`]), then run the command in
-/// a subshell so its exit status is the script's.
-pub(crate) fn build_session_script(cwd: &str, command: &str) -> String {
-    [
-        format!("cd {} || exit $?", shell_quote(cwd)),
-        "export BASH_ENV=''".to_owned(),
-        "(".to_owned(),
-        command.to_owned(),
-        ")".to_owned(),
-    ]
-    .join("\n")
-}
-
-/// The command handed to the session: one quoted `/bin/bash -c` so the
-/// caller's source stays inert until Bash evaluates it, and the session
-/// shell resumes afterwards to drain logs and record the exit code.
-pub(crate) fn wrap_session_script(script: &str) -> String {
-    format!("/bin/bash -c {}", shell_quote(script))
 }
 
 #[cfg(test)]
