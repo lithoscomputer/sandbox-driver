@@ -14,16 +14,15 @@ use std::str;
 use std::sync::Arc;
 use std::time::Duration;
 
-use daytona_sdk::DaytonaError;
+use daytona_sdk::{DaytonaError, ProcessService};
 use sandbox_driver::{
     Result, SpawnSpec, StderrTail, StdioProcess, StdioProcessHandle, Termination,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time;
 
-use crate::exec::{build_session_script, wrap_session_script};
 use crate::sdk::{DaytonaClient, daytona_error};
 use crate::session::Session;
 use crate::shell::exec_line;
@@ -41,47 +40,56 @@ pub(crate) async fn spawn(
     spec: &SpawnSpec,
 ) -> Result<StdioProcess> {
     let sandbox = toolbox::sandbox(client, sandbox_id).await?;
+    // Both toolbox handles come before the session exists, so a failed
+    // connection leaves nothing to close.
+    let stream_process = toolbox::process_of(&sandbox).await?;
+    let input_process = toolbox::process_of(&sandbox).await?;
 
-    let mut session = Session::create(client, &sandbox).await?;
     let command = exec_line(&spec.launch_env(), &spec.program, &spec.args);
-    let program = wrap_session_script(&build_session_script(cwd, &command));
-    let started = match session.execute(&program).await {
-        Ok(result) => result,
-        Err(error) => {
-            session.close().await;
-            return Err(error);
-        }
-    };
+    let (session, started) = Session::start_command(client, &sandbox, cwd, &command).await?;
     let command_id = started.cmd_id;
 
-    let stream_process = match toolbox::process_of(&sandbox).await {
-        Ok(process) => process,
-        Err(error) => {
-            session.close().await;
-            return Err(error);
-        }
-    };
-    let input_process = match toolbox::process_of(&sandbox).await {
-        Ok(process) => process,
-        Err(error) => {
-            session.close().await;
-            return Err(error);
-        }
+    let (stdout_reader, stderr_tail, stream_task) =
+        spawn_output_pump(stream_process, sandbox_id, session.id(), &command_id);
+    let (stdin_writer, stdin_task) =
+        spawn_input_pump(input_process, sandbox_id, session.id(), &command_id);
+
+    let handle = DaytonaStdioHandle {
+        sandbox_id: sandbox_id.to_owned(),
+        session: Mutex::new(session),
+        command_id,
+        stream_task: Mutex::new(Some(stream_task)),
+        stdin_task: Mutex::new(Some(stdin_task)),
     };
 
-    // Stdout: the log stream's stdout side feeds one half of a local
-    // pipe; the caller reads the other half. Stderr is the bounded
-    // diagnostic tail from the facet contract, not a stream.
+    Ok(StdioProcess {
+        stdin: Box::pin(stdin_writer),
+        stdout: Box::pin(stdout_reader),
+        stderr_tail,
+        handle: Box::new(handle),
+    })
+}
+
+/// Stdout: the log stream's stdout side feeds one half of a local pipe;
+/// the caller reads the other half. Stderr is the bounded diagnostic
+/// tail from the facet contract, not a stream. The task ends when the
+/// stream closes, which drops the writer half and delivers EOF.
+fn spawn_output_pump(
+    process: ProcessService,
+    sandbox_id: &str,
+    session_id: &str,
+    command_id: &str,
+) -> (DuplexStream, StderrTail, JoinHandle<()>) {
     let (stdout_into, stdout_reader) = duplex(PIPE_CAPACITY);
     let stderr_tail = StderrTail::default();
-    let stream_task = tokio::spawn({
+    let task = tokio::spawn({
         let sandbox_id = sandbox_id.to_owned();
-        let session_id = session.id().to_owned();
-        let command_id = command_id.clone();
+        let session_id = session_id.to_owned();
+        let command_id = command_id.to_owned();
         let stdout_into = Arc::new(Mutex::new(stdout_into));
         let stderr_tail = stderr_tail.clone();
         async move {
-            let outcome = stream_process
+            let outcome = process
                 .get_session_command_logs_stream(
                     &session_id,
                     &command_id,
@@ -127,17 +135,25 @@ pub(crate) async fn spawn(
             // Dropping the writer half delivers EOF to the reader.
         }
     });
+    (stdout_reader, stderr_tail, task)
+}
 
-    // Stdin: the caller writes bytes into a local pipe; a pump forwards
-    // complete UTF-8 prefixes through the session input endpoint,
-    // holding back a split multi-byte character until its remainder
-    // arrives. Invalid UTF-8 ends the pump (the caller's next write
-    // fails with a closed pipe) instead of corrupting the stream.
+/// Stdin: the caller writes bytes into a local pipe; a pump forwards
+/// complete UTF-8 prefixes through the session input endpoint, holding
+/// back a split multi-byte character until its remainder arrives.
+/// Invalid UTF-8 ends the pump (the caller's next write fails with a
+/// closed pipe) instead of corrupting the stream.
+fn spawn_input_pump(
+    process: ProcessService,
+    sandbox_id: &str,
+    session_id: &str,
+    command_id: &str,
+) -> (DuplexStream, JoinHandle<()>) {
     let (stdin_writer, mut stdin_reader) = duplex(PIPE_CAPACITY);
-    let stdin_task = tokio::spawn({
+    let task = tokio::spawn({
         let sandbox_id = sandbox_id.to_owned();
-        let session_id = session.id().to_owned();
-        let command_id = command_id.clone();
+        let session_id = session_id.to_owned();
+        let command_id = command_id.to_owned();
         async move {
             let mut pending: Vec<u8> = Vec::new();
             let mut buffer = vec![0u8; PIPE_CAPACITY];
@@ -171,7 +187,7 @@ pub(crate) async fn spawn(
                 }
                 let data = String::from_utf8_lossy(&pending[..valid_up_to]).into_owned();
                 pending.drain(..valid_up_to);
-                if let Err(error) = input_process
+                if let Err(error) = process
                     .send_session_command_input(&session_id, &command_id, &data)
                     .await
                 {
@@ -187,21 +203,7 @@ pub(crate) async fn spawn(
             }
         }
     });
-
-    let handle = DaytonaStdioHandle {
-        sandbox_id: sandbox_id.to_owned(),
-        session: Mutex::new(session),
-        command_id,
-        stream_task: Mutex::new(Some(stream_task)),
-        stdin_task: Mutex::new(Some(stdin_task)),
-    };
-
-    Ok(StdioProcess {
-        stdin: Box::pin(stdin_writer),
-        stdout: Box::pin(stdout_reader),
-        stderr_tail,
-        handle: Box::new(handle),
-    })
+    (stdin_writer, task)
 }
 
 /// The length of the longest prefix of `bytes` that is complete UTF-8:
