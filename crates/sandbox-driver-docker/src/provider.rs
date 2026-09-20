@@ -6,26 +6,21 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bollard::Docker;
-use bollard::container::{
-    Config, CreateContainerOptions, ListContainersOptions, StartContainerOptions,
-};
-use bollard::models::{
-    ContainerInspectResponse, EndpointSettings, HostConfig, Mount, MountTypeEnum,
-};
+use bollard::container::{ListContainersOptions, StartContainerOptions};
+use bollard::models::{ContainerInspectResponse, EndpointSettings};
 use bollard::network::{ConnectNetworkOptions, DisconnectNetworkOptions};
 use sandbox_driver::{
-    Action, BASH_ENV_VAR, Capabilities, Error, EventContext, EventEmitter, EventSubject, Exec,
-    HealthStatus, LifecycleTimers, NetworkPolicy, OperationReporter, Progress, ProgressCode,
-    ProviderError, ProviderHealth, ProviderKind, ResourceKind, Result, Sandbox, SandboxFilter,
-    SandboxId, SandboxKind, SandboxProvider, SandboxSource, SandboxSpec, SandboxState,
-    SandboxStatus,
+    Action, Capabilities, Error, EventContext, EventEmitter, EventSubject, Exec, HealthStatus,
+    OperationReporter, Progress, ProgressCode, ProviderError, ProviderHealth, ProviderKind,
+    ResourceKind, Result, Sandbox, SandboxFilter, SandboxId, SandboxProvider, SandboxSpec,
+    SandboxState, SandboxStatus,
 };
-use serde::Deserialize;
 
 use crate::access::DockerShellCommand;
-use crate::config::{DockerProviderConfig, RegistryAuth};
+use crate::config::RegistryAuth;
 use crate::container::{ContainerRef, inspect_container, remove_container_forced, remove_sandbox};
-use crate::daemon::{POSIX_SH, docker_error, docker_kind, is_conflict, shell_quote};
+use crate::create::ContainerPlan;
+use crate::daemon::{docker_error, docker_kind, is_conflict};
 use crate::exec::DockerExec;
 use crate::forward::DockerForwards;
 use crate::fs::DockerFs;
@@ -36,22 +31,7 @@ use crate::inspect::{
 use crate::one_shot::DockerOneShot;
 use crate::pty::DockerPty;
 use crate::sandbox::DockerSandbox;
-use crate::{
-    DEFAULT_WORKING_DIRECTORY, MANAGED_LABEL, RUNTIME_DIRECTORY, RUNTIME_DIRECTORY_PARENT,
-    SIDECAR_NETWORK_LABEL, docker_capabilities, non_empty, sidecars,
-};
-
-/// Parses `SandboxSpec::provider_config` as [`DockerProviderConfig`]:
-/// `null` is the default, an object is validated, anything else is
-/// rejected.
-fn provider_config(value: &serde_json::Value) -> Result<DockerProviderConfig> {
-    match value {
-        serde_json::Value::Null => Ok(DockerProviderConfig::default()),
-        serde_json::Value::Object(_) => DockerProviderConfig::deserialize(value)
-            .map_err(|error| Error::invalid_spec("provider_config", error.to_string())),
-        _ => Err(Error::invalid_spec("provider_config", "expected an object")),
-    }
-}
+use crate::{MANAGED_LABEL, docker_capabilities, sidecars};
 
 /// The Docker provider. One per process, sharing one daemon connection.
 pub struct DockerProvider {
@@ -173,63 +153,6 @@ impl DockerProvider {
     }
 }
 
-fn network_mode(policy: &NetworkPolicy) -> Result<Option<String>> {
-    match policy {
-        NetworkPolicy::ProviderDefault => Ok(None),
-        NetworkPolicy::AllowAll => Ok(Some("bridge".to_owned())),
-        NetworkPolicy::Block => Ok(Some("none".to_owned())),
-        NetworkPolicy::CidrAllowList { .. } => Err(Error::invalid_spec(
-            "network",
-            "the docker provider does not support CIDR allow lists",
-        )),
-        NetworkPolicy::DomainAllowList { .. } => Err(Error::invalid_spec(
-            "network",
-            "the docker provider does not support domain allow lists",
-        )),
-        _ => Err(Error::invalid_spec("network", "unsupported network policy")),
-    }
-}
-
-fn validate_supported_creation_fields(spec: &SandboxSpec) -> Result<()> {
-    if spec.resources.disk_mb.is_some() {
-        return Err(Error::invalid_spec(
-            "resources.disk_mb",
-            "the docker provider does not enforce a writable-layer disk limit",
-        ));
-    }
-    if spec.resources.gpus.is_some() {
-        return Err(Error::invalid_spec(
-            "resources.gpus",
-            "the docker provider does not configure GPU devices",
-        ));
-    }
-    if spec.timers != LifecycleTimers::default() {
-        return Err(Error::invalid_spec(
-            "timers",
-            "the docker provider does not support lifecycle timers",
-        ));
-    }
-    if spec.ephemeral {
-        return Err(Error::invalid_spec(
-            "ephemeral",
-            "the docker provider does not delete a container when it stops",
-        ));
-    }
-    if spec.public.is_some() {
-        return Err(Error::invalid_spec(
-            "public",
-            "the docker provider does not manage public access",
-        ));
-    }
-    if spec.region.is_some() {
-        return Err(Error::invalid_spec(
-            "region",
-            "the docker provider does not select a region",
-        ));
-    }
-    Ok(())
-}
-
 #[async_trait]
 impl SandboxProvider for DockerProvider {
     fn kind(&self) -> &ProviderKind {
@@ -246,53 +169,9 @@ impl SandboxProvider for DockerProvider {
         spec: &SandboxSpec,
         events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
-        spec.validate()?;
-        validate_supported_creation_fields(spec)?;
-        if matches!(spec.sandbox_kind, Some(kind) if kind != SandboxKind::Container) {
-            return Err(Error::invalid_spec(
-                "sandbox_kind",
-                "the docker provider creates container sandboxes only",
-            ));
-        }
-        let SandboxSource::Image { reference } = &spec.source else {
-            return Err(Error::invalid_spec(
-                "source",
-                "the docker provider supports SandboxSource::Image only",
-            ));
-        };
-        if !spec.volumes.is_empty() {
-            return Err(Error::invalid_spec(
-                "volumes",
-                "the docker provider does not support volumes yet",
-            ));
-        }
-        let config_options = provider_config(&spec.provider_config)?;
-        let base_network = if config_options.host_network {
-            if !matches!(
-                spec.network,
-                NetworkPolicy::ProviderDefault | NetworkPolicy::AllowAll
-            ) || !config_options.sidecars.is_empty()
-            {
-                return Err(Error::invalid_spec(
-                    "provider_config.host_network",
-                    "host networking requires unrestricted networking and no sidecars",
-                ));
-            }
-            Some("host".to_owned())
-        } else {
-            network_mode(&spec.network)?
-        };
-        // Sidecars live on one user-defined network the main container
-        // joins, named after the sandbox. They need a named sandbox.
-        let sidecar_network = if config_options.sidecars.is_empty() {
-            None
-        } else {
-            let name = spec.name.clone().ok_or_else(|| {
-                Error::invalid_spec("name", "a sandbox with sidecars must be named")
-            })?;
-            Some(format!("{name}-net"))
-        };
-
+        // Boxed: the plan carries the whole container request, and a future
+        // that held it inline would be large.
+        let plan = Box::new(ContainerPlan::plan(spec)?);
         let emitter = EventEmitter::new(self.kind.clone(), events);
         let handle_emitter = emitter.clone();
         emitter
@@ -301,128 +180,16 @@ impl SandboxProvider for DockerProvider {
                 Action::Create,
                 |reporter| async move {
                     self.ensure_image(
-                        reference,
-                        config_options.auto_pull,
-                        config_options.registry_auth.as_ref(),
-                        config_options.platform.as_deref(),
+                        &plan.image,
+                        plan.auto_pull,
+                        plan.registry_auth.as_ref(),
+                        plan.platform.as_deref(),
                         &reporter,
                     )
                     .await?;
-
-                    let working_dir = spec
-                        .working_directory
-                        .clone()
-                        .unwrap_or_else(|| DEFAULT_WORKING_DIRECTORY.to_owned());
-                    let mut labels: HashMap<String, String> = spec
-                        .labels
-                        .iter()
-                        .map(|(key, value)| (key.clone(), value.clone()))
-                        .collect();
-                    labels.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
-                    if let Some(network) = &sidecar_network {
-                        labels.insert(SIDECAR_NETWORK_LABEL.to_owned(), network.clone());
-                    }
-
-                    // The primary image is ready; map its container options.
-                    let DockerProviderConfig {
-                        init,
-                        privileged,
-                        binds,
-                        extra_hosts,
-                        dns,
-                        cap_add,
-                        ..
-                    } = config_options;
-                    // The labeled primary must exist before any dependent
-                    // resource. Keep it stopped and isolated while preparing
-                    // its network; the label records cleanup identity even
-                    // before the container joins that network.
-                    let network_mode = if sidecar_network.is_some() {
-                        Some("none".to_owned())
-                    } else {
-                        base_network
-                    };
-                    // The workspace is the sandbox's own volume, unless the
-                    // caller bound a host directory there.
-                    let workspace_bound = binds.iter().any(|bind| {
-                        bind.container.trim_end_matches('/') == working_dir.trim_end_matches('/')
-                    });
-                    let mounts = (!workspace_bound).then(|| {
-                        vec![Mount {
-                            target: Some(working_dir.clone()),
-                            typ: Some(MountTypeEnum::VOLUME),
-                            ..Default::default()
-                        }]
-                    });
-                    let binds: Vec<String> = binds
-                        .iter()
-                        .map(|bind| {
-                            let mode = bind.mode.as_deref().unwrap_or("rw");
-                            format!("{}:{}:{mode}", bind.host, bind.container)
-                        })
-                        .collect();
-                    let host_config = HostConfig {
-                        network_mode,
-                        binds: non_empty(binds),
-                        mounts,
-                        init: init.then_some(true),
-                        privileged: privileged.then_some(true),
-                        extra_hosts: non_empty(extra_hosts),
-                        dns: non_empty(dns),
-                        cap_add: non_empty(cap_add),
-                        memory: spec
-                            .resources
-                            .memory_mb
-                            .and_then(|mb| i64::try_from(mb).ok())
-                            .map(|mb| mb * 1024 * 1024),
-                        cpu_quota: spec
-                            .resources
-                            .cpu_cores
-                            .map(|cores| i64::from(cores) * 100_000),
-                        ..Default::default()
-                    };
-                    // Blank BASH_ENV at the container level too: an image (or spec)
-                    // startup file would otherwise run inside the init command below
-                    // and can kill the container the moment it starts.
-                    let mut env_entries: Vec<String> = spec
-                        .env
-                        .iter()
-                        .filter(|(key, _)| key.as_str() != BASH_ENV_VAR)
-                        .map(|(key, value)| format!("{key}={value}"))
-                        .collect();
-                    env_entries.push(format!("{BASH_ENV_VAR}="));
-                    // The init script is POSIX and runs under /bin/sh, which
-                    // every Linux image has.
-                    let config = Config {
-                        image: Some(reference.clone()),
-                        user: spec.user.clone(),
-                        cmd: Some(vec![
-                            POSIX_SH.to_owned(),
-                            "-c".to_owned(),
-                            format!(
-                                "mkdir -p {working_dir} {runtime_dir} && chmod 0700 \
-                                 {runtime_parent} {runtime_dir} && exec sleep infinity",
-                                working_dir = shell_quote(&working_dir),
-                                runtime_parent = shell_quote(RUNTIME_DIRECTORY_PARENT),
-                                runtime_dir = shell_quote(RUNTIME_DIRECTORY),
-                            ),
-                        ]),
-                        working_dir: Some(working_dir.clone()),
-                        env: Some(env_entries),
-                        labels: Some(labels),
-                        host_config: Some(host_config),
-                        ..Default::default()
-                    };
-                    let options =
-                        (spec.name.is_some() || config_options.platform.is_some()).then(|| {
-                            CreateContainerOptions {
-                                name:     spec.name.clone().unwrap_or_default(),
-                                platform: config_options.platform.clone(),
-                            }
-                        });
                     // A failure cleans dependencies before the primary so
                     // unsuccessful cleanup remains discoverable by label.
-                    let cleanup_network = &sidecar_network;
+                    let cleanup_network = &plan.sidecar_network;
                     let sweep_on_error = |error: Error, container: Option<String>| async move {
                         if let Some(container) = container {
                             if let Some(network) = cleanup_network {
@@ -447,10 +214,14 @@ impl SandboxProvider for DockerProvider {
                         }
                         error
                     };
-                    let created = match self.docker.create_container(options, config).await {
+                    let created = match self
+                        .docker
+                        .create_container(plan.options.clone(), plan.config.clone())
+                        .await
+                    {
                         Ok(created) => created,
                         Err(error) => {
-                            let error = if is_conflict(&error) && spec.name.is_some() {
+                            let error = if is_conflict(&error) && plan.named {
                                 Error::invalid_spec(
                                     "name",
                                     "a container with this name already exists",
@@ -469,9 +240,9 @@ impl SandboxProvider for DockerProvider {
                         ).await),
                     };
                     reporter.set_subject(EventSubject::sandbox(Some(event_id)));
-                    if let Some(network) = &sidecar_network {
+                    if let Some(network) = &plan.sidecar_network {
                         let prepare = async {
-                            sidecars::realize(&self.docker, network, &config_options.sidecars).await?;
+                            sidecars::realize(&self.docker, network, &plan.sidecars).await?;
                             self.docker.disconnect_network("none", DisconnectNetworkOptions {
                                 container: created.id.as_str(), force: true,
                             }).await.map_err(|error| docker_error("disconnecting initial sandbox network", error))?;
@@ -637,62 +408,5 @@ impl SandboxProvider for DockerProvider {
             statuses.push(status_from_inspect(sandbox_id, &inspect));
         }
         Ok(statuses)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use super::*;
-
-    fn image_spec() -> SandboxSpec {
-        SandboxSpec::new(SandboxSource::Image {
-            reference: "debian:stable-slim".to_owned(),
-        })
-    }
-
-    fn assert_invalid_field(spec: &SandboxSpec, expected_field: &str) {
-        let error = validate_supported_creation_fields(spec)
-            .expect_err("unsupported field should fail validation");
-        assert!(
-            matches!(&error, Error::InvalidSpec { field, .. } if field == expected_field),
-            "expected InvalidSpec for {expected_field}, got {error}"
-        );
-    }
-
-    #[test]
-    fn unsupported_creation_fields_return_invalid_spec() {
-        let mut spec = image_spec();
-        spec.resources.disk_mb = Some(1024);
-        assert_invalid_field(&spec, "resources.disk_mb");
-
-        let mut spec = image_spec();
-        spec.resources.gpus = Some(1);
-        assert_invalid_field(&spec, "resources.gpus");
-
-        let mut spec = image_spec();
-        spec.timers.auto_stop_after_idle = Some(Duration::from_secs(60));
-        assert_invalid_field(&spec, "timers");
-
-        let mut spec = image_spec();
-        spec.ephemeral = true;
-        assert_invalid_field(&spec, "ephemeral");
-
-        let mut spec = image_spec();
-        spec.public = Some(false);
-        assert_invalid_field(&spec, "public");
-
-        let mut spec = image_spec();
-        spec.region = Some("local".to_owned());
-        assert_invalid_field(&spec, "region");
-    }
-
-    #[test]
-    fn supported_cpu_and_memory_requests_pass_creation_field_validation() {
-        let mut spec = image_spec();
-        spec.resources.cpu_cores = Some(2);
-        spec.resources.memory_mb = Some(4096);
-        validate_supported_creation_fields(&spec).expect("CPU and memory are supported");
     }
 }
