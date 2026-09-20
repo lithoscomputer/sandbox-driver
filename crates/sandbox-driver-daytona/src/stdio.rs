@@ -156,21 +156,15 @@ pub(crate) async fn spawn(
                     Ok(read) => read,
                 };
                 pending.extend_from_slice(&buffer[..read]);
-                let valid_up_to = match str::from_utf8(&pending) {
-                    Ok(_) => pending.len(),
-                    Err(error) => {
-                        if error.error_len().is_some() {
-                            // Genuinely invalid bytes, not a split
-                            // character: refuse rather than corrupt.
-                            tracing::warn!(
-                                provider_kind = "daytona",
-                                sandbox_id = %sandbox_id,
-                                "stdio input was not valid UTF-8"
-                            );
-                            break;
-                        }
-                        error.valid_up_to()
-                    }
+                let Some(valid_up_to) = complete_utf8_prefix(&pending) else {
+                    // Genuinely invalid bytes, not a split character:
+                    // refuse rather than corrupt.
+                    tracing::warn!(
+                        provider_kind = "daytona",
+                        sandbox_id = %sandbox_id,
+                        "stdio input was not valid UTF-8"
+                    );
+                    break;
                 };
                 if valid_up_to == 0 {
                     continue;
@@ -208,6 +202,18 @@ pub(crate) async fn spawn(
         stderr_tail,
         handle: Box::new(handle),
     })
+}
+
+/// The length of the longest prefix of `bytes` that is complete UTF-8:
+/// the whole slice when it is valid, the length before a trailing
+/// multi-byte character that is still arriving, and `None` when the
+/// bytes hold a sequence no continuation could complete.
+fn complete_utf8_prefix(bytes: &[u8]) -> Option<usize> {
+    match str::from_utf8(bytes) {
+        Ok(_) => Some(bytes.len()),
+        Err(error) if error.error_len().is_some() => None,
+        Err(error) => Some(error.valid_up_to()),
+    }
 }
 
 struct DaytonaStdioHandle {
@@ -279,5 +285,30 @@ impl StdioProcessHandle for DaytonaStdioHandle {
             }
             time::sleep(STATUS_POLL).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::complete_utf8_prefix;
+
+    #[test]
+    fn a_split_multibyte_character_is_held_back_until_it_completes() {
+        // "é" is two bytes; "😀" is four.
+        assert_eq!(complete_utf8_prefix(b"ab\xC3"), Some(2));
+        assert_eq!(complete_utf8_prefix(b"ab\xC3\xA9"), Some(4));
+        assert_eq!(complete_utf8_prefix(b"a\xF0\x9F\x98"), Some(1));
+        assert_eq!(complete_utf8_prefix(b"a\xF0\x9F\x98\x80b"), Some(6));
+        assert_eq!(complete_utf8_prefix(b""), Some(0));
+        assert_eq!(complete_utf8_prefix(b"\xE2\x82"), Some(0));
+    }
+
+    #[test]
+    fn invalid_bytes_are_refused_rather_than_forwarded() {
+        assert_eq!(complete_utf8_prefix(b"ab\xFF"), None);
+        // A continuation byte with no lead byte can never complete.
+        assert_eq!(complete_utf8_prefix(b"\xA9"), None);
+        // An invalid byte after a split character is still invalid.
+        assert_eq!(complete_utf8_prefix(b"a\xC3\x28"), None);
     }
 }
