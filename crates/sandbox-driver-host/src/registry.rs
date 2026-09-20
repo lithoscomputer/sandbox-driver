@@ -101,6 +101,41 @@ pub(crate) async fn read(root: &Path, id: &SandboxId) -> Result<Record> {
     Ok(record)
 }
 
+/// Every record under `root`, in directory order. A directory whose name is
+/// not a sandbox id or that holds no record is skipped; a missing root is
+/// an empty registry.
+pub(crate) async fn records(root: &Path) -> Result<Vec<Record>> {
+    let mut entries = match fs::read_dir(root).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(Error::io("listing host registry", e)),
+    };
+    let mut records = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| Error::io("reading host registry entry", e))?
+    {
+        if !entry
+            .file_type()
+            .await
+            .map_err(|e| Error::io("reading registry entry type", e))?
+            .is_dir()
+        {
+            continue;
+        }
+        let Ok(id) = SandboxId::try_new(entry.file_name().to_string_lossy().into_owned()) else {
+            continue;
+        };
+        match read(root, &id).await {
+            Ok(record) => records.push(record),
+            Err(Error::NotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(records)
+}
+
 pub(crate) async fn write(root: &Path, record: &Record) -> Result<()> {
     let directory = resource_dir(root, &record.id)?;
     private_directory(&directory).await?;

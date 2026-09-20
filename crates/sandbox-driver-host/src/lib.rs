@@ -44,11 +44,8 @@
 
 mod access;
 mod exec;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod fence;
 mod fs;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-mod observation;
 mod registry;
 
 use std::collections::{BTreeMap, HashMap};
@@ -71,12 +68,16 @@ use tokio::sync::Mutex;
 use crate::access::HostPreview;
 pub use crate::exec::HostExec;
 use crate::exec::effective_env;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::fence::ProcessGroups;
 pub use crate::fs::HostFs;
 use crate::registry::Record;
 
 type HandleRegistry = Mutex<HashMap<SandboxId, Arc<HostSandbox>>>;
+
+/// The provider kind every Host error and event reports.
+pub(crate) fn host_kind() -> ProviderKind {
+    ProviderKind::try_new("host").expect("static kind is valid")
+}
 
 /// A directory-backed provider. Use [`Self::with_registry`] to preserve
 /// sandbox identity across provider or plugin restarts.
@@ -119,7 +120,7 @@ impl HostProvider {
 
     fn at(root: PathBuf, cleanup_on_drop: bool) -> Self {
         Self {
-            kind: ProviderKind::try_new("host").expect("static kind is valid"),
+            kind: host_kind(),
             capabilities: host_capabilities(),
             root,
             cleanup_on_drop,
@@ -136,15 +137,25 @@ impl HostProvider {
         if record.state == SandboxState::Deleted {
             return Err(registry::missing(id));
         }
-        let sandbox = Arc::new(HostSandbox::new(
+        self.cache_handle(
+            &mut registry,
             record,
-            self.root.clone(),
-            self.capabilities.clone(),
             EventEmitter::new(self.kind.clone(), None),
-            self.cleanup_on_drop,
-            Arc::downgrade(&self.registry),
-        )?);
-        registry.insert(id.clone(), sandbox.clone());
+        )
+    }
+
+    /// Builds the shared handle for `record` and caches it in `handles`,
+    /// the locked handle registry. Every handle a provider hands out is
+    /// built here, from the provider's own root, so attached handles for
+    /// one sandbox share one live state.
+    fn cache_handle(
+        &self,
+        handles: &mut HashMap<SandboxId, Arc<HostSandbox>>,
+        record: Record,
+        events: EventEmitter,
+    ) -> Result<Arc<HostSandbox>> {
+        let sandbox = Arc::new(HostSandbox::new(self, record, events)?);
+        handles.insert(sandbox.record.id.clone(), sandbox.clone());
         Ok(sandbox)
     }
 
@@ -178,16 +189,11 @@ impl HostProvider {
         };
         registry::write(&self.root, &record).await?;
         let mut registry = self.registry.lock().await;
-        let sandbox = Arc::new(HostSandbox::new(
+        self.cache_handle(
+            &mut registry,
             record,
-            self.root.clone(),
-            self.capabilities.clone(),
             EventEmitter::new(self.kind.clone(), None),
-            self.cleanup_on_drop,
-            Arc::downgrade(&self.registry),
-        )?);
-        registry.insert(id.clone(), sandbox.clone());
-        Ok(sandbox)
+        )
     }
 }
 
@@ -211,6 +217,79 @@ async fn canonical_directory(path: &Path) -> Result<PathBuf> {
             error,
         )
     })
+}
+
+/// Where a new sandbox's workspace comes from, decided once from the spec.
+enum WorkspacePlan {
+    /// A caller-owned directory that must already exist; `delete` never
+    /// touches it.
+    Designated(PathBuf),
+    /// A caller-named directory this provider creates if needed and owns
+    /// from then on.
+    ManagedNamed(PathBuf),
+    /// A directory under the sandbox's registry entry, created here and
+    /// owned by this provider.
+    ManagedFresh,
+}
+
+impl WorkspacePlan {
+    fn from_spec(spec: &SandboxSpec) -> Self {
+        let Some(path) = &spec.working_directory else {
+            return Self::ManagedFresh;
+        };
+        let path = PathBuf::from(path.as_str());
+        if spec.workspace_ownership == Some(WorkspaceOwnership::Managed) {
+            Self::ManagedNamed(path)
+        } else {
+            Self::Designated(path)
+        }
+    }
+
+    /// The canonical path of a designated directory, when the plan names
+    /// one that resolves. Only a designated directory is its own identity.
+    async fn designated_directory(&self) -> Option<PathBuf> {
+        match self {
+            Self::Designated(path) => canonical_directory(path).await.ok(),
+            Self::ManagedNamed(_) | Self::ManagedFresh => None,
+        }
+    }
+
+    /// Makes the workspace exist and returns its canonical path with the
+    /// ownership the record stores. `root` is the canonical registry root
+    /// a fresh managed workspace lives under.
+    async fn realize(self, root: &Path, id: &SandboxId) -> Result<(PathBuf, WorkspaceOwnership)> {
+        match self {
+            Self::Designated(path) => Ok((
+                canonical_directory(&path).await?,
+                WorkspaceOwnership::Designated,
+            )),
+            Self::ManagedNamed(path) => {
+                tokio_fs::create_dir_all(&path)
+                    .await
+                    .map_err(|e| Error::io("creating managed host workspace", e))?;
+                Ok((
+                    canonical_directory(&path).await?,
+                    WorkspaceOwnership::Managed,
+                ))
+            }
+            Self::ManagedFresh => {
+                let path = registry::resource_dir(root, id)?.join("workspace");
+                tokio_fs::create_dir_all(&path).await.map_err(|error| {
+                    Error::io(
+                        format!("creating managed workspace {}", path.display()),
+                        error,
+                    )
+                })?;
+                let path = tokio_fs::canonicalize(&path).await.map_err(|error| {
+                    Error::io(
+                        format!("resolving managed workspace {}", path.display()),
+                        error,
+                    )
+                })?;
+                Ok((path, WorkspaceOwnership::Managed))
+            }
+        }
+    }
 }
 
 /// Prefix of a sandbox id derived from a designated directory's path.
@@ -330,6 +409,24 @@ fn validate_supported_creation_fields(spec: &SandboxSpec) -> Result<()> {
             "the host provider has no provider-specific creation options",
         ));
     }
+    if spec.sandbox_kind.is_some() {
+        return Err(Error::invalid_spec(
+            "sandbox_kind",
+            "the host provider does not provision containers or virtual machines",
+        ));
+    }
+    if !matches!(spec.source, SandboxSource::HostDirectory) {
+        return Err(Error::invalid_spec(
+            "source",
+            "the host provider only supports SandboxSource::HostDirectory",
+        ));
+    }
+    if !spec.volumes.is_empty() {
+        return Err(Error::invalid_spec(
+            "volumes",
+            "the host provider has no volumes",
+        ));
+    }
     Ok(())
 }
 
@@ -357,43 +454,17 @@ impl SandboxProvider for HostProvider {
     ) -> Result<Arc<dyn Sandbox>> {
         spec.validate()?;
         validate_supported_creation_fields(spec)?;
-        if spec.sandbox_kind.is_some() {
-            return Err(Error::invalid_spec(
-                "sandbox_kind",
-                "the host provider does not provision containers or virtual machines",
-            ));
-        }
-        if !matches!(spec.source, SandboxSource::HostDirectory) {
-            return Err(Error::invalid_spec(
-                "source",
-                "the host provider only supports SandboxSource::HostDirectory",
-            ));
-        }
-        if !spec.volumes.is_empty() {
-            return Err(Error::invalid_spec(
-                "volumes",
-                "the host provider has no volumes",
-            ));
-        }
 
         let emitter = EventEmitter::new(self.kind.clone(), events);
-        let designated = match &spec.working_directory {
-            Some(path)
-                if spec
-                    .workspace_ownership
-                    .unwrap_or(WorkspaceOwnership::Designated)
-                    == WorkspaceOwnership::Designated =>
-            {
-                // A path that does not resolve keeps a fresh id here and
-                // fails inside the create operation below, where the
-                // failure is reported through the events.
-                canonical_directory(Path::new(path)).await.ok()
-            }
-            _ => None,
-        };
+        let plan = WorkspacePlan::from_spec(spec);
         // A designated directory is its own identity: the id is derived from
-        // the path, so a later process attaches to it without a record.
-        let id = designated
+        // the path, so a later process attaches to it without a record. A
+        // path that does not resolve keeps a fresh id here and fails inside
+        // the create operation below, where the failure is reported through
+        // the events.
+        let id = plan
+            .designated_directory()
+            .await
             .as_deref()
             .and_then(directory_id)
             .unwrap_or_else(|| {
@@ -417,51 +488,7 @@ impl SandboxProvider for HostProvider {
                 let root = tokio_fs::canonicalize(&self.root)
                     .await
                     .map_err(|e| Error::io("resolving host registry", e))?;
-                let (workspace, ownership) = if let Some(path) = &spec.working_directory {
-                    let path = PathBuf::from(path.as_str());
-                    let ownership = spec
-                        .workspace_ownership
-                        .unwrap_or(WorkspaceOwnership::Designated);
-                    if ownership == WorkspaceOwnership::Managed {
-                        tokio_fs::create_dir_all(&path)
-                            .await
-                            .map_err(|e| Error::io("creating managed host workspace", e))?;
-                    }
-                    let metadata = tokio_fs::metadata(&path).await.map_err(|error| {
-                        Error::io(
-                            format!("designated directory {} is not usable", path.display()),
-                            error,
-                        )
-                    })?;
-                    if !metadata.is_dir() {
-                        return Err(Error::invalid_spec(
-                            "working_directory",
-                            "designated path is not a directory",
-                        ));
-                    }
-                    let path = tokio_fs::canonicalize(&path).await.map_err(|error| {
-                        Error::io(
-                            format!("resolving designated directory {}", path.display()),
-                            error,
-                        )
-                    })?;
-                    (path, ownership)
-                } else {
-                    let path = registry::resource_dir(&root, &id)?.join("workspace");
-                    tokio_fs::create_dir_all(&path).await.map_err(|error| {
-                        Error::io(
-                            format!("creating managed workspace {}", path.display()),
-                            error,
-                        )
-                    })?;
-                    let path = tokio_fs::canonicalize(&path).await.map_err(|error| {
-                        Error::io(
-                            format!("resolving managed workspace {}", path.display()),
-                            error,
-                        )
-                    })?;
-                    (path, WorkspaceOwnership::Managed)
-                };
+                let (workspace, ownership) = plan.realize(&root, &id).await?;
                 let record = Record {
                     version: 1,
                     id: id.clone(),
@@ -474,15 +501,8 @@ impl SandboxProvider for HostProvider {
                     created_at: SystemTime::now(),
                 };
                 registry::write(&root, &record).await?;
-                let sandbox = Arc::new(HostSandbox::new(
-                    record,
-                    root,
-                    self.capabilities.clone(),
-                    handle_emitter,
-                    self.cleanup_on_drop,
-                    Arc::downgrade(&self.registry),
-                )?);
-                self.registry.lock().await.insert(id, sandbox.clone());
+                let mut handles = self.registry.lock().await;
+                let sandbox = self.cache_handle(&mut handles, record, handle_emitter)?;
                 Ok(sandbox as Arc<dyn Sandbox>)
             })
             .await
@@ -540,59 +560,39 @@ impl SandboxProvider for HostProvider {
         err
     )]
     async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>> {
-        let mut entries = match tokio_fs::read_dir(&self.root).await {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(Error::io("listing host registry", e)),
-        };
-        let mut statuses = Vec::new();
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|e| Error::io("reading host registry entry", e))?
-        {
-            if !entry
-                .file_type()
-                .await
-                .map_err(|e| Error::io("reading registry entry type", e))?
-                .is_dir()
-            {
-                continue;
-            }
-            let Ok(id) = SandboxId::try_new(entry.file_name().to_string_lossy().into_owned())
-            else {
-                continue;
-            };
-            // Reading the record is enough to report a sandbox. Building a
-            // handle here would allocate process groups and cache a tombstone
-            // for every resource the registry has ever held.
-            let record = match registry::read(&self.root, &id).await {
-                Ok(record) => record,
-                Err(Error::NotFound { .. }) => continue,
-                Err(error) => return Err(error),
-            };
-            if record.state != SandboxState::Deleted
-                && filter
-                    .labels
-                    .iter()
-                    .all(|(key, value)| record.labels.get(key) == Some(value))
-            {
-                statuses.push(record.status(record.state));
-            }
-        }
-        Ok(statuses)
+        // Reading the records is enough to report sandboxes. Building
+        // handles here would allocate process groups and cache a tombstone
+        // for every resource the registry has ever held.
+        let records = registry::records(&self.root).await?;
+        Ok(records
+            .into_iter()
+            .filter(|record| {
+                record.state != SandboxState::Deleted
+                    && filter
+                        .labels
+                        .iter()
+                        .all(|(key, value)| record.labels.get(key) == Some(value))
+            })
+            .map(|record| record.status(record.state))
+            .collect())
     }
 }
 
 /// A directory-backed sandbox on the local machine.
+///
+/// Lifecycle state has one owner per layer: `state` is the live value,
+/// the registry record on disk is its durable copy, and `ProcessGroups`
+/// admission is a projection of `state == Running`. All three change only
+/// through [`Self::transition`], which holds the state lock for the whole
+/// change.
 pub struct HostSandbox {
     registry:          Weak<HandleRegistry>,
     root:              PathBuf,
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     groups:            Arc<ProcessGroups>,
-    /// Identity and metadata exactly as the registry stores them. Its
-    /// `state` is the value last written to disk; `state` below is the
-    /// live one shared across attached handles.
+    /// Identity and metadata as the registry stored them when this handle
+    /// was built. Its `state` is that moment's value and is never updated;
+    /// `state` below is the live one shared across attached handles, and
+    /// `persist` writes the record with the live state in its place.
     record:            Record,
     capabilities:      Capabilities,
     state:             Arc<Mutex<SandboxState>>,
@@ -604,35 +604,24 @@ pub struct HostSandbox {
 }
 
 impl HostSandbox {
-    fn new(
-        record: Record,
-        root: PathBuf,
-        capabilities: Capabilities,
-        events: EventEmitter,
-        cleanup_on_drop: bool,
-        registry: Weak<HandleRegistry>,
-    ) -> Result<Self> {
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let _ = cleanup_on_drop;
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn new(provider: &HostProvider, record: Record, events: EventEmitter) -> Result<Self> {
+        let root = provider.root.clone();
         let groups = Arc::new(ProcessGroups::new(
             registry::resource_dir(&root, &record.id)?.join("groups"),
             record.state == SandboxState::Running,
-            cleanup_on_drop,
+            provider.cleanup_on_drop,
         ));
         let exec = HostExec::with_groups(
             record.workspace.clone(),
             record.env.clone(),
             record.ownership == WorkspaceOwnership::Managed,
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
             groups.clone(),
         );
         Ok(Self {
-            registry,
+            registry: Arc::downgrade(&provider.registry),
             root,
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
             groups,
-            capabilities,
+            capabilities: provider.capabilities.clone(),
             working_directory: record.workspace.to_string_lossy().into_owned(),
             fs: HostFs::new(record.workspace.clone()),
             state: Arc::new(Mutex::new(record.state)),
@@ -654,7 +643,6 @@ impl HostSandbox {
         Self {
             registry: self.registry.clone(),
             root: self.root.clone(),
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
             groups: self.groups.clone(),
             record: self.record.clone(),
             capabilities: self.capabilities.clone(),
@@ -674,6 +662,104 @@ impl HostSandbox {
     async fn remove_cached_handle(&self) {
         if let Some(registry) = self.registry.upgrade() {
             registry.lock().await.remove(&self.record.id);
+        }
+    }
+
+    /// Drives one lifecycle change to `target` under the `action` events.
+    /// This is the only place the three copies of lifecycle state move:
+    /// it holds the state lock for the whole change, applies the
+    /// idempotency rule for a deleted sandbox, changes `ProcessGroups`
+    /// admission to match `target`, runs `work`, persists the record, sets
+    /// the live state, and evicts a deleted handle from the cache.
+    ///
+    /// A deleted sandbox cannot start again (it is reported missing), while
+    /// stopping or deleting it again succeeds and only drops the cached
+    /// handle.
+    ///
+    /// When `work` or the persist fails after admission moved, admission is
+    /// moved back to match the unchanged live state, so a sandbox that still
+    /// reports `Running` admits work and one that reports `Stopped` refuses
+    /// it, and the caller can retry the whole change. Work that a failed
+    /// stop already fenced stays fenced.
+    async fn transition(
+        &self,
+        action: Action,
+        target: SandboxState,
+        work: impl AsyncFnOnce() -> Result<()>,
+    ) -> Result<()> {
+        self.events
+            .run(
+                EventSubject::sandbox(Some(self.record.id.clone())),
+                action,
+                |_| async {
+                    let mut state = self.state.lock().await;
+                    if *state == SandboxState::Deleted {
+                        if target == SandboxState::Running {
+                            return Err(registry::missing(&self.record.id));
+                        }
+                        drop(state);
+                        self.remove_cached_handle().await;
+                        return Ok(());
+                    }
+                    self.admit_work(target == SandboxState::Running).await?;
+                    let outcome = async {
+                        work().await?;
+                        self.persist(target).await
+                    }
+                    .await;
+                    if let Err(error) = outcome {
+                        if let Err(rollback) =
+                            self.admit_work(*state == SandboxState::Running).await
+                        {
+                            tracing::warn!(
+                                provider_kind = "host",
+                                sandbox_id = %self.record.id,
+                                error = %rollback,
+                                "restoring process admission after a failed lifecycle change"
+                            );
+                        }
+                        return Err(error);
+                    }
+                    *state = target;
+                    if target == SandboxState::Deleted {
+                        // Persisted tombstones remain available for recovery
+                        // policy, but deleted resources need no cached handle.
+                        drop(state);
+                        self.remove_cached_handle().await;
+                    }
+                    Ok(())
+                },
+            )
+            .await
+    }
+
+    /// Moves `ProcessGroups` admission to match a `Running` (`true`) or
+    /// non-running (`false`) live state. Refusing admission fences every
+    /// group the sandbox owns.
+    async fn admit_work(&self, running: bool) -> Result<()> {
+        if running {
+            self.groups.start().await
+        } else {
+            self.groups.stop().await
+        }
+    }
+
+    /// Removes a managed workspace; a designated directory is never
+    /// touched. A workspace that is already gone is not an error.
+    async fn remove_managed_workspace(&self) -> Result<()> {
+        if self.record.ownership != WorkspaceOwnership::Managed {
+            return Ok(());
+        }
+        match tokio_fs::remove_dir_all(&self.record.workspace).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::io(
+                format!(
+                    "removing managed workspace {}",
+                    self.record.workspace.display()
+                ),
+                error,
+            )),
         }
     }
 
@@ -727,89 +813,23 @@ impl Sandbox for HostSandbox {
     /// Permit work after a successful stop, preserving the workspace.
     #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.record.id), err)]
     async fn start(&self) -> Result<()> {
-        self.events
-            .run(
-                EventSubject::sandbox(Some(self.record.id.clone())),
-                Action::Start,
-                |_| async {
-                    let mut state = self.state.lock().await;
-                    if *state == SandboxState::Deleted {
-                        return Err(registry::missing(&self.record.id));
-                    }
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
-                    self.groups.start().await?;
-                    self.persist(SandboxState::Running).await?;
-                    *state = SandboxState::Running;
-                    Ok(())
-                },
-            )
+        self.transition(Action::Start, SandboxState::Running, async || Ok(()))
             .await
     }
 
     /// End this sandbox's work while retaining its workspace.
     #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.record.id), err)]
     async fn stop(&self) -> Result<()> {
-        self.events
-            .run(
-                EventSubject::sandbox(Some(self.record.id.clone())),
-                Action::Stop,
-                |_| async {
-                    let mut state = self.state.lock().await;
-                    if *state == SandboxState::Deleted {
-                        drop(state);
-                        self.remove_cached_handle().await;
-                        return Ok(());
-                    }
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
-                    self.groups.stop().await?;
-                    self.persist(SandboxState::Stopped).await?;
-                    *state = SandboxState::Stopped;
-                    Ok(())
-                },
-            )
+        self.transition(Action::Stop, SandboxState::Stopped, async || Ok(()))
             .await
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.record.id), err)]
     async fn delete(&self) -> Result<()> {
-        self.events
-            .run(
-                EventSubject::sandbox(Some(self.record.id.clone())),
-                Action::Delete,
-                |_| async {
-                    let mut state = self.state.lock().await;
-                    if *state == SandboxState::Deleted {
-                        drop(state);
-                        self.remove_cached_handle().await;
-                        return Ok(());
-                    }
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
-                    self.groups.stop().await?;
-                    if self.record.ownership == WorkspaceOwnership::Managed {
-                        match tokio_fs::remove_dir_all(&self.record.workspace).await {
-                            Ok(()) => {}
-                            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                            Err(error) => {
-                                return Err(Error::io(
-                                    format!(
-                                        "removing managed workspace {}",
-                                        self.record.workspace.display()
-                                    ),
-                                    error,
-                                ));
-                            }
-                        }
-                    }
-                    self.persist(SandboxState::Deleted).await?;
-                    *state = SandboxState::Deleted;
-                    // Persisted tombstones remain available for recovery
-                    // policy, but deleted resources need no cached handle.
-                    drop(state);
-                    self.remove_cached_handle().await;
-                    Ok(())
-                },
-            )
-            .await
+        self.transition(Action::Delete, SandboxState::Deleted, async || {
+            self.remove_managed_workspace().await
+        })
+        .await
     }
 
     fn exec(&self) -> &dyn Exec {

@@ -1,33 +1,26 @@
 use std::collections::BTreeMap;
-#[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::pin::pin;
-use std::process::Stdio;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::pin::{Pin, pin};
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::{env, future, io};
 
 use async_trait::async_trait;
-#[cfg(unix)]
-use nix::sys::signal::Signal;
 use sandbox_driver::{
     Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputCaptureBuffer,
-    OutputSanitization, OutputSanitizer, OutputSink, OutputStream, Result, SpawnSpec, StderrTail,
-    StdioProcess, StdioProcessHandle, Termination, feed_stdin, run_with_stop_grace, stop_signal,
+    OutputSanitizer, OutputSink, OutputStream, Result, SpawnSpec, StderrTail, StdioProcess,
+    StdioProcessHandle, Termination, feed_stdin, run_with_stop_grace, stop_signal,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-use tokio::process::Child as HostChild;
-use tokio::process::Command;
+use tokio::process::{ChildStderr, ChildStdout, Command};
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio::{fs, time};
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::fence::{HostChild, ProcessGroups};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::fence::{HostChild, ProcessGroups, exec_result};
 use crate::registry;
 
 /// Bash sources this file at startup. Dropped from the inherited
@@ -115,7 +108,6 @@ pub(crate) fn effective_env(base_env: &BTreeMap<String, String>) -> BTreeMap<Str
 /// process ends. Process-record removal is best effort while Tokio is
 /// available.
 pub struct HostExec {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     groups:                     Arc<ProcessGroups>,
     working_dir:                PathBuf,
     base_env:                   BTreeMap<String, String>,
@@ -138,7 +130,6 @@ impl HostExec {
             working_dir,
             base_env,
             recreate_missing_workspace,
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Arc::new(ProcessGroups::new(
                 env::temp_dir()
                     .join("sandbox-driver-host-groups")
@@ -153,10 +144,9 @@ impl HostExec {
         working_dir: PathBuf,
         base_env: BTreeMap<String, String>,
         recreate_missing_workspace: bool,
-        #[cfg(any(target_os = "linux", target_os = "macos"))] groups: Arc<ProcessGroups>,
+        groups: Arc<ProcessGroups>,
     ) -> Self {
         Self {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
             groups,
             working_dir,
             base_env,
@@ -208,80 +198,8 @@ impl HostExec {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
         };
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            self.groups.spawn(program, args, configure).await
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            let mut command = Command::new(program);
-            command.args(args);
-            configure(&mut command);
-            #[cfg(unix)]
-            command.process_group(0);
-            command.kill_on_drop(true);
-            command
-                .spawn()
-                .map_err(|error| Error::io("spawning host command", error))
-        }
+        self.groups.spawn(program, args, configure).await
     }
-}
-
-#[cfg(unix)]
-fn signal_process_group(child: &HostChild, signal: Signal) {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    child.signal(signal);
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    if let Some(pid) = child.id() {
-        use nix::sys::signal::killpg;
-        use nix::unistd::Pid;
-        // A pid that does not fit i32 must skip the kill entirely: a
-        // zero pgid would signal the caller's own process group.
-        let Ok(pid) = i32::try_from(pid) else {
-            return;
-        };
-        let _ = killpg(Pid::from_raw(pid), signal);
-    }
-}
-
-/// Sends SIGTERM to the process group, waits `grace` for a graceful exit,
-/// then SIGKILLs the group and the child directly: the stdio handle's
-/// `terminate`.
-///
-/// The direct kill is the guarantee: a command that moved itself out of
-/// its process group makes the group signals miss entirely (killpg on
-/// an empty group is ESRCH), and the callers' subsequent `wait()` would
-/// hang forever. SIGKILL to the immediate child always lands, and
-/// `kill()` reaps it, so a completed terminate means a returned wait.
-async fn terminate_process_group(child: &mut HostChild, grace: Duration) {
-    #[cfg(unix)]
-    {
-        signal_process_group(child, Signal::SIGTERM);
-        if time::timeout(grace, child.wait()).await.is_ok() {
-            return;
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = grace;
-    kill_process_group(child).await;
-}
-
-/// SIGTERMs the process group, once, and returns: the
-/// [`ExecControls::term`] path. Whether the command ends is the
-/// command's business; the caller escalates to `kill` if it must.
-fn term_process_group(child: &HostChild) {
-    #[cfg(unix)]
-    signal_process_group(child, Signal::SIGTERM);
-    #[cfg(not(unix))]
-    let _ = child;
-}
-
-/// SIGKILLs the process group and the child directly: the
-/// [`ExecControls::kill`] path, the timeout, and a failing sink.
-async fn kill_process_group(child: &mut HostChild) {
-    #[cfg(unix)]
-    signal_process_group(child, Signal::SIGKILL);
-    let _ = child.kill().await;
 }
 
 enum PumpError {
@@ -291,48 +209,134 @@ enum PumpError {
     Read(io::Error),
 }
 
-/// Reads one output stream to EOF, feeding the capture buffer and sink.
-/// `progress` counts the chunks read, so the post-exit drain can tell a
-/// silent pipe from a slow consumer.
-async fn pump_stream(
-    mut reader: impl AsyncRead + Unpin,
-    stream: OutputStream,
-    capture: &mut OutputCaptureBuffer,
-    sink: Option<&OutputSink>,
-    output_sanitization: OutputSanitization,
-    progress: &AtomicU64,
-) -> Result<(), PumpError> {
-    let mut buffer = [0u8; 8192];
-    let mut sanitizer = OutputSanitizer::new(output_sanitization);
-    loop {
-        match reader.read(&mut buffer).await {
-            Ok(0) => {
-                let chunk = sanitizer.finish();
-                capture.push(&chunk);
-                if !chunk.is_empty() {
-                    if let Some(sink) = sink {
-                        if sink(stream, chunk).await.is_err() {
-                            return Err(PumpError::Sink);
-                        }
-                    }
-                }
-                return Ok(());
+/// One output stream's pump: reads the pipe to EOF and delivers each chunk
+/// to the capture buffer and the sink.
+struct OutputPump<'a> {
+    stream:    OutputStream,
+    sanitizer: OutputSanitizer,
+    capture:   &'a mut OutputCaptureBuffer,
+    sink:      Option<&'a OutputSink>,
+    /// Counts the chunks read, so the post-exit drain can tell a silent
+    /// pipe from a slow consumer.
+    progress:  &'a AtomicU64,
+}
+
+impl OutputPump<'_> {
+    /// Captures one sanitized chunk and hands it to the sink; the sink
+    /// only sees chunks with bytes in them.
+    async fn deliver(&mut self, chunk: Vec<u8>) -> Result<(), PumpError> {
+        self.capture.push(&chunk);
+        match self.sink {
+            Some(sink) if !chunk.is_empty() => {
+                sink(self.stream, chunk).await.map_err(|_| PumpError::Sink)
             }
-            Err(error) => return Err(PumpError::Read(error)),
-            Ok(read) => {
-                progress.fetch_add(1, Ordering::Relaxed);
-                let chunk = sanitizer.push(&buffer[..read]);
-                capture.push(&chunk);
-                if !chunk.is_empty() {
-                    if let Some(sink) = sink {
-                        if sink(stream, chunk).await.is_err() {
-                            return Err(PumpError::Sink);
-                        }
-                    }
+            _ => Ok(()),
+        }
+    }
+
+    async fn run(mut self, mut reader: impl AsyncRead + Unpin) -> Result<(), PumpError> {
+        let mut buffer = [0u8; 8192];
+        loop {
+            match reader.read(&mut buffer).await {
+                Ok(0) => {
+                    let chunk = self.sanitizer.finish();
+                    return self.deliver(chunk).await;
+                }
+                Err(error) => return Err(PumpError::Read(error)),
+                Ok(read) => {
+                    self.progress.fetch_add(1, Ordering::Relaxed);
+                    let chunk = self.sanitizer.push(&buffer[..read]);
+                    self.deliver(chunk).await?;
                 }
             }
         }
     }
+}
+
+/// A spawned command with its pipes taken: the child to race, the stdin
+/// writer task when the spec has input, and the output pipes to pump.
+struct Wired {
+    child:      HostChild,
+    stdin_task: Option<JoinHandle<Result<()>>>,
+    stdout:     ChildStdout,
+    stderr:     ChildStderr,
+}
+
+/// Where the exec race stands.
+#[derive(Clone, Copy)]
+enum Phase {
+    /// The process is running; its exit, or a stop, ends this phase.
+    Running,
+    /// The process has exited. Its remaining output drains until the pumps
+    /// finish or the pipes stay silent for the grace; `seen` is the pump
+    /// progress when the drain deadline was last armed.
+    Draining { status: ExitStatus, seen: u64 },
+}
+
+impl Phase {
+    /// Kills the process group and settles the race as `termination`. The
+    /// exit status is already known once the process has exited; otherwise
+    /// it is awaited now that the group has been killed.
+    async fn stop(
+        self,
+        child: &mut HostChild,
+        termination: Termination,
+    ) -> Result<(Termination, ExitStatus)> {
+        child.kill().await;
+        let status = match self {
+            Self::Running => child
+                .wait()
+                .await
+                .map_err(|error| Error::io("waiting for exec process", error))?,
+            Self::Draining { status, .. } => status,
+        };
+        Ok((termination, status))
+    }
+}
+
+/// How a process that ended on its own is reported: cancelled when the
+/// caller's `term` was sent, exited otherwise.
+fn natural_termination(term_fired: bool) -> Termination {
+    if term_fired {
+        Termination::Cancelled
+    } else {
+        Termination::Exited
+    }
+}
+
+/// How the race ended.
+struct Raced {
+    termination:  Termination,
+    status:       ExitStatus,
+    /// How the pumps ended, or `None` when the race ended before both
+    /// pumps had finished.
+    pump_outcome: Option<Result<(), PumpError>>,
+}
+
+fn assemble_result(
+    termination: Termination,
+    status: ExitStatus,
+    duration: Duration,
+    drain_truncated: bool,
+    stdout_capture: OutputCaptureBuffer,
+    stderr_capture: OutputCaptureBuffer,
+) -> ExecStreamingResult {
+    let (stdout_bytes, mut stdout_stats) = stdout_capture.into_parts();
+    let (stderr_bytes, mut stderr_stats) = stderr_capture.into_parts();
+    if drain_truncated {
+        stdout_stats.truncated = true;
+        stderr_stats.truncated = true;
+    }
+    let mut result = exec_result(termination, status, duration);
+    result.stdout = stdout_bytes;
+    result.stderr = stderr_bytes;
+
+    let mut streaming = ExecStreamingResult::new(result);
+    streaming.streams_separated = true;
+    streaming.live_streaming = true;
+    streaming.stdout_capture = stdout_stats;
+    streaming.stderr_capture = stderr_stats;
+    streaming
 }
 
 #[async_trait]
@@ -377,6 +381,91 @@ impl HostExec {
         controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
         let started = Instant::now();
+        let Wired {
+            mut child,
+            stdin_task,
+            stdout,
+            stderr,
+        } = self.spawn_and_wire(spec, &controls).await?;
+        let mut stdout_capture = OutputCaptureBuffer::new(controls.retained_output_limit);
+        let mut stderr_capture = OutputCaptureBuffer::new(controls.retained_output_limit);
+        let sink = controls.sink.as_ref();
+        let progress = AtomicU64::new(0);
+        // Pinned here, not inside `race`, so the race future stays small
+        // while the pumps own their read buffers. The block ends the pumps'
+        // borrow of the captures once the race has settled.
+        let Raced {
+            termination,
+            status,
+            pump_outcome,
+        } = {
+            let mut pumps = pin!(async {
+                tokio::try_join!(
+                    OutputPump {
+                        stream: OutputStream::Stdout,
+                        sanitizer: OutputSanitizer::new(spec.output_sanitization),
+                        capture: &mut stdout_capture,
+                        sink,
+                        progress: &progress,
+                    }
+                    .run(stdout),
+                    OutputPump {
+                        stream: OutputStream::Stderr,
+                        sanitizer: OutputSanitizer::new(spec.output_sanitization),
+                        capture: &mut stderr_capture,
+                        sink,
+                        progress: &progress,
+                    }
+                    .run(stderr),
+                )?;
+                Ok::<(), PumpError>(())
+            });
+            self.race(
+                &mut child,
+                &controls,
+                spec.timeout,
+                pumps.as_mut(),
+                &progress,
+            )
+            .await?
+        };
+        if let Some(stdin_task) = stdin_task {
+            // The process is gone, so unwritten stdin bytes are unwanted.
+            // Abort instead of joining unbounded: a backgrounded
+            // grandchild that inherited the pipe could otherwise block
+            // the writer forever.
+            stdin_task.abort();
+            match stdin_task.await {
+                Ok(result) => result?,
+                Err(join_error) if join_error.is_cancelled() => {}
+                Err(join_error) => {
+                    return Err(Error::io(
+                        "exec stdin writer task",
+                        io::Error::other(join_error),
+                    ));
+                }
+            }
+        }
+        // Pumps that finished cleanly are the only complete output. Every
+        // other way out of the race (a stop, the timeout, a failed sink or
+        // read, or a pipe that stayed silent after exit) left output unread.
+        let drain_truncated = !matches!(pump_outcome, Some(Ok(())));
+        if let Some(Err(PumpError::Read(error))) = pump_outcome {
+            return Err(Error::io("reading exec output", error));
+        }
+        Ok(assemble_result(
+            termination,
+            status,
+            started.elapsed(),
+            drain_truncated,
+            stdout_capture,
+            stderr_capture,
+        ))
+    }
+
+    /// Spawns the command and takes its pipes: stdin goes to a writer task
+    /// when the spec has input, stdout and stderr to the caller's pumps.
+    async fn spawn_and_wire(&self, spec: &ExecSpec, controls: &ExecControls) -> Result<Wired> {
         let stdin_reader = controls.stdin_reader(spec);
         let mut child = self
             .spawn_command(
@@ -399,208 +488,104 @@ impl HostExec {
             .take()
             .zip(stdin_reader)
             .map(|(stdin, reader)| tokio::spawn(feed_stdin(stdin, reader)));
-
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
-        let mut stdout_capture = OutputCaptureBuffer::new(controls.retained_output_limit);
-        let mut stderr_capture = OutputCaptureBuffer::new(controls.retained_output_limit);
-        let sink = controls.sink.as_ref();
+        Ok(Wired {
+            child,
+            stdin_task,
+            stdout,
+            stderr,
+        })
+    }
 
-        // The process, the stop tokens, and the timeout race until the
-        // process ends; the pumps run alongside without gating any of
-        // them, so a command that closes its own stdout/stderr (a
-        // daemonizing child) is still bounded by the timeout. A `term`
-        // signals and keeps waiting — the command may exit, or the
-        // caller's `kill` may follow — so it records the termination
-        // rather than ending the race. Remaining output is drained after
-        // the process ends, until the pipes have been silent for
-        // `drain_grace`.
-        let mut read_error: Option<io::Error> = None;
-        let mut drain_truncated = false;
-        let progress = AtomicU64::new(0);
-        let (termination, status) = {
-            let mut pumps = pin!(async {
-                tokio::try_join!(
-                    pump_stream(
-                        stdout,
-                        OutputStream::Stdout,
-                        &mut stdout_capture,
-                        sink,
-                        spec.output_sanitization,
-                        &progress,
-                    ),
-                    pump_stream(
-                        stderr,
-                        OutputStream::Stderr,
-                        &mut stderr_capture,
-                        sink,
-                        spec.output_sanitization,
-                        &progress,
-                    ),
-                )
-            });
-            let mut pumps_done = false;
+    /// Races the process against the stop tokens, the timeout, and the
+    /// output pumps until it has ended and its output has drained.
+    ///
+    /// The pumps run alongside without gating the process, so a command
+    /// that closes its own stdout/stderr (a daemonizing child) is still
+    /// bounded by the timeout. A `term` signals and keeps waiting — the
+    /// command may exit, or the caller's `kill` may follow — so it records
+    /// the termination rather than ending the race. Once the process has
+    /// ended, the caller's stop controls and the original timeout stay
+    /// live while the remaining output drains: the leader can exit while
+    /// descendants keep its pipes open or a sink stays blocked. The drain
+    /// deadline measures silence: output still arriving, however slowly
+    /// the sink takes it, re-arms it, so a loaded consumer never loses the
+    /// tail of a command that already exited.
+    async fn race(
+        &self,
+        child: &mut HostChild,
+        controls: &ExecControls,
+        timeout: Option<Duration>,
+        mut pumps: Pin<&mut impl Future<Output = Result<(), PumpError>>>,
+        progress: &AtomicU64,
+    ) -> Result<Raced> {
+        let mut pump_outcome = None;
+        let mut termed = pin!(stop_signal(controls.term.as_ref()));
+        let mut killed = pin!(stop_signal(controls.kill.as_ref()));
+        let mut term_fired = false;
+        let mut timeout = pin!(async {
+            match timeout {
+                Some(timeout) => time::sleep(timeout).await,
+                None => future::pending().await,
+            }
+        });
+        // Armed when the process exits; disabled until then.
+        let mut drain_deadline = pin!(time::sleep(self.drain_grace));
+        let mut phase = Phase::Running;
 
-            let mut termed = pin!(stop_signal(controls.term.as_ref()));
-            let mut killed = pin!(stop_signal(controls.kill.as_ref()));
-            let mut term_fired = false;
-
-            let mut timeout = pin!(async {
-                match spec.timeout {
-                    Some(timeout) => time::sleep(timeout).await,
-                    None => future::pending().await,
+        let (termination, status) = loop {
+            tokio::select! {
+                biased;
+                () = &mut killed => break phase.stop(child, Termination::Killed).await?,
+                () = &mut timeout => break phase.stop(child, Termination::TimedOut).await?,
+                () = &mut termed, if !term_fired => {
+                    term_fired = true;
+                    child.term();
                 }
-            });
-
-            let (mut termination, status) = loop {
-                tokio::select! {
-                    outcome = &mut pumps, if !pumps_done => {
-                        pumps_done = true;
-                        if let Err(error) = outcome {
-                            if let PumpError::Read(error) = error {
-                                read_error = Some(error);
-                            }
-                            drain_truncated = true;
-                            kill_process_group(&mut child).await;
-                            break (Termination::Cancelled, None);
-                        }
+                outcome = &mut pumps, if pump_outcome.is_none() => {
+                    let failed = outcome.is_err();
+                    pump_outcome = Some(outcome);
+                    if failed {
+                        break phase.stop(child, Termination::Cancelled).await?;
                     }
-                    wait_result = child.wait() => {
-                        let status = wait_result.map_err(|error| {
-                            Error::io("waiting for exec process", error)
-                        })?;
-                        let termination = if term_fired {
-                            Termination::Cancelled
-                        } else {
-                            Termination::Exited
-                        };
-                        break (termination, Some(status));
-                    }
-                    () = &mut termed, if !term_fired => {
-                        term_fired = true;
-                        term_process_group(&child);
-                    }
-                    () = &mut killed => {
-                        kill_process_group(&mut child).await;
-                        break (Termination::Killed, None);
-                    }
-                    () = &mut timeout => {
-                        kill_process_group(&mut child).await;
-                        break (Termination::TimedOut, None);
+                    if let Phase::Draining { status, .. } = phase {
+                        break (natural_termination(term_fired), status);
                     }
                 }
-            };
-
-            let status = match status {
-                Some(status) => status,
-                None => child
-                    .wait()
-                    .await
-                    .map_err(|error| Error::io("waiting for exec process", error))?,
-            };
-            if !pumps_done {
-                // The leader can exit while descendants keep its pipes open
-                // or a sink stays blocked. Keep the caller's stop controls and
-                // the original timeout live until those pumps finish too.
-                // The deadline measures silence: output still arriving, however
-                // slowly the sink takes it, re-arms it, so a loaded consumer
-                // never loses the tail of a command that already exited.
-                let mut seen = progress.load(Ordering::Relaxed);
-                let mut drain_deadline = pin!(time::sleep(self.drain_grace));
-                loop {
-                    if matches!(termination, Termination::Killed | Termination::TimedOut) {
-                        drain_truncated = true;
-                        break;
+                wait_result = child.wait(), if matches!(phase, Phase::Running) => {
+                    let status = wait_result
+                        .map_err(|error| Error::io("waiting for exec process", error))?;
+                    if pump_outcome.is_some() {
+                        break (natural_termination(term_fired), status);
                     }
-                    tokio::select! {
-                        biased;
-                        () = &mut killed => {
-                            kill_process_group(&mut child).await;
-                            termination = Termination::Killed;
+                    drain_deadline
+                        .as_mut()
+                        .reset(time::Instant::now() + self.drain_grace);
+                    phase = Phase::Draining {
+                        status,
+                        seen: progress.load(Ordering::Relaxed),
+                    };
+                }
+                () = &mut drain_deadline, if matches!(phase, Phase::Draining { .. }) => {
+                    if let Phase::Draining { status, seen } = &mut phase {
+                        let now = progress.load(Ordering::Relaxed);
+                        if now == *seen {
+                            break (natural_termination(term_fired), *status);
                         }
-                        () = &mut timeout => {
-                            kill_process_group(&mut child).await;
-                            termination = Termination::TimedOut;
-                        }
-                        () = &mut termed, if !term_fired => {
-                            term_fired = true;
-                            term_process_group(&child);
-                            termination = Termination::Cancelled;
-                        }
-                        outcome = &mut pumps => {
-                            if let Err(error) = outcome {
-                                if let PumpError::Read(error) = error {
-                                    read_error = Some(error);
-                                }
-                                kill_process_group(&mut child).await;
-                                termination = Termination::Cancelled;
-                                drain_truncated = true;
-                            }
-                            break;
-                        }
-                        () = &mut drain_deadline => {
-                            let now = progress.load(Ordering::Relaxed);
-                            if now != seen {
-                                seen = now;
-                                drain_deadline
-                                    .as_mut()
-                                    .reset(time::Instant::now() + self.drain_grace);
-                                continue;
-                            }
-                            drain_truncated = true;
-                            break;
-                        }
+                        *seen = now;
+                        drain_deadline
+                            .as_mut()
+                            .reset(time::Instant::now() + self.drain_grace);
                     }
                 }
             }
-            (termination, status)
         };
-        if let Some(stdin_task) = stdin_task {
-            // The process is gone, so unwritten stdin bytes are unwanted.
-            // Abort instead of joining unbounded: a backgrounded
-            // grandchild that inherited the pipe could otherwise block
-            // the writer forever.
-            stdin_task.abort();
-            match stdin_task.await {
-                Ok(result) => result?,
-                Err(join_error) if join_error.is_cancelled() => {}
-                Err(join_error) => {
-                    return Err(Error::io(
-                        "exec stdin writer task",
-                        io::Error::other(join_error),
-                    ));
-                }
-            }
-        }
-        if let Some(error) = read_error {
-            return Err(Error::io("reading exec output", error));
-        }
-        let exit_code = status.code();
-        #[cfg(unix)]
-        let exit_signal = ExitStatusExt::signal(&status);
-        #[cfg(not(unix))]
-        let exit_signal: Option<i32> = None;
-
-        let (stdout_bytes, mut stdout_stats) = stdout_capture.into_parts();
-        let (stderr_bytes, mut stderr_stats) = stderr_capture.into_parts();
-        if drain_truncated {
-            stdout_stats.truncated = true;
-            stderr_stats.truncated = true;
-        }
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let mut result = ExecResult::from_shell_status(termination, exit_code, started.elapsed());
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let mut result = ExecResult::new(termination, exit_code, started.elapsed());
-        result.signal = exit_signal.or(result.signal);
-        result.stdout = stdout_bytes;
-        result.stderr = stderr_bytes;
-
-        let mut streaming = ExecStreamingResult::new(result);
-        streaming.streams_separated = true;
-        streaming.live_streaming = true;
-        streaming.stdout_capture = stdout_stats;
-        streaming.stderr_capture = stderr_stats;
-        Ok(streaming)
+        Ok(Raced {
+            termination,
+            status,
+            pump_outcome,
+        })
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "host"), err)]
@@ -682,7 +667,7 @@ impl HostStdioHandle {
                         future::pending::<()>().await;
                     }
                 } => {
-                    terminate_process_group(&mut child, TERM_GRACE).await;
+                    child.terminate(TERM_GRACE).await;
                     let code = match child.wait().await {
                         Ok(status) => status.code(),
                         Err(error) => {
@@ -739,30 +724,11 @@ impl StdioProcessHandle for HostStdioHandle {
     }
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
-    use sandbox_driver::{SandboxProvider, SandboxSource, SandboxSpec};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::task::spawn_blocking;
-
     use super::*;
-    use crate::HostProvider;
-    use crate::observation::group_is_live;
-
-    async fn wait_for_group_exit(pgid: i32) {
-        time::timeout(Duration::from_secs(3), async {
-            while spawn_blocking(move || group_is_live(pgid))
-                .await
-                .expect("observe process group")
-            {
-                time::sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("the final temporary owner releases its sentinel");
-    }
 
     fn expected_seq(count: usize) -> Vec<u8> {
         let mut lines = String::new();
@@ -821,76 +787,5 @@ mod tests {
         assert!(streaming.stdout_capture.truncated);
         assert!(started.elapsed() < Duration::from_secs(5));
         drop(exec);
-    }
-
-    #[tokio::test]
-    async fn standalone_exec_releases_completed_process_groups_on_drop() {
-        let exec = HostExec::new(env::temp_dir(), BTreeMap::new(), false);
-        let result = exec.run(&ExecSpec::bash("echo $PPID")).await.unwrap();
-        let pgid = result.stdout_lossy().trim().parse().unwrap();
-        drop(exec);
-        wait_for_group_exit(pgid).await;
-    }
-
-    #[tokio::test]
-    async fn standalone_stdio_owns_its_process_after_the_executor_drops() {
-        let exec = HostExec::new(env::temp_dir(), BTreeMap::new(), false);
-        let mut process = exec
-            .spawn_stdio(&SpawnSpec::new("sh").args(["-c", "echo $PPID; exec cat"]))
-            .await
-            .unwrap();
-        drop(exec);
-        let mut output = BufReader::new(process.stdout);
-        let mut line = String::new();
-        output.read_line(&mut line).await.unwrap();
-        let pgid = line.trim().parse().unwrap();
-        process.stdin.write_all(b"still alive\n").await.unwrap();
-        line.clear();
-        time::timeout(Duration::from_secs(3), output.read_line(&mut line))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(line, "still alive\n");
-        process.handle.terminate().await;
-        wait_for_group_exit(pgid).await;
-    }
-
-    #[tokio::test]
-    async fn only_durable_providers_keep_groups_after_the_last_handle_drops() {
-        for durable in [false, true] {
-            let root = env::temp_dir().join(registry::fresh_id());
-            let provider = if durable {
-                HostProvider::with_registry(&root).await.unwrap()
-            } else {
-                HostProvider::new()
-            };
-            let sandbox = provider
-                .create(&SandboxSpec::new(SandboxSource::HostDirectory), None)
-                .await
-                .unwrap();
-            let id = sandbox.id().clone();
-            let workspace = sandbox.working_directory().to_owned();
-            let result = sandbox
-                .exec()
-                .run(&ExecSpec::bash("echo $PPID"))
-                .await
-                .unwrap();
-            let pgid = result.stdout_lossy().trim().parse().unwrap();
-            drop(sandbox);
-            drop(provider);
-            if durable {
-                assert!(spawn_blocking(move || group_is_live(pgid)).await.unwrap());
-                HostProvider::with_registry(&root)
-                    .await
-                    .unwrap()
-                    .delete(&id, None)
-                    .await
-                    .unwrap();
-                fs::remove_dir_all(root).await.unwrap();
-            } else {
-                fs::remove_dir_all(workspace).await.unwrap();
-            }
-            wait_for_group_exit(pgid).await;
-        }
     }
 }
