@@ -2,52 +2,59 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
-use sandbox_driver::{SandboxSource, SandboxSpec};
+use sandbox_driver::{ProviderKind, SandboxSource, SandboxSpec};
 use tokio::fs::{read, read_to_string};
 use tokio::io::{AsyncReadExt as _, stdin as async_stdin};
 
+use super::is_host;
 use crate::cli::CreateSpecArgs;
 
-pub(super) async fn build_spec(
-    args: &CreateSpecArgs,
-    provider_kind: &str,
-    running_one_shot: bool,
-) -> Result<SandboxSpec> {
+pub(super) async fn build_spec(args: &CreateSpecArgs, kind: &ProviderKind) -> Result<SandboxSpec> {
     let explicit_source = source_from_args(args).await?;
-    let mut spec = if let Some(path) = &args.spec {
-        let contents = read_local_input(path).await?;
-        serde_json::from_slice(&contents)
-            .with_context(|| format!("parsing SandboxSpec from {}", display_input(path)))?
-    } else {
-        let source = explicit_source
-            .clone()
-            .or_else(|| (provider_kind == "host").then_some(SandboxSource::HostDirectory));
-        SandboxSpec::new(source.context(
-            "a creation source is required; use --image, --dockerfile, --snapshot, --host-directory, or --spec",
-        )?)
-    };
+    let mut spec = base_spec(args, kind, explicit_source).await?;
+    apply_overrides(&mut spec, args)?;
+    spec.validate()
+        .context("validating sandbox specification")?;
+    Ok(spec)
+}
 
+/// Chooses the starting specification: the `--spec` document when given,
+/// otherwise a fresh one from the explicit source, or the Host directory
+/// default. An explicit source always wins over the document's.
+async fn base_spec(
+    args: &CreateSpecArgs,
+    kind: &ProviderKind,
+    explicit_source: Option<SandboxSource>,
+) -> Result<SandboxSpec> {
+    let Some(path) = &args.spec else {
+        let source =
+            explicit_source.or_else(|| is_host(kind).then_some(SandboxSource::HostDirectory));
+        return Ok(SandboxSpec::new(source.context(
+            "a creation source is required; use --image, --dockerfile, --snapshot, --host-directory, or --spec",
+        )?));
+    };
+    let contents = read_local_input(path).await?;
+    let mut spec: SandboxSpec = serde_json::from_slice(&contents)
+        .with_context(|| format!("parsing SandboxSpec from {}", display_input(path)))?;
     if let Some(source) = explicit_source {
         spec.source = source;
     }
+    Ok(spec)
+}
+
+/// Applies every field option to `spec`; an option that was not given
+/// leaves the field as it is.
+fn apply_overrides(spec: &mut SandboxSpec, args: &CreateSpecArgs) -> Result<()> {
     if let Some(name) = &args.name {
         spec.name = Some(name.clone());
     }
     if let Some(kind) = args.kind {
         spec.sandbox_kind = Some(kind.into());
     }
-    if args.cpu.is_some()
-        || args.memory_mb.is_some()
-        || args.disk_mb.is_some()
-        || args.gpus.is_some()
-    {
-        let mut resources = spec.resources;
-        resources.cpu_cores = args.cpu.or(resources.cpu_cores);
-        resources.memory_mb = args.memory_mb.or(resources.memory_mb);
-        resources.disk_mb = args.disk_mb.or(resources.disk_mb);
-        resources.gpus = args.gpus.or(resources.gpus);
-        spec.resources = resources;
-    }
+    spec.resources.cpu_cores = args.cpu.or(spec.resources.cpu_cores);
+    spec.resources.memory_mb = args.memory_mb.or(spec.resources.memory_mb);
+    spec.resources.disk_mb = args.disk_mb.or(spec.resources.disk_mb);
+    spec.resources.gpus = args.gpus.or(spec.resources.gpus);
     spec.env.extend(parse_assignments(&args.env, "env")?);
     spec.labels
         .extend(parse_assignments(&args.labels, "label")?);
@@ -67,13 +74,7 @@ pub(super) async fn build_spec(
         spec.provider_config =
             serde_json::from_str(provider_config).context("parsing --provider-config as JSON")?;
     }
-
-    if running_one_shot && provider_kind == "host" && spec.working_directory.is_none() {
-        tracing::debug!("Host run will use a managed temporary workspace");
-    }
-    spec.validate()
-        .context("validating sandbox specification")?;
-    Ok(spec)
+    Ok(())
 }
 
 async fn source_from_args(args: &CreateSpecArgs) -> Result<Option<SandboxSource>> {
@@ -138,7 +139,44 @@ pub(super) fn parse_assignments(
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser as _;
+
     use super::*;
+    use crate::cli::{Cli, Command, SandboxCommand};
+
+    fn create_args(options: &[&str]) -> CreateSpecArgs {
+        let cli = Cli::try_parse_from(
+            ["lithos-sandbox", "sandbox", "create"]
+                .into_iter()
+                .chain(options.iter().copied()),
+        )
+        .expect("create options parse");
+        let Command::Sandbox { command } = cli.command else {
+            panic!("expected sandbox command");
+        };
+        let SandboxCommand::Create(args) = *command else {
+            panic!("expected sandbox create");
+        };
+        args.spec
+    }
+
+    #[test]
+    fn overrides_replace_only_the_given_fields() {
+        let mut spec = SandboxSpec::new(SandboxSource::HostDirectory);
+        spec.name = Some("from-spec".to_owned());
+        spec.resources.cpu_cores = Some(1);
+        spec.resources.memory_mb = Some(512);
+        spec.env.insert("KEEP".to_owned(), "yes".to_owned());
+
+        let args = create_args(&["--cpu", "2", "--env", "ADDED=1"]);
+        apply_overrides(&mut spec, &args).expect("overrides apply");
+
+        assert_eq!(spec.name.as_deref(), Some("from-spec"));
+        assert_eq!(spec.resources.cpu_cores, Some(2));
+        assert_eq!(spec.resources.memory_mb, Some(512));
+        assert_eq!(spec.env["KEEP"], "yes");
+        assert_eq!(spec.env["ADDED"], "1");
+    }
 
     #[test]
     fn assignments_split_only_on_the_first_equals_sign() {

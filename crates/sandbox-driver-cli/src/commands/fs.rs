@@ -1,9 +1,8 @@
 use anyhow::Result;
 use sandbox_driver::{Capability, EventContext, SandboxProvider};
 
-use super::{attach, require_capability};
+use super::act_on_sandbox;
 use crate::cli::{FsCommand, OutputFormat};
-use crate::output::write_action;
 
 pub(super) async fn execute_fs(
     command: &FsCommand,
@@ -13,29 +12,28 @@ pub(super) async fn execute_fs(
 ) -> Result<u8> {
     match command {
         FsCommand::Upload { id, local, remote } => {
-            let sandbox = attach(provider, id, events).await?;
-            require_capability(provider, sandbox.as_ref(), Capability::FsUpload)?;
-            sandbox.fs().upload(local, remote).await?;
-            write_action(
-                provider.kind().as_str(),
-                sandbox.id().as_str(),
-                "uploaded file to",
+            act_on_sandbox(
+                provider,
+                id,
+                events,
                 output,
+                Capability::FsUpload,
+                "uploaded file to",
+                async |sandbox| sandbox.fs().upload(local, remote).await,
             )
-            .await?;
+            .await
         }
         FsCommand::Download { id, remote, local } => {
-            let sandbox = attach(provider, id, events).await?;
-            require_capability(provider, sandbox.as_ref(), Capability::FsDownload)?;
-            sandbox.fs().download(remote, local).await?;
-            write_action(
-                provider.kind().as_str(),
-                sandbox.id().as_str(),
-                "downloaded file from",
+            act_on_sandbox(
+                provider,
+                id,
+                events,
                 output,
+                Capability::FsDownload,
+                "downloaded file from",
+                async |sandbox| sandbox.fs().download(remote, local).await,
             )
-            .await?;
+            .await
         }
     }
-    Ok(0)
 }

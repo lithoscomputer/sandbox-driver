@@ -10,7 +10,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context as _, Result};
 use clap::Parser as _;
-use cli::{Cli, Command, ProviderCommand};
+use cli::Cli;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
@@ -34,26 +34,7 @@ async fn main() -> ExitCode {
 
 async fn run(cli: &Cli) -> Result<u8> {
     let config = config::Config::load(cli.config.as_deref()).await?;
-    let selected = config.selected_provider(cli.provider.as_deref());
-
-    if matches!(cli.command, Command::Provider {
-        command: ProviderCommand::List,
-    }) {
-        commands::list_providers(&config, selected, cli.output).await?;
-        return Ok(0);
-    }
-
-    let session = provider::ProviderSession::connect(selected, &config).await?;
-    let command_result =
-        commands::execute(&cli.command, &session.provider, cli.output, cli.events).await;
-    let shutdown_result = session.shutdown().await;
-    match (command_result, shutdown_result) {
-        (Ok(code), Ok(())) => Ok(code),
-        (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(shutdown_error)) => Err(error.context(format!(
-            "the command also failed to shut down its plugin: {shutdown_error:#}"
-        ))),
-    }
+    commands::execute(cli, &config).await
 }
 
 fn configure_diagnostics(verbosity: u8) -> Result<()> {

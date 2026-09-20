@@ -1,3 +1,4 @@
+use std::io::Result as IoResult;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,14 +9,14 @@ use sandbox_driver::{
     SandboxProvider, Termination, WaitOptions,
 };
 use tokio::io::{
-    AsyncReadExt as _, AsyncWriteExt as _, stderr as async_stderr, stdin as async_stdin,
-    stdout as async_stdout,
+    AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, stderr as async_stderr,
+    stdin as async_stdin, stdout as async_stdout,
 };
 use tokio::signal::ctrl_c;
 use tokio_util::sync::CancellationToken;
 
 use super::spec::{build_spec, parse_assignments};
-use super::{CANCELLED_EXIT, DRIVER_ERROR_EXIT, KILLED_EXIT, TIMEOUT_EXIT};
+use super::{CANCELLED_EXIT, DRIVER_ERROR_EXIT, KILLED_EXIT, TIMEOUT_EXIT, is_host};
 use crate::cli::{ExecOptions, RunArgs};
 use crate::output::write_stderr;
 
@@ -27,13 +28,13 @@ pub(super) async fn execute_run(
     if args.spec.spec.as_deref() == Some(Path::new("-")) && args.exec.stdin {
         bail!("--spec - and --stdin cannot read from stdin in the same command");
     }
-    if args.keep && provider.kind().as_str() == "host" {
+    if args.keep && is_host(provider.kind()) {
         bail!(
             "Host sandboxes cannot be reattached after this command exits; remove --keep or use a persistent provider"
         );
     }
 
-    let spec = build_spec(&args.spec, provider.kind().as_str(), true).await?;
+    let spec = build_spec(&args.spec, provider.kind()).await?;
     let sandbox = provider.create(&spec, events).await?;
     let operation = async {
         sandbox_driver::activate(sandbox.as_ref(), &WaitOptions::default()).await?;
@@ -134,24 +135,20 @@ fn command_output_sink() -> OutputSink {
     Arc::new(|stream, bytes| {
         Box::pin(async move {
             let result = match stream {
-                OutputStream::Stdout => {
-                    let mut output = async_stdout();
-                    match output.write_all(&bytes).await {
-                        Ok(()) => output.flush().await,
-                        Err(error) => Err(error),
-                    }
-                }
-                OutputStream::Stderr => {
-                    let mut output = async_stderr();
-                    match output.write_all(&bytes).await {
-                        Ok(()) => output.flush().await,
-                        Err(error) => Err(error),
-                    }
-                }
+                OutputStream::Stdout => write_and_flush(async_stdout(), &bytes).await,
+                OutputStream::Stderr => write_and_flush(async_stderr(), &bytes).await,
             };
             result.map_err(|error| Error::io("writing command output", error))
         })
     })
+}
+
+async fn write_and_flush<W>(mut writer: W, bytes: &[u8]) -> IoResult<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_all(bytes).await?;
+    writer.flush().await
 }
 
 async fn termination_exit_code(termination: Termination, exit_code: Option<i32>) -> Result<u8> {
