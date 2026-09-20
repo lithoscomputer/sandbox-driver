@@ -43,6 +43,12 @@ impl ScriptedExec {
         result
     }
 
+    /// `count` successes with no output, for a verb that runs several
+    /// commands whose output the test does not read.
+    pub(crate) fn succeeding(count: usize) -> Vec<ExecResult> {
+        (0..count).map(|_| Self::ok("")).collect()
+    }
+
     /// A clean exit with a non-zero code.
     pub(crate) fn failed(code: i32) -> ExecResult {
         ExecResult::new(Termination::Exited, Some(code), Duration::from_millis(1))

@@ -1,7 +1,7 @@
 //! Parsers for git's porcelain and plumbing output.
 
 use super::command::{lossy, malformed};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::git::{GitChange, GitCommit, GitDiffEntry, GitIdentity, GitNumstat, GitStatus};
 
 /// Git's separator format for one commit of a log: unit separator between
@@ -220,12 +220,18 @@ pub(super) fn parse_batch(
         }
     }
     if blobs.len() != count {
-        return Err(malformed(
-            "git cat-file",
-            format!("{} objects answered for {count} requested", blobs.len()),
-        ));
+        return Err(count_mismatch("git cat-file", blobs.len(), count));
     }
     Ok(blobs)
+}
+
+/// A batch command answered for a different number of objects than it
+/// was asked about.
+pub(super) fn count_mismatch(what: &str, answered: usize, requested: usize) -> Error {
+    malformed(
+        what,
+        format!("{answered} objects answered for {requested} requested"),
+    )
 }
 
 /// Parses `git status --porcelain=v2 -z --branch` output: entries are
@@ -242,15 +248,35 @@ pub(super) fn parse_status_v2(output: &str) -> GitStatus {
     };
     let mut entries = output.split('\0');
     while let Some(entry) = entries.next() {
-        if let Some(oid) = entry.strip_prefix("# branch.oid ") {
-            status.head = (oid != "(initial)").then(|| oid.to_owned());
-        } else if let Some(head) = entry.strip_prefix("# branch.head ") {
-            if head == "(detached)" {
-                status.detached = true;
-            } else {
-                status.current_branch = Some(head.to_owned());
+        match entry.split_once(' ') {
+            Some(("#", header)) => parse_branch_header(header, &mut status),
+            // 8 fixed fields after the marker, then the path.
+            Some(("1", fields)) => status.dirty_paths.extend(path_after_fields(fields, 8)),
+            // Rename/copy: 9 fields, the new path, then the original
+            // path as its own NUL-separated field.
+            Some(("2", fields)) => {
+                status.dirty_paths.extend(path_after_fields(fields, 9));
+                let _original_path = entries.next();
             }
-        } else if let Some(ab) = entry.strip_prefix("# branch.ab ") {
+            // Unmerged (conflict): 10 fields, then the path. A repo
+            // mid-merge must not pass a "workspace clean" check.
+            Some(("u", fields)) => status.dirty_paths.extend(path_after_fields(fields, 10)),
+            Some(("?", path)) => status.dirty_paths.push(path.to_owned()),
+            _ => {}
+        }
+    }
+    status
+}
+
+/// One `# branch.<key> <value>` header of a porcelain v2 status.
+fn parse_branch_header(header: &str, status: &mut GitStatus) {
+    match header.split_once(' ') {
+        Some(("branch.oid", oid)) => {
+            status.head = (oid != "(initial)").then(|| oid.to_owned());
+        }
+        Some(("branch.head", "(detached)")) => status.detached = true,
+        Some(("branch.head", head)) => status.current_branch = Some(head.to_owned()),
+        Some(("branch.ab", ab)) => {
             for part in ab.split_whitespace() {
                 if let Some(ahead) = part.strip_prefix('+') {
                     status.ahead = ahead.parse().unwrap_or(0);
@@ -258,29 +284,14 @@ pub(super) fn parse_status_v2(output: &str) -> GitStatus {
                     status.behind = behind.parse().unwrap_or(0);
                 }
             }
-        } else if let Some(entry) = entry.strip_prefix("1 ") {
-            // 8 fixed fields after the marker, then the path.
-            if let Some(path) = entry.splitn(8, ' ').nth(7) {
-                status.dirty_paths.push(path.to_owned());
-            }
-        } else if let Some(entry) = entry.strip_prefix("2 ") {
-            // Rename/copy: 9 fields, the new path, then the original
-            // path as its own NUL-separated field.
-            if let Some(path) = entry.splitn(9, ' ').nth(8) {
-                status.dirty_paths.push(path.to_owned());
-            }
-            let _original_path = entries.next();
-        } else if let Some(entry) = entry.strip_prefix("u ") {
-            // Unmerged (conflict): 10 fields, then the path. A repo
-            // mid-merge must not pass a "workspace clean" check.
-            if let Some(path) = entry.splitn(10, ' ').nth(9) {
-                status.dirty_paths.push(path.to_owned());
-            }
-        } else if let Some(path) = entry.strip_prefix("? ") {
-            status.dirty_paths.push(path.to_owned());
         }
+        _ => {}
     }
-    status
+}
+
+/// The path that follows `count - 1` space-separated fields.
+fn path_after_fields(fields: &str, count: usize) -> Option<String> {
+    fields.splitn(count, ' ').nth(count - 1).map(str::to_owned)
 }
 
 #[cfg(test)]

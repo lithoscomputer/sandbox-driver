@@ -8,12 +8,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use self::command::{
-    GIT, GIT_READ, GIT_TIMEOUT, NETWORK_TIMEOUT, feed_object_names, git_command, git_failure,
-    git_spec, lossy, malformed,
+    GIT_READ, GIT_TIMEOUT, GitCommand, NETWORK_TIMEOUT, feed_object_names, git_failure, git_spec,
+    lossy,
 };
 use self::parse::{
-    LOG_FORMAT, batch_header, parse_batch, parse_log, parse_numstat, parse_raw_diff,
-    parse_status_v2,
+    LOG_FORMAT, batch_header, count_mismatch, parse_batch, parse_log, parse_numstat,
+    parse_raw_diff, parse_status_v2,
 };
 use crate::error::Result;
 use crate::exec::{Exec, ExecResult, Termination};
@@ -53,37 +53,10 @@ impl<'e> DerivedGit<'e> {
         self
     }
 
-    async fn run(
-        &self,
-        label: &str,
-        repo: Option<&str>,
-        args: &[String],
-        timeout: Duration,
-    ) -> Result<ExecResult> {
-        self.run_prefixed(GIT, label, repo, args, timeout).await
-    }
-
-    /// A read-only command, which also refuses the file transport.
-    async fn run_read(
-        &self,
-        label: &str,
-        repo: Option<&str>,
-        args: &[String],
-        timeout: Duration,
-    ) -> Result<ExecResult> {
-        self.run_prefixed(GIT_READ, label, repo, args, timeout)
-            .await
-    }
-
-    async fn run_prefixed(
-        &self,
-        prefix: &str,
-        label: &str,
-        repo: Option<&str>,
-        args: &[String],
-        timeout: Duration,
-    ) -> Result<ExecResult> {
-        self.run_script(label, repo, git_command(prefix, args), None, timeout)
+    /// Runs one git command in `repo` and reports a failed one as a
+    /// classified git failure under the command's label.
+    async fn run(&self, repo: Option<&str>, command: GitCommand) -> Result<ExecResult> {
+        self.run_script(command.label, repo, command.script(), None, command.timeout)
             .await
     }
 
@@ -106,6 +79,28 @@ impl<'e> DerivedGit<'e> {
             return Ok(result);
         }
         Err(git_failure(label, result))
+    }
+
+    /// `cat-file <mode>` (`--batch` or `--batch-check`) fed every name in
+    /// `blobs`, once each has been validated; the caller reads stdout.
+    async fn cat_file_batch(
+        &self,
+        repo_path: &str,
+        blobs: &[String],
+        mode: &str,
+    ) -> Result<ExecResult> {
+        for blob in blobs {
+            validate_object_name("blobs", blob)?;
+        }
+        let script = format!("{} | {GIT_READ} cat-file {mode}", feed_object_names(blobs));
+        self.run_script(
+            &format!("git cat-file {mode}"),
+            Some(repo_path),
+            script,
+            None,
+            GIT_TIMEOUT,
+        )
+        .await
     }
 }
 
@@ -131,51 +126,30 @@ impl Git for DerivedGit<'_> {
         // `-z` delimits entries with NUL and keeps paths verbatim —
         // without it git C-quotes special-character paths and a newline
         // in a path corrupts adjacent entries.
-        let result = self
-            .run(
-                "git status",
-                Some(repo_path),
-                &[
-                    "status".into(),
-                    "--porcelain=v2".into(),
-                    "-z".into(),
-                    "--branch".into(),
-                ],
-                GIT_TIMEOUT,
-            )
-            .await?;
+        let status =
+            GitCommand::new("git status", "status").args(["--porcelain=v2", "-z", "--branch"]);
+        let result = self.run(Some(repo_path), status).await?;
         Ok(parse_status_v2(&result.stdout_lossy()))
     }
 
     async fn add(&self, repo_path: &str, paths: &[String]) -> Result<()> {
-        let mut args: Vec<String> = vec!["add".into(), "--".into()];
-        args.extend(paths.iter().cloned());
-        self.run("git add", Some(repo_path), &args, GIT_TIMEOUT)
-            .await?;
+        let add = GitCommand::new("git add", "add").arg("--").args(paths);
+        self.run(Some(repo_path), add).await?;
         Ok(())
     }
 
     async fn commit(&self, repo_path: &str, options: &GitCommitOptions) -> Result<String> {
-        let mut args: Vec<String> = vec![
-            "-c".into(),
-            format!("user.name={}", options.author_name),
-            "-c".into(),
-            format!("user.email={}", options.author_email),
-            "commit".into(),
-            "-m".into(),
-            options.message.clone(),
-        ];
-        if options.allow_empty {
-            args.push("--allow-empty".into());
-        }
-        self.run("git commit", Some(repo_path), &args, GIT_TIMEOUT)
-            .await?;
+        let commit = GitCommand::new("git commit", "commit")
+            .config(format!("user.name={}", options.author_name))
+            .config(format!("user.email={}", options.author_email))
+            .arg("-m")
+            .arg(&options.message)
+            .flag_if(options.allow_empty, "--allow-empty");
+        self.run(Some(repo_path), commit).await?;
         let sha = self
             .run(
-                "git rev-parse",
                 Some(repo_path),
-                &["rev-parse".into(), "HEAD".into()],
-                GIT_TIMEOUT,
+                GitCommand::new("git rev-parse", "rev-parse").arg("HEAD"),
             )
             .await?
             .stdout_lossy();
@@ -185,41 +159,28 @@ impl Git for DerivedGit<'_> {
     async fn push(&self, repo_path: &str, options: &GitPushOptions) -> Result<()> {
         options.validate()?;
         let remote = options.remote.as_deref().unwrap_or("origin");
-        let mut args: Vec<String> = Vec::new();
-        if let Some(rewrite) = self
+        let rewrite = self
             .credential_rewrite(repo_path, remote, options.credentials.as_ref())
-            .await?
-        {
-            args.push("-c".into());
-            args.push(rewrite);
-        }
-        args.push("push".into());
-        if options.set_upstream {
-            args.push("--set-upstream".into());
-        }
-        args.push(remote.to_owned());
-        if let Some(target) = options.refspec.as_ref().or(options.branch.as_ref()) {
-            args.push(target.clone());
-        }
-        let timeout = options.timeout.unwrap_or(NETWORK_TIMEOUT);
-        self.run("git push", Some(repo_path), &args, timeout)
             .await?;
+        let push = GitCommand::new("git push", "push")
+            .configs(rewrite)
+            .flag_if(options.set_upstream, "--set-upstream")
+            .arg(remote)
+            .args(options.refspec.as_ref().or(options.branch.as_ref()))
+            .timeout(options.timeout.unwrap_or(NETWORK_TIMEOUT));
+        self.run(Some(repo_path), push).await?;
         Ok(())
     }
 
     async fn pull(&self, repo_path: &str, credentials: Option<&GitCredentials>) -> Result<()> {
-        let mut args: Vec<String> = Vec::new();
-        if let Some(rewrite) = self
+        let rewrite = self
             .credential_rewrite(repo_path, "origin", credentials)
-            .await?
-        {
-            args.push("-c".into());
-            args.push(rewrite);
-        }
-        args.push("pull".into());
-        args.push("origin".into());
-        self.run("git pull", Some(repo_path), &args, NETWORK_TIMEOUT)
             .await?;
+        let pull = GitCommand::new("git pull", "pull")
+            .configs(rewrite)
+            .arg("origin")
+            .timeout(NETWORK_TIMEOUT);
+        self.run(Some(repo_path), pull).await?;
         Ok(())
     }
 
@@ -228,23 +189,16 @@ impl Git for DerivedGit<'_> {
         // emit a "(HEAD detached at …)" pseudo-entry in detached state.
         let list = self
             .run(
-                "git for-each-ref",
                 Some(repo_path),
-                &[
-                    "for-each-ref".into(),
-                    "--format=%(refname:short)".into(),
-                    "refs/heads".into(),
-                ],
-                GIT_TIMEOUT,
+                GitCommand::new("git for-each-ref", "for-each-ref")
+                    .args(["--format=%(refname:short)", "refs/heads"]),
             )
             .await?
             .stdout_lossy();
         let head = self
             .run(
-                "git rev-parse",
                 Some(repo_path),
-                &["rev-parse".into(), "--abbrev-ref".into(), "HEAD".into()],
-                GIT_TIMEOUT,
+                GitCommand::new("git rev-parse", "rev-parse").args(["--abbrev-ref", "HEAD"]),
             )
             .await?
             .stdout_lossy();
@@ -266,47 +220,25 @@ impl Git for DerivedGit<'_> {
     async fn fetch(&self, repo_path: &str, options: &GitFetchOptions) -> Result<()> {
         options.validate()?;
         let remote = options.remote.as_deref().unwrap_or("origin");
-        let mut args: Vec<String> = Vec::new();
-        if let Some(rewrite) = self
+        let rewrite = self
             .credential_rewrite(repo_path, remote, options.credentials.as_ref())
-            .await?
-        {
-            args.push("-c".into());
-            args.push(rewrite);
-        }
-        args.push("fetch".into());
-        if let Some(depth) = options.depth {
-            args.push("--depth".into());
-            args.push(depth.to_string());
-        }
-        args.push(remote.to_owned());
-        args.extend(options.refspecs.iter().cloned());
-        self.run(
-            "git fetch",
-            Some(repo_path),
-            &args,
-            options.timeout.unwrap_or(NETWORK_TIMEOUT),
-        )
-        .await?;
+            .await?;
+        let fetch = GitCommand::new("git fetch", "fetch")
+            .configs(rewrite)
+            .option("--depth", options.depth)
+            .arg(remote)
+            .args(&options.refspecs)
+            .timeout(options.timeout.unwrap_or(NETWORK_TIMEOUT));
+        self.run(Some(repo_path), fetch).await?;
         Ok(())
     }
 
     async fn rev_parse(&self, repo_path: &str, revision: &str) -> Result<String> {
         validate_argument("revision", revision)?;
-        let output = self
-            .run_read(
-                "git rev-parse",
-                Some(repo_path),
-                &[
-                    "rev-parse".into(),
-                    "--verify".into(),
-                    "--end-of-options".into(),
-                    revision.to_owned(),
-                ],
-                GIT_TIMEOUT,
-            )
-            .await?
-            .stdout_lossy();
+        let rev_parse = GitCommand::new("git rev-parse", "rev-parse")
+            .read_only()
+            .args(["--verify", "--end-of-options", revision]);
+        let output = self.run(Some(repo_path), rev_parse).await?.stdout_lossy();
         Ok(output.trim().to_owned())
     }
 
@@ -314,20 +246,22 @@ impl Git for DerivedGit<'_> {
         validate_argument("ancestor", ancestor)?;
         validate_argument("descendant", descendant)?;
         // Exit 0 and 1 are the two answers; anything else is a failure.
-        let script = git_command(GIT_READ, &[
-            "merge-base".into(),
-            "--is-ancestor".into(),
-            ancestor.to_owned(),
-            descendant.to_owned(),
-        ]);
+        let merge_base = GitCommand::new("git merge-base", "merge-base")
+            .read_only()
+            .args(["--is-ancestor", ancestor, descendant]);
         let result = self
             .exec
-            .run(&git_spec(script, Some(repo_path), None, GIT_TIMEOUT))
+            .run(&git_spec(
+                merge_base.script(),
+                Some(repo_path),
+                None,
+                merge_base.timeout,
+            ))
             .await?;
         match result.exit_code {
             Some(0) if result.termination == Termination::Exited => Ok(true),
             Some(1) if result.termination == Termination::Exited => Ok(false),
-            _ => Err(git_failure("git merge-base", result)),
+            _ => Err(git_failure(merge_base.label, result)),
         }
     }
 
@@ -337,25 +271,16 @@ impl Git for DerivedGit<'_> {
         options: &GitDiffOptions,
     ) -> Result<Vec<GitDiffEntry>> {
         options.validate()?;
-        let mut args: Vec<String> = vec![
-            "diff".into(),
-            "--no-ext-diff".into(),
-            "--raw".into(),
+        let diff = GitCommand::new("git diff --raw", "diff")
+            .read_only()
+            .args(["--no-ext-diff", "--raw"])
             // Full blob names, so a caller can hand them straight back to the
             // blob verbs.
-            "--no-abbrev".into(),
-            "-z".into(),
-        ];
-        args.extend(rename_flag(options));
-        args.push(options.range.spec(None));
-        let result = self
-            .run_read(
-                "git diff --raw",
-                Some(repo_path),
-                &args,
-                options.timeout.unwrap_or(GIT_TIMEOUT),
-            )
-            .await?;
+            .args(["--no-abbrev", "-z"])
+            .args(rename_flag(options))
+            .arg(options.range.spec(None))
+            .timeout(options.timeout.unwrap_or(GIT_TIMEOUT));
+        let result = self.run(Some(repo_path), diff).await?;
         parse_raw_diff(&result.stdout)
     }
 
@@ -365,63 +290,43 @@ impl Git for DerivedGit<'_> {
         options: &GitDiffOptions,
     ) -> Result<Vec<GitNumstat>> {
         options.validate()?;
-        let mut args: Vec<String> = vec![
-            "diff".into(),
-            "--no-ext-diff".into(),
-            "--numstat".into(),
-            "-z".into(),
-        ];
-        args.extend(rename_flag(options));
-        args.push(options.range.spec(None));
-        let result = self
-            .run_read(
-                "git diff --numstat",
-                Some(repo_path),
-                &args,
-                options.timeout.unwrap_or(GIT_TIMEOUT),
-            )
-            .await?;
+        let diff = GitCommand::new("git diff --numstat", "diff")
+            .read_only()
+            .args(["--no-ext-diff", "--numstat", "-z"])
+            .args(rename_flag(options))
+            .arg(options.range.spec(None))
+            .timeout(options.timeout.unwrap_or(GIT_TIMEOUT));
+        let result = self.run(Some(repo_path), diff).await?;
         parse_numstat(&result.stdout)
     }
 
     async fn diff_patch(&self, repo_path: &str, options: &GitDiffOptions) -> Result<String> {
         options.validate()?;
-        let mut args: Vec<String> =
-            vec!["diff".into(), "--no-ext-diff".into(), "--no-color".into()];
-        args.extend(rename_flag(options));
-        args.push(options.range.spec(None));
-        let result = self
-            .run_read(
-                "git diff",
-                Some(repo_path),
-                &args,
-                options.timeout.unwrap_or(GIT_TIMEOUT),
-            )
-            .await?;
+        let diff = GitCommand::new("git diff", "diff")
+            .read_only()
+            .args(["--no-ext-diff", "--no-color"])
+            .args(rename_flag(options))
+            .arg(options.range.spec(None))
+            .timeout(options.timeout.unwrap_or(GIT_TIMEOUT));
+        let result = self.run(Some(repo_path), diff).await?;
         Ok(result.stdout_lossy())
     }
 
     async fn log(&self, repo_path: &str, options: &GitLogOptions) -> Result<Vec<GitCommit>> {
         options.validate()?;
-        let mut args: Vec<String> = vec!["log".into(), format!("--format={LOG_FORMAT}")];
-        if options.first_parent {
-            args.push("--first-parent".into());
-        }
-        if options.reverse {
-            args.push("--reverse".into());
-        }
-        if let Some(count) = options.max_count {
-            args.push(format!("--max-count={count}"));
-        }
-        args.push(options.range.spec(Some("HEAD")));
-        let result = self
-            .run_read(
-                "git log",
-                Some(repo_path),
-                &args,
-                options.timeout.unwrap_or(GIT_TIMEOUT),
+        let log = GitCommand::new("git log", "log")
+            .read_only()
+            .arg(format!("--format={LOG_FORMAT}"))
+            .flag_if(options.first_parent, "--first-parent")
+            .flag_if(options.reverse, "--reverse")
+            .args(
+                options
+                    .max_count
+                    .map(|count| format!("--max-count={count}")),
             )
-            .await?;
+            .arg(options.range.spec(Some("HEAD")))
+            .timeout(options.timeout.unwrap_or(GIT_TIMEOUT));
+        let result = self.run(Some(repo_path), log).await?;
         parse_log(&result.stdout_lossy())
     }
 
@@ -429,21 +334,8 @@ impl Git for DerivedGit<'_> {
         if blobs.is_empty() {
             return Ok(Vec::new());
         }
-        for blob in blobs {
-            validate_object_name("blobs", blob)?;
-        }
-        let script = format!(
-            "{} | {GIT_READ} cat-file --batch-check",
-            feed_object_names(blobs)
-        );
         let result = self
-            .run_script(
-                "git cat-file --batch-check",
-                Some(repo_path),
-                script,
-                None,
-                GIT_TIMEOUT,
-            )
+            .cat_file_batch(repo_path, blobs, "--batch-check")
             .await?;
         let sizes = result
             .stdout_lossy()
@@ -454,13 +346,10 @@ impl Git for DerivedGit<'_> {
             })
             .collect::<Result<Vec<_>>>()?;
         if sizes.len() != blobs.len() {
-            return Err(malformed(
+            return Err(count_mismatch(
                 "git cat-file --batch-check",
-                format!(
-                    "{} objects answered for {} requested",
-                    sizes.len(),
-                    blobs.len()
-                ),
+                sizes.len(),
+                blobs.len(),
             ));
         }
         Ok(sizes)
@@ -475,54 +364,22 @@ impl Git for DerivedGit<'_> {
         if blobs.is_empty() {
             return Ok(Vec::new());
         }
-        for blob in blobs {
-            validate_object_name("blobs", blob)?;
-        }
-        let script = format!("{} | {GIT_READ} cat-file --batch", feed_object_names(blobs));
-        let result = self
-            .run_script(
-                "git cat-file --batch",
-                Some(repo_path),
-                script,
-                None,
-                GIT_TIMEOUT,
-            )
-            .await?;
+        let result = self.cat_file_batch(repo_path, blobs, "--batch").await?;
         parse_batch(&result.stdout, blobs.len(), max_bytes)
     }
 
     async fn config_set(&self, repo_path: &str, key: &str, value: &str) -> Result<()> {
         validate_config_key(key)?;
-        self.run(
-            "git config",
-            Some(repo_path),
-            &[
-                "config".into(),
-                "--local".into(),
-                "--".into(),
-                key.to_owned(),
-                value.to_owned(),
-            ],
-            GIT_TIMEOUT,
-        )
-        .await?;
+        let config = GitCommand::new("git config", "config").args(["--local", "--", key, value]);
+        self.run(Some(repo_path), config).await?;
         Ok(())
     }
 
     async fn untracked_files(&self, repo_path: &str) -> Result<Vec<String>> {
-        let result = self
-            .run_read(
-                "git ls-files",
-                Some(repo_path),
-                &[
-                    "ls-files".into(),
-                    "--others".into(),
-                    "--exclude-standard".into(),
-                    "-z".into(),
-                ],
-                GIT_TIMEOUT,
-            )
-            .await?;
+        let ls_files = GitCommand::new("git ls-files", "ls-files")
+            .read_only()
+            .args(["--others", "--exclude-standard", "-z"]);
+        let result = self.run(Some(repo_path), ls_files).await?;
         Ok(result
             .stdout
             .split(|byte| *byte == 0)
@@ -532,38 +389,36 @@ impl Git for DerivedGit<'_> {
     }
 
     async fn add_all(&self, repo_path: &str, pathspecs: &[String]) -> Result<()> {
-        let mut args: Vec<String> = vec!["add".into(), "-A".into(), "--".into()];
-        if pathspecs.is_empty() {
-            args.push(".".into());
+        let add = GitCommand::new("git add", "add").args(["-A", "--"]);
+        let add = if pathspecs.is_empty() {
+            add.arg(".")
         } else {
-            args.extend(pathspecs.iter().cloned());
-        }
-        self.run("git add", Some(repo_path), &args, GIT_TIMEOUT)
-            .await?;
+            add.args(pathspecs)
+        };
+        self.run(Some(repo_path), add).await?;
         Ok(())
     }
 
     async fn checkout(&self, repo_path: &str, options: &GitCheckoutOptions) -> Result<()> {
         options.validate()?;
-        let mut args: Vec<String> = vec!["checkout".into()];
+        let mut checkout = GitCommand::new("git checkout", "checkout");
         if options.create {
-            args.push(if options.reset { "-B" } else { "-b" }.into());
+            checkout = checkout.arg(if options.reset { "-B" } else { "-b" });
         }
-        args.push(options.branch.clone());
-        if let Some(start_point) = &options.start_point {
-            args.push(start_point.clone());
-        }
-        // Forces branch interpretation: a branch that also matches a
-        // path would otherwise restore the file instead.
-        args.push("--".into());
-        self.run("git checkout", Some(repo_path), &args, GIT_TIMEOUT)
-            .await?;
+        let checkout = checkout
+            .arg(&options.branch)
+            .args(options.start_point.as_ref())
+            // Forces branch interpretation: a branch that also matches a
+            // path would otherwise restore the file instead.
+            .arg("--");
+        self.run(Some(repo_path), checkout).await?;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use self::command::GIT;
     use super::*;
     use crate::error::Error;
     use crate::test_exec::ScriptedExec;
@@ -649,7 +504,7 @@ mod tests {
 
     #[tokio::test]
     async fn checkout_creates_or_resets_at_a_start_point() {
-        let exec = ScriptedExec::new(vec![ScriptedExec::ok(""), ScriptedExec::ok("")]);
+        let exec = ScriptedExec::new(ScriptedExec::succeeding(2));
         let git = DerivedGit::new(&exec);
         git.checkout(
             "/repo",
@@ -760,11 +615,7 @@ mod tests {
 
     #[tokio::test]
     async fn mutating_verbs_run_hardened_without_refusing_the_file_transport() {
-        let exec = ScriptedExec::new(vec![
-            ScriptedExec::ok(""),
-            ScriptedExec::ok(""),
-            ScriptedExec::ok(""),
-        ]);
+        let exec = ScriptedExec::new(ScriptedExec::succeeding(3));
         let git = DerivedGit::new(&exec);
         git.fetch("/repo", &GitFetchOptions {
             refspecs: vec!["+refs/heads/main:refs/remotes/origin/main".into()],
