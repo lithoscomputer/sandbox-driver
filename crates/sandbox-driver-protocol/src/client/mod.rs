@@ -386,6 +386,20 @@ impl Client {
         )
     }
 
+    /// Routes later events for sandbox `id` to `context`. The cache is
+    /// bounded like the route cache: once it is full, an arbitrary older
+    /// entry is evicted, and an event for an evicted sandbox fails the
+    /// subscription explicitly rather than disappearing.
+    fn remember_event_context(&self, id: &SandboxId, context: &EventContext) {
+        let mut contexts = self.event_contexts.lock().expect("event contexts lock");
+        if contexts.len() >= self.limits.cached_handles {
+            if let Some(old) = contexts.keys().next().cloned() {
+                contexts.remove(&old);
+            }
+        }
+        contexts.insert(id.as_str().to_owned(), context.clone());
+    }
+
     fn register_events(&self, events: Option<&EventContext>) -> Option<m::EventRequest> {
         events.map(|context| {
             let route_id = format!(

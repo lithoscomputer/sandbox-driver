@@ -143,12 +143,16 @@ pub(super) struct SandboxHandle {
 impl SandboxHandle {
     pub(super) fn new(
         client: Arc<Client>,
-        id: SandboxId,
-        capabilities: Capabilities,
-        working_directory: String,
-        runtime_directory: Option<String>,
+        info: m::HandleInfo,
         events: Option<EventContext>,
     ) -> Self {
+        let m::HandleInfo {
+            status,
+            capabilities,
+            working_directory,
+            runtime_directory,
+        } = info;
+        let id = status.id;
         Self {
             exec: SandboxExec {
                 client:     Arc::clone(&client),
@@ -289,20 +293,12 @@ impl Sandbox for SandboxHandle {
                 options:    options.into(),
             })
             .await?;
-        let id = info.status.id.clone();
         if let Some(context) = &self.events {
-            self.client
-                .event_contexts
-                .lock()
-                .expect("event contexts lock")
-                .insert(id.as_str().to_owned(), context.clone());
+            self.client.remember_event_context(&info.status.id, context);
         }
         Ok(Arc::new(Self::new(
             Arc::clone(&self.client),
-            id,
-            info.capabilities,
-            info.working_directory,
-            info.runtime_directory,
+            info,
             self.events.clone(),
         )))
     }

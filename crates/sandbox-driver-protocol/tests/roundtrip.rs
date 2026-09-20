@@ -12,8 +12,8 @@ use std::{future, io, mem, process};
 use async_trait::async_trait;
 use sandbox_driver::{
     Action, Capabilities, Capability, CorrelationId, DerivedGit, Error, Event, EventBody,
-    EventContext, EventEmitter, EventObserver, EventSubject, ExecControls, ExecSpec, Git,
-    GitCloneOptions, GitCommitOptions, GitFailureKind, LogSink, LogSource, Logs, LogsCaps,
+    EventContext, EventEmitter, EventObserver, EventSubject, ExecControls, ExecSpec, ForkOptions,
+    Git, GitCloneOptions, GitCommitOptions, GitFailureKind, LogSink, LogSource, Logs, LogsCaps,
     OutputStream, ProviderKind, Result, Sandbox, SandboxFilter, SandboxId, SandboxProvider,
     SandboxSource, SandboxSpec, SandboxStatus, SpawnSpec, StdinSource, Termination, WaitOptions,
     activate,
@@ -1981,5 +1981,175 @@ async fn log_follow_cancel_and_sink_errors_release_the_server_stream() {
         .expect("cancelled and failed follows release their streams");
     }
     sandbox.delete().await.expect("delete");
+    provider.shutdown().await.expect("shutdown");
+}
+
+/// A Host provider whose sandboxes can be "forked": the fork is a fresh
+/// Host sandbox, which is enough to drive `sandbox/fork` over the wire.
+struct ForkingProvider {
+    host: Arc<HostProvider>,
+    caps: Capabilities,
+}
+
+struct ForkingSandbox {
+    inner: Arc<dyn Sandbox>,
+    host:  Arc<HostProvider>,
+    caps:  Capabilities,
+}
+
+impl ForkingProvider {
+    fn new() -> Self {
+        let host = Arc::new(HostProvider::new());
+        let mut caps = host.capabilities().clone();
+        caps.lifecycle.fork = true;
+        Self { host, caps }
+    }
+
+    fn wrap(&self, inner: Arc<dyn Sandbox>) -> Arc<dyn Sandbox> {
+        let mut caps = inner.capabilities().clone();
+        caps.lifecycle.fork = true;
+        Arc::new(ForkingSandbox {
+            inner,
+            host: Arc::clone(&self.host),
+            caps,
+        })
+    }
+}
+
+#[async_trait]
+impl SandboxProvider for ForkingProvider {
+    fn kind(&self) -> &ProviderKind {
+        self.host.kind()
+    }
+
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    async fn create(
+        &self,
+        spec: &SandboxSpec,
+        events: Option<EventContext>,
+    ) -> Result<Arc<dyn Sandbox>> {
+        Ok(self.wrap(self.host.create(spec, events).await?))
+    }
+
+    async fn attach(
+        &self,
+        id: &SandboxId,
+        events: Option<EventContext>,
+    ) -> Result<Arc<dyn Sandbox>> {
+        Ok(self.wrap(self.host.attach(id, events).await?))
+    }
+
+    async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>> {
+        self.host.list(filter).await
+    }
+}
+
+#[async_trait]
+impl Sandbox for ForkingSandbox {
+    fn id(&self) -> &SandboxId {
+        self.inner.id()
+    }
+
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    async fn describe(&self) -> Result<SandboxStatus> {
+        self.inner.describe().await
+    }
+
+    fn working_directory(&self) -> &str {
+        self.inner.working_directory()
+    }
+
+    async fn platform_info(&self) -> Result<sandbox_driver::PlatformInfo> {
+        self.inner.platform_info().await
+    }
+
+    async fn start(&self) -> Result<()> {
+        self.inner.start().await
+    }
+
+    async fn stop(&self) -> Result<()> {
+        self.inner.stop().await
+    }
+
+    async fn delete(&self) -> Result<()> {
+        self.inner.delete().await
+    }
+
+    async fn fork(&self, _: &ForkOptions) -> Result<Arc<dyn Sandbox>> {
+        let forked = self.host.create(&host_spec(), None).await?;
+        let mut caps = forked.capabilities().clone();
+        caps.lifecycle.fork = true;
+        Ok(Arc::new(Self {
+            inner: forked,
+            host: Arc::clone(&self.host),
+            caps,
+        }))
+    }
+
+    fn exec(&self) -> &dyn sandbox_driver::Exec {
+        self.inner.exec()
+    }
+
+    fn fs(&self) -> &dyn sandbox_driver::Filesystem {
+        self.inner.fs()
+    }
+}
+
+/// Event contexts the host keeps per sandbox are a bounded cache. A
+/// forked handle inherits its parent's context through the same cache
+/// as a created or attached one, so repeated forks cannot grow it past
+/// `cached_handles`.
+#[tokio::test]
+async fn forked_handles_share_the_bounded_event_context_cache() {
+    let mut limits = sandbox_driver_protocol::TransportLimits::default();
+    limits.cached_handles = 2;
+    let (host_side, plugin_side) = duplex(1024 * 1024);
+    let (host_read, host_write) = split(host_side);
+    let (plugin_read, plugin_write) = split(plugin_side);
+    tokio::spawn(sandbox_driver_protocol::serve_with_limits(
+        Arc::new(ForkingProvider::new()),
+        plugin_read,
+        plugin_write,
+        limits.clone(),
+    ));
+    let provider = PluginProvider::connect_with_limits(
+        host_read,
+        host_write,
+        limits,
+        TrustedPeer::Process(process::id()),
+    )
+    .await
+    .expect("handshake succeeds");
+
+    let observer = Arc::new(RecordingEventObserver::default());
+    let events = EventContext::new(observer);
+    let parent = provider
+        .create(&host_spec(), Some(events))
+        .await
+        .expect("sandbox with events");
+    let mut forks = Vec::new();
+    for _ in 0..5 {
+        forks.push(parent.fork(&ForkOptions::default()).await.expect("fork"));
+    }
+    let stats = provider.transport_diagnostics().await.expect("diagnostics");
+    assert!(
+        stats.client.event_contexts <= 2,
+        "forks must not grow the event context cache past cached_handles: {}",
+        stats.client.event_contexts
+    );
+    assert!(
+        forks.iter().all(|fork| fork.capabilities().lifecycle.fork),
+        "forked handles carry the plugin's capabilities"
+    );
+    for fork in forks {
+        fork.delete().await.expect("delete fork");
+    }
+    parent.delete().await.expect("delete parent");
     provider.shutdown().await.expect("shutdown");
 }

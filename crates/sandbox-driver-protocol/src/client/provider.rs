@@ -277,28 +277,10 @@ impl PluginProvider {
         events: Option<EventContext>,
     ) -> Arc<dyn Sandbox> {
         mask_wire_capabilities(&mut info.capabilities);
-        let id = info.status.id.clone();
         if let Some(context) = &events {
-            let mut contexts = self
-                .client
-                .event_contexts
-                .lock()
-                .expect("event contexts lock");
-            if contexts.len() >= self.client.limits.cached_handles {
-                if let Some(old) = contexts.keys().next().cloned() {
-                    contexts.remove(&old);
-                }
-            }
-            contexts.insert(id.as_str().to_owned(), context.clone());
+            self.client.remember_event_context(&info.status.id, context);
         }
-        Arc::new(SandboxHandle::new(
-            Arc::clone(&self.client),
-            id,
-            info.capabilities,
-            info.working_directory,
-            info.runtime_directory,
-            events,
-        ))
+        Arc::new(SandboxHandle::new(Arc::clone(&self.client), info, events))
     }
 }
 
