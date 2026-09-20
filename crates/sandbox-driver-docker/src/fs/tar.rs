@@ -54,6 +54,27 @@ enum ScanState {
     Done,
 }
 
+/// What one state did with the bytes it was given.
+enum Step {
+    /// The chunk ran out before the state was done; feed more.
+    NeedMore,
+    /// The state changed; run the next one on the rest of the chunk.
+    Continue,
+    /// Nothing further is wanted from the archive.
+    Finished,
+}
+
+/// Whether the archive held the regular file a read asked for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Archived {
+    /// The first entry was a regular file; its requested range was
+    /// collected.
+    File,
+    /// The archived resource is a directory or a link, or the archive
+    /// was empty; the caller follows or refuses it.
+    NotAFile,
+}
+
 impl TarScanner {
     pub(super) fn new(offset: u64, length: Option<u64>) -> Self {
         Self {
@@ -85,82 +106,100 @@ impl TarScanner {
     /// Consumes `chunk`; `true` once nothing further is wanted.
     pub(super) fn feed(&mut self, mut chunk: &[u8]) -> Result<bool> {
         loop {
-            match self.state {
+            let step = match self.state {
                 ScanState::Done => return Ok(true),
-                ScanState::Header => {
-                    let take = (TAR_BLOCK - self.header_len).min(chunk.len());
-                    self.header[self.header_len..self.header_len + take]
-                        .copy_from_slice(&chunk[..take]);
-                    self.header_len += take;
-                    chunk = &chunk[take..];
-                    if self.header_len < TAR_BLOCK {
-                        return Ok(false);
-                    }
-                    self.header_len = 0;
-                    if self.header.iter().all(|byte| *byte == 0) {
-                        // End-of-archive marker: no regular file came.
-                        self.state = ScanState::Done;
-                        return Ok(true);
-                    }
-                    let header = tar::Header::from_byte_slice(&self.header);
-                    let size = header
-                        .entry_size()
-                        .map_err(|error| Error::io("reading download archive", error))?;
-                    let kind = header.entry_type();
-                    if kind.is_file() {
-                        self.found = true;
-                        self.state = ScanState::Content { position: 0, size };
-                    } else if kind.is_dir() || kind.is_symlink() || kind.is_hard_link() {
-                        // The archived resource itself is not a regular
-                        // file; the caller follows or refuses it.
-                        self.state = ScanState::Done;
-                        return Ok(true);
-                    } else {
-                        // A pax or long-name header, or something
-                        // exotic: skip its data and read on.
-                        self.state = ScanState::Skip {
-                            remaining: Self::padded(size)?,
-                        };
-                    }
-                }
-                ScanState::Skip { remaining } => {
-                    let take = usize::try_from(remaining)
-                        .unwrap_or(usize::MAX)
-                        .min(chunk.len());
-                    chunk = &chunk[take..];
-                    let remaining = remaining - take as u64;
-                    if remaining > 0 {
-                        self.state = ScanState::Skip { remaining };
-                        return Ok(false);
-                    }
-                    self.state = ScanState::Header;
-                }
-                ScanState::Content { position, size } => {
-                    let available = chunk.len() as u64;
-                    let file_left = size.saturating_sub(position);
-                    let take = available.min(file_left);
-                    let end = self.end();
-                    // Keep the slice of this chunk inside [offset, end).
-                    let keep_from = self.offset.saturating_sub(position).min(take);
-                    let keep_to = end.saturating_sub(position).min(take);
-                    if keep_to > keep_from {
-                        let from = usize::try_from(keep_from).unwrap_or(usize::MAX);
-                        let to = usize::try_from(keep_to).unwrap_or(usize::MAX);
-                        self.collected.extend_from_slice(&chunk[from..to]);
-                    }
-                    let position = position + take;
-                    if position >= size || position >= end {
-                        self.state = ScanState::Done;
-                        return Ok(true);
-                    }
-                    self.state = ScanState::Content { position, size };
-                    return Ok(false);
-                }
+                ScanState::Header => self.feed_header(&mut chunk)?,
+                ScanState::Skip { remaining } => self.feed_skip(&mut chunk, remaining),
+                ScanState::Content { position, size } => self.feed_content(chunk, position, size),
+            };
+            match step {
+                Step::NeedMore => return Ok(false),
+                Step::Continue => {}
+                Step::Finished => return Ok(true),
             }
         }
     }
 
-    pub(super) fn finish(self) -> Result<Option<Vec<u8>>> {
+    /// Reads header bytes; once a whole block is in, decides what the
+    /// entry is and where to go next.
+    fn feed_header(&mut self, chunk: &mut &[u8]) -> Result<Step> {
+        let take = (TAR_BLOCK - self.header_len).min(chunk.len());
+        self.header[self.header_len..self.header_len + take].copy_from_slice(&chunk[..take]);
+        self.header_len += take;
+        *chunk = &chunk[take..];
+        if self.header_len < TAR_BLOCK {
+            return Ok(Step::NeedMore);
+        }
+        self.header_len = 0;
+        if self.header.iter().all(|byte| *byte == 0) {
+            // End-of-archive marker: no regular file came.
+            self.state = ScanState::Done;
+            return Ok(Step::Finished);
+        }
+        let header = tar::Header::from_byte_slice(&self.header);
+        let size = header
+            .entry_size()
+            .map_err(|error| Error::io("reading download archive", error))?;
+        let kind = header.entry_type();
+        if kind.is_file() {
+            self.found = true;
+            self.state = ScanState::Content { position: 0, size };
+        } else if kind.is_dir() || kind.is_symlink() || kind.is_hard_link() {
+            // The archived resource itself is not a regular
+            // file; the caller follows or refuses it.
+            self.state = ScanState::Done;
+            return Ok(Step::Finished);
+        } else {
+            // A pax or long-name header, or something
+            // exotic: skip its data and read on.
+            self.state = ScanState::Skip {
+                remaining: Self::padded(size)?,
+            };
+        }
+        Ok(Step::Continue)
+    }
+
+    /// Discards the data of an entry nobody wants.
+    fn feed_skip(&mut self, chunk: &mut &[u8], remaining: u64) -> Step {
+        let take = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(chunk.len());
+        *chunk = &chunk[take..];
+        let remaining = remaining - take as u64;
+        if remaining > 0 {
+            self.state = ScanState::Skip { remaining };
+            return Step::NeedMore;
+        }
+        self.state = ScanState::Header;
+        Step::Continue
+    }
+
+    /// Collects the part of this chunk that lies inside the requested
+    /// range. Nothing after the wanted file is read, so the chunk is not
+    /// advanced.
+    fn feed_content(&mut self, chunk: &[u8], position: u64, size: u64) -> Step {
+        let available = chunk.len() as u64;
+        let file_left = size.saturating_sub(position);
+        let take = available.min(file_left);
+        let end = self.end();
+        // Keep the slice of this chunk inside [offset, end).
+        let keep_from = self.offset.saturating_sub(position).min(take);
+        let keep_to = end.saturating_sub(position).min(take);
+        if keep_to > keep_from {
+            let from = usize::try_from(keep_from).unwrap_or(usize::MAX);
+            let to = usize::try_from(keep_to).unwrap_or(usize::MAX);
+            self.collected.extend_from_slice(&chunk[from..to]);
+        }
+        let position = position + take;
+        if position >= size || position >= end {
+            self.state = ScanState::Done;
+            return Step::Finished;
+        }
+        self.state = ScanState::Content { position, size };
+        Step::NeedMore
+    }
+
+    pub(super) fn finish(self) -> Result<Archived> {
         if !matches!(self.state, ScanState::Done) {
             return Err(Error::io(
                 "reading download archive",
@@ -170,7 +209,11 @@ impl TarScanner {
                 ),
             ));
         }
-        Ok(self.found.then_some(self.collected))
+        Ok(if self.found {
+            Archived::File
+        } else {
+            Archived::NotAFile
+        })
     }
 }
 
@@ -443,12 +486,13 @@ mod tests {
                     done || length.is_none(),
                     "chunk {chunk_size} never finished"
                 );
+                let collected = scanner.collected.clone();
                 assert_eq!(
-                    scanner
-                        .finish()
-                        .expect("the requested data is complete")
-                        .expect("a file was found"),
-                    expected,
+                    scanner.finish().expect("the requested data is complete"),
+                    Archived::File
+                );
+                assert_eq!(
+                    collected, expected,
                     "offset {offset} length {length:?} chunk {chunk_size}"
                 );
             }
@@ -468,7 +512,10 @@ mod tests {
         let archive = builder.into_inner().expect("tar");
         let mut scanner = TarScanner::new(0, None);
         scanner.feed(&archive).expect("feed");
-        assert!(scanner.finish().expect("complete symlink header").is_none());
+        assert_eq!(
+            scanner.finish().expect("complete symlink header"),
+            Archived::NotAFile
+        );
     }
 
     #[test]
@@ -494,10 +541,9 @@ mod tests {
         ] {
             let mut scanner = TarScanner::new(offset, length);
             assert!(scanner.feed(&archive[..end]).expect("valid archive prefix"));
-            assert_eq!(
-                scanner.finish().expect("complete range").expect("file"),
-                expected
-            );
+            let collected = scanner.collected.clone();
+            assert_eq!(scanner.finish().expect("complete range"), Archived::File);
+            assert_eq!(collected, expected);
         }
     }
 
@@ -519,7 +565,10 @@ mod tests {
         }
         let mut scanner = TarScanner::new(0, None);
         assert!(scanner.feed(&archive).expect("complete archive"));
-        assert!(scanner.finish().expect("archive with no file").is_none());
+        assert_eq!(
+            scanner.finish().expect("archive with no file"),
+            Archived::NotAFile
+        );
     }
 
     #[test]

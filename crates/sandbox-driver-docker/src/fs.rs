@@ -30,7 +30,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{OnceCell, mpsc};
 
 use self::tar::{
-    Owner, TRANSFER_CHUNK_BYTES, TarScanner, directory_archive, file_archive_header,
+    Archived, Owner, TRANSFER_CHUNK_BYTES, TarScanner, directory_archive, file_archive_header,
     send_file_archive,
 };
 use crate::container::ContainerRef;
@@ -112,14 +112,14 @@ impl DockerFs {
     }
 
     /// Streams the requested file bytes to `output`. A non-file archive
-    /// returns false without writing, so the caller can follow a symlink.
+    /// is reported without writing, so the caller can follow a symlink.
     async fn read_archived_to(
         &self,
         container_path: &str,
         offset: u64,
         length: Option<u64>,
         output: &mut (dyn AsyncWrite + Unpin + Send),
-    ) -> Result<bool> {
+    ) -> Result<Archived> {
         let options = DownloadFromContainerOptions {
             path: container_path.to_owned(),
         };
@@ -151,7 +151,7 @@ impl DockerFs {
                 }
             }
         }
-        Ok(scanner.finish()?.is_some())
+        scanner.finish()
     }
 
     async fn read_range_to(
@@ -165,20 +165,20 @@ impl DockerFs {
         if self
             .read_archived_to(&container_path, offset, length, output)
             .await?
+            == Archived::File
         {
             return Ok(());
         }
         let target = self.resolve_link(&container_path).await?;
-        if self
+        match self
             .read_archived_to(&target, offset, length, output)
             .await?
         {
-            Ok(())
-        } else {
-            Err(Error::invalid_spec(
+            Archived::File => Ok(()),
+            Archived::NotAFile => Err(Error::invalid_spec(
                 "path",
                 format!("{path:?} is not a regular file"),
-            ))
+            )),
         }
     }
 
