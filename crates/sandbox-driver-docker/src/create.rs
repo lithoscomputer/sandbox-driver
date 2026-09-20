@@ -3,19 +3,25 @@
 
 use std::collections::HashMap;
 
-use bollard::container::{Config, CreateContainerOptions};
-use bollard::models::{HostConfig, Mount, MountTypeEnum};
+use bollard::Docker;
+use bollard::container::{Config, CreateContainerOptions, StartContainerOptions};
+use bollard::models::{
+    ContainerInspectResponse, EndpointSettings, HostConfig, Mount, MountTypeEnum,
+};
+use bollard::network::{ConnectNetworkOptions, DisconnectNetworkOptions};
 use sandbox_driver::{
-    BASH_ENV_VAR, Error, LifecycleTimers, NetworkPolicy, Result, SandboxKind, SandboxSource,
-    SandboxSpec,
+    BASH_ENV_VAR, Error, LifecycleTimers, NetworkPolicy, ProviderError, ProviderKind, Result,
+    SandboxKind, SandboxSource, SandboxSpec, SandboxState,
 };
 use serde::Deserialize;
 
 use crate::config::{DockerProviderConfig, RegistryAuth, Sidecar};
-use crate::daemon::{POSIX_SH, shell_quote};
+use crate::container::{inspect_container, remove_container_forced};
+use crate::daemon::{POSIX_SH, docker_error, is_conflict, shell_quote};
+use crate::inspect::map_state;
 use crate::{
     DEFAULT_WORKING_DIRECTORY, MANAGED_LABEL, RUNTIME_DIRECTORY, RUNTIME_DIRECTORY_PARENT,
-    SIDECAR_NETWORK_LABEL, non_empty,
+    SIDECAR_NETWORK_LABEL, non_empty, sidecars,
 };
 
 /// Everything `create` decides before it touches the daemon, derived from
@@ -281,6 +287,122 @@ fn validate_supported_creation_fields(spec: &SandboxSpec) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// A container `create` made and has not yet handed to a sandbox handle.
+/// Every step after creation either finishes or abandons it, so a new
+/// early return cannot leak the container.
+pub(crate) struct CreatedContainer {
+    docker:          Docker,
+    pub(crate) id:   String,
+    sidecar_network: Option<String>,
+}
+
+impl CreatedContainer {
+    /// Creates the planned container. A name already in use is the
+    /// caller's spec at fault, not the daemon.
+    pub(crate) async fn create(docker: &Docker, plan: &ContainerPlan) -> Result<Self> {
+        let created = docker
+            .create_container(plan.options.clone(), plan.config.clone())
+            .await
+            .map_err(|error| {
+                if is_conflict(&error) && plan.named {
+                    Error::invalid_spec("name", "a container with this name already exists")
+                } else {
+                    docker_error("creating container", error)
+                }
+            })?;
+        Ok(Self {
+            docker:          docker.clone(),
+            id:              created.id,
+            sidecar_network: plan.sidecar_network.clone(),
+        })
+    }
+
+    /// Brings up the sidecars and moves the container from its isolated
+    /// initial network onto theirs. Nothing to do for a sandbox without
+    /// sidecars.
+    pub(crate) async fn connect_sidecars(&self, sidecars: &[Sidecar]) -> Result<()> {
+        let Some(network) = &self.sidecar_network else {
+            return Ok(());
+        };
+        sidecars::realize(&self.docker, network, sidecars).await?;
+        self.docker
+            .disconnect_network("none", DisconnectNetworkOptions {
+                container: self.id.as_str(),
+                force:     true,
+            })
+            .await
+            .map_err(|error| docker_error("disconnecting initial sandbox network", error))?;
+        self.docker
+            .connect_network(network, ConnectNetworkOptions {
+                container:       self.id.as_str(),
+                endpoint_config: EndpointSettings::default(),
+            })
+            .await
+            .map_err(|error| docker_error("connecting sandbox to services", error))
+    }
+
+    pub(crate) async fn start(&self) -> Result<()> {
+        self.docker
+            .start_container(&self.id, None::<StartContainerOptions<String>>)
+            .await
+            .map_err(|error| docker_error("starting container", error))
+    }
+
+    /// `start` returning is not the container running: an init that
+    /// exits at once (a missing interpreter, a bad user) leaves a stopped
+    /// container every exec would then 409 on. Fail create instead,
+    /// naming the cause.
+    pub(crate) async fn verify_running(
+        &self,
+        kind: &ProviderKind,
+    ) -> Result<ContainerInspectResponse> {
+        let started = inspect_container(&self.docker, &self.id).await?;
+        if map_state(&started) != SandboxState::Running {
+            let exit = started
+                .state
+                .as_ref()
+                .and_then(|state| state.exit_code)
+                .unwrap_or_default();
+            let mut provider = ProviderError::new(
+                kind.clone(),
+                format!(
+                    "container exited immediately after start (exit code {exit}); \
+                     the image must run its init under /bin/sh as the configured user"
+                ),
+            );
+            provider.code = Some("exited".to_owned());
+            return Err(Error::Provider(provider));
+        }
+        Ok(started)
+    }
+
+    /// Gives up on the container after `error`: dependencies go before
+    /// the primary, so unsuccessful cleanup remains discoverable by
+    /// label. Returns the error that caused the abandonment.
+    pub(crate) async fn abandon(self, error: Error) -> Error {
+        if let Some(network) = &self.sidecar_network {
+            if let Err(cleanup_error) = sidecars::sweep(&self.docker, network, Some(&self.id)).await
+            {
+                tracing::warn!(
+                    error = %cleanup_error,
+                    "failed sandbox sidecar cleanup failed; primary retained for retry"
+                );
+                return error;
+            }
+        }
+        if let Err(cleanup_error) =
+            remove_container_forced(&self.docker, &self.id, "removing failed sandbox").await
+        {
+            tracing::warn!(
+                provider_kind = "docker",
+                error = %cleanup_error,
+                "failed sandbox cleanup failed"
+            );
+        }
+        error
+    }
 }
 
 #[cfg(test)]
