@@ -3,10 +3,10 @@
 
 use std::sync::Arc;
 
-use sandbox_driver::{Error, Sandbox, SandboxId, SandboxSpec, SandboxStatus};
+use sandbox_driver::{Sandbox, SandboxSpec, SandboxStatus};
 use serde_json::Value;
 
-use super::{DispatchError, ServerState, parse, to_value};
+use super::{DispatchError, ServerState, parse, sandbox_id, to_value};
 use crate::methods as m;
 
 fn handle_info(handle: &Arc<dyn Sandbox>, status: SandboxStatus) -> m::HandleInfo {
@@ -35,10 +35,9 @@ pub(super) async fn dispatch(
         }
         m::SANDBOX_ATTACH => {
             let request: m::AttachParams = parse(params)?;
-            let sandbox_id = SandboxId::try_new(&request.sandbox_id)
-                .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
+            let id = sandbox_id(&request.sandbox_id)?;
             let events = state.event_context(request.events);
-            let handle = state.provider.attach(&sandbox_id, events).await?;
+            let handle = state.provider.attach(&id, events).await?;
             state.remember(&handle);
             let status = handle.describe().await?;
             to_value(&handle_info(&handle, status))
@@ -78,25 +77,15 @@ pub(super) async fn dispatch(
             // connection already holds is used so its event route sees the
             // delete.
             let request: m::AttachParams = parse(params)?;
-            let remembered = state
-                .handles
-                .lock()
-                .expect("handles lock")
-                .get(&request.sandbox_id)
-                .cloned();
+            let remembered = state.handles.get(&request.sandbox_id);
             if let Some(handle) = remembered {
                 handle.delete().await?;
             } else {
-                let sandbox_id = SandboxId::try_new(&request.sandbox_id)
-                    .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
+                let id = sandbox_id(&request.sandbox_id)?;
                 let events = state.event_context(request.events);
-                state.provider.delete(&sandbox_id, events).await?;
+                state.provider.delete(&id, events).await?;
             }
-            state
-                .handles
-                .lock()
-                .expect("handles lock")
-                .remove(&request.sandbox_id);
+            state.handles.remove(&request.sandbox_id);
             to_value(&m::Empty)
         }
         m::SANDBOX_START
@@ -121,10 +110,9 @@ pub(super) async fn dispatch(
         }
         m::SANDBOX_UNDELETE => {
             let request: m::AttachParams = parse(params)?;
-            let sandbox_id = SandboxId::try_new(&request.sandbox_id)
-                .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
+            let id = sandbox_id(&request.sandbox_id)?;
             let events = state.event_context(request.events);
-            let handle = state.provider.undelete(&sandbox_id, events).await?;
+            let handle = state.provider.undelete(&id, events).await?;
             state.remember(&handle);
             let status = handle.describe().await?;
             to_value(&handle_info(&handle, status))

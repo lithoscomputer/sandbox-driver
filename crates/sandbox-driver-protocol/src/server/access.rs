@@ -24,7 +24,7 @@ pub(super) async fn dispatch(
             // regardless of transport.
             let git = handle
                 .git()
-                .ok_or(DispatchError::App(Error::unsupported(Capability::Git)))?;
+                .ok_or_else(|| Error::unsupported(Capability::Git))?;
             git.clone_repo(&request.url, &request.target_path, &request.options)
                 .await?;
             to_value(&m::Empty)
@@ -34,9 +34,7 @@ pub(super) async fn dispatch(
             let handle = state.sandbox(&request.sandbox_id).await?;
             let facet = handle
                 .preview_urls()
-                .ok_or(DispatchError::App(Error::unsupported(
-                    Capability::PreviewUrls,
-                )))?;
+                .ok_or_else(|| Error::unsupported(Capability::PreviewUrls))?;
             let preview = facet.preview_url(request.port).await?;
             to_value(&m::PreviewUrlResult { preview })
         }
@@ -45,9 +43,7 @@ pub(super) async fn dispatch(
             let handle = state.sandbox(&request.sandbox_id).await?;
             let facet = handle
                 .preview_urls()
-                .ok_or(DispatchError::App(Error::unsupported(
-                    Capability::PreviewUrls,
-                )))?;
+                .ok_or_else(|| Error::unsupported(Capability::PreviewUrls))?;
             let preview = facet
                 .signed_preview_url(request.port, Duration::from_millis(request.expires_in_ms))
                 .await?;
@@ -58,9 +54,7 @@ pub(super) async fn dispatch(
             let handle = state.sandbox(&request.sandbox_id).await?;
             let facet = handle
                 .preview_urls()
-                .ok_or(DispatchError::App(Error::unsupported(
-                    Capability::PreviewUrls,
-                )))?;
+                .ok_or_else(|| Error::unsupported(Capability::PreviewUrls))?;
             facet.release_preview_url(request.port).await?;
             to_value(&m::Empty)
         }
@@ -72,7 +66,7 @@ pub(super) async fn dispatch(
             }
             let facet = handle
                 .ssh()
-                .ok_or(DispatchError::App(Error::unsupported(Capability::Ssh)))?;
+                .ok_or_else(|| Error::unsupported(Capability::Ssh))?;
             let access = facet
                 .ssh_access(request.ttl_ms.map(Duration::from_millis))
                 .await?;
@@ -86,7 +80,7 @@ pub(super) async fn dispatch(
             }
             let facet = handle
                 .ssh()
-                .ok_or(DispatchError::App(Error::unsupported(Capability::Ssh)))?;
+                .ok_or_else(|| Error::unsupported(Capability::Ssh))?;
             facet.revoke_ssh_access(&request.token).await?;
             to_value(&m::Empty)
         }
