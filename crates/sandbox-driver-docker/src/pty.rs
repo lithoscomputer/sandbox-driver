@@ -15,7 +15,7 @@ use sandbox_driver::{BASH_ENV_VAR, Error, Pty, PtyOptions, PtySession, PtySize, 
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-use crate::exec::{docker_error, shell_quote};
+use crate::daemon::{docker_error, shell_quote};
 
 const DEFAULT_TERM: &str = "xterm-256color";
 const DEFAULT_LANG: &str = "C.UTF-8";
