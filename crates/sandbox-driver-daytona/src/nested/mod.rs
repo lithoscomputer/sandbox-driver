@@ -12,7 +12,6 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -302,13 +301,27 @@ fn checked(result: ExecResult, operation: &str) -> Result<ExecResult> {
     }
 }
 
+/// Where this handle stands with the nested daemon. One value under one
+/// lock: the lock serializes readiness work, and the value says whether
+/// the next `ensure_ready` must sweep what an earlier generation left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Generation {
+    /// Never made ready through this handle. Other handles may own active
+    /// image preparation, so the first readiness pass sweeps nothing.
+    Fresh,
+    /// Docker and its services are up for the current sandbox generation.
+    Ready,
+    /// The sandbox stopped since this handle was last ready. Every
+    /// preparation and action from before the stop is stale.
+    Restarted,
+}
+
 pub(super) struct NestedDocker {
-    target:   DockerExecutionTarget,
-    cli:      Arc<DockerCli>,
-    exec:     Arc<NestedExec>,
-    fs:       NestedFs,
-    ready:    Mutex<bool>,
-    recovery: AtomicBool,
+    target: DockerExecutionTarget,
+    cli:    Arc<DockerCli>,
+    exec:   Arc<NestedExec>,
+    fs:     NestedFs,
+    state:  Mutex<Generation>,
 }
 
 impl NestedDocker {
@@ -330,8 +343,7 @@ impl NestedDocker {
             cli,
             exec,
             fs,
-            ready: Mutex::new(false),
-            recovery: AtomicBool::new(false),
+            state: Mutex::new(Generation::Fresh),
         }
     }
 
@@ -391,7 +403,7 @@ impl NestedDocker {
         if !self.targets_container() {
             return Ok(());
         }
-        let mut ready = self.ready.lock().await;
+        let mut state = self.state.lock().await;
         self.bootstrap().await?;
         self.clean_stale_preparation().await?;
         if config.options.auto_pull {
@@ -443,63 +455,87 @@ impl NestedDocker {
         }
         self.cli.run(words(["start", CONTAINER_NAME])).await?;
         self.initialize_runtime_directory().await?;
-        *ready = true;
+        *state = Generation::Ready;
         Ok(())
     }
 
     pub(super) async fn stopped(&self) {
-        *self.ready.lock().await = false;
-        self.recovery.store(true, Ordering::SeqCst);
+        *self.state.lock().await = Generation::Restarted;
     }
 
+    /// Brings the nested daemon, and for a container target its primary
+    /// container and services, up for the current sandbox generation.
+    /// A handle that is already ready does nothing. A handle whose
+    /// sandbox restarted first sweeps the stale preparation and action
+    /// containers the previous generation left behind.
     pub(super) async fn ensure_ready(&self) -> Result<()> {
-        let mut ready = self.ready.lock().await;
-        if *ready {
-            return Ok(());
-        }
+        let mut state = self.state.lock().await;
+        let sweep = match *state {
+            Generation::Ready => return Ok(()),
+            Generation::Fresh => false,
+            Generation::Restarted => true,
+        };
         self.bootstrap().await?;
-        let recovery = self.recovery.load(Ordering::SeqCst);
-        if recovery {
+        if sweep {
             self.clean_stale_preparation().await?;
         }
-        if !self.targets_container() {
-            if recovery {
-                for action in self.cli.ids(ONE_SHOT_LABEL).await? {
-                    self.cli.remove(&action).await?;
-                }
-            }
-            self.recovery.store(false, Ordering::SeqCst);
-            *ready = true;
-            return Ok(());
+        if self.targets_container() {
+            self.recover_container_target(sweep).await?;
+        } else {
+            self.recover_vm_target(sweep).await?;
         }
+        *state = Generation::Ready;
+        Ok(())
+    }
+
+    /// The VM target runs actions straight on the daemon; recovery only
+    /// removes the actions a previous generation left.
+    async fn recover_vm_target(&self, sweep: bool) -> Result<()> {
+        if sweep {
+            for action in self.cli.ids(ONE_SHOT_LABEL).await? {
+                self.cli.remove(&action).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The container target restarts its primary container, after its
+    /// services when it has any, and reclaims the container-local
+    /// runtime directory.
+    async fn recover_container_target(&self, sweep: bool) -> Result<()> {
         let primary = self.cli.inspect(CONTAINER_NAME).await?;
         let id = primary["Id"]
             .as_str()
             .ok_or_else(|| Error::invalid_spec("docker inspect", "container id missing"))?;
-        if recovery {
+        if sweep {
             for action in self.cli.ids(&format!("{ONE_SHOT_LABEL}={id}")).await? {
                 self.cli.remove(&action).await?;
             }
         }
         if let Some(network) = primary["Config"]["Labels"][SIDECAR_NETWORK_LABEL].as_str() {
-            if primary["NetworkSettings"]["Networks"][network].is_null() {
-                return Err(Error::invalid_spec(
-                    "nested Docker",
-                    "service allocation did not complete",
-                ));
-            }
-            let services = self.cli.ids(&format!("{NETWORK_LABEL}={network}")).await?;
-            for service in &services {
-                self.cli.run(words(["start", service])).await?;
-            }
-            for service in services {
-                self.cli.await_health(&service).await?;
-            }
+            self.restart_services(&primary, network).await?;
         }
         self.cli.run(words(["start", CONTAINER_NAME])).await?;
         self.initialize_runtime_directory().await?;
-        self.recovery.store(false, Ordering::SeqCst);
-        *ready = true;
+        Ok(())
+    }
+
+    /// Starts every service on the primary's sidecar network and waits
+    /// for each to be healthy before the primary itself starts.
+    async fn restart_services(&self, primary: &Value, network: &str) -> Result<()> {
+        if primary["NetworkSettings"]["Networks"][network].is_null() {
+            return Err(Error::invalid_spec(
+                "nested Docker",
+                "service allocation did not complete",
+            ));
+        }
+        let services = self.cli.ids(&format!("{NETWORK_LABEL}={network}")).await?;
+        for service in &services {
+            self.cli.run(words(["start", service])).await?;
+        }
+        for service in services {
+            self.cli.await_health(&service).await?;
+        }
         Ok(())
     }
 
@@ -920,7 +956,7 @@ mod tests {
         symlink(&outside, &runtime).unwrap();
         nested.stopped().await;
         assert!(nested.ensure_ready().await.is_err());
-        assert!(!*nested.ready.lock().await);
+        assert_eq!(*nested.state.lock().await, Generation::Restarted);
         fs::remove_file(&runtime).unwrap();
         fs::remove_dir(&parent).unwrap();
         symlink(&outside, &parent).unwrap();
@@ -1021,7 +1057,7 @@ mod tests {
         let result = nested.create(&config, &BTreeMap::new()).await;
         assert!(result.is_err());
         assert!(primary.load(Ordering::SeqCst));
-        assert!(!*nested.ready.lock().await);
+        assert_eq!(*nested.state.lock().await, Generation::Fresh);
     }
 
     #[tokio::test]
@@ -1090,7 +1126,7 @@ mod tests {
             options: DockerProviderConfig::default(),
         };
         nested.create(&config, &BTreeMap::new()).await.unwrap();
-        assert!(!*nested.ready.lock().await);
+        assert_eq!(*nested.state.lock().await, Generation::Fresh);
     }
 
     #[tokio::test]
@@ -1142,7 +1178,7 @@ mod tests {
             }),
             DockerExecutionTarget::VirtualMachine,
         );
-        *nested.ready.lock().await = true;
+        *nested.state.lock().await = Generation::Ready;
         let action = tokio::spawn(async move {
             OneShot::run(
                 &nested,
