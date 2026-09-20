@@ -6,10 +6,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{future, io, process};
 
 use async_trait::async_trait;
-use bollard::Docker;
 use bollard::container::LogOutput;
 use bollard::errors::Error as DockerApiError;
-use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
+use bollard::exec::CreateExecOptions;
 use futures_util::{Stream, StreamExt};
 use sandbox_driver::{
     BASH_ENV_VAR, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
@@ -21,6 +20,7 @@ use tokio::io::{AsyncWriteExt, duplex};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
+use crate::container::{AttachedExec, ContainerRef, exit_code_of};
 use crate::daemon::{POSIX_SH, docker_error, shell_quote};
 
 /// `$0` of the wrapper shell, so the user's argv starts at `$1`.
@@ -165,24 +165,15 @@ impl StreamOutput {
 /// given. One consequence: `env` reads a leading word containing `=` as
 /// an assignment, so a program whose name contains `=` cannot be run.
 pub struct DockerExec {
-    docker:       Docker,
-    container_id: String,
-    working_dir:  String,
+    container:    ContainerRef,
     base_env:     BTreeMap<String, String>,
     exec_counter: AtomicU64,
 }
 
 impl DockerExec {
-    pub(crate) fn new(
-        docker: Docker,
-        container_id: String,
-        working_dir: String,
-        base_env: BTreeMap<String, String>,
-    ) -> Self {
+    pub(crate) fn new(container: ContainerRef, base_env: BTreeMap<String, String>) -> Self {
         Self {
-            docker,
-            container_id,
-            working_dir,
+            container,
             base_env,
             exec_counter: AtomicU64::new(0),
         }
@@ -221,14 +212,37 @@ impl DockerExec {
         cmd
     }
 
-    /// Resolves a relative working directory against the sandbox
-    /// working directory, matching the fs facet — Docker rejects a
-    /// relative exec `Cwd` outright.
-    fn resolve_dir(&self, dir: Option<&str>) -> String {
-        match dir {
-            None => self.working_dir.clone(),
-            Some(dir) if dir.starts_with('/') => dir.to_owned(),
-            Some(dir) => format!("{}/{}", self.working_dir.trim_end_matches('/'), dir),
+    /// The exec of one wrapped command: the wrapper under `/bin/sh` with
+    /// the environment, program, and arguments as its positional
+    /// parameters, attached to both output streams and, when asked, to
+    /// stdin, in the resolved working directory. The wrapper shell itself
+    /// gets a blank `BASH_ENV`; the command's environment travels through
+    /// `env` inside the wrapper.
+    fn wrapped_exec_options(
+        &self,
+        stop_file: &str,
+        pid_file: &str,
+        program: &str,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+        working_dir: Option<&str>,
+        attach_stdin: bool,
+    ) -> CreateExecOptions<String> {
+        let wrapper = Self::command_wrapper(stop_file, pid_file, attach_stdin);
+        CreateExecOptions {
+            attach_stdin: Some(attach_stdin),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            tty: Some(false),
+            cmd: Some(Self::wrapped_cmd(
+                wrapper,
+                self.env_entries(env),
+                program,
+                args,
+            )),
+            working_dir: Some(self.container.resolve_dir(working_dir)),
+            env: Some(vec![format!("{BASH_ENV_VAR}=")]),
+            ..Default::default()
         }
     }
 
@@ -318,70 +332,52 @@ impl DockerExec {
              exit \"$status\""
         )
     }
+}
 
-    /// Requests a stop by writing the rendered `mode` into the stop file
-    /// the in-container watcher polls for; a stop that arrives before
-    /// the command starts is honored by the wrapper's pre-check. Runs
-    /// from `/` — the exec being stopped may have removed the working
-    /// directory the container would otherwise start this one in — with
-    /// a blank `BASH_ENV`, and reports failure: a stop that could not be
-    /// requested must never masquerade as a kill.
-    async fn request_stop(&self, stop_file: &str, mode: StopMode) -> Result<()> {
-        let command = format!(
-            "mkdir -p /tmp/.sandbox-driver && printf '%s' {} > {}",
-            shell_quote(mode.render()),
-            shell_quote(stop_file)
-        );
-        let options = CreateExecOptions {
-            cmd: Some(vec![POSIX_SH.to_owned(), "-c".to_owned(), command]),
-            attach_stdout: Some(true),
-            attach_stderr: Some(true),
-            tty: Some(false),
-            working_dir: Some("/".to_owned()),
-            env: Some(vec![format!("{BASH_ENV_VAR}=")]),
-            ..Default::default()
-        };
-        let exec = self
-            .docker
-            .create_exec(&self.container_id, options)
-            .await
-            .map_err(|error| docker_error("creating stop-request exec", error))?;
-        let start = self
-            .docker
-            .start_exec(&exec.id, None::<StartExecOptions>)
-            .await
-            .map_err(|error| docker_error("starting stop-request exec", error))?;
-        if let StartExecResults::Attached { mut output, .. } = start {
-            // Drain to completion so the exit code below is final.
-            while let Some(chunk) = output.next().await {
-                if let Err(error) = chunk {
-                    let error = docker_error("reading stop request output", error);
-                    tracing::warn!(
-                        provider_kind = "docker",
-                        sandbox_id = %self.container_id,
-                        error = %error,
-                        "stop request output stream failed"
-                    );
-                    break;
-                }
-            }
-        }
-        match self.exit_code(&exec.id).await? {
-            None | Some(0) => Ok(()),
-            Some(code) => Err(Error::io(
-                "requesting exec stop",
-                io::Error::other(format!("stop request exited {code}")),
-            )),
+/// Requests a stop by writing the rendered `mode` into the stop file
+/// the in-container watcher polls for; a stop that arrives before
+/// the command starts is honored by the wrapper's pre-check. Runs
+/// from `/` — the exec being stopped may have removed the working
+/// directory the container would otherwise start this one in — with
+/// a blank `BASH_ENV`, and reports failure: a stop that could not be
+/// requested must never masquerade as a kill.
+async fn request_stop(container: &ContainerRef, stop_file: &str, mode: StopMode) -> Result<()> {
+    let command = format!(
+        "mkdir -p /tmp/.sandbox-driver && printf '%s' {} > {}",
+        shell_quote(mode.render()),
+        shell_quote(stop_file)
+    );
+    let options = CreateExecOptions {
+        cmd: Some(vec![POSIX_SH.to_owned(), "-c".to_owned(), command]),
+        attach_stdout: Some(true),
+        attach_stderr: Some(true),
+        tty: Some(false),
+        working_dir: Some("/".to_owned()),
+        env: Some(vec![format!("{BASH_ENV_VAR}=")]),
+        ..Default::default()
+    };
+    let AttachedExec { id, mut output, .. } = container
+        .start_attached(options, "stop-request exec")
+        .await?;
+    // Drain to completion so the exit code below is final.
+    while let Some(chunk) = output.next().await {
+        if let Err(error) = chunk {
+            let error = docker_error("reading stop request output", error);
+            tracing::warn!(
+                provider_kind = "docker",
+                sandbox_id = %container.id,
+                error = %error,
+                "stop request output stream failed"
+            );
+            break;
         }
     }
-
-    async fn exit_code(&self, exec_id: &str) -> Result<Option<i32>> {
-        let inspect = self
-            .docker
-            .inspect_exec(exec_id)
-            .await
-            .map_err(|error| docker_error("inspecting exec", error))?;
-        Ok(inspect.exit_code.and_then(|code| i32::try_from(code).ok()))
+    match container.exec_exit_code(&id).await? {
+        None | Some(0) => Ok(()),
+        Some(code) => Err(Error::io(
+            "requesting exec stop",
+            io::Error::other(format!("stop request exited {code}")),
+        )),
     }
 }
 
@@ -396,7 +392,7 @@ impl Exec for DockerExec {
         skip_all,
         fields(
             provider_kind = "docker",
-            sandbox_id = %self.container_id,
+            sandbox_id = %self.container.id,
             has_stdin = spec.stdin.is_some()
         ),
         err
@@ -428,39 +424,20 @@ impl DockerExec {
         let started = Instant::now();
         let (stop_file, pid_file) = self.control_paths();
         let stdin_reader = controls.stdin_reader(spec);
-        let wrapper = Self::command_wrapper(&stop_file, &pid_file, stdin_reader.is_some());
-
-        let working_dir = self.resolve_dir(spec.working_dir.as_deref());
-        let options = CreateExecOptions {
-            attach_stdin: Some(stdin_reader.is_some()),
-            attach_stdout: Some(true),
-            attach_stderr: Some(true),
-            tty: Some(false),
-            cmd: Some(Self::wrapped_cmd(
-                wrapper,
-                self.env_entries(&spec.launch_env()),
-                &spec.program,
-                &spec.args,
-            )),
-            working_dir: Some(working_dir),
-            env: Some(vec![format!("{BASH_ENV_VAR}=")]),
-            ..Default::default()
-        };
-        let exec = self
-            .docker
-            .create_exec(&self.container_id, options)
-            .await
-            .map_err(|error| docker_error("creating exec", error))?;
-        let start = self
-            .docker
-            .start_exec(&exec.id, None::<StartExecOptions>)
-            .await
-            .map_err(|error| docker_error("starting exec", error))?;
-        let StartExecResults::Attached { output, input } = start else {
-            return Err(docker_error("starting exec", DockerApiError::IOError {
-                err: io::Error::other("exec started detached"),
-            }));
-        };
+        let options = self.wrapped_exec_options(
+            &stop_file,
+            &pid_file,
+            &spec.program,
+            &spec.args,
+            &spec.launch_env(),
+            spec.working_dir.as_deref(),
+            stdin_reader.is_some(),
+        );
+        let AttachedExec {
+            id: exec_id,
+            output,
+            input,
+        } = self.container.start_attached(options, "exec").await?;
 
         // A command without stdin gets the attached input closed at once.
         let stdin_task = stdin_reader.map(|reader| tokio::spawn(feed_stdin(input, reader)));
@@ -497,24 +474,24 @@ impl DockerExec {
                         termination = Termination::Cancelled;
                         kill_fired = true;
                         drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                        self.request_stop(&stop_file, StopMode::Kill).await?;
+                        request_stop(&self.container, &stop_file, StopMode::Kill).await?;
                     }
                     () = &mut termed, if !term_fired && !kill_fired => {
                         termination = Termination::Cancelled;
                         term_fired = true;
-                        self.request_stop(&stop_file, StopMode::Term).await?;
+                        request_stop(&self.container, &stop_file, StopMode::Term).await?;
                     }
                     () = &mut killed, if !kill_fired => {
                         termination = Termination::Killed;
                         kill_fired = true;
                         drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                        self.request_stop(&stop_file, StopMode::Kill).await?;
+                        request_stop(&self.container, &stop_file, StopMode::Kill).await?;
                     }
                     () = timeout => {
                         termination = Termination::TimedOut;
                         kill_fired = true;
                         drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                        self.request_stop(&stop_file, StopMode::Kill).await?;
+                        request_stop(&self.container, &stop_file, StopMode::Kill).await?;
                     }
                     () = drain_timeout => break (Ok(()), true),
                 }
@@ -522,7 +499,7 @@ impl DockerExec {
         };
         if sink_failed.is_cancelled() && !kill_fired {
             termination = Termination::Cancelled;
-            self.request_stop(&stop_file, StopMode::Kill).await?;
+            request_stop(&self.container, &stop_file, StopMode::Kill).await?;
         }
 
         if let Some(stdin_task) = stdin_task {
@@ -541,58 +518,37 @@ impl DockerExec {
             }
         }
         stream_result.map_err(|error| docker_error("reading exec output", error))?;
-        let exit_code = self.exit_code(&exec.id).await?;
+        let exit_code = self.container.exec_exit_code(&exec_id).await?;
         Ok(captured.into_result(termination, exit_code, started.elapsed(), truncated))
     }
 
     #[tracing::instrument(
         skip_all,
-        fields(provider_kind = "docker", sandbox_id = %self.container_id),
+        fields(provider_kind = "docker", sandbox_id = %self.container.id),
         err
     )]
     async fn spawn_stdio_raw(&self, spec: &SpawnSpec) -> Result<StdioProcess> {
         let (stop_file, pid_file) = self.control_paths();
-        let wrapper = Self::command_wrapper(&stop_file, &pid_file, true);
-        let working_dir = self.resolve_dir(spec.working_dir.as_deref());
-        let options = CreateExecOptions {
-            attach_stdin: Some(true),
-            attach_stdout: Some(true),
-            attach_stderr: Some(true),
-            tty: Some(false),
-            cmd: Some(Self::wrapped_cmd(
-                wrapper,
-                self.env_entries(&spec.launch_env()),
-                &spec.program,
-                &spec.args,
-            )),
-            working_dir: Some(working_dir),
-            env: Some(vec![format!("{BASH_ENV_VAR}=")]),
-            ..Default::default()
-        };
-        let exec = self
-            .docker
-            .create_exec(&self.container_id, options)
-            .await
-            .map_err(|error| docker_error("creating stdio exec", error))?;
-        let start = self
-            .docker
-            .start_exec(&exec.id, None::<StartExecOptions>)
-            .await
-            .map_err(|error| docker_error("starting stdio exec", error))?;
-        let StartExecResults::Attached { mut output, input } = start else {
-            return Err(docker_error(
-                "starting stdio exec",
-                DockerApiError::IOError {
-                    err: io::Error::other("exec started detached"),
-                },
-            ));
-        };
+        let options = self.wrapped_exec_options(
+            &stop_file,
+            &pid_file,
+            &spec.program,
+            &spec.args,
+            &spec.launch_env(),
+            spec.working_dir.as_deref(),
+            true,
+        );
+        let AttachedExec {
+            id: exec_id,
+            mut output,
+            input,
+        } = self.container.start_attached(options, "stdio exec").await?;
 
         // Demux the attached stream into a stdout pipe and a stderr tail.
         let (stdout_writer, stdout_reader) = duplex(64 * 1024);
         let stderr_tail = StderrTail::default();
         let tail = stderr_tail.clone();
-        let sandbox_id = self.container_id.clone();
+        let sandbox_id = self.container.id.clone();
         tokio::spawn(async move {
             let mut stdout_writer = stdout_writer;
             loop {
@@ -641,13 +597,8 @@ impl DockerExec {
         });
 
         let handle = DockerStdioHandle {
-            exec: Self::new(
-                self.docker.clone(),
-                self.container_id.clone(),
-                self.working_dir.clone(),
-                self.base_env.clone(),
-            ),
-            exec_id: exec.id,
+            container: self.container.clone(),
+            exec_id,
             stop_file,
             stop_requested: AtomicBool::new(false),
         };
@@ -661,7 +612,7 @@ impl DockerExec {
 }
 
 struct DockerStdioHandle {
-    exec:           DockerExec,
+    container:      ContainerRef,
     exec_id:        String,
     stop_file:      String,
     /// At most one stop request per handle: a repeat call, or one after
@@ -670,11 +621,22 @@ struct DockerStdioHandle {
     stop_requested: AtomicBool,
 }
 
+impl DockerStdioHandle {
+    /// Whether the exec is still running. An inspect failure counts as
+    /// running: when in doubt, kill.
+    async fn still_running(&self) -> bool {
+        match self.container.docker.inspect_exec(&self.exec_id).await {
+            Ok(inspect) => inspect.running == Some(true),
+            Err(_) => true,
+        }
+    }
+}
+
 #[async_trait]
 impl StdioProcessHandle for DockerStdioHandle {
     #[tracing::instrument(
         skip_all,
-        fields(provider_kind = "docker", sandbox_id = %self.exec.container_id)
+        fields(provider_kind = "docker", sandbox_id = %self.container.id)
     )]
     async fn terminate(&self) {
         if self.stop_requested.swap(true, Ordering::SeqCst) {
@@ -685,57 +647,42 @@ impl StdioProcessHandle for DockerStdioHandle {
         // would spawn a pointless exec and leave a permanent stray file
         // (fabro gated on observed termination the same way). An
         // inspect failure still sends the stop — when in doubt, kill.
-        if let Ok(inspect) = self.exec.docker.inspect_exec(&self.exec_id).await {
-            if inspect.running != Some(true) {
-                return;
-            }
+        if !self.still_running().await {
+            return;
         }
         // The trait offers no error channel; awaiting at least keeps
         // the request ordered before any caller-side cleanup.
         // TERM, then KILL after the grace: the handle's own ladder, since
         // the trait has one verb. The watcher keeps reading the stop file
         // after a term, so the kill lands on a process that ignored it.
-        if let Err(error) = self
-            .exec
-            .request_stop(&self.stop_file, StopMode::Term)
-            .await
-        {
+        if let Err(error) = request_stop(&self.container, &self.stop_file, StopMode::Term).await {
             tracing::warn!(error = %error, "stdio stop request failed");
             return;
         }
         time::sleep(TERM_GRACE).await;
-        if let Ok(inspect) = self.exec.docker.inspect_exec(&self.exec_id).await {
-            if inspect.running != Some(true) {
-                return;
-            }
+        if !self.still_running().await {
+            return;
         }
-        if let Err(error) = self
-            .exec
-            .request_stop(&self.stop_file, StopMode::Kill)
-            .await
-        {
+        if let Err(error) = request_stop(&self.container, &self.stop_file, StopMode::Kill).await {
             tracing::warn!(error = %error, "stdio kill request failed");
         }
     }
 
     #[tracing::instrument(
         skip_all,
-        fields(provider_kind = "docker", sandbox_id = %self.exec.container_id)
+        fields(provider_kind = "docker", sandbox_id = %self.container.id)
     )]
     async fn wait(&self) -> (Termination, Option<i32>) {
         let mut errors_since: Option<Instant> = None;
         let mut retry_delay = Duration::from_millis(100);
         loop {
-            match self.exec.docker.inspect_exec(&self.exec_id).await {
+            match self.container.docker.inspect_exec(&self.exec_id).await {
                 Ok(inspect) if inspect.running == Some(true) => {
                     errors_since = None;
                     retry_delay = Duration::from_millis(100);
                     time::sleep(Duration::from_millis(100)).await;
                 }
-                Ok(inspect) => {
-                    let code = inspect.exit_code.and_then(|code| i32::try_from(code).ok());
-                    return (Termination::Exited, code);
-                }
+                Ok(inspect) => return (Termination::Exited, exit_code_of(&inspect)),
                 // A transient daemon hiccup must not report an end that
                 // was never observed; give up with `Unknown` only after
                 // the daemon has been unreachable for the whole bound.
