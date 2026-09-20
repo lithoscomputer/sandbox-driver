@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use sandbox_driver::{
     BASH_ENV_VAR, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, Result,
     SpawnSpec, StderrTail, StdioProcess, StdioProcessHandle, StopLevel, Termination, feed_stdin,
-    run_with_stop_grace,
+    finish_stdin_writer, run_with_stop_grace,
 };
 use tokio::io::{AsyncWriteExt, duplex};
 use tokio::time;
@@ -353,19 +353,7 @@ impl DockerExec {
         .await?;
 
         if let Some(stdin_task) = stdin_task {
-            // The command is done, so unwritten stdin bytes are
-            // unwanted; abort instead of joining unbounded.
-            stdin_task.abort();
-            match stdin_task.await {
-                Ok(result) => result?,
-                Err(join_error) if join_error.is_cancelled() => {}
-                Err(join_error) => {
-                    return Err(Error::io(
-                        "exec stdin writer task",
-                        io::Error::other(join_error),
-                    ));
-                }
-            }
+            finish_stdin_writer(stdin_task).await?;
         }
         outcome
             .stream
