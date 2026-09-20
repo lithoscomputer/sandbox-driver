@@ -675,6 +675,12 @@ impl HostSandbox {
     /// A deleted sandbox cannot start again (it is reported missing), while
     /// stopping or deleting it again succeeds and only drops the cached
     /// handle.
+    ///
+    /// When `work` or the persist fails after admission moved, admission is
+    /// moved back to match the unchanged live state, so a sandbox that still
+    /// reports `Running` admits work and one that reports `Stopped` refuses
+    /// it, and the caller can retry the whole change. Work that a failed
+    /// stop already fenced stays fenced.
     async fn transition(
         &self,
         action: Action,
@@ -695,13 +701,25 @@ impl HostSandbox {
                         self.remove_cached_handle().await;
                         return Ok(());
                     }
-                    if target == SandboxState::Running {
-                        self.groups.start().await?;
-                    } else {
-                        self.groups.stop().await?;
+                    self.admit_work(target == SandboxState::Running).await?;
+                    let outcome = async {
+                        work().await?;
+                        self.persist(target).await
                     }
-                    work().await?;
-                    self.persist(target).await?;
+                    .await;
+                    if let Err(error) = outcome {
+                        if let Err(rollback) =
+                            self.admit_work(*state == SandboxState::Running).await
+                        {
+                            tracing::warn!(
+                                provider_kind = "host",
+                                sandbox_id = %self.record.id,
+                                error = %rollback,
+                                "restoring process admission after a failed lifecycle change"
+                            );
+                        }
+                        return Err(error);
+                    }
                     *state = target;
                     if target == SandboxState::Deleted {
                         // Persisted tombstones remain available for recovery
@@ -713,6 +731,17 @@ impl HostSandbox {
                 },
             )
             .await
+    }
+
+    /// Moves `ProcessGroups` admission to match a `Running` (`true`) or
+    /// non-running (`false`) live state. Refusing admission fences every
+    /// group the sandbox owns.
+    async fn admit_work(&self, running: bool) -> Result<()> {
+        if running {
+            self.groups.start().await
+        } else {
+            self.groups.stop().await
+        }
     }
 
     /// Removes a managed workspace; a designated directory is never
