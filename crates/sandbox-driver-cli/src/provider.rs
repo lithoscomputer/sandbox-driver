@@ -7,6 +7,8 @@ use sandbox_driver_protocol::{PluginConfig, PluginProvider, launch_plugin};
 
 use crate::config::{Config, DaytonaProfile, PluginProfile, ProviderProfile};
 
+/// The provider kinds this binary ships as adjacent plugin executables.
+pub(crate) const BUILTIN_PROVIDERS: &[&str] = &["host", "docker", "daytona"];
 const PLUGIN_PREFIX: &str = "sandbox-driver";
 const EXTERNAL_PLUGIN_PREFIX: &str = "lithos-sandbox";
 const DAYTONA_ENV: &[&str] = &[
@@ -58,7 +60,7 @@ impl ProviderSession {
 }
 
 fn builtin_config(kind: &str) -> Result<PluginConfig> {
-    if !matches!(kind, "host" | "docker" | "daytona") {
+    if !BUILTIN_PROVIDERS.contains(&kind) {
         bail!("unknown provider {kind:?}; use host, docker, daytona, or a configured profile");
     }
     let mut config =

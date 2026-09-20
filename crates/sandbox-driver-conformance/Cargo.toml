@@ -15,3 +15,6 @@ sandbox-driver.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-util.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+sandbox-driver-testing.workspace = true

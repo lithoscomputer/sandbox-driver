@@ -282,6 +282,17 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             .map_err(|error| transport_error("reading data frame", error))?;
         Ok(Some((kind, payload)))
     }
+
+    /// The next `Stdin` payload from the host, or `None` once anything
+    /// else arrives: the host's `Eof`, a closed connection, a read
+    /// failure, or a stray kind. Each of those ends the consumer's input;
+    /// none is an error to the plugin, which only forwards bytes.
+    pub(crate) async fn next_stdin(&mut self) -> Option<Vec<u8>> {
+        match self.read().await {
+            Ok(Some((FrameKind::Stdin, payload))) => Some(payload),
+            _ => None,
+        }
+    }
 }
 
 /// One accepted and authenticated channel connection, split for
@@ -700,6 +711,35 @@ pub async fn open(transport: &DataTransport, request: &ChannelRequest) -> Result
         }
     }
     Ok(channel)
+}
+
+/// Why [`write_with_progress`] stopped short. The caller names the
+/// operation in the error it reports.
+pub(crate) enum WriteStall {
+    /// One write made no progress within the timeout.
+    Timeout,
+    /// The writer failed, or accepted zero bytes.
+    Io(io::Error),
+}
+
+/// Writes all of `bytes` to `output`, each write under `timeout`, so a
+/// consumer that stops reading is detected instead of waited on forever.
+pub(crate) async fn write_with_progress<W: AsyncWrite + Unpin + ?Sized>(
+    output: &mut W,
+    mut bytes: &[u8],
+    timeout: Duration,
+) -> Result<(), WriteStall> {
+    while !bytes.is_empty() {
+        let written = time::timeout(timeout, output.write(bytes))
+            .await
+            .map_err(|_| WriteStall::Timeout)?
+            .map_err(WriteStall::Io)?;
+        if written == 0 {
+            return Err(WriteStall::Io(io::ErrorKind::WriteZero.into()));
+        }
+        bytes = &bytes[written..];
+    }
+    Ok(())
 }
 
 fn random_token() -> String {

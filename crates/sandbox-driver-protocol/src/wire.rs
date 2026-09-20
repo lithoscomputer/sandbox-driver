@@ -15,6 +15,7 @@ use sandbox_driver::{
     Action, AuthError, Capability, Error, ErrorReport, ExecFailure, GitFailure, GitFailureKind,
     ProviderError, ProviderKind, ResourceKind, SandboxState, Termination, TransportError,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -127,49 +128,96 @@ pub(crate) fn decode_bytes(text: &str) -> Result<Vec<u8>, Error> {
         .map_err(|error| Error::invalid_spec("base64", error.to_string()))
 }
 
-/// Variant-specific reconstruction payloads.
+// Per-kind `detail` payloads, one per row of the `docs/protocol.md`
+// section 7 table. Each carries exactly the fields its `report.kind`
+// needs to rebuild the typed error; the wire shape is the flat object
+// those fields form.
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UnsupportedDetail {
+    capability: Capability,
+}
+
+/// `not_found` and `not_owned`: the resource kind and id in question.
+#[derive(Debug, Serialize, Deserialize)]
+struct ResourceDetail {
+    resource: ResourceKind,
+    id:       String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct InvalidSpecDetail {
+    field:  String,
+    reason: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct InvalidStateDetail {
+    current: SandboxState,
+    action:  Action,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TimeoutDetail {
+    operation: String,
+    elapsed:   Duration,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AuthEnvelope {
+    auth: AuthDetail,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct Detail {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    limit:             Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    incomplete:        Option<sandbox_driver::IncompleteOperation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_bytes:         Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    not_started:       Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    capability:        Option<Capability>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    resource:          Option<ResourceKind>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    id:                Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    field:             Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reason:            Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    current:           Option<SandboxState>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    action:            Option<Action>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    operation:         Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    elapsed:           Option<Duration>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    auth:              Option<AuthDetail>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    retry_after:       Option<Duration>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    provider:          Option<ProviderError>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    exec:              Option<ExecDetail>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    git:               Option<GitDetail>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    io_context:        Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    transport_context: Option<String>,
+struct RateLimitedDetail {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_after: Option<Duration>,
+}
+
+/// `overloaded`: admission was refused before any work started, which
+/// `not_started` states explicitly so a receiver never confuses it with
+/// an incomplete operation.
+#[derive(Debug, Serialize, Deserialize)]
+struct OverloadedDetail {
+    limit:       String,
+    #[serde(default)]
+    not_started: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LimitDetail {
+    limit:     String,
+    max_bytes: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IncompleteDetail {
+    incomplete: sandbox_driver::IncompleteOperation,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ProviderEnvelope {
+    provider: ProviderError,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ExecEnvelope {
+    exec: ExecDetail,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct GitEnvelope {
+    git: GitDetail,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IoDetail {
+    io_context: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TransportDetail {
+    transport_context: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -278,64 +326,12 @@ impl WireError {
     /// to reconstruct the important variants on the other side.
     pub fn from_error(error: &Error) -> Self {
         let report = ErrorReport::from(error);
-        let mut detail = Detail::default();
-        match error {
-            Error::Incomplete(outcome) => detail.incomplete = Some(outcome.clone()),
-            Error::Overloaded { limit } => {
-                detail.limit = Some(limit.clone());
-                detail.not_started = Some(true);
-            }
-            Error::LimitExceeded { limit, max_bytes } => {
-                detail.limit = Some(limit.clone());
-                detail.max_bytes = Some(*max_bytes);
-            }
-            Error::Unsupported { capability } => detail.capability = Some(*capability),
-            Error::NotFound { resource, id } | Error::NotOwned { resource, id } => {
-                detail.resource = Some(*resource);
-                detail.id = Some(id.clone());
-            }
-            Error::InvalidSpec { field, reason } => {
-                detail.field = Some(field.clone());
-                detail.reason = Some(reason.clone());
-            }
-            Error::InvalidState { current, action } => {
-                detail.current = Some(*current);
-                detail.action = Some(*action);
-            }
-            Error::Timeout { operation, elapsed } => {
-                detail.operation = Some(operation.clone());
-                detail.elapsed = Some(*elapsed);
-            }
-            Error::Auth(auth) => {
-                detail.auth = Some(AuthDetail {
-                    provider: auth.provider.clone(),
-                    reason:   auth.reason.clone(),
-                });
-            }
-            Error::RateLimited { retry_after } => detail.retry_after = *retry_after,
-            Error::Provider(provider) => detail.provider = Some(provider_copy(provider)),
-            Error::Exec(failure) => detail.exec = Some(exec_detail(failure)),
-            Error::Git(failure) => {
-                detail.git = Some(GitDetail {
-                    operation: failure.operation().to_owned(),
-                    kind:      failure.kind(),
-                    exec:      failure.output().map(exec_detail),
-                    provider:  failure.provider().map(provider_copy),
-                });
-            }
-            Error::Io { context, .. } => detail.io_context = Some(context.clone()),
-            Error::Transport(transport) => {
-                detail.transport_context = Some(transport.context.clone());
-            }
-            _ => {}
-        }
         Self {
             code:    CODE_APPLICATION,
             message: report.message.clone(),
             data:    Some(WireErrorData {
                 report,
-                detail: serde_json::to_value(detail)
-                    .expect("wire error detail contains only serializable values"),
+                detail: detail_of(error),
             }),
         }
     }
@@ -350,120 +346,199 @@ impl WireError {
             provider.code = Some(self.code.to_string());
             return Error::Provider(provider);
         };
-        let detail: Detail = serde_json::from_value(data.detail).unwrap_or_default();
-        match data.report.kind.as_str() {
-            "incomplete" => {
-                if let Some(outcome) = detail.incomplete {
-                    return Error::Incomplete(outcome);
-                }
-            }
-            "overloaded" if detail.not_started == Some(true) => {
-                if let Some(limit) = detail.limit {
-                    return Error::Overloaded { limit };
-                }
-            }
-            "limit_exceeded" => {
-                if let (Some(limit), Some(max_bytes)) = (detail.limit, detail.max_bytes) {
-                    return Error::LimitExceeded { limit, max_bytes };
-                }
-            }
-            "unsupported" => {
-                if let Some(capability) = detail.capability {
-                    return Error::Unsupported { capability };
-                }
-            }
-            "not_found" => {
-                if let (Some(resource), Some(id)) = (detail.resource, detail.id) {
-                    return Error::NotFound { resource, id };
-                }
-            }
-            "not_owned" => {
-                if let (Some(resource), Some(id)) = (detail.resource, detail.id) {
-                    return Error::NotOwned { resource, id };
-                }
-            }
-            "invalid_spec" => {
-                if let (Some(field), Some(reason)) = (detail.field, detail.reason) {
-                    return Error::InvalidSpec { field, reason };
-                }
-            }
-            "invalid_state" => {
-                if let (Some(current), Some(action)) = (detail.current, detail.action) {
-                    return Error::InvalidState { current, action };
-                }
-            }
-            "timeout" => {
-                if let (Some(operation), Some(elapsed)) = (detail.operation, detail.elapsed) {
-                    return Error::Timeout { operation, elapsed };
-                }
-            }
-            "auth" => {
-                if let Some(auth) = detail.auth {
-                    let auth = match remote_cause(&data.report.causes) {
-                        Some(source) => AuthError::with_source(auth.provider, auth.reason, source),
-                        None => AuthError::new(auth.provider, auth.reason),
-                    };
-                    return Error::Auth(auth);
-                }
-            }
-            "rate_limited" => {
-                return Error::RateLimited {
-                    retry_after: detail.retry_after,
-                };
-            }
-            "provider" => {
-                if let Some(provider) = detail.provider {
-                    let mut copy = match remote_cause(&data.report.causes) {
-                        Some(source) => {
-                            ProviderError::with_source(provider.provider, provider.message, source)
-                        }
-                        None => ProviderError::new(provider.provider, provider.message),
-                    };
-                    copy.code = provider.code;
-                    copy.retryable = provider.retryable;
-                    copy.detail = provider.detail;
-                    return Error::Provider(copy);
-                }
-            }
-            "exec" => {
-                if let Some(failure) = detail.exec.and_then(exec_failure) {
-                    return Error::Exec(failure);
-                }
-            }
-            "git" => {
-                if let Some(git) = detail.git {
-                    let mut failure = GitFailure::classified(git.operation, git.kind, git.provider);
-                    if let Some(output) = git.exec.and_then(exec_failure) {
-                        failure = failure.with_output(output);
-                    }
-                    return Error::Git(failure);
-                }
-            }
-            "io" => {
-                if let Some(context) = detail.io_context {
-                    let source = remote_cause(&data.report.causes).unwrap_or_else(|| RemoteCause {
-                        message: "remote I/O failure".to_owned(),
-                        source:  None,
-                    });
-                    return Error::io(context, io::Error::other(source));
-                }
-            }
-            "transport" => {
-                if let Some(context) = detail.transport_context {
-                    let transport = match remote_cause(&data.report.causes) {
-                        Some(source) => TransportError::with_source(context, source),
-                        None => TransportError::new(context),
-                    };
-                    return Error::Transport(transport);
-                }
-            }
-            _ => {}
+        if let Some(error) = typed_error(&data.report.kind, data.detail, &data.report.causes) {
+            return error;
         }
+        // A kind this side does not know, or a detail missing the fields
+        // its kind needs: keep what the report says.
         let mut provider = ProviderError::new(unknown_kind(), data.report.message);
         provider.retryable = data.report.retryable;
         provider.code = Some(data.report.kind);
         Error::Provider(provider)
     }
+}
+
+/// The kind-specific `detail` object for `error`, or `{}` for a kind
+/// that needs none.
+fn detail_of(error: &Error) -> Value {
+    let detail = match error {
+        Error::Incomplete(outcome) => serde_json::to_value(IncompleteDetail {
+            incomplete: outcome.clone(),
+        }),
+        Error::Overloaded { limit } => serde_json::to_value(OverloadedDetail {
+            limit:       limit.clone(),
+            not_started: true,
+        }),
+        Error::LimitExceeded { limit, max_bytes } => serde_json::to_value(LimitDetail {
+            limit:     limit.clone(),
+            max_bytes: *max_bytes,
+        }),
+        Error::Unsupported { capability } => serde_json::to_value(UnsupportedDetail {
+            capability: *capability,
+        }),
+        Error::NotFound { resource, id } | Error::NotOwned { resource, id } => {
+            serde_json::to_value(ResourceDetail {
+                resource: *resource,
+                id:       id.clone(),
+            })
+        }
+        Error::InvalidSpec { field, reason } => serde_json::to_value(InvalidSpecDetail {
+            field:  field.clone(),
+            reason: reason.clone(),
+        }),
+        Error::InvalidState { current, action } => serde_json::to_value(InvalidStateDetail {
+            current: *current,
+            action:  *action,
+        }),
+        Error::Timeout { operation, elapsed } => serde_json::to_value(TimeoutDetail {
+            operation: operation.clone(),
+            elapsed:   *elapsed,
+        }),
+        Error::Auth(auth) => serde_json::to_value(AuthEnvelope {
+            auth: AuthDetail {
+                provider: auth.provider.clone(),
+                reason:   auth.reason.clone(),
+            },
+        }),
+        Error::RateLimited { retry_after } => serde_json::to_value(RateLimitedDetail {
+            retry_after: *retry_after,
+        }),
+        Error::Provider(provider) => serde_json::to_value(ProviderEnvelope {
+            provider: provider_copy(provider),
+        }),
+        Error::Exec(failure) => serde_json::to_value(ExecEnvelope {
+            exec: exec_detail(failure),
+        }),
+        Error::Git(failure) => serde_json::to_value(GitEnvelope {
+            git: GitDetail {
+                operation: failure.operation().to_owned(),
+                kind:      failure.kind(),
+                exec:      failure.output().map(exec_detail),
+                provider:  failure.provider().map(provider_copy),
+            },
+        }),
+        Error::Io { context, .. } => serde_json::to_value(IoDetail {
+            io_context: context.clone(),
+        }),
+        Error::Transport(transport) => serde_json::to_value(TransportDetail {
+            transport_context: transport.context.clone(),
+        }),
+        _ => Ok(Value::Object(serde_json::Map::new())),
+    };
+    detail.expect("wire error detail contains only serializable values")
+}
+
+/// The typed [`Error`] that `kind` and its `detail` describe, or `None`
+/// when the kind is unknown here or the detail lacks the fields the
+/// kind needs. `causes` is the report's rendered source chain, restored
+/// as an opaque remote source where the error type carries one.
+fn typed_error(kind: &str, detail: Value, causes: &[String]) -> Option<Error> {
+    fn read<T: DeserializeOwned>(detail: Value) -> Option<T> {
+        serde_json::from_value(detail).ok()
+    }
+    Some(match kind {
+        "incomplete" => Error::Incomplete(read::<IncompleteDetail>(detail)?.incomplete),
+        "overloaded" => {
+            let detail: OverloadedDetail = read(detail)?;
+            if !detail.not_started {
+                return None;
+            }
+            Error::Overloaded {
+                limit: detail.limit,
+            }
+        }
+        "limit_exceeded" => {
+            let LimitDetail { limit, max_bytes } = read(detail)?;
+            Error::LimitExceeded { limit, max_bytes }
+        }
+        "unsupported" => Error::Unsupported {
+            capability: read::<UnsupportedDetail>(detail)?.capability,
+        },
+        "not_found" => {
+            let ResourceDetail { resource, id } = read(detail)?;
+            Error::NotFound { resource, id }
+        }
+        "not_owned" => {
+            let ResourceDetail { resource, id } = read(detail)?;
+            Error::NotOwned { resource, id }
+        }
+        "invalid_spec" => {
+            let InvalidSpecDetail { field, reason } = read(detail)?;
+            Error::InvalidSpec { field, reason }
+        }
+        "invalid_state" => {
+            let InvalidStateDetail { current, action } = read(detail)?;
+            Error::InvalidState { current, action }
+        }
+        "timeout" => {
+            let TimeoutDetail { operation, elapsed } = read(detail)?;
+            Error::Timeout { operation, elapsed }
+        }
+        "auth" => {
+            let AuthEnvelope { auth } = read(detail)?;
+            Error::Auth(match remote_cause(causes) {
+                Some(source) => AuthError::with_source(auth.provider, auth.reason, source),
+                None => AuthError::new(auth.provider, auth.reason),
+            })
+        }
+        // A rate limit needs no detail at all; an absent or malformed
+        // one still reads as "rate limited, retry time unknown".
+        "rate_limited" => Error::RateLimited {
+            retry_after: read::<RateLimitedDetail>(detail)
+                .unwrap_or_default()
+                .retry_after,
+        },
+        "provider" => {
+            let ProviderEnvelope { provider } = read(detail)?;
+            let mut copy = match remote_cause(causes) {
+                Some(source) => {
+                    ProviderError::with_source(provider.provider, provider.message, source)
+                }
+                None => ProviderError::new(provider.provider, provider.message),
+            };
+            copy.code = provider.code;
+            copy.retryable = provider.retryable;
+            copy.detail = provider.detail;
+            Error::Provider(copy)
+        }
+        "exec" => Error::Exec(exec_failure(read::<ExecEnvelope>(detail)?.exec)?),
+        "git" => {
+            let GitEnvelope { git } = read(detail)?;
+            let mut failure = GitFailure::classified(git.operation, git.kind, git.provider);
+            if let Some(output) = git.exec.and_then(exec_failure) {
+                failure = failure.with_output(output);
+            }
+            Error::Git(failure)
+        }
+        "io" => {
+            let IoDetail { io_context } = read(detail)?;
+            let source = remote_cause(causes).unwrap_or_else(|| RemoteCause {
+                message: "remote I/O failure".to_owned(),
+                source:  None,
+            });
+            Error::io(io_context, io::Error::other(source))
+        }
+        "transport" => {
+            let TransportDetail { transport_context } = read(detail)?;
+            Error::Transport(match remote_cause(causes) {
+                Some(source) => TransportError::with_source(transport_context, source),
+                None => TransportError::new(transport_context),
+            })
+        }
+        _ => return None,
+    })
+}
+
+/// Whether `error` is a plugin's `-32601` for a method it does not know.
+/// Methods added within a protocol version are optional on the plugin
+/// side, and a host treats this answer as "not offered", not as failure.
+pub(crate) fn is_method_not_found(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Provider(provider)
+            if provider.code.as_deref().and_then(|code| code.parse::<i64>().ok())
+                == Some(CODE_METHOD_NOT_FOUND)
+    )
 }
 
 fn unknown_kind() -> sandbox_driver::ProviderKind {

@@ -12,10 +12,11 @@ use std::{future, io, mem, process};
 use async_trait::async_trait;
 use sandbox_driver::{
     Action, Capabilities, Capability, CorrelationId, DerivedGit, Error, Event, EventBody,
-    EventContext, EventEmitter, EventObserver, EventSubject, ExecControls, ExecSpec, Git,
-    GitCloneOptions, GitCommitOptions, GitFailureKind, OutputStream, ProviderKind, Result, Sandbox,
-    SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec, SandboxStatus,
-    SpawnSpec, StdinSource, Termination, WaitOptions, activate,
+    EventContext, EventEmitter, EventObserver, EventSubject, ExecControls, ExecSpec, ForkOptions,
+    Git, GitCloneOptions, GitCommitOptions, GitFailureKind, LogSink, LogSource, Logs, LogsCaps,
+    OutputStream, ProviderKind, Result, Sandbox, SandboxFilter, SandboxId, SandboxProvider,
+    SandboxSource, SandboxSpec, SandboxStatus, SpawnSpec, StdinSource, Termination, WaitOptions,
+    activate,
 };
 use sandbox_driver_host::HostProvider;
 use sandbox_driver_protocol::channel::TrustedPeer;
@@ -1778,5 +1779,377 @@ async fn cancellation_during_streamed_input_drops_the_source_and_preserves_other
             .success()
     );
     sandbox.delete().await.expect("delete");
+    provider.shutdown().await.expect("shutdown");
+}
+
+/// A Host provider whose sandboxes also declare an endless entrypoint log,
+/// so log streams can be driven over the wire without a provider that
+/// really produces logs.
+struct LoggingProvider {
+    host: HostProvider,
+    caps: Capabilities,
+}
+
+struct LoggingSandbox {
+    inner: Arc<dyn Sandbox>,
+    caps:  Capabilities,
+    logs:  EndlessLogs,
+}
+
+/// Emits a line every few milliseconds until the follow is dropped or
+/// the sink refuses a chunk.
+struct EndlessLogs;
+
+#[async_trait]
+impl Logs for EndlessLogs {
+    async fn follow(&self, _: LogSource, sink: LogSink) -> Result<()> {
+        loop {
+            sink(b"tick\n".to_vec()).await?;
+            time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
+impl LoggingProvider {
+    fn new() -> Self {
+        let host = HostProvider::new();
+        let mut caps = host.capabilities().clone();
+        let mut logs = LogsCaps::default();
+        logs.entrypoint = true;
+        caps.logs = Some(logs);
+        Self { host, caps }
+    }
+
+    fn wrap(&self, inner: Arc<dyn Sandbox>) -> Arc<dyn Sandbox> {
+        let mut caps = inner.capabilities().clone();
+        caps.logs.clone_from(&self.caps.logs);
+        Arc::new(LoggingSandbox {
+            inner,
+            caps,
+            logs: EndlessLogs,
+        })
+    }
+}
+
+#[async_trait]
+impl SandboxProvider for LoggingProvider {
+    fn kind(&self) -> &ProviderKind {
+        self.host.kind()
+    }
+
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    async fn create(
+        &self,
+        spec: &SandboxSpec,
+        events: Option<EventContext>,
+    ) -> Result<Arc<dyn Sandbox>> {
+        Ok(self.wrap(self.host.create(spec, events).await?))
+    }
+
+    async fn attach(
+        &self,
+        id: &SandboxId,
+        events: Option<EventContext>,
+    ) -> Result<Arc<dyn Sandbox>> {
+        Ok(self.wrap(self.host.attach(id, events).await?))
+    }
+
+    async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>> {
+        self.host.list(filter).await
+    }
+}
+
+#[async_trait]
+impl Sandbox for LoggingSandbox {
+    fn id(&self) -> &SandboxId {
+        self.inner.id()
+    }
+
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    async fn describe(&self) -> Result<SandboxStatus> {
+        self.inner.describe().await
+    }
+
+    fn working_directory(&self) -> &str {
+        self.inner.working_directory()
+    }
+
+    async fn platform_info(&self) -> Result<sandbox_driver::PlatformInfo> {
+        self.inner.platform_info().await
+    }
+
+    async fn start(&self) -> Result<()> {
+        self.inner.start().await
+    }
+
+    async fn stop(&self) -> Result<()> {
+        self.inner.stop().await
+    }
+
+    async fn delete(&self) -> Result<()> {
+        self.inner.delete().await
+    }
+
+    fn exec(&self) -> &dyn sandbox_driver::Exec {
+        self.inner.exec()
+    }
+
+    fn fs(&self) -> &dyn sandbox_driver::Filesystem {
+        self.inner.fs()
+    }
+
+    fn logs(&self) -> Option<&dyn Logs> {
+        Some(&self.logs)
+    }
+}
+
+/// Dropping a log follow on the host sends `stream/cancel`, which ends
+/// the plugin's follow and releases its stream registration; a sink
+/// error ends the follow and reaches the caller unchanged. Both leave the
+/// connection with no live streams, so a later follow starts clean.
+#[tokio::test]
+async fn log_follow_cancel_and_sink_errors_release_the_server_stream() {
+    let (host_side, plugin_side) = duplex(1024 * 1024);
+    let (host_read, host_write) = split(host_side);
+    let (plugin_read, plugin_write) = split(plugin_side);
+    tokio::spawn(serve(
+        Arc::new(LoggingProvider::new()),
+        plugin_read,
+        plugin_write,
+    ));
+    let provider = PluginProvider::connect(host_read, host_write)
+        .await
+        .expect("handshake succeeds");
+    let sandbox = provider.create(&host_spec(), None).await.expect("sandbox");
+    let logs = sandbox.logs().expect("logs facet crosses the wire");
+
+    for _ in 0..3 {
+        let seen = Arc::new(Mutex::new(0usize));
+        let counting = Arc::clone(&seen);
+        let sink: LogSink = Arc::new(move |chunk| {
+            assert_eq!(chunk, b"tick\n");
+            *counting.lock().expect("seen lock") += 1;
+            Box::pin(async { Ok(()) })
+        });
+        let follow = time::timeout(
+            Duration::from_millis(200),
+            logs.follow(LogSource::Entrypoint, sink),
+        )
+        .await;
+        assert!(follow.is_err(), "an endless follow only ends by cancel");
+        assert!(
+            *seen.lock().expect("seen lock") > 0,
+            "chunks reached the sink"
+        );
+
+        let rejecting: LogSink = Arc::new(|_| {
+            Box::pin(async { Err(Error::invalid_spec("log_sink", "roundtrip sentinel")) })
+        });
+        let outcome = time::timeout(
+            Duration::from_secs(5),
+            logs.follow(LogSource::Entrypoint, rejecting),
+        )
+        .await
+        .expect("a rejected chunk ends the follow");
+        assert!(
+            matches!(outcome, Err(Error::InvalidSpec { ref field, ref reason })
+                if field == "log_sink" && reason == "roundtrip sentinel"),
+            "{outcome:?}"
+        );
+
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                let stats = provider.transport_diagnostics().await.expect("diagnostics");
+                if stats.server.streams == 0
+                    && stats.server.active_io == 0
+                    && stats.client.active_io == 0
+                    && stats.client.cleanup_tasks == 0
+                {
+                    break;
+                }
+                assert_eq!(stats.client.failed_cleanups, 0);
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled and failed follows release their streams");
+    }
+    sandbox.delete().await.expect("delete");
+    provider.shutdown().await.expect("shutdown");
+}
+
+/// A Host provider whose sandboxes can be "forked": the fork is a fresh
+/// Host sandbox, which is enough to drive `sandbox/fork` over the wire.
+struct ForkingProvider {
+    host: Arc<HostProvider>,
+    caps: Capabilities,
+}
+
+struct ForkingSandbox {
+    inner: Arc<dyn Sandbox>,
+    host:  Arc<HostProvider>,
+    caps:  Capabilities,
+}
+
+impl ForkingProvider {
+    fn new() -> Self {
+        let host = Arc::new(HostProvider::new());
+        let mut caps = host.capabilities().clone();
+        caps.lifecycle.fork = true;
+        Self { host, caps }
+    }
+
+    fn wrap(&self, inner: Arc<dyn Sandbox>) -> Arc<dyn Sandbox> {
+        let mut caps = inner.capabilities().clone();
+        caps.lifecycle.fork = true;
+        Arc::new(ForkingSandbox {
+            inner,
+            host: Arc::clone(&self.host),
+            caps,
+        })
+    }
+}
+
+#[async_trait]
+impl SandboxProvider for ForkingProvider {
+    fn kind(&self) -> &ProviderKind {
+        self.host.kind()
+    }
+
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    async fn create(
+        &self,
+        spec: &SandboxSpec,
+        events: Option<EventContext>,
+    ) -> Result<Arc<dyn Sandbox>> {
+        Ok(self.wrap(self.host.create(spec, events).await?))
+    }
+
+    async fn attach(
+        &self,
+        id: &SandboxId,
+        events: Option<EventContext>,
+    ) -> Result<Arc<dyn Sandbox>> {
+        Ok(self.wrap(self.host.attach(id, events).await?))
+    }
+
+    async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>> {
+        self.host.list(filter).await
+    }
+}
+
+#[async_trait]
+impl Sandbox for ForkingSandbox {
+    fn id(&self) -> &SandboxId {
+        self.inner.id()
+    }
+
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    async fn describe(&self) -> Result<SandboxStatus> {
+        self.inner.describe().await
+    }
+
+    fn working_directory(&self) -> &str {
+        self.inner.working_directory()
+    }
+
+    async fn platform_info(&self) -> Result<sandbox_driver::PlatformInfo> {
+        self.inner.platform_info().await
+    }
+
+    async fn start(&self) -> Result<()> {
+        self.inner.start().await
+    }
+
+    async fn stop(&self) -> Result<()> {
+        self.inner.stop().await
+    }
+
+    async fn delete(&self) -> Result<()> {
+        self.inner.delete().await
+    }
+
+    async fn fork(&self, _: &ForkOptions) -> Result<Arc<dyn Sandbox>> {
+        let forked = self.host.create(&host_spec(), None).await?;
+        let mut caps = forked.capabilities().clone();
+        caps.lifecycle.fork = true;
+        Ok(Arc::new(Self {
+            inner: forked,
+            host: Arc::clone(&self.host),
+            caps,
+        }))
+    }
+
+    fn exec(&self) -> &dyn sandbox_driver::Exec {
+        self.inner.exec()
+    }
+
+    fn fs(&self) -> &dyn sandbox_driver::Filesystem {
+        self.inner.fs()
+    }
+}
+
+/// Event contexts the host keeps per sandbox are a bounded cache. A
+/// forked handle inherits its parent's context through the same cache
+/// as a created or attached one, so repeated forks cannot grow it past
+/// `cached_handles`.
+#[tokio::test]
+async fn forked_handles_share_the_bounded_event_context_cache() {
+    let mut limits = sandbox_driver_protocol::TransportLimits::default();
+    limits.cached_handles = 2;
+    let (host_side, plugin_side) = duplex(1024 * 1024);
+    let (host_read, host_write) = split(host_side);
+    let (plugin_read, plugin_write) = split(plugin_side);
+    tokio::spawn(sandbox_driver_protocol::serve_with_limits(
+        Arc::new(ForkingProvider::new()),
+        plugin_read,
+        plugin_write,
+        limits.clone(),
+    ));
+    let provider = PluginProvider::connect_with_limits(
+        host_read,
+        host_write,
+        limits,
+        TrustedPeer::Process(process::id()),
+    )
+    .await
+    .expect("handshake succeeds");
+
+    let observer = Arc::new(RecordingEventObserver::default());
+    let events = EventContext::new(observer);
+    let parent = provider
+        .create(&host_spec(), Some(events))
+        .await
+        .expect("sandbox with events");
+    let mut forks = Vec::new();
+    for _ in 0..5 {
+        forks.push(parent.fork(&ForkOptions::default()).await.expect("fork"));
+    }
+    let stats = provider.transport_diagnostics().await.expect("diagnostics");
+    assert!(
+        stats.client.event_contexts <= 2,
+        "forks must not grow the event context cache past cached_handles: {}",
+        stats.client.event_contexts
+    );
+    assert!(
+        forks.iter().all(|fork| fork.capabilities().lifecycle.fork),
+        "forked handles carry the plugin's capabilities"
+    );
+    for fork in forks {
+        fork.delete().await.expect("delete fork");
+    }
+    parent.delete().await.expect("delete parent");
     provider.shutdown().await.expect("shutdown");
 }
