@@ -12,9 +12,9 @@ use daytona_api_client::models::{
 use daytona_sdk::{CreateSnapshotParams, DaytonaError, DockerImage, ImageSource};
 use sandbox_driver::{
     Action, Capability, Error, EventContext, EventEmitter, EventSubject, LogSink, ProviderError,
-    ProviderKind, ResourceKind, Resources, Result, SandboxKind, SandboxState, SnapshotFilter,
-    SnapshotId, SnapshotMode, SnapshotProvider, SnapshotSource, SnapshotSpec, SnapshotState,
-    SnapshotStatus,
+    ProviderKind, ResourceKind, Resources, Result, SandboxId, SandboxKind, SandboxState,
+    SnapshotFilter, SnapshotId, SnapshotMode, SnapshotProvider, SnapshotSource, SnapshotSpec,
+    SnapshotState, SnapshotStatus,
 };
 use tokio::time;
 
@@ -179,6 +179,98 @@ pub(crate) struct DaytonaSnapshots {
     pub(crate) kind:   ProviderKind,
 }
 
+impl DaytonaSnapshots {
+    /// A snapshot built from an image or a Dockerfile, sized by the
+    /// spec's resources.
+    async fn snapshot_from_image(&self, spec: &SnapshotSpec, name: String) -> Result<SnapshotId> {
+        let (image, sandbox_class) = match &spec.source {
+            SnapshotSource::Image { reference } => (
+                ImageSource::Name(reference.clone()),
+                daytona_snapshot_class(spec.sandbox_kind.unwrap_or(SandboxKind::Container))?,
+            ),
+            SnapshotSource::Dockerfile { content } => {
+                if spec.sandbox_kind == Some(SandboxKind::VirtualMachine) {
+                    return Err(Error::unsupported(Capability::SnapshotsVmFromDockerfile));
+                }
+                (
+                    ImageSource::Custom(DockerImage::from_dockerfile(content)),
+                    DaytonaCreateSandboxClass::CONTAINER,
+                )
+            }
+            _ => return Err(Error::invalid_spec("source", "unsupported snapshot source")),
+        };
+        let params = CreateSnapshotParams {
+            name,
+            image,
+            region_id: spec.region.clone(),
+            sandbox_class: Some(sandbox_class),
+            resources: sdk_resources(&spec.resources),
+            entrypoint: None,
+        };
+        let created = self
+            .client
+            .snapshot
+            .create(&params)
+            .await
+            .map_err(|error| daytona_error("creating snapshot", error))?;
+        SnapshotId::try_new(created.id)
+            .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))
+    }
+
+    /// A snapshot of an existing sandbox. The sandbox's kind and region
+    /// are inherited, so a spec that names either must agree with them,
+    /// and it must not size the snapshot itself.
+    async fn snapshot_from_sandbox(
+        &self,
+        spec: &SnapshotSpec,
+        id: &SandboxId,
+        mode: SnapshotMode,
+        name: &str,
+    ) -> Result<SnapshotId> {
+        let sdk = self
+            .client
+            .get(id.as_str())
+            .await
+            .map_err(|error| daytona_error("fetching sandbox for snapshot", error))?;
+        let actual_kind = sdk.sandbox_class.map(sandbox_kind_from_sandbox_class);
+        if let Some(requested) = spec.sandbox_kind {
+            if actual_kind != Some(requested) {
+                return Err(Error::invalid_spec(
+                    "sandbox_kind",
+                    format!("the source sandbox has kind {actual_kind:?}, not {requested:?}"),
+                ));
+            }
+        }
+        if let Some(region) = &spec.region {
+            if sdk.target != *region {
+                return Err(Error::invalid_spec(
+                    "region",
+                    format!(
+                        "the source sandbox is in region {}, not {region}",
+                        sdk.target
+                    ),
+                ));
+            }
+        }
+        if spec.resources != Resources::default() {
+            return Err(Error::invalid_spec(
+                "resources",
+                "resources are inherited when snapshotting a sandbox",
+            ));
+        }
+        if mode == SnapshotMode::LiveProcessState
+            && matches!(
+                sdk.sandbox_class,
+                Some(DaytonaSandboxClass::CONTAINER | DaytonaSandboxClass::ANDROID)
+            )
+        {
+            return Err(Error::unsupported(Capability::SnapshotsLiveProcessState));
+        }
+        create_sandbox_snapshot(&self.client, id.as_str(), name, mode).await?;
+        created_snapshot_id(&self.client, name).await
+    }
+}
+
 #[async_trait]
 impl SnapshotProvider for DaytonaSnapshots {
     #[tracing::instrument(skip_all, fields(provider_kind = "daytona"), err)]
@@ -200,85 +292,12 @@ impl SnapshotProvider for DaytonaSnapshots {
                             sandbox_driver::ProgressCode::SNAPSHOT_BUILD,
                         ))
                         .await;
-                    let (image, sandbox_class) = match &spec.source {
-            SnapshotSource::Image { reference } => (
-                ImageSource::Name(reference.clone()),
-                daytona_snapshot_class(spec.sandbox_kind.unwrap_or(SandboxKind::Container))?,
-            ),
-            SnapshotSource::Dockerfile { content } => {
-                if spec.sandbox_kind == Some(SandboxKind::VirtualMachine) {
-                    return Err(Error::unsupported(Capability::SnapshotsVmFromDockerfile));
-                }
-                (
-                    ImageSource::Custom(DockerImage::from_dockerfile(content)),
-                    DaytonaCreateSandboxClass::CONTAINER,
-                )
-            }
-            SnapshotSource::Sandbox { id, mode } => {
-                let sdk = self
-                    .client
-                    .get(id.as_str())
-                    .await
-                    .map_err(|error| daytona_error("fetching sandbox for snapshot", error))?;
-                let actual_kind = sdk.sandbox_class.map(sandbox_kind_from_sandbox_class);
-                if let Some(requested) = spec.sandbox_kind {
-                    if actual_kind != Some(requested) {
-                        return Err(Error::invalid_spec(
-                            "sandbox_kind",
-                            format!(
-                                "the source sandbox has kind {actual_kind:?}, not {requested:?}"
-                            ),
-                        ));
-                    }
-                }
-                if let Some(region) = &spec.region {
-                    if sdk.target != *region {
-                        return Err(Error::invalid_spec(
-                            "region",
-                            format!(
-                                "the source sandbox is in region {}, not {region}",
-                                sdk.target
-                            ),
-                        ));
-                    }
-                }
-                if spec.resources != Resources::default() {
-                    return Err(Error::invalid_spec(
-                        "resources",
-                        "resources are inherited when snapshotting a sandbox",
-                    ));
-                }
-                if *mode == SnapshotMode::LiveProcessState
-                    && matches!(
-                        sdk.sandbox_class,
-                        Some(DaytonaSandboxClass::CONTAINER | DaytonaSandboxClass::ANDROID)
-                    )
-                {
-                    return Err(Error::unsupported(Capability::SnapshotsLiveProcessState));
-                }
-                create_sandbox_snapshot(&self.client, id.as_str(), &name, *mode).await?;
-                let created = created_snapshot_id(&self.client, &name).await?;
-                reporter.set_subject(EventSubject::snapshot(Some(created.clone())));
-                return Ok(created);
-            }
-            _ => return Err(Error::invalid_spec("source", "unsupported snapshot source")),
-        };
-                    let params = CreateSnapshotParams {
-                        name,
-                        image,
-                        region_id: spec.region.clone(),
-                        sandbox_class: Some(sandbox_class),
-                        resources: sdk_resources(&spec.resources),
-                        entrypoint: None,
+                    let id = match &spec.source {
+                        SnapshotSource::Sandbox { id, mode } => {
+                            self.snapshot_from_sandbox(spec, id, *mode, &name).await?
+                        }
+                        _ => self.snapshot_from_image(spec, name).await?,
                     };
-                    let created = self
-                        .client
-                        .snapshot
-                        .create(&params)
-                        .await
-                        .map_err(|error| daytona_error("creating snapshot", error))?;
-                    let id = SnapshotId::try_new(created.id)
-                        .map_err(|error| Error::invalid_spec("snapshot_id", error.to_string()))?;
                     reporter.set_subject(EventSubject::snapshot(Some(id.clone())));
                     Ok(id)
                 },

@@ -1,6 +1,7 @@
 //! The Daytona sandbox handle and its lifecycle.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -192,14 +193,15 @@ impl DaytonaSandbox {
             .map_err(|error| daytona_error("fetching sandbox", error))
     }
 
-    /// Polls until the sandbox settles in a stable state, bounded by
-    /// [`TRANSITION_BUDGET`] from the caller's `started` so waits and
-    /// retries share one budget. A sandbox that disappears mid-wait
-    /// reports `Deleted`.
-    async fn wait_for_stable_state(
+    /// Polls until the sandbox reaches a state that `done` accepts or a
+    /// stable state, bounded by [`TRANSITION_BUDGET`] from the caller's
+    /// `started` so waits and retries share one budget. A sandbox that
+    /// disappears mid-wait reports `Deleted`.
+    async fn wait_for_state(
         &self,
         operation: &str,
         started: Instant,
+        done: impl Fn(SandboxState) -> bool,
     ) -> Result<SandboxState> {
         let mut attempt = 0_u64;
         loop {
@@ -210,7 +212,7 @@ impl DaytonaSandbox {
                 Err(error) => return Err(daytona_error("fetching sandbox", error)),
             };
             tracing::debug!(attempt, state = ?state, "sandbox transition state observed");
-            if state.is_stable() {
+            if done(state) || state.is_stable() {
                 return Ok(state);
             }
             let elapsed = started.elapsed();
@@ -238,11 +240,45 @@ impl DaytonaSandbox {
         Ok(())
     }
 
-    async fn start_inner(&self) -> Result<()> {
+    /// Drives an idempotent lifecycle `call` through another actor's
+    /// in-flight transition. Daytona rejects a lifecycle POST while a
+    /// state change is in progress; the call is then held until the
+    /// sandbox reaches a state `settled` accepts (the goal is already
+    /// met, so the call succeeds without being sent) or a stable state
+    /// (the call is paused and repeated), all within [`TRANSITION_BUDGET`].
+    /// Any other rejection is the operation's error. `call` returns its
+    /// SDK outcome inside the crate result so a bounded call can report
+    /// its own timeout.
+    async fn retry_through_transition<Call, Fut>(
+        &self,
+        operation: &'static str,
+        mut call: Call,
+        settled: impl Fn(SandboxState) -> bool,
+    ) -> Result<()>
+    where
+        Call: FnMut() -> Fut,
+        Fut: Future<Output = Result<StdResult<(), DaytonaError>>>,
+    {
         let started = Instant::now();
+        loop {
+            match call().await? {
+                Ok(()) => return Ok(()),
+                Err(error) if is_state_change_in_progress(&error) => {
+                    let state = self.wait_for_state(operation, started, &settled).await?;
+                    if settled(state) {
+                        return Ok(());
+                    }
+                    self.transition_retry_pause(operation, started).await?;
+                }
+                Err(error) => return Err(daytona_error(operation, error)),
+            }
+        }
+    }
+
+    async fn start_inner(&self) -> Result<()> {
         // Start is documented as a no-op on a running sandbox; Daytona
         // rejects a start POST on one, so check first (as fabro did).
-        // The check can race another actor — the loop below still
+        // The check can race another actor — the retry below still
         // handles every non-Running answer.
         let current = self
             .client
@@ -252,59 +288,44 @@ impl DaytonaSandbox {
         if map_state(current.state) == SandboxState::Running {
             return Ok(());
         }
-        loop {
-            match self.client.start(&self.sdk_id).await {
-                Ok(_) => return Ok(()),
-                // Another actor's transition is in flight: wait it out
-                // and retry until the budget runs out.
-                Err(error) if is_state_change_in_progress(&error) => {
-                    let state = self
-                        .wait_for_stable_state("starting sandbox", started)
-                        .await?;
-                    if state == SandboxState::Running {
-                        return Ok(());
-                    }
-                    self.transition_retry_pause("starting sandbox", started)
-                        .await?;
-                }
-                Err(error) => return Err(daytona_error("starting sandbox", error)),
-            }
-        }
+        self.retry_through_transition(
+            "starting sandbox",
+            || async { Ok(self.client.start(&self.sdk_id).await.map(|_| ())) },
+            |state| state == SandboxState::Running,
+        )
+        .await
     }
 
     async fn stop_inner(&self) -> Result<()> {
-        let started = Instant::now();
-        loop {
-            match self.client.stop(&self.sdk_id).await {
-                Ok(_) => return Ok(()),
-                // Ephemeral sandboxes destroy themselves on stop.
-                Err(error) if is_not_found(&error) => return Ok(()),
-                // The in-flight transition may be the stop itself (an
-                // auto-stop that fired first).
-                Err(error) if is_state_change_in_progress(&error) => {
-                    match self
-                        .wait_for_stable_state("stopping sandbox", started)
-                        .await?
-                    {
-                        SandboxState::Stopped | SandboxState::Archived | SandboxState::Deleted => {
-                            return Ok(());
-                        }
-                        _ => {
-                            self.transition_retry_pause("stopping sandbox", started)
-                                .await?;
-                        }
-                    }
+        // The in-flight transition may be the stop itself (an auto-stop
+        // that fired first).
+        self.retry_through_transition(
+            "stopping sandbox",
+            || async {
+                match self.client.stop(&self.sdk_id).await {
+                    Ok(_) => Ok(Ok(())),
+                    // Ephemeral sandboxes destroy themselves on stop.
+                    Err(error) if is_not_found(&error) => Ok(Ok(())),
+                    Err(error) => Ok(Err(error)),
                 }
-                Err(error) => return Err(daytona_error("stopping sandbox", error)),
-            }
-        }
+            },
+            |state| {
+                matches!(
+                    state,
+                    SandboxState::Stopped | SandboxState::Archived | SandboxState::Deleted
+                )
+            },
+        )
+        .await
     }
 
     /// One bounded delete call: a stalled REST call cannot block a
     /// cleanup path indefinitely.
     async fn delete_once(&self) -> Result<StdResult<(), DaytonaError>> {
         match time::timeout(CLEANUP_TIMEOUT, self.client.delete(&self.sdk_id)).await {
-            Ok(result) => Ok(result),
+            Ok(Ok(())) => Ok(Ok(())),
+            Ok(Err(error)) if is_not_found(&error) => Ok(Ok(())),
+            Ok(Err(error)) => Ok(Err(error)),
             Err(_) => Err(Error::Timeout {
                 operation: "deleting sandbox".to_owned(),
                 elapsed:   CLEANUP_TIMEOUT,
@@ -313,39 +334,17 @@ impl DaytonaSandbox {
     }
 
     async fn delete_inner(&self) -> Result<()> {
-        let started = Instant::now();
-        loop {
-            match self.delete_once().await? {
-                Ok(()) => return Ok(()),
-                Err(error) if is_not_found(&error) => return Ok(()),
-                Err(error) if is_state_change_in_progress(&error) => {
-                    // A delete racing an in-flight destroy is already
-                    // satisfied: the accepted delete also returns while
-                    // destruction still runs, so a rejected repeat must
-                    // not wait out a slow destroy (observed >2 minutes
-                    // live) for the same outcome.
-                    let state = match self.client.get(&self.sdk_id).await {
-                        Ok(sdk) => map_state(sdk.state),
-                        Err(error) if is_not_found(&error) => return Ok(()),
-                        Err(error) => return Err(daytona_error("fetching sandbox", error)),
-                    };
-                    if matches!(state, SandboxState::Deleting | SandboxState::Deleted) {
-                        return Ok(());
-                    }
-                    match self
-                        .wait_for_stable_state("deleting sandbox", started)
-                        .await?
-                    {
-                        SandboxState::Deleted => return Ok(()),
-                        _ => {
-                            self.transition_retry_pause("deleting sandbox", started)
-                                .await?;
-                        }
-                    }
-                }
-                Err(error) => return Err(daytona_error("deleting sandbox", error)),
-            }
-        }
+        // A delete racing an in-flight destroy is already satisfied: the
+        // accepted delete also returns while destruction still runs, so a
+        // rejected repeat must not wait out a slow destroy (observed >2
+        // minutes live) for the same outcome. Deleting therefore counts
+        // as settled, and the first observation of it ends the wait.
+        self.retry_through_transition(
+            "deleting sandbox",
+            || self.delete_once(),
+            |state| matches!(state, SandboxState::Deleting | SandboxState::Deleted),
+        )
+        .await
     }
 }
 
