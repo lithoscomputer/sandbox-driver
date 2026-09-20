@@ -492,14 +492,16 @@ async fn exec_timeout_fires_after_output_streams_close() {
     // any daemonizing command. The timeout must still fire.
     let spec = ExecSpec::bash("exec >/dev/null 2>&1; sleep 30").timeout(Duration::from_millis(300));
     let started = Instant::now();
-    let result = sandbox
+    let streaming = sandbox
         .exec()
         .run_streaming(&spec, ExecControls::buffered())
         .await
-        .expect("exec resolves")
-        .result;
-    assert_eq!(result.termination, Termination::TimedOut);
+        .expect("exec resolves");
+    assert_eq!(streaming.result.termination, Termination::TimedOut);
     assert!(started.elapsed() < Duration::from_secs(10));
+    // Both pipes reached EOF before the kill, so nothing was left unread.
+    assert!(!streaming.stdout_capture.truncated);
+    assert!(!streaming.stderr_capture.truncated);
 
     sandbox.delete().await.expect("delete");
 }
