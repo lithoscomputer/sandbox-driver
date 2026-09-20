@@ -6,32 +6,29 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bollard::Docker;
-use bollard::container::{ListContainersOptions, StartContainerOptions};
-use bollard::models::{ContainerInspectResponse, EndpointSettings};
-use bollard::network::{ConnectNetworkOptions, DisconnectNetworkOptions};
+use bollard::container::ListContainersOptions;
+use bollard::models::ContainerInspectResponse;
 use sandbox_driver::{
     Action, Capabilities, Error, EventContext, EventEmitter, EventSubject, Exec, HealthStatus,
     OperationReporter, Progress, ProgressCode, ProviderError, ProviderHealth, ProviderKind,
     ResourceKind, Result, Sandbox, SandboxFilter, SandboxId, SandboxProvider, SandboxSpec,
-    SandboxState, SandboxStatus,
+    SandboxStatus,
 };
 
 use crate::access::DockerShellCommand;
 use crate::config::RegistryAuth;
-use crate::container::{ContainerRef, inspect_container, remove_container_forced, remove_sandbox};
-use crate::create::ContainerPlan;
-use crate::daemon::{docker_error, docker_kind, is_conflict};
+use crate::container::{ContainerRef, inspect_container, remove_sandbox};
+use crate::create::{ContainerPlan, CreatedContainer};
+use crate::daemon::{docker_error, docker_kind};
 use crate::exec::DockerExec;
 use crate::forward::DockerForwards;
 use crate::fs::DockerFs;
 use crate::image::{image_present, pull_image};
-use crate::inspect::{
-    ContainerFacts, is_managed, map_state, sidecar_network_of, status_from_inspect,
-};
+use crate::inspect::{ContainerFacts, is_managed, sidecar_network_of, status_from_inspect};
 use crate::one_shot::DockerOneShot;
 use crate::pty::DockerPty;
 use crate::sandbox::DockerSandbox;
-use crate::{MANAGED_LABEL, docker_capabilities, sidecars};
+use crate::{MANAGED_LABEL, docker_capabilities};
 
 /// The Docker provider. One per process, sharing one daemon connection.
 pub struct DockerProvider {
@@ -187,104 +184,25 @@ impl SandboxProvider for DockerProvider {
                         &reporter,
                     )
                     .await?;
-                    // A failure cleans dependencies before the primary so
-                    // unsuccessful cleanup remains discoverable by label.
-                    let cleanup_network = &plan.sidecar_network;
-                    let sweep_on_error = |error: Error, container: Option<String>| async move {
-                        if let Some(container) = container {
-                            if let Some(network) = cleanup_network {
-                                if let Err(cleanup_error) = sidecars::sweep(&self.docker, network, Some(&container)).await {
-                                    tracing::warn!(error = %cleanup_error, "failed sandbox sidecar cleanup failed; primary retained for retry");
-                                    return error;
-                                }
-                            }
-                            if let Err(cleanup_error) = remove_container_forced(
-                                &self.docker,
-                                &container,
-                                "removing failed sandbox",
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    provider_kind = "docker",
-                                    error = %cleanup_error,
-                                    "failed sandbox cleanup failed"
-                                );
-                            }
-                        }
-                        error
-                    };
-                    let created = match self
-                        .docker
-                        .create_container(plan.options.clone(), plan.config.clone())
-                        .await
-                    {
-                        Ok(created) => created,
-                        Err(error) => {
-                            let error = if is_conflict(&error) && plan.named {
-                                Error::invalid_spec(
-                                    "name",
-                                    "a container with this name already exists",
-                                )
-                            } else {
-                                docker_error("creating container", error)
-                            };
-                            return Err(sweep_on_error(error, None).await);
-                        }
-                    };
+                    let created = CreatedContainer::create(&self.docker, &plan).await?;
                     let event_id = match SandboxId::try_new(created.id.clone()) {
                         Ok(id) => id,
-                        Err(error) => return Err(sweep_on_error(
-                            Error::invalid_spec("sandbox_id", error.to_string()),
-                            Some(created.id.clone()),
-                        ).await),
+                        Err(error) => {
+                            let error = Error::invalid_spec("sandbox_id", error.to_string());
+                            return Err(created.abandon(error).await);
+                        }
                     };
                     reporter.set_subject(EventSubject::sandbox(Some(event_id)));
-                    if let Some(network) = &plan.sidecar_network {
-                        let prepare = async {
-                            sidecars::realize(&self.docker, network, &plan.sidecars).await?;
-                            self.docker.disconnect_network("none", DisconnectNetworkOptions {
-                                container: created.id.as_str(), force: true,
-                            }).await.map_err(|error| docker_error("disconnecting initial sandbox network", error))?;
-                            self.docker.connect_network(network, ConnectNetworkOptions {
-                                container: created.id.as_str(), endpoint_config: EndpointSettings::default(),
-                            }).await.map_err(|error| docker_error("connecting sandbox to services", error))
-                        }.await;
-                        if let Err(error) = prepare {
-                            return Err(sweep_on_error(error, Some(created.id.clone())).await);
-                        }
+                    if let Err(error) = created.connect_sidecars(&plan.sidecars).await {
+                        return Err(created.abandon(error).await);
                     }
-                    if let Err(error) = self
-                        .docker
-                        .start_container(&created.id, None::<StartContainerOptions<String>>)
-                        .await
-                    {
-                        return Err(sweep_on_error(docker_error("starting container", error), Some(created.id.clone())).await);
+                    if let Err(error) = created.start().await {
+                        return Err(created.abandon(error).await);
                     }
-                    // `start` returning is not the container running: an init
-                    // that exits at once (a missing interpreter, a bad user)
-                    // leaves a stopped container every exec would then 409 on.
-                    // Fail create instead, naming the cause.
-                    let started = match self.inspect(&created.id).await {
-                        Ok(inspect) => inspect,
-                        Err(error) => return Err(sweep_on_error(error, Some(created.id.clone())).await),
+                    let started = match created.verify_running(&self.kind).await {
+                        Ok(started) => started,
+                        Err(error) => return Err(created.abandon(error).await),
                     };
-                    if map_state(&started) != SandboxState::Running {
-                        let exit = started
-                            .state
-                            .as_ref()
-                            .and_then(|state| state.exit_code)
-                            .unwrap_or_default();
-                        let mut provider = ProviderError::new(
-                            self.kind.clone(),
-                            format!(
-                                "container exited immediately after start (exit code {exit}); \
-                                 the image must run its init under /bin/sh as the configured user"
-                            ),
-                        );
-                        provider.code = Some("exited".to_owned());
-                        return Err(sweep_on_error(Error::Provider(provider), Some(created.id.clone())).await);
-                    }
                     let facts = ContainerFacts::from_inspect(&started, &created.id);
                     Ok(self.handle(facts, handle_emitter) as Arc<dyn Sandbox>)
                 },
