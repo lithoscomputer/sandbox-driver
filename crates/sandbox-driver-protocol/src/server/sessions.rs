@@ -1,7 +1,6 @@
 //! `exec/stdio_*` and `pty/*`: long-lived processes and terminals the
 //! plugin holds for the host between requests.
 
-use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use sandbox_driver::{Capability, Error, Result, StderrTail, StdioProcessHandle};
@@ -29,18 +28,13 @@ pub(super) struct ServerPty {
 fn stdio(state: &ServerState, id: &str) -> Result<Arc<ServerStdio>> {
     state
         .stdios
-        .lock()
-        .expect("stdios lock")
         .get(id)
-        .cloned()
         .ok_or_else(|| Error::invalid_spec("process_id", "unknown stdio process id"))
 }
 
 fn pty(state: &ServerState, id: &str) -> Result<Arc<dyn sandbox_driver::PtySession>> {
     state
         .ptys
-        .lock()
-        .expect("ptys lock")
         .get(id)
         .map(|entry| Arc::clone(&entry.session))
         .ok_or_else(|| Error::invalid_spec("pty_id", "unknown PTY id"))
@@ -65,22 +59,15 @@ pub(super) async fn dispatch(
                 .spawn_stdio(&request.spec)
                 .await?;
             let handle: Arc<dyn StdioProcessHandle> = Arc::from(process.handle);
-            let entry_value = Arc::new(ServerStdio {
-                handle:      Arc::clone(&handle),
-                stderr_tail: process.stderr_tail,
-                _permit:     io_permit.clone(),
-            });
-            let inserted = {
-                let mut stdios = state.stdios.lock().expect("stdios lock");
-                match stdios.entry(request.process_id.clone()) {
-                    Entry::Vacant(entry) => {
-                        entry.insert(entry_value);
-                        true
-                    }
-                    Entry::Occupied(_) => false,
-                }
-            };
-            if !inserted {
+            let registered = state.stdios.try_insert(
+                request.process_id.clone(),
+                Arc::new(ServerStdio {
+                    handle:      Arc::clone(&handle),
+                    stderr_tail: process.stderr_tail,
+                    _permit:     io_permit.clone(),
+                }),
+            );
+            if registered.is_err() {
                 handle.terminate().await;
                 return Err(Error::invalid_spec("process_id", "duplicate stdio process id").into());
             }
@@ -128,11 +115,7 @@ pub(super) async fn dispatch(
             let request: m::StdioIdParams = parse(params)?;
             let process = stdio(state, &request.process_id)?;
             let (termination, exit_code) = process.handle.wait().await;
-            state
-                .stdios
-                .lock()
-                .expect("stdios lock")
-                .remove(&request.process_id);
+            state.stdios.remove(&request.process_id);
             to_value(&m::StdioWaitResult {
                 termination,
                 exit_code,
@@ -151,20 +134,14 @@ pub(super) async fn dispatch(
                 .open(&request.options)
                 .await?;
             let pty: Arc<dyn sandbox_driver::PtySession> = Arc::from(pty);
-            let inserted = {
-                let mut ptys = state.ptys.lock().expect("ptys lock");
-                match ptys.entry(request.pty_id.clone()) {
-                    Entry::Vacant(entry) => {
-                        entry.insert(Arc::new(ServerPty {
-                            session: Arc::clone(&pty),
-                            _permit: io_permit.clone(),
-                        }));
-                        true
-                    }
-                    Entry::Occupied(_) => false,
-                }
-            };
-            if !inserted {
+            let registered = state.ptys.try_insert(
+                request.pty_id.clone(),
+                Arc::new(ServerPty {
+                    session: Arc::clone(&pty),
+                    _permit: io_permit.clone(),
+                }),
+            );
+            if registered.is_err() {
                 if let Err(error) = pty.close().await {
                     tracing::warn!(error = %error, "duplicate plugin PTY cleanup failed");
                 }
@@ -204,18 +181,9 @@ pub(super) async fn dispatch(
         }
         m::PTY_CLOSE => {
             let request: m::PtyIdParams = parse(params)?;
-            let session = state
-                .ptys
-                .lock()
-                .expect("ptys lock")
-                .remove(&request.pty_id);
-            if let Some(session) = session {
+            if let Some(session) = state.ptys.remove(&request.pty_id) {
                 if let Err(error) = session.session.close().await {
-                    state
-                        .ptys
-                        .lock()
-                        .expect("ptys lock")
-                        .insert(request.pty_id, session);
+                    state.ptys.insert(request.pty_id, session);
                     return Err(error.into());
                 }
             }

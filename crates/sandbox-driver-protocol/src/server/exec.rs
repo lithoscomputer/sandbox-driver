@@ -2,7 +2,6 @@
 //! whose output rides a data channel and whose stop tokens are
 //! addressable by exec id, plus the frame pumps they share.
 
-use std::collections::hash_map::Entry;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -157,16 +156,12 @@ impl<'a> ExecRegistration<'a> {
     ) -> Result<(Self, Channel)> {
         let term = CancellationToken::new();
         let kill = state.exec_shutdown.child_token();
+        if state
+            .execs
+            .try_insert(id.to_owned(), (term.clone(), kill.clone()))
+            .is_err()
         {
-            let mut execs = state.execs.lock().expect("execs lock");
-            match execs.entry(id.to_owned()) {
-                Entry::Vacant(entry) => {
-                    entry.insert((term.clone(), kill.clone()));
-                }
-                Entry::Occupied(_) => {
-                    return Err(Error::invalid_spec("exec_id", "duplicate execution id"));
-                }
-            }
+            return Err(Error::invalid_spec("exec_id", "duplicate execution id"));
         }
         let registration = Self {
             state,
@@ -181,7 +176,7 @@ impl<'a> ExecRegistration<'a> {
 
 impl Drop for ExecRegistration<'_> {
     fn drop(&mut self) {
-        self.state.execs.lock().expect("execs lock").remove(self.id);
+        self.state.execs.remove(self.id);
     }
 }
 
@@ -302,13 +297,7 @@ pub(super) async fn dispatch(
         }
         m::EXEC_STOP => {
             let request: m::ExecStopParams = parse(params)?;
-            let tokens = state
-                .execs
-                .lock()
-                .expect("execs lock")
-                .get(&request.exec_id)
-                .cloned();
-            if let Some((term, kill)) = tokens {
+            if let Some((term, kill)) = state.execs.get(&request.exec_id) {
                 match request.level {
                     StopLevel::Term => term.cancel(),
                     StopLevel::Kill => kill.cancel(),
