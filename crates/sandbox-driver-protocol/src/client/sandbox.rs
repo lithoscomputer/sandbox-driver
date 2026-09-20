@@ -21,6 +21,7 @@ use super::fs::SandboxFs;
 use super::pty::SandboxPty;
 use super::streams::follow_log_stream;
 use crate::methods as m;
+use crate::wire::is_method_not_found;
 
 /// Preview-URL and SSH access backed by the plugin.
 pub(super) struct SandboxAccess {
@@ -65,7 +66,7 @@ impl PreviewUrls for SandboxAccess {
             Ok(_) => Ok(()),
             // A plugin predating the method holds nothing for a preview
             // URL, so there is nothing to release.
-            Err(Error::Provider(provider)) if provider.code.as_deref() == Some("-32601") => Ok(()),
+            Err(error) if is_method_not_found(&error) => Ok(()),
             Err(error) => Err(error),
         }
     }
@@ -475,7 +476,7 @@ impl Git for SandboxGit {
             // A plugin predating `git/clone` served git through exec only;
             // the derived clone is what such a host ran before the method
             // existed, so the fallback changes nothing for it.
-            Err(Error::Provider(provider)) if provider.code.as_deref() == Some("-32601") => {
+            Err(error) if is_method_not_found(&error) => {
                 self.derived().clone_repo(url, target_path, options).await
             }
             Err(error) => Err(error),

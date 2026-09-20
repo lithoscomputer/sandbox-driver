@@ -30,7 +30,8 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::field;
 
-use crate::channel::ChannelListener;
+use self::exec::ExecProgress;
+use crate::channel::{Channel, ChannelListener, ChannelReceiver};
 use crate::wire::Message;
 use crate::{TransportLimits, control, limits, methods as m};
 
@@ -282,20 +283,34 @@ impl Client {
         Error::Transport(error)
     }
 
-    async fn pump<R, T>(
+    /// Sends `call` and pumps the data channel it names, together. The
+    /// pump owns the channel from acceptance on, and acceptance is what
+    /// proves the plugin opened the channel: a response that arrives
+    /// first waits a bounded grace for it, so a result never lands ahead
+    /// of the bytes it describes.
+    async fn call_with_channel<R, T, Fut>(
         &self,
-        call: impl Future<Output = Result<R>>,
-        pump: impl Future<Output = Result<T>>,
-        accepted: &AtomicBool,
         method: &str,
-    ) -> Result<(R, T)> {
+        call: impl Future<Output = Result<R>>,
+        receiver: ChannelReceiver,
+        pump: impl FnOnce(Channel) -> Fut,
+    ) -> Result<(R, T)>
+    where
+        Fut: Future<Output = Result<T>>,
+    {
+        let accepted = AtomicBool::new(false);
+        let pump = async {
+            let channel = receiver.accept().await?;
+            accepted.store(true, Ordering::SeqCst);
+            pump(channel).await
+        };
         let responded = AtomicBool::new(false);
         let call = async {
             let result = call.await?;
             responded.store(true, Ordering::SeqCst);
             Ok(result)
         };
-        let mut operation = pin!(call_with_pump(call, pump, accepted, method));
+        let mut operation = pin!(call_with_pump(call, pump, &accepted, method));
         tokio::select! {
             biased;
             result = &mut operation => result,
@@ -540,7 +555,7 @@ impl Client {
         self: &Arc<Self>,
         exec_id: &str,
         controls: &ExecControls,
-        acknowledged: Arc<AtomicBool>,
+        progress: Arc<ExecProgress>,
     ) -> Option<JoinHandle<()>> {
         (controls.term.is_some() || controls.kill.is_some()).then(|| {
             let client = Arc::clone(self);
@@ -557,13 +572,13 @@ impl Client {
                         () = &mut killed => StopLevel::Kill,
                     };
                     if level == StopLevel::Kill {
-                        acknowledged.store(client.send_stop(&exec_id, level).await, Ordering::SeqCst);
+                        progress.stop_acknowledged.store(client.send_stop(&exec_id, level).await, Ordering::SeqCst);
                         break;
                     }
                     tokio::select! {
                         _ = client.send_stop(&exec_id, level) => {},
                         () = &mut killed => {
-                            acknowledged.store(client.send_stop(&exec_id, StopLevel::Kill).await, Ordering::SeqCst);
+                            progress.stop_acknowledged.store(client.send_stop(&exec_id, StopLevel::Kill).await, Ordering::SeqCst);
                             break;
                         }
                     }

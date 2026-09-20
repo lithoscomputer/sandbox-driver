@@ -466,6 +466,18 @@ impl WireError {
     }
 }
 
+/// Whether `error` is a plugin's `-32601` for a method it does not know.
+/// Methods added within a protocol version are optional on the plugin
+/// side, and a host treats this answer as "not offered", not as failure.
+pub(crate) fn is_method_not_found(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Provider(provider)
+            if provider.code.as_deref().and_then(|code| code.parse::<i64>().ok())
+                == Some(CODE_METHOD_NOT_FOUND)
+    )
+}
+
 fn unknown_kind() -> sandbox_driver::ProviderKind {
     sandbox_driver::ProviderKind::try_new("plugin").expect("static kind is valid")
 }

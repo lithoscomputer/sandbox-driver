@@ -1,7 +1,6 @@
 //! Cancellable log streams: `logs/follow` and `snapshot/build_logs`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use sandbox_driver::{Error, LogSink, Result, TransportError};
@@ -46,14 +45,8 @@ impl Drop for StreamCancelGuard {
 
 /// Feeds a log channel to `sink` until the plugin's `Eof`. A sink error
 /// ends the pump and is the caller's result.
-async fn pump_log_channel(
-    receiver: ChannelReceiver,
-    accepted: Arc<AtomicBool>,
-    sink: LogSink,
-    timeout: Duration,
-) -> Result<()> {
-    let Channel { mut reader, .. } = receiver.accept().await?;
-    accepted.store(true, Ordering::SeqCst);
+async fn pump_log_channel(channel: Channel, sink: LogSink, timeout: Duration) -> Result<()> {
+    let Channel { mut reader, .. } = channel;
     loop {
         match reader.read().await? {
             Some((FrameKind::Stdout | FrameKind::Stderr, payload)) => {
@@ -86,24 +79,15 @@ pub(super) async fn follow_log_stream<P: Serialize>(
         stream_id: stream_id.to_owned(),
         armed:     true,
     };
-    let accepted = Arc::new(AtomicBool::new(false));
     let call = async {
         let outcome = client.call::<_, m::Empty>(method, params).await;
         guard.armed = false;
         outcome
     };
     client
-        .pump(
-            call,
-            pump_log_channel(
-                receiver,
-                Arc::clone(&accepted),
-                sink,
-                client.limits.output_progress_timeout,
-            ),
-            &accepted,
-            method,
-        )
+        .call_with_channel(method, call, receiver, |channel| {
+            pump_log_channel(channel, sink, client.limits.output_progress_timeout)
+        })
         .await?;
     Ok(())
 }
