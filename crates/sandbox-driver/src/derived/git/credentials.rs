@@ -4,7 +4,7 @@
 use std::fmt::Write as _;
 
 use super::DerivedGit;
-use super::command::{GIT, GIT_TIMEOUT};
+use super::command::{GIT, GIT_TIMEOUT, GitCommand};
 use crate::derived::shell_quote;
 use crate::error::{Error, Result};
 use crate::git::GitCredentials;
@@ -32,10 +32,10 @@ impl DerivedGit<'_> {
     async fn remote_url(&self, repo: &str, remote: &str) -> Result<String> {
         let url = self
             .run(
-                "git remote get-url",
                 Some(repo),
-                &["remote".into(), "get-url".into(), remote.to_owned()],
-                GIT_TIMEOUT,
+                GitCommand::new("git remote get-url", "remote")
+                    .arg("get-url")
+                    .arg(remote),
             )
             .await?
             .stdout_lossy();
@@ -56,10 +56,8 @@ impl DerivedGit<'_> {
         }
         let git_dir = self
             .run(
-                "git rev-parse",
                 Some(repo),
-                &["rev-parse".into(), "--absolute-git-dir".into()],
-                GIT_TIMEOUT,
+                GitCommand::new("git rev-parse", "rev-parse").arg("--absolute-git-dir"),
             )
             .await?
             .stdout_lossy();
@@ -112,41 +110,54 @@ fn store_file_name(repo_path: &str) -> String {
 /// The git-credential-store line for `url`'s host: `scheme://user:pass@host`,
 /// percent-encoded like the per-call rewrite. `None` for other schemes.
 fn store_entry(url: &str, credentials: &GitCredentials) -> Option<String> {
-    let (scheme, rest) = url.split_once("://")?;
-    if scheme != "http" && scheme != "https" {
-        return None;
-    }
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    let host = match authority.rfind('@') {
-        Some(at) => &authority[at + 1..],
-        None => authority,
-    };
-    Some(format!(
-        "{scheme}://{}:{}@{host}",
-        encode_userinfo(&credentials.username),
-        encode_userinfo(&credentials.password),
-    ))
+    Some(HttpUrl::parse(url)?.origin_with(credentials))
 }
 
 /// Embeds credentials into an http(s) URL; `None` for other schemes.
 pub(super) fn authed_url(url: &str, credentials: &GitCredentials) -> Option<String> {
-    let (scheme, rest) = url.split_once("://")?;
-    if scheme != "http" && scheme != "https" {
-        return None;
+    let url = HttpUrl::parse(url)?;
+    Some(format!("{}{}", url.origin_with(credentials), url.rest))
+}
+
+/// An http(s) URL taken apart for credential embedding: the scheme, the
+/// host (with its port, without any userinfo), and everything after the
+/// authority.
+struct HttpUrl<'a> {
+    scheme: &'a str,
+    host:   &'a str,
+    rest:   &'a str,
+}
+
+impl<'a> HttpUrl<'a> {
+    /// `None` for other schemes.
+    fn parse(url: &'a str) -> Option<Self> {
+        let (scheme, after_scheme) = url.split_once("://")?;
+        if scheme != "http" && scheme != "https" {
+            return None;
+        }
+        // Existing userinfo ends at the last `@` inside the authority only —
+        // an `@` in the path (`/org/repo@v2.git`) is part of the path.
+        let authority_end = after_scheme
+            .find(['/', '?', '#'])
+            .unwrap_or(after_scheme.len());
+        let (authority, rest) = after_scheme.split_at(authority_end);
+        let host = match authority.rfind('@') {
+            Some(at) => &authority[at + 1..],
+            None => authority,
+        };
+        Some(Self { scheme, host, rest })
     }
-    // Existing userinfo ends at the last `@` inside the authority only —
-    // an `@` in the path (`/org/repo@v2.git`) is part of the path.
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let rest = match rest[..authority_end].rfind('@') {
-        Some(at) => &rest[at + 1..],
-        None => rest,
-    };
-    Some(format!(
-        "{scheme}://{}:{}@{rest}",
-        encode_userinfo(&credentials.username),
-        encode_userinfo(&credentials.password),
-    ))
+
+    /// `scheme://user:pass@host`, with the userinfo percent-encoded.
+    fn origin_with(&self, credentials: &GitCredentials) -> String {
+        format!(
+            "{}://{}:{}@{}",
+            self.scheme,
+            encode_userinfo(&credentials.username),
+            encode_userinfo(&credentials.password),
+            self.host,
+        )
+    }
 }
 
 fn encode_userinfo(value: &str) -> String {
