@@ -212,36 +212,50 @@ impl OneShot for NestedDocker {
         }
         args.push(image);
         args.extend(spec.args.clone());
-        let cli = Arc::clone(&self.cli);
-        let cleanup_cli = Arc::clone(&cli);
+        let cleanup_cli = Arc::clone(&self.cli);
         let cleanup_name = name.clone();
-        let spec = spec.clone();
+        let action = Action {
+            cli: Arc::clone(&self.cli),
+            name,
+            spec: spec.clone(),
+            started,
+        };
         run_owned(
-            move |abandoned| Self::run_action(cli, name, args, spec, controls, started, abandoned),
+            move |abandoned| action.run(args, controls, abandoned),
             move || async move { cleanup_cli.remove(&cleanup_name).await },
         )
         .await
     }
 }
 
-impl NestedDocker {
-    async fn run_action(
-        cli: Arc<DockerCli>,
-        name: String,
+/// One action container, owned by the run that drives it: the CLI it is
+/// created through, its container name, the spec it runs, and when the
+/// run began (its timeout counts from there, image preparation included).
+/// The bundle exists because `run_owned` moves the run onto its own
+/// task, which needs everything `'static`.
+struct Action {
+    cli:     Arc<DockerCli>,
+    name:    String,
+    spec:    OneShotSpec,
+    started: Instant,
+}
+
+impl Action {
+    async fn run(
+        self,
         args: Vec<String>,
-        spec: OneShotSpec,
         controls: ExecControls,
-        started: Instant,
         abandoned: CancellationToken,
     ) -> Result<ExecStreamingResult> {
         let deadline = async {
-            match spec.timeout {
-                Some(limit) => time::sleep(limit.saturating_sub(started.elapsed())).await,
+            match self.spec.timeout {
+                Some(limit) => time::sleep(limit.saturating_sub(self.started.elapsed())).await,
                 None => future::pending().await,
             }
         };
         let mut deadline = pin!(deadline);
-        cli.run_spec(&DockerCli::command(args).timeout(START_TIMEOUT))
+        self.cli
+            .run_spec(&DockerCli::command(args).timeout(START_TIMEOUT))
             .await?;
         let stopped = if abandoned.is_cancelled()
             || controls
@@ -256,7 +270,11 @@ impl NestedDocker {
             .is_some_and(CancellationToken::is_cancelled)
         {
             Some(Termination::Cancelled)
-        } else if spec.timeout.is_some_and(|limit| started.elapsed() >= limit) {
+        } else if self
+            .spec
+            .timeout
+            .is_some_and(|limit| self.started.elapsed() >= limit)
+        {
             Some(Termination::TimedOut)
         } else {
             None
@@ -265,7 +283,7 @@ impl NestedDocker {
             return Ok(ExecStreamingResult::new(ExecResult::from_shell_status(
                 reason,
                 None,
-                started.elapsed(),
+                self.started.elapsed(),
             )));
         }
         async {
@@ -285,9 +303,10 @@ impl NestedDocker {
                 }) as OutputSink
             });
             let transport_kill = CancellationToken::new();
-            let mut command = DockerCli::command(words(["start", "--attach", &name])).no_timeout();
-            command.output_sanitization = spec.output_sanitization;
-            let mut run = pin!(cli.exec.run_streaming(&command, ExecControls {
+            let mut command =
+                DockerCli::command(words(["start", "--attach", &self.name])).no_timeout();
+            command.output_sanitization = self.spec.output_sanitization;
+            let mut run = pin!(self.cli.exec.run_streaming(&command, ExecControls {
                 sink,
                 kill: Some(transport_kill.clone()),
                 retained_output_limit: controls.retained_output_limit,
@@ -310,36 +329,36 @@ impl NestedDocker {
                         termination = Some(Termination::Killed);
                         kill_sent = true;
                         drain_deadline = Some(time::Instant::now() + DRAIN_GRACE);
-                        Self::signal_action(&cli, &name, "KILL").await?;
+                        NestedDocker::signal_action(&self.cli, &self.name, "KILL").await?;
                     }
                     result = &mut run => {
                         let mut result = result?;
                         if let Some(reason) = termination { result.result.termination = reason; }
-                        result.result.duration = started.elapsed();
+                        result.result.duration = self.started.elapsed();
                         return Ok(result);
                     }
                     () = stop_signal(controls.term.as_ref()), if !term_sent && !kill_sent => {
                         termination = Some(Termination::Cancelled);
                         term_sent = true;
-                        Self::signal_action(&cli, &name, "TERM").await?;
+                        NestedDocker::signal_action(&self.cli, &self.name, "TERM").await?;
                     }
                     () = stop_signal(controls.kill.as_ref()), if !kill_sent => {
                         termination = Some(Termination::Killed);
                         kill_sent = true;
                         drain_deadline = Some(time::Instant::now() + DRAIN_GRACE);
-                        Self::signal_action(&cli, &name, "KILL").await?;
+                        NestedDocker::signal_action(&self.cli, &self.name, "KILL").await?;
                     }
                     () = sink_failed.cancelled(), if !kill_sent => {
                         termination = Some(Termination::Cancelled);
                         kill_sent = true;
                         drain_deadline = Some(time::Instant::now() + DRAIN_GRACE);
-                        Self::signal_action(&cli, &name, "KILL").await?;
+                        NestedDocker::signal_action(&self.cli, &self.name, "KILL").await?;
                     }
                     () = &mut deadline, if !kill_sent => {
                         termination = Some(Termination::TimedOut);
                         kill_sent = true;
                         drain_deadline = Some(time::Instant::now() + DRAIN_GRACE);
-                        Self::signal_action(&cli, &name, "KILL").await?;
+                        NestedDocker::signal_action(&self.cli, &self.name, "KILL").await?;
                     }
                     () = drain_timeout => {
                         transport_kill.cancel();
