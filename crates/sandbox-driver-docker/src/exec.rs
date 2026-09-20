@@ -9,7 +9,7 @@ use bollard::exec::CreateExecOptions;
 use futures_util::StreamExt;
 use sandbox_driver::{
     BASH_ENV_VAR, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, Result,
-    SpawnSpec, StderrTail, StdioProcess, StdioProcessHandle, Termination, feed_stdin,
+    SpawnSpec, StderrTail, StdioProcess, StdioProcessHandle, StopLevel, Termination, feed_stdin,
     run_with_stop_grace,
 };
 use tokio::io::{AsyncWriteExt, duplex};
@@ -17,7 +17,7 @@ use tokio::time;
 
 use crate::container::{AttachedExec, ContainerRef, exit_code_of};
 use crate::daemon::{POSIX_SH, docker_error, shell_quote};
-use crate::output::{StopMode, StreamOutput, drain_with_stops};
+use crate::output::{StreamOutput, drain_with_stops};
 
 /// `$0` of the wrapper shell, so the user's argv starts at `$1`.
 const WRAPPER_NAME: &str = "sandbox-driver";
@@ -33,13 +33,13 @@ const STOP_POLL_SLEEP_SECONDS: &str = "0.1";
 /// exec path has no ladder of its own: its caller escalates.
 const TERM_GRACE: Duration = Duration::from_secs(2);
 
-/// The stop file's contents for `mode`; the in-container watcher reads
+/// The stop file's contents for `level`; the in-container watcher reads
 /// it and signals the command's process group accordingly. A `kill`
 /// written after a `term` is honoured — the watcher keeps reading.
-fn stop_file_contents(mode: StopMode) -> &'static str {
-    match mode {
-        StopMode::Term => "term",
-        StopMode::Kill => "kill",
+fn stop_file_contents(level: StopLevel) -> &'static str {
+    match level {
+        StopLevel::Term => "term",
+        StopLevel::Kill => "kill",
     }
 }
 
@@ -232,17 +232,17 @@ impl DockerExec {
     }
 }
 
-/// Requests a stop by writing the rendered `mode` into the stop file
+/// Requests a stop by writing the rendered `level` into the stop file
 /// the in-container watcher polls for; a stop that arrives before
 /// the command starts is honored by the wrapper's pre-check. Runs
 /// from `/` — the exec being stopped may have removed the working
 /// directory the container would otherwise start this one in — with
 /// a blank `BASH_ENV`, and reports failure: a stop that could not be
 /// requested must never masquerade as a kill.
-async fn request_stop(container: &ContainerRef, stop_file: &str, mode: StopMode) -> Result<()> {
+async fn request_stop(container: &ContainerRef, stop_file: &str, level: StopLevel) -> Result<()> {
     let command = format!(
         "mkdir -p /tmp/.sandbox-driver && printf '%s' {} > {}",
-        shell_quote(stop_file_contents(mode)),
+        shell_quote(stop_file_contents(level)),
         shell_quote(stop_file)
     );
     let options = CreateExecOptions {
@@ -346,9 +346,9 @@ impl DockerExec {
             &mut captured,
             output,
             &controls,
-            spec.timeout,
-            started,
-            |mode| request_stop(&self.container, &stop_file, mode),
+            spec.timeout
+                .map(|timeout| timeout.saturating_sub(started.elapsed())),
+            |level| request_stop(&self.container, &stop_file, level),
         )
         .await?;
 
@@ -512,7 +512,7 @@ impl StdioProcessHandle for DockerStdioHandle {
         // TERM, then KILL after the grace: the handle's own ladder, since
         // the trait has one verb. The watcher keeps reading the stop file
         // after a term, so the kill lands on a process that ignored it.
-        if let Err(error) = request_stop(&self.container, &self.stop_file, StopMode::Term).await {
+        if let Err(error) = request_stop(&self.container, &self.stop_file, StopLevel::Term).await {
             tracing::warn!(error = %error, "stdio stop request failed");
             return;
         }
@@ -520,7 +520,7 @@ impl StdioProcessHandle for DockerStdioHandle {
         if !self.still_running().await {
             return;
         }
-        if let Err(error) = request_stop(&self.container, &self.stop_file, StopMode::Kill).await {
+        if let Err(error) = request_stop(&self.container, &self.stop_file, StopLevel::Kill).await {
             tracing::warn!(error = %error, "stdio kill request failed");
         }
     }

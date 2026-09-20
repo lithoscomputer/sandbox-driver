@@ -1201,4 +1201,99 @@ mod tests {
             .await
             .expect("the abandoned action is removed after late creation");
     }
+
+    /// The shared drain race asks the action to stop through `docker
+    /// kill`: a term is one TERM and the attach keeps draining; the kill
+    /// that follows is a KILL, and the run reports it.
+    #[tokio::test]
+    async fn a_termed_then_killed_action_is_signalled_in_order_and_reports_the_kill() {
+        use std::sync::Mutex as StdMutex;
+
+        use tokio::sync::Notify;
+
+        struct SignalledAttach {
+            signals:  StdMutex<Vec<String>>,
+            attached: Notify,
+            killed:   Notify,
+        }
+
+        #[async_trait]
+        impl Exec for SignalledAttach {
+            async fn run(&self, spec: &ExecSpec) -> Result<ExecResult> {
+                if spec.args.first().is_some_and(|arg| arg == "kill") {
+                    let signal = spec.args[2].clone();
+                    let is_kill = signal == "KILL";
+                    self.signals.lock().unwrap().push(signal);
+                    if is_kill {
+                        self.killed.notify_one();
+                    }
+                }
+                Ok(response(0, Vec::new()))
+            }
+
+            async fn run_streaming(
+                &self,
+                spec: &ExecSpec,
+                _: ExecControls,
+            ) -> Result<ExecStreamingResult> {
+                if spec.args.starts_with(&words(["start", "--attach"])) {
+                    // The attach ends when the container dies, which only
+                    // the KILL does here.
+                    self.attached.notify_one();
+                    self.killed.notified().await;
+                    return Ok(ExecStreamingResult::new(response(137, Vec::new())));
+                }
+                self.run(spec).await.map(ExecStreamingResult::new)
+            }
+        }
+
+        let native = fake_nested(|_| unreachable!()).await;
+        let exec = Arc::new(SignalledAttach {
+            signals:  StdMutex::new(Vec::new()),
+            attached: Notify::new(),
+            killed:   Notify::new(),
+        });
+        let nested = NestedDocker::from_cli(
+            Arc::new(DockerCli {
+                exec:        exec.clone(),
+                fs:          Arc::clone(&native.cli.fs),
+                pty:         Arc::clone(&native.cli.pty),
+                working_dir: "/workspace".to_owned(),
+            }),
+            DockerExecutionTarget::VirtualMachine,
+        );
+        *nested.state.lock().await = Generation::Ready;
+        let term = CancellationToken::new();
+        let kill = CancellationToken::new();
+        let controls = ExecControls {
+            term: Some(term.clone()),
+            kill: Some(kill.clone()),
+            ..ExecControls::buffered()
+        };
+        let action = tokio::spawn(async move {
+            OneShot::run(&nested, &OneShotSpec::registry("alpine"), controls).await
+        });
+        // A stop before the attach ends the run without a signal; the
+        // race under test starts with the attach.
+        time::timeout(Duration::from_secs(5), exec.attached.notified())
+            .await
+            .expect("the action attaches");
+        term.cancel();
+        time::timeout(Duration::from_secs(5), async {
+            while exec.signals.lock().unwrap().is_empty() {
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the term reaches the action");
+        assert_eq!(*exec.signals.lock().unwrap(), ["TERM"]);
+        kill.cancel();
+        let result = time::timeout(Duration::from_secs(5), action)
+            .await
+            .expect("the kill ends the run")
+            .expect("the run task")
+            .expect("the run");
+        assert_eq!(result.result.termination, Termination::Killed);
+        assert_eq!(*exec.signals.lock().unwrap(), ["TERM", "KILL"]);
+    }
 }

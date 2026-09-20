@@ -43,6 +43,7 @@ mod access;
 mod capabilities;
 mod capture;
 mod derived;
+mod drain;
 mod error;
 mod event;
 mod exec;
@@ -79,6 +80,7 @@ pub use capabilities::{
 };
 pub use capture::OutputCaptureBuffer;
 pub use derived::{DerivedFs, DerivedGit, DerivedSearch, DerivedServices};
+pub use drain::{DrainOutcome, drain_with_stops};
 pub use error::{
     AuthError, Error, ExecFailure, GitFailure, GitFailureKind, ProviderError, ResourceKind, Result,
     TransportError,

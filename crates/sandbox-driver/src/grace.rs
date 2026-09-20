@@ -131,7 +131,7 @@ async fn drive(
     future::pending::<()>().await;
 }
 
-async fn sleep_or_never(timeout: Option<Duration>) {
+pub(crate) async fn sleep_or_never(timeout: Option<Duration>) {
     match timeout {
         Some(timeout) => time::sleep(timeout).await,
         None => future::pending().await,

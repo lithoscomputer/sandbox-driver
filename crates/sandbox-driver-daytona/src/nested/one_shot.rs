@@ -8,7 +8,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use sandbox_driver::{
     Error, ExecControls, ExecResult, ExecStreamingResult, OneShot, OneShotImage, OneShotSpec,
-    OutputSink, Result, Termination, stop_signal,
+    OutputSink, Result, StopLevel, Termination, drain_with_stops, stop_signal,
 };
 use sandbox_driver_docker::is_missing_platform;
 use tokio::time;
@@ -247,13 +247,6 @@ impl Action {
         controls: ExecControls,
         abandoned: CancellationToken,
     ) -> Result<ExecStreamingResult> {
-        let deadline = async {
-            match self.spec.timeout {
-                Some(limit) => time::sleep(limit.saturating_sub(self.started.elapsed())).await,
-                None => future::pending().await,
-            }
-        };
-        let mut deadline = pin!(deadline);
         self.cli
             .run_spec(&DockerCli::command(args).timeout(START_TIMEOUT))
             .await?;
@@ -312,60 +305,54 @@ impl Action {
                 retained_output_limit: controls.retained_output_limit,
                 ..Default::default()
             }));
-            let mut termination = None;
-            let mut term_sent = false;
-            let mut kill_sent = false;
-            let mut drain_deadline = None;
-            loop {
-                let drain_timeout = async {
-                    match drain_deadline {
-                        Some(deadline) => time::sleep_until(deadline).await,
-                        None => future::pending().await,
-                    }
-                };
-                tokio::select! {
-                    biased;
-                    () = abandoned.cancelled(), if !kill_sent => {
-                        termination = Some(Termination::Killed);
-                        kill_sent = true;
-                        drain_deadline = Some(time::Instant::now() + DRAIN_GRACE);
-                        NestedDocker::signal_action(&self.cli, &self.name, "KILL").await?;
-                    }
-                    result = &mut run => {
-                        let mut result = result?;
-                        if let Some(reason) = termination { result.result.termination = reason; }
-                        result.result.duration = self.started.elapsed();
-                        return Ok(result);
-                    }
-                    () = stop_signal(controls.term.as_ref()), if !term_sent && !kill_sent => {
-                        termination = Some(Termination::Cancelled);
-                        term_sent = true;
-                        NestedDocker::signal_action(&self.cli, &self.name, "TERM").await?;
-                    }
-                    () = stop_signal(controls.kill.as_ref()), if !kill_sent => {
-                        termination = Some(Termination::Killed);
-                        kill_sent = true;
-                        drain_deadline = Some(time::Instant::now() + DRAIN_GRACE);
-                        NestedDocker::signal_action(&self.cli, &self.name, "KILL").await?;
-                    }
-                    () = sink_failed.cancelled(), if !kill_sent => {
-                        termination = Some(Termination::Cancelled);
-                        kill_sent = true;
-                        drain_deadline = Some(time::Instant::now() + DRAIN_GRACE);
-                        NestedDocker::signal_action(&self.cli, &self.name, "KILL").await?;
-                    }
-                    () = &mut deadline, if !kill_sent => {
-                        termination = Some(Termination::TimedOut);
-                        kill_sent = true;
-                        drain_deadline = Some(time::Instant::now() + DRAIN_GRACE);
-                        NestedDocker::signal_action(&self.cli, &self.name, "KILL").await?;
-                    }
-                    () = drain_timeout => {
-                        transport_kill.cancel();
-                        drain_deadline = None;
-                    },
-                }
+            // Abandonment by the owner is a kill like any other: the race
+            // sees one kill token, which the caller's own kill also
+            // cancels through a link that, like the stop ladder, only
+            // drives the token and never resolves.
+            let kill = abandoned.child_token();
+            let link = async {
+                stop_signal(controls.kill.as_ref()).await;
+                kill.cancel();
+                future::pending::<()>().await;
+            };
+            let race_controls = ExecControls {
+                term: controls.term.clone(),
+                kill: Some(kill.clone()),
+                ..ExecControls::default()
+            };
+            let race = drain_with_stops(
+                run.as_mut(),
+                &sink_failed,
+                &race_controls,
+                self.spec
+                    .timeout
+                    .map(|limit| limit.saturating_sub(self.started.elapsed())),
+                DRAIN_GRACE,
+                |level| {
+                    let signal = match level {
+                        StopLevel::Term => "TERM",
+                        StopLevel::Kill => "KILL",
+                    };
+                    NestedDocker::signal_action(&self.cli, &self.name, signal)
+                },
+            );
+            let outcome = tokio::select! {
+                outcome = race => outcome?,
+                () = link => unreachable!("the kill link never resolves"),
+            };
+            let mut result = if let Some(result) = outcome.drained {
+                result?
+            } else {
+                // The action was killed and its output still has not
+                // closed: end the native transport and wait for it.
+                transport_kill.cancel();
+                run.await?
+            };
+            if outcome.termination != Termination::Exited {
+                result.result.termination = outcome.termination;
             }
+            result.result.duration = self.started.elapsed();
+            Ok(result)
         }
         .await
     }
