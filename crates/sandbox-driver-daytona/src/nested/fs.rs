@@ -18,10 +18,10 @@ use tokio::runtime::Handle;
 use tokio::sync::OnceCell;
 use tokio::time::timeout;
 
-use crate::nested_docker::{CONTAINER_NAME, DockerCli};
-use crate::shell_quote;
+use super::{CONTAINER_NAME, DockerCli};
+use crate::shell::shell_quote;
 
-const COMMAND: &str = include_str!("nested_files.py");
+const COMMAND: &str = include_str!("files.py");
 const CHUNK: usize = 1024 * 1024;
 const FILE_TIMEOUT: Duration = Duration::from_secs(120);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);

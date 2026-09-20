@@ -6,7 +6,7 @@ use sandbox_driver::{
     PreviewUrl, PreviewUrls, Result, SshAccess, SshAccessInfo, Vnc, VncConnection, WebTerminal,
 };
 
-use crate::{DaytonaClient, daytona_error};
+use crate::sdk::{DaytonaClient, daytona_error};
 
 const WEB_TERMINAL_PORT: u16 = 22_222;
 const VNC_PORT: u16 = 6_080;

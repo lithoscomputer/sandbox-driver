@@ -24,8 +24,9 @@ use tokio::task::JoinHandle;
 use tokio::time;
 
 use crate::exec::{build_session_script, wrap_session_script};
+use crate::sdk::{DaytonaClient, daytona_error};
 use crate::session::Session;
-use crate::{DaytonaClient, daytona_error, exec_line};
+use crate::shell::exec_line;
 
 /// Buffered bytes per stdio pipe.
 const PIPE_CAPACITY: usize = 64 * 1024;

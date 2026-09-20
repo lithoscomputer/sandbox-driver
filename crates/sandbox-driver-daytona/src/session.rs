@@ -20,7 +20,8 @@ use tokio::runtime::Handle;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
-use crate::{DaytonaClient, daytona_error, toolbox};
+use crate::sdk::{DaytonaClient, daytona_error};
+use crate::toolbox;
 
 /// Bound on session cleanup so a stalled REST call can never block a
 /// cancellation or timeout path indefinitely.

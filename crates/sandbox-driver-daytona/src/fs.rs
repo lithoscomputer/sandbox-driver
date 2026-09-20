@@ -13,7 +13,7 @@ use tokio::fs as tokio_fs;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::OnceCell;
 
-use crate::{DaytonaClient, daytona_error, is_not_found};
+use crate::sdk::{DaytonaClient, daytona_error, is_not_found};
 
 /// Native filesystem access through the Daytona toolbox file API.
 ///

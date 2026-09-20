@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use daytona_sdk::DaytonaError;
 use sandbox_driver::{Capability, Error, LogSink, LogSource, Logs, Result};
 
-use crate::{DaytonaClient, daytona_error};
+use crate::sdk::{DaytonaClient, daytona_error};
 
 /// Provider logs for one Daytona sandbox.
 pub struct DaytonaLogs {
