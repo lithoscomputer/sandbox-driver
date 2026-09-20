@@ -18,8 +18,10 @@ use tokio::sync::{Mutex, OnceCell};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
+use crate::sdk::{DaytonaClient, daytona_error};
 use crate::session::{Session, dedup_capture, missing_suffix, wait_for_completion};
-use crate::{DaytonaClient, daytona_error, encoded_exec, exec_line, shell_quote, stdio, toolbox};
+use crate::shell::{exec_line, shell_quote};
+use crate::{encoded_exec, stdio, toolbox};
 
 #[derive(Deserialize)]
 struct BufferedResponse {
@@ -709,7 +711,7 @@ impl StreamSide {
 
 /// Bash source run inside the session's `/bin/bash -c`: pin the working
 /// directory, blank `BASH_ENV` (sandbox-level hygiene; the command's own
-/// env comes with it, see [`crate::exec_line`]), then run the command in
+/// env comes with it, see [`crate::shell::exec_line`]), then run the command in
 /// a subshell so its exit status is the script's.
 pub(crate) fn build_session_script(cwd: &str, command: &str) -> String {
     [

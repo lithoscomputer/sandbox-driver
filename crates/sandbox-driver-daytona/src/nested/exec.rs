@@ -19,8 +19,8 @@ use tokio::sync::Mutex;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
-use crate::nested_docker::{CONTAINER_NAME, DockerCli};
-use crate::{exec_line, shell_quote};
+use super::{CONTAINER_NAME, DockerCli};
+use crate::shell::{exec_line, shell_quote};
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const TERM_GRACE: Duration = Duration::from_secs(2);

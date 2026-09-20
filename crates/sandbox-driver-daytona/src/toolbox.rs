@@ -7,7 +7,7 @@ use reqwest::Method;
 use sandbox_driver::{DEFAULT_BUFFER_BYTES, Error, Result};
 use serde_json::Value;
 
-use crate::DaytonaClient;
+use crate::sdk::DaytonaClient;
 
 pub(crate) async fn endpoint(client: &DaytonaClient, sandbox_id: &str) -> Result<String> {
     let proxy = sandbox_api::get_toolbox_proxy_url(

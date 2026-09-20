@@ -13,7 +13,7 @@ use daytona_sdk::{PtyCreateOptions, PtyHandle};
 use sandbox_driver::{Pty, PtyOptions, PtySession, PtySize, Result};
 use tokio::sync::{Mutex, RwLock, mpsc};
 
-use crate::{DaytonaClient, daytona_error};
+use crate::sdk::{DaytonaClient, daytona_error};
 
 /// The PTY facet of one Daytona sandbox.
 pub struct DaytonaPty {

@@ -21,7 +21,7 @@ use sandbox_driver::{
 };
 
 use crate::exec::DaytonaExec;
-use crate::{DaytonaClient, daytona_error};
+use crate::sdk::{DaytonaClient, daytona_error};
 
 /// Daytona's provider-owned hybrid git implementation.
 pub struct DaytonaGit {

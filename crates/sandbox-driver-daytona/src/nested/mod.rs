@@ -3,20 +3,23 @@
 //! Docker remains private to the sandbox. No Docker API listener or preview
 //! connection is created; the sandbox lifecycle owns all nested resources.
 
+mod exec;
+mod fs;
+mod one_shot;
+mod operation;
+
 use std::collections::BTreeMap;
+use std::io;
 use std::path::Path;
-use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use std::{future, io};
 
 use async_trait::async_trait;
 use sandbox_driver::{
     Capabilities, DirEntry, Error, Exec, ExecControls, ExecFailure, ExecResult, ExecSpec,
-    ExecStreamingResult, FileMetadata, Filesystem, OneShot, OneShotCaps, OneShotImage, OneShotSpec,
-    OutputSink, Pty, PtyOptions, PtySession, Result, SandboxSpec, SpawnSpec, StdioProcess,
-    Termination, stop_signal,
+    ExecStreamingResult, FileMetadata, Filesystem, OneShotCaps, Pty, PtyOptions, PtySession,
+    Result, SandboxSpec, SpawnSpec, StdioProcess,
 };
 use sandbox_driver_daytona_config::{DockerExecutionTarget, NestedDockerConfig};
 use sandbox_driver_docker_config::{RegistryAuth, Sidecar};
@@ -24,14 +27,13 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 use tokio::time;
-use tokio_util::sync::CancellationToken;
 
-use crate::nested_exec::NestedExec;
-use crate::nested_fs::NestedFs;
-use crate::nested_operation::{run_command, run_owned};
-use crate::{DaytonaClient, DaytonaExec, DaytonaFs, DaytonaPty, RUNTIME_DIRECTORY};
+use self::exec::NestedExec;
+use self::fs::NestedFs;
+use self::operation::{run_command, run_owned};
+use crate::sdk::DaytonaClient;
+use crate::{DaytonaExec, DaytonaFs, DaytonaPty, RUNTIME_DIRECTORY};
 
-pub(super) const TARGET_LABEL: &str = "sh.sandbox-driver.docker-target";
 pub(super) const CONTAINER_NAME: &str = "sandbox-driver-workspace";
 const NETWORK: &str = "sandbox-driver-services";
 const NETWORK_LABEL: &str = "sh.sandbox-driver.network";
@@ -661,347 +663,6 @@ fn sidecar_args(sidecar: &Sidecar, name: &str) -> Vec<String> {
     args
 }
 
-impl NestedDocker {
-    async fn prepare_action_image(&self, image: &OneShotImage) -> Result<String> {
-        match image {
-            OneShotImage::Registry { reference } => {
-                if let Err(error) = self.cli.pull(reference, None, None).await {
-                    if !error.to_string().contains("no matching manifest") {
-                        // Native CLI diagnostics live in the command's output.
-                        let missing = matches!(&error, Error::Exec(failure) if String::from_utf8_lossy(failure.stdout()).contains("no matching manifest") || String::from_utf8_lossy(failure.stderr()).contains("no matching manifest"));
-                        if !missing {
-                            return Err(error);
-                        }
-                    }
-                    self.cli
-                        .pull(reference, None, Some("linux/amd64"))
-                        .await
-                        .map_err(|_| error)?;
-                }
-                Ok(reference.clone())
-            }
-            OneShotImage::Build {
-                context,
-                dockerfile,
-                tag,
-                reuse,
-            } => {
-                if *reuse && self.cli.image_present(tag).await? {
-                    return Ok(tag.clone());
-                }
-                let context = self.cli.resolve(context);
-                if dockerfile
-                    .as_ref()
-                    .is_some_and(|path| path.starts_with('/'))
-                {
-                    return Err(Error::invalid_spec(
-                        "dockerfile",
-                        "expected a path within the build context",
-                    ));
-                }
-                let stage = self
-                    .targets_container()
-                    .then(|| format!("{RUNTIME_DIRECTORY}/build-{:016x}", rand::random::<u64>()));
-                let cleanup_stage = stage.clone();
-                let cli = Arc::clone(&self.cli);
-                let cleanup_fs = Arc::clone(&self.cli.fs);
-                let tag = tag.clone();
-                let dockerfile = dockerfile.clone();
-                run_owned(
-                    move |cancel| async move {
-                        let context = if let Some(stage) = stage {
-                            cli.fs.create_dir(&stage).await?;
-                            // Docker resolves the context in the job container. It may
-                            // be outside the workspace bind or behind a container symlink.
-                            checked(
-                                run_command(
-                                    &*cli.exec,
-                                    &DockerCli::command(words([
-                                        "cp",
-                                        "--",
-                                        &format!("{CONTAINER_NAME}:{context}/."),
-                                        &stage,
-                                    ])),
-                                    &cancel,
-                                )
-                                .await?,
-                                "copying nested Docker build context",
-                            )?;
-                            stage
-                        } else {
-                            context
-                        };
-                        let mut args = words(["build", "--tag", &tag]);
-                        if let Some(dockerfile) = &dockerfile {
-                            args.extend(words(["--file", &format!("{context}/{dockerfile}")]));
-                        }
-                        args.push(context);
-                        checked(
-                            run_command(&*cli.exec, &DockerCli::command(args), &cancel).await?,
-                            "building nested Docker action image",
-                        )?;
-                        Ok(tag)
-                    },
-                    move || async move {
-                        if let Some(stage) = cleanup_stage {
-                            cleanup_fs.delete(&stage, true).await?;
-                        }
-                        Ok(())
-                    },
-                )
-                .await
-            }
-            _ => Err(Error::invalid_spec("image", "unsupported one-shot image")),
-        }
-    }
-
-    async fn signal_action(cli: &DockerCli, container: &str, signal: &str) -> Result<()> {
-        let command =
-            DockerCli::command(words(["kill", "--signal", signal, container])).timeout(DRAIN_GRACE);
-        let output = cli.exec.run(&command).await?;
-        if output.success() {
-            return Ok(());
-        }
-        let message = format!("{}{}", output.stdout_lossy(), output.stderr_lossy());
-        if message.contains("No such container") {
-            return Ok(());
-        }
-        if message.contains("is not running") {
-            // Removing a created container fences a Docker start that has not
-            // reached the daemon yet. No later attach command can launch it.
-            return cli.remove(container).await;
-        }
-        checked(output, "signalling nested Docker action").map(|_| ())
-    }
-}
-
-#[async_trait]
-impl OneShot for NestedDocker {
-    async fn run(&self, spec: &OneShotSpec, controls: ExecControls) -> Result<ExecStreamingResult> {
-        let started = Instant::now();
-        let deadline = async {
-            match spec.timeout {
-                Some(limit) => time::sleep(limit).await,
-                None => future::pending().await,
-            }
-        };
-        let mut deadline = pin!(deadline);
-        let prepared = tokio::select! {
-            biased;
-            () = stop_signal(controls.kill.as_ref()) => Err(Termination::Killed),
-            () = stop_signal(controls.term.as_ref()) => Err(Termination::Cancelled),
-            () = &mut deadline => Err(Termination::TimedOut),
-            image = async { self.ensure_ready().await?; self.prepare_action_image(&spec.image).await } => Ok(image?),
-        };
-        let image = match prepared {
-            Ok(image) => image,
-            Err(reason) => {
-                return Ok(ExecStreamingResult::new(ExecResult::from_shell_status(
-                    reason,
-                    None,
-                    started.elapsed(),
-                )));
-            }
-        };
-        let (primary, network) = if self.targets_container() {
-            let inspect = self.cli.inspect(CONTAINER_NAME).await?;
-            let id = inspect["Id"]
-                .as_str()
-                .ok_or_else(|| Error::invalid_spec("docker inspect", "container id missing"))?
-                .to_owned();
-            let network = format!("container:{id}");
-            (id, network)
-        } else {
-            (CONTAINER_NAME.to_owned(), "host".to_owned())
-        };
-        let name = format!("sandbox-driver-action-{:016x}", rand::random::<u64>());
-        let mut args = words([
-            "create",
-            "--name",
-            &name,
-            "--init",
-            "--label",
-            MANAGED_LABEL,
-            "--label",
-            &format!("{ONE_SHOT_LABEL}={primary}"),
-            "--network",
-            &network,
-            "--mount",
-            &workspace_mount(&self.cli.working_dir),
-            "--workdir",
-            spec.working_dir.as_deref().unwrap_or(&self.cli.working_dir),
-        ]);
-        flags(
-            &mut args,
-            "--env",
-            spec.env.iter().map(|(key, value)| format!("{key}={value}")),
-        );
-        if let Some(entrypoint) = &spec.entrypoint {
-            args.extend(words(["--entrypoint", entrypoint]));
-        }
-        args.push(image);
-        args.extend(spec.args.clone());
-        let cli = Arc::clone(&self.cli);
-        let cleanup_cli = Arc::clone(&cli);
-        let cleanup_name = name.clone();
-        let spec = spec.clone();
-        run_owned(
-            move |abandoned| Self::run_action(cli, name, args, spec, controls, started, abandoned),
-            move || async move { cleanup_cli.remove(&cleanup_name).await },
-        )
-        .await
-    }
-}
-
-impl NestedDocker {
-    async fn run_action(
-        cli: Arc<DockerCli>,
-        name: String,
-        args: Vec<String>,
-        spec: OneShotSpec,
-        controls: ExecControls,
-        started: Instant,
-        abandoned: CancellationToken,
-    ) -> Result<ExecStreamingResult> {
-        let deadline = async {
-            match spec.timeout {
-                Some(limit) => time::sleep(limit.saturating_sub(started.elapsed())).await,
-                None => future::pending().await,
-            }
-        };
-        let mut deadline = pin!(deadline);
-        cli.run_spec(&DockerCli::command(args).timeout(START_TIMEOUT))
-            .await?;
-        let stopped = if abandoned.is_cancelled()
-            || controls
-                .kill
-                .as_ref()
-                .is_some_and(CancellationToken::is_cancelled)
-        {
-            Some(Termination::Killed)
-        } else if controls
-            .term
-            .as_ref()
-            .is_some_and(CancellationToken::is_cancelled)
-        {
-            Some(Termination::Cancelled)
-        } else if spec.timeout.is_some_and(|limit| started.elapsed() >= limit) {
-            Some(Termination::TimedOut)
-        } else {
-            None
-        };
-        if let Some(reason) = stopped {
-            return Ok(ExecStreamingResult::new(ExecResult::from_shell_status(
-                reason,
-                None,
-                started.elapsed(),
-            )));
-        }
-        async {
-            let sink_failed = CancellationToken::new();
-            let sink = controls.sink.clone().map(|sink| {
-                let failed = sink_failed.clone();
-                Arc::new(move |stream, bytes| {
-                    let sink = Arc::clone(&sink);
-                    let failed = failed.clone();
-                    Box::pin(async move {
-                        if sink(stream, bytes).await.is_err() {
-                            failed.cancel();
-                        }
-                        Ok(())
-                    })
-                        as Pin<Box<dyn future::Future<Output = Result<()>> + Send>>
-                }) as OutputSink
-            });
-            let transport_kill = CancellationToken::new();
-            let mut command = DockerCli::command(words(["start", "--attach", &name])).no_timeout();
-            command.output_sanitization = spec.output_sanitization;
-            let mut run = pin!(cli.exec.run_streaming(&command, ExecControls {
-                sink,
-                kill: Some(transport_kill.clone()),
-                retained_output_limit: controls.retained_output_limit,
-                ..Default::default()
-            }));
-            let mut termination = None;
-            let mut term_sent = false;
-            let mut kill_sent = false;
-            let mut drain_deadline = None;
-            loop {
-                let drain_timeout = async {
-                    match drain_deadline {
-                        Some(deadline) => time::sleep_until(deadline).await,
-                        None => future::pending().await,
-                    }
-                };
-                tokio::select! {
-                    biased;
-                    () = abandoned.cancelled(), if !kill_sent => {
-                        termination = Some(Termination::Killed);
-                        kill_sent = true;
-                        drain_deadline = Some(time::Instant::now() + DRAIN_GRACE);
-                        Self::signal_action(&cli, &name, "KILL").await?;
-                    }
-                    result = &mut run => {
-                        let mut result = result?;
-                        if let Some(reason) = termination { result.result.termination = reason; }
-                        result.result.duration = started.elapsed();
-                        return Ok(result);
-                    }
-                    () = stop_signal(controls.term.as_ref()), if !term_sent && !kill_sent => {
-                        termination = Some(Termination::Cancelled);
-                        term_sent = true;
-                        Self::signal_action(&cli, &name, "TERM").await?;
-                    }
-                    () = stop_signal(controls.kill.as_ref()), if !kill_sent => {
-                        termination = Some(Termination::Killed);
-                        kill_sent = true;
-                        drain_deadline = Some(time::Instant::now() + DRAIN_GRACE);
-                        Self::signal_action(&cli, &name, "KILL").await?;
-                    }
-                    () = sink_failed.cancelled(), if !kill_sent => {
-                        termination = Some(Termination::Cancelled);
-                        kill_sent = true;
-                        drain_deadline = Some(time::Instant::now() + DRAIN_GRACE);
-                        Self::signal_action(&cli, &name, "KILL").await?;
-                    }
-                    () = &mut deadline, if !kill_sent => {
-                        termination = Some(Termination::TimedOut);
-                        kill_sent = true;
-                        drain_deadline = Some(time::Instant::now() + DRAIN_GRACE);
-                        Self::signal_action(&cli, &name, "KILL").await?;
-                    }
-                    () = drain_timeout => {
-                        transport_kill.cancel();
-                        drain_deadline = None;
-                    },
-                }
-            }
-        }
-        .await
-    }
-}
-
-/// The stored Daytona label. It must stay the configuration enum's own
-/// serde encoding, so a label and a `provider_config` value can never
-/// disagree; the tests below pin the two together.
-pub(super) fn target_label(target: DockerExecutionTarget) -> &'static str {
-    match target {
-        DockerExecutionTarget::Container => "container",
-        DockerExecutionTarget::VirtualMachine => "virtual_machine",
-    }
-}
-
-pub(super) fn parse_target(label: &str) -> Result<DockerExecutionTarget> {
-    match label {
-        "container" => Ok(DockerExecutionTarget::Container),
-        "virtual_machine" => Ok(DockerExecutionTarget::VirtualMachine),
-        _ => Err(Error::invalid_spec(
-            "docker-target",
-            "unrecognized stored Docker execution target",
-        )),
-    }
-}
-
 pub(super) fn validate(config: &NestedDockerConfig, _spec: &SandboxSpec) -> Result<()> {
     if config.target == DockerExecutionTarget::Container && config.image.trim().is_empty() {
         return Err(Error::invalid_spec(
@@ -1130,27 +791,15 @@ impl Filesystem for NestedDocker {
 
 #[cfg(test)]
 mod tests {
-    use sandbox_driver::Capability;
+    use std::time::Duration;
+
+    use sandbox_driver::{Capability, OneShot, OneShotSpec, Termination};
     use sandbox_driver_docker_config::DockerProviderConfig;
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::{DaytonaConfig, DaytonaProvider, daytona_capabilities};
-
-    #[test]
-    fn stored_labels_are_the_configuration_encoding_and_round_trip() {
-        for target in [
-            DockerExecutionTarget::Container,
-            DockerExecutionTarget::VirtualMachine,
-        ] {
-            let label = target_label(target);
-            assert_eq!(
-                serde_json::to_value(target).expect("plain enum"),
-                serde_json::Value::String(label.to_owned()),
-                "the Daytona label and provider_config encodings disagree"
-            );
-            assert_eq!(parse_target(label).expect("own label"), target);
-        }
-    }
+    use crate::provider::daytona_capabilities;
+    use crate::{DaytonaConfig, DaytonaProvider};
 
     #[tokio::test]
     async fn previews_are_only_available_for_the_vm_execution_target() {

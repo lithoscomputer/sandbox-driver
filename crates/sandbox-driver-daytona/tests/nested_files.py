@@ -14,7 +14,7 @@ import uuid
 
 
 spec = importlib.util.spec_from_file_location(
-    "nested_files", Path(__file__).parents[1] / "src" / "nested_files.py"
+    "nested_files", Path(__file__).parents[1] / "src" / "nested" / "files.py"
 )
 files = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(files)
