@@ -21,7 +21,8 @@ use sandbox_driver::{
 };
 
 use crate::exec::DaytonaExec;
-use crate::{DaytonaClient, daytona_error};
+use crate::resolve_path;
+use crate::sdk::{DaytonaClient, daytona_error};
 
 /// Daytona's provider-owned hybrid git implementation.
 pub struct DaytonaGit {
@@ -46,11 +47,7 @@ impl DaytonaGit {
     }
 
     fn resolve_path(&self, path: &str) -> String {
-        if path.starts_with('/') {
-            path.to_owned()
-        } else {
-            format!("{}/{}", self.working_dir.trim_end_matches('/'), path)
-        }
+        resolve_path(&self.working_dir, path)
     }
 
     fn derived(&self) -> DerivedGit<'_> {

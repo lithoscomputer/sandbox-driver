@@ -1,13 +1,49 @@
-//! Bounded reads for toolbox endpoints whose SDK convenience methods buffer
-//! an entire response before returning it.
+//! Toolbox connections, and bounded reads for toolbox endpoints whose SDK
+//! convenience methods buffer an entire response before returning it.
 use std::io;
 
 use daytona_api_client::apis::sandbox_api;
+use daytona_sdk::{FileSystemService, ProcessService, Sandbox as SdkSandbox};
 use reqwest::Method;
 use sandbox_driver::{DEFAULT_BUFFER_BYTES, Error, Result};
 use serde_json::Value;
 
-use crate::DaytonaClient;
+use crate::sdk::{DaytonaClient, daytona_error};
+
+/// The control-plane record for `sandbox_id`, the starting point for every
+/// toolbox service.
+pub(crate) async fn sandbox(client: &DaytonaClient, sandbox_id: &str) -> Result<SdkSandbox> {
+    client
+        .get(sandbox_id)
+        .await
+        .map_err(|error| daytona_error("fetching sandbox", error))
+}
+
+/// The process service of an already fetched sandbox.
+pub(crate) async fn process_of(sandbox: &SdkSandbox) -> Result<ProcessService> {
+    sandbox
+        .process()
+        .await
+        .map_err(|error| daytona_error("connecting to the toolbox", error))
+}
+
+/// The filesystem service of an already fetched sandbox.
+pub(crate) async fn fs_of(sandbox: &SdkSandbox) -> Result<FileSystemService> {
+    sandbox
+        .fs()
+        .await
+        .map_err(|error| daytona_error("connecting to the toolbox", error))
+}
+
+/// Fetches the sandbox and connects its process service.
+pub(crate) async fn process(client: &DaytonaClient, sandbox_id: &str) -> Result<ProcessService> {
+    process_of(&sandbox(client, sandbox_id).await?).await
+}
+
+/// Fetches the sandbox and connects its filesystem service.
+pub(crate) async fn fs(client: &DaytonaClient, sandbox_id: &str) -> Result<FileSystemService> {
+    fs_of(&sandbox(client, sandbox_id).await?).await
+}
 
 pub(crate) async fn endpoint(client: &DaytonaClient, sandbox_id: &str) -> Result<String> {
     let proxy = sandbox_api::get_toolbox_proxy_url(

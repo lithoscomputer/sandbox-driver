@@ -38,4 +38,4 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 futures-util.workspace = true
 sandbox-driver-conformance.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }

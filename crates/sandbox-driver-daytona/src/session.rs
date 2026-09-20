@@ -20,7 +20,9 @@ use tokio::runtime::Handle;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
-use crate::{DaytonaClient, daytona_error, toolbox};
+use crate::sdk::{DaytonaClient, daytona_error};
+use crate::shell::shell_quote;
+use crate::toolbox;
 
 /// Bound on session cleanup so a stalled REST call can never block a
 /// cancellation or timeout path indefinitely.
@@ -46,10 +48,7 @@ pub(crate) struct Session {
 impl Session {
     pub(crate) async fn create(client: &DaytonaClient, sandbox: &SdkSandbox) -> Result<Self> {
         let endpoint = toolbox::endpoint(client, &sandbox.id).await?;
-        let process = sandbox
-            .process()
-            .await
-            .map_err(|error| daytona_error("connecting to the toolbox", error))?;
+        let process = toolbox::process_of(sandbox).await?;
         // Random nonce plus host pid: a session id can never collide
         // with one from a crashed or concurrent driver — including two
         // concurrent execs in one process on a coarse-clock platform,
@@ -65,6 +64,27 @@ impl Session {
             process: Some(process),
             id,
         })
+    }
+
+    /// Creates a session and starts `command` in it, as one quoted
+    /// `/bin/bash -c` that pins `cwd` and blanks `BASH_ENV`. A session
+    /// whose command fails to start is closed before the error returns,
+    /// so the caller never holds a session with nothing running in it.
+    pub(crate) async fn start_command(
+        client: &DaytonaClient,
+        sandbox: &SdkSandbox,
+        cwd: &str,
+        command: &str,
+    ) -> Result<(Self, SessionExecuteResult)> {
+        let program = wrap_session_script(&build_session_script(cwd, command));
+        let mut session = Self::create(client, sandbox).await?;
+        match session.execute(&program).await {
+            Ok(started) => Ok((session, started)),
+            Err(error) => {
+                session.close().await;
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn id(&self) -> &str {
@@ -170,6 +190,28 @@ impl Drop for Session {
             tracing::warn!("command session cleanup skipped without a runtime");
         }
     }
+}
+
+/// Bash source run inside the session's `/bin/bash -c`: pin the working
+/// directory, blank `BASH_ENV` (sandbox-level hygiene; the command's own
+/// env comes with it, see [`crate::shell::exec_line`]), then run the
+/// command in a subshell so its exit status is the script's.
+fn build_session_script(cwd: &str, command: &str) -> String {
+    [
+        format!("cd {} || exit $?", shell_quote(cwd)),
+        "export BASH_ENV=''".to_owned(),
+        "(".to_owned(),
+        command.to_owned(),
+        ")".to_owned(),
+    ]
+    .join("\n")
+}
+
+/// The command handed to the session: one quoted `/bin/bash -c` so the
+/// caller's source stays inert until Bash evaluates it, and the session
+/// shell resumes afterwards to drain logs and record the exit code.
+fn wrap_session_script(script: &str) -> String {
+    format!("/bin/bash -c {}", shell_quote(script))
 }
 
 /// Toolbox variants: separated JSON, a JSON string, or text with the

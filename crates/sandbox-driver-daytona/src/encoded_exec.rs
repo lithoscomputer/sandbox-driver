@@ -87,38 +87,72 @@ fn encoded_spec(spec: &ExecSpec) -> ExecSpec {
     encoded
 }
 
+/// The stream a record's leading tag names: `O` for stdout, `E` for
+/// stderr. The encoder writes exactly these two tags.
+fn stream_tag(tag: u8) -> Option<OutputStream> {
+    match tag {
+        b'O' => Some(OutputStream::Stdout),
+        b'E' => Some(OutputStream::Stderr),
+        _ => None,
+    }
+}
+
 /// Decode the ASCII subset emitted by Bash printf %q with LC_ALL=C.
 /// This is data decoding; no shell evaluates returned command output.
 /// The error names what made the body unreadable; the caller counts it.
-fn decode_quoted(mut input: &[u8]) -> StdResult<Vec<u8>, &'static str> {
+/// printf %q writes one of two forms: a plain word with each special
+/// character backslash-escaped, or an ANSI-C `$'…'` string when the
+/// bytes include anything unprintable.
+fn decode_quoted(input: &[u8]) -> StdResult<Vec<u8>, &'static str> {
     if input == b"''" {
         return Ok(Vec::new());
     }
-    let ansi = input.starts_with(b"$'");
-    if ansi {
-        input = input
-            .strip_prefix(b"$'")
-            .and_then(|value| value.strip_suffix(b"'"))
-            .ok_or("unterminated quoted output")?;
+    match input.strip_prefix(b"$'") {
+        Some(body) => decode_ansi_c(
+            body.strip_suffix(b"'")
+                .ok_or("unterminated quoted output")?,
+        ),
+        None => decode_plain(input),
     }
+}
+
+/// A byte of a quoted body outside an escape: printable ASCII only.
+fn printable(byte: u8) -> StdResult<u8, &'static str> {
+    if (0x20..=0x7e).contains(&byte) {
+        Ok(byte)
+    } else {
+        Err("non-ASCII output frame")
+    }
+}
+
+/// The plain form: a backslash escapes the next byte literally.
+fn decode_plain(input: &[u8]) -> StdResult<Vec<u8>, &'static str> {
+    let mut decoded = Vec::with_capacity(input.len());
+    let mut bytes = input.iter().copied();
+    while let Some(byte) = bytes.next() {
+        if byte == b'\\' {
+            decoded.push(bytes.next().ok_or("incomplete output escape")?);
+        } else {
+            decoded.push(printable(byte)?);
+        }
+    }
+    Ok(decoded)
+}
+
+/// The ANSI-C form: the body of a `$'…'` string, with Bash's named
+/// escapes and up to three octal digits per byte.
+fn decode_ansi_c(input: &[u8]) -> StdResult<Vec<u8>, &'static str> {
     let mut decoded = Vec::with_capacity(input.len());
     let mut i = 0;
     while i < input.len() {
         let byte = input[i];
         i += 1;
         if byte != b'\\' {
-            if !(0x20..=0x7e).contains(&byte) {
-                return Err("non-ASCII output frame");
-            }
-            decoded.push(byte);
+            decoded.push(printable(byte)?);
             continue;
         }
         let escaped = *input.get(i).ok_or("incomplete output escape")?;
         i += 1;
-        if !ansi {
-            decoded.push(escaped);
-            continue;
-        }
         let value = match escaped {
             b'a' => 7,
             b'b' => 8,
@@ -198,13 +232,12 @@ impl FramedOutput {
         self.loss.dropped_bytes += u64::try_from(bytes).unwrap_or(u64::MAX);
     }
 
-    async fn emit(&mut self, index: usize, raw: &[u8]) -> Result<()> {
-        let (sanitizer, capture) = &mut self.streams[index];
+    async fn emit(&mut self, stream: OutputStream, raw: &[u8]) -> Result<()> {
+        let (sanitizer, capture) = &mut self.streams[stream as usize];
         let bytes = sanitizer.push(raw);
         capture.push(&bytes);
         if !bytes.is_empty() {
             if let Some(sink) = &self.sink {
-                let stream = [OutputStream::Stdout, OutputStream::Stderr][index];
                 sink(stream, bytes).await?;
             }
         }
@@ -217,7 +250,7 @@ impl FramedOutput {
     async fn push(&mut self, stream: OutputStream, mut bytes: &[u8]) -> Result<()> {
         if stream == OutputStream::Stderr {
             // Wrapper startup failures remain ordinary stderr diagnostics.
-            return self.emit(1, bytes).await;
+            return self.emit(OutputStream::Stderr, bytes).await;
         }
         while !bytes.is_empty() {
             let end = bytes.iter().position(|byte| *byte == b'\n');
@@ -243,21 +276,21 @@ impl FramedOutput {
                 self.pending.clear();
                 continue;
             }
-            let index = match self.pending.first() {
-                Some(b'O') => Some(0),
-                Some(b'E') => Some(1),
-                _ => None,
-            };
-            let decoded = index.map(|index| {
-                (
-                    index,
-                    decode_quoted(&self.pending[1..self.pending.len() - 1]),
-                )
-            });
+            let decoded = self
+                .pending
+                .first()
+                .copied()
+                .and_then(stream_tag)
+                .map(|stream| {
+                    (
+                        stream,
+                        decode_quoted(&self.pending[1..self.pending.len() - 1]),
+                    )
+                });
             let record_bytes = self.pending.len();
             self.pending.clear();
             match decoded {
-                Some((index, Ok(raw))) => self.emit(index, &raw).await?,
+                Some((stream, Ok(raw))) => self.emit(stream, &raw).await?,
                 Some((_, Err(reason))) => self.discard(reason, record_bytes),
                 None => self.discard(MISSING_TAG, record_bytes),
             }
@@ -271,27 +304,24 @@ impl FramedOutput {
             self.pending.clear();
             self.discard(UNTERMINATED_FRAME, bytes);
         }
-        for (index, (sanitizer, capture)) in self.streams.iter_mut().enumerate() {
+        for stream in [OutputStream::Stdout, OutputStream::Stderr] {
+            let (sanitizer, capture) = &mut self.streams[stream as usize];
             let final_bytes = sanitizer.finish();
             capture.push(&final_bytes);
             if !final_bytes.is_empty() {
                 if let Some(sink) = &self.sink {
-                    sink(
-                        [OutputStream::Stdout, OutputStream::Stderr][index],
-                        final_bytes,
-                    )
-                    .await?;
+                    sink(stream, final_bytes).await?;
                 }
             }
         }
-        result.result.stdout = self.streams[0].1.to_bytes();
-        result.result.stderr = self.streams[1].1.to_bytes();
+        result.result.stdout = self.streams[OutputStream::Stdout as usize].1.to_bytes();
+        result.result.stderr = self.streams[OutputStream::Stderr as usize].1.to_bytes();
         // A discarded record's stream is unknown, so a loss truncates both.
         let truncated = result.stdout_capture.truncated
             || result.stderr_capture.truncated
             || self.loss.is_lossy();
-        result.stdout_capture = self.streams[0].1.stats();
-        result.stderr_capture = self.streams[1].1.stats();
+        result.stdout_capture = self.streams[OutputStream::Stdout as usize].1.stats();
+        result.stderr_capture = self.streams[OutputStream::Stderr as usize].1.stats();
         result.stdout_capture.truncated |= truncated;
         result.stderr_capture.truncated |= truncated;
         result.output_loss = self.loss;

@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use daytona_sdk::DaytonaError;
 use sandbox_driver::{Capability, Error, LogSink, LogSource, Logs, Result};
 
-use crate::{DaytonaClient, daytona_error};
+use crate::sdk::{DaytonaClient, daytona_error};
+use crate::toolbox;
 
 /// Provider logs for one Daytona sandbox.
 pub struct DaytonaLogs {
@@ -32,15 +33,7 @@ impl Logs for DaytonaLogs {
         if source != LogSource::Entrypoint {
             return Err(Error::unsupported(Capability::Logs));
         }
-        let sandbox = self
-            .client
-            .get(&self.sandbox_id)
-            .await
-            .map_err(|error| daytona_error("fetching sandbox", error))?;
-        let process = sandbox
-            .process()
-            .await
-            .map_err(|error| daytona_error("connecting to the toolbox", error))?;
+        let process = toolbox::process(&self.client, &self.sandbox_id).await?;
 
         // The SDK callback error type cannot carry sandbox-driver's
         // typed sink error. Save it and use a sentinel SDK error to stop

@@ -69,6 +69,7 @@ use sandbox_driver::{Capabilities, Isolation, OneShotCaps, PtyCaps};
 
 pub use crate::config::{BindMount, DockerProviderConfig, Health, RegistryAuth, Sidecar};
 pub use crate::exec::DockerExec;
+pub use crate::one_shot::is_missing_platform;
 pub use crate::provider::DockerProvider;
 pub use crate::sandbox::DockerSandbox;
 

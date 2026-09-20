@@ -3,7 +3,6 @@ use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use daytona_api_client::apis::sandbox_api;
 use daytona_sdk::{FileSystemService, SetFilePermissionsOptions};
 use sandbox_driver::{
     BoundedBuffer, DEFAULT_BUFFER_BYTES, DirEntry, Error, FileKind, FileMetadata, Filesystem,
@@ -13,7 +12,8 @@ use tokio::fs as tokio_fs;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::OnceCell;
 
-use crate::{DaytonaClient, daytona_error, is_not_found};
+use crate::sdk::{DaytonaClient, daytona_error, is_not_found};
+use crate::{resolve_path, toolbox};
 
 /// Native filesystem access through the Daytona toolbox file API.
 ///
@@ -39,26 +39,12 @@ impl DaytonaFs {
 
     async fn service(&self) -> Result<&FileSystemService> {
         self.service
-            .get_or_try_init(|| async {
-                let sandbox = self
-                    .client
-                    .get(&self.sandbox_id)
-                    .await
-                    .map_err(|error| daytona_error("fetching sandbox", error))?;
-                sandbox
-                    .fs()
-                    .await
-                    .map_err(|error| daytona_error("connecting to the toolbox", error))
-            })
+            .get_or_try_init(|| toolbox::fs(&self.client, &self.sandbox_id))
             .await
     }
 
     fn resolve(&self, path: &str) -> String {
-        if path.starts_with('/') {
-            path.to_owned()
-        } else {
-            format!("{}/{}", self.working_dir.trim_end_matches('/'), path)
-        }
+        resolve_path(&self.working_dir, path)
     }
 }
 
@@ -102,20 +88,8 @@ impl Filesystem for DaytonaFs {
         let endpoint = self
             .download_endpoint
             .get_or_try_init(|| async {
-                let proxy = sandbox_api::get_toolbox_proxy_url(
-                    config,
-                    &self.sandbox_id,
-                    self.client.organization_id(),
-                )
-                .await
-                .map_err(|error| {
-                    Error::io("resolving file download endpoint", io::Error::other(error))
-                })?;
-                Ok::<_, Error>(format!(
-                    "{}/{}/files/download",
-                    proxy.url.trim_end_matches('/'),
-                    self.sandbox_id
-                ))
+                let endpoint = toolbox::endpoint(&self.client, &self.sandbox_id).await?;
+                Ok::<_, Error>(format!("{endpoint}/files/download"))
             })
             .await?;
         let mut request = config
