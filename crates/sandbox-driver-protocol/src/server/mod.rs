@@ -188,7 +188,7 @@ pub async fn serve_with_limits(
                 continue;
             }
         };
-        let stream_id = if matches!(method.as_str(), m::LOGS_FOLLOW | m::SNAPSHOT_BUILD_LOGS) {
+        let stream_id = if m::traits(&method).owns_stream {
             message
                 .params
                 .as_ref()
@@ -423,7 +423,8 @@ impl ServerState {
     /// Reserved methods draw on their own budget so a stop or cancel
     /// still gets through when ordinary requests have filled theirs.
     fn admit(&self, method: &str) -> Result<Admission> {
-        let priority = limits::reserved(method);
+        let traits = m::traits(method);
+        let priority = traits.reserved;
         let request_permit = limits::acquire(
             if priority {
                 &self.reserved_budget
@@ -436,7 +437,7 @@ impl ServerState {
                 "provider_requests"
             },
         )?;
-        let io_permit = if limits::uses_io(method) {
+        let io_permit = if traits.uses_io {
             Some(Arc::new(limits::acquire(&self.io_budget, "active_io")?))
         } else {
             None

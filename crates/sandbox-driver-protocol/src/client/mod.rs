@@ -512,7 +512,7 @@ impl Client {
         err
     )]
     async fn call<P: Serialize, R: DeserializeOwned>(&self, method: &str, params: &P) -> Result<R> {
-        let priority = limits::reserved(method);
+        let priority = m::traits(method).reserved;
         let _admission = limits::acquire(
             if priority {
                 &self.reserved

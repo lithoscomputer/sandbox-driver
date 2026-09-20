@@ -95,6 +95,55 @@ pub const ACCESS_SSH_REVOKE: &str = "access/ssh_revoke";
 pub const ACCESS_WEB_TERMINAL: &str = "access/web_terminal";
 pub const ACCESS_VNC: &str = "access/vnc";
 
+/// What a method needs from the transport, read by both peers from one
+/// table so their admission and stream bookkeeping cannot drift apart.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct MethodTraits {
+    /// Admitted from the reserved request budget, so a stop, cancel,
+    /// close, or diagnostic still gets through when ordinary requests
+    /// have filled theirs.
+    pub(crate) reserved:    bool,
+    /// Moves bytes over a data channel and so holds an `active_io` slot.
+    pub(crate) uses_io:     bool,
+    /// Names a `stream_id` the host can cancel with `stream/cancel`.
+    pub(crate) owns_stream: bool,
+}
+
+/// The transport traits of `method`; every trait is false for a method
+/// this table does not name, including unknown ones.
+pub(crate) fn traits(method: &str) -> MethodTraits {
+    let reserved = matches!(
+        method,
+        EXEC_STOP
+            | EXEC_STDIO_TERMINATE
+            | PTY_CLOSE
+            | STREAM_CANCEL
+            | SHUTDOWN
+            | SANDBOX_STOP
+            | SANDBOX_DELETE
+            | ACCESS_PREVIEW_RELEASE
+            | TRANSPORT_DIAGNOSTICS
+            | PROVIDER_HEALTH
+    );
+    let uses_io = matches!(
+        method,
+        EXEC_STREAM
+            | ONE_SHOT_RUN
+            | EXEC_STDIO_OPEN
+            | PTY_OPEN
+            | LOGS_FOLLOW
+            | FS_READ
+            | FS_WRITE
+            | SNAPSHOT_BUILD_LOGS
+    );
+    let owns_stream = matches!(method, LOGS_FOLLOW | SNAPSHOT_BUILD_LOGS);
+    MethodTraits {
+        reserved,
+        uses_io,
+        owns_stream,
+    }
+}
+
 // Notifications, plugin → host.
 pub const HOST_EVENT: &str = "host/event";
 pub const HOST_LOG: &str = "host/log";
