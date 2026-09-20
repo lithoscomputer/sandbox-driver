@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use sandbox_driver::{Result, ShellCommand};
 
-use crate::exec::shell_quote;
+use crate::daemon::shell_quote;
 
 /// Local Docker CLI access for one container sandbox.
 pub(crate) struct DockerShellCommand {

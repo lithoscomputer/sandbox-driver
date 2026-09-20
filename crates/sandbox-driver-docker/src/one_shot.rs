@@ -12,13 +12,11 @@
 //! (`term` sends SIGTERM once, `kill` and the timeout send SIGKILL), and
 //! the exit code is the container's own.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::error::Error as StdError;
-use std::io::Cursor;
+use std::future;
 use std::pin::pin;
 use std::time::{Duration, Instant};
-use std::{future, io};
 
 use async_trait::async_trait;
 use bollard::Docker;
@@ -38,8 +36,11 @@ use sandbox_driver::{
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
-use crate::exec::{StreamOutput, docker_error, docker_kind, is_conflict, is_not_found};
-use crate::{MANAGED_LABEL, image_present, non_empty, pull_image};
+use crate::daemon::{docker_error, docker_kind, is_conflict, is_not_found};
+use crate::exec::StreamOutput;
+use crate::fs::tar::reroot;
+use crate::image::{image_present, pull_image};
+use crate::{MANAGED_LABEL, non_empty};
 
 /// The label every one-shot container carries, naming the sandbox it
 /// belongs to (the sandbox container's id).
@@ -125,7 +126,7 @@ impl DockerOneShot {
             let chunk = chunk.map_err(|error| docker_error("reading build context", error))?;
             archive.extend_from_slice(&chunk);
         }
-        let context_tar = strip_leading_component(&archive)?;
+        let context_tar = reroot(&archive)?;
         let options = BuildImageOptions {
             dockerfile: dockerfile.unwrap_or("Dockerfile").to_owned(),
             t: tag.to_owned(),
@@ -196,52 +197,6 @@ fn is_missing_platform(error: &Error) -> bool {
         source = current.source();
     }
     false
-}
-
-/// Re-roots an archive of one directory so its contents sit at the top
-/// level, as a build context expects: `dir/Dockerfile` becomes
-/// `Dockerfile`.
-fn strip_leading_component(archive: &[u8]) -> Result<Vec<u8>> {
-    let tar_io = |error| Error::io("re-rooting build context", error);
-    let mut source = tar::Archive::new(Cursor::new(archive));
-    let mut builder = tar::Builder::new(Vec::new());
-    for entry in source.entries().map_err(tar_io)? {
-        let mut entry = entry.map_err(tar_io)?;
-        let path = entry.path().map_err(tar_io)?.into_owned();
-        let mut components = path.components();
-        components.next();
-        let rest = components.as_path().to_path_buf();
-        if rest.as_os_str().is_empty() {
-            continue;
-        }
-        let mut header = entry.header().clone();
-        if header.entry_type().is_dir() {
-            builder
-                .append_data(&mut header, rest, io::empty())
-                .map_err(tar_io)?;
-        } else if header.entry_type().is_symlink() || header.entry_type().is_hard_link() {
-            let mut link = entry
-                .link_name()
-                .map_err(tar_io)?
-                .map(Cow::into_owned)
-                .unwrap_or_default();
-            // Hard-link targets are archive-root paths; symlink targets
-            // remain relative to the symlink itself.
-            if header.entry_type().is_hard_link() {
-                let mut components = link.components();
-                components.next();
-                link = components.as_path().to_path_buf();
-            }
-            builder
-                .append_link(&mut header, rest, link)
-                .map_err(tar_io)?;
-        } else {
-            builder
-                .append_data(&mut header, rest, &mut entry)
-                .map_err(tar_io)?;
-        }
-    }
-    builder.into_inner().map_err(tar_io)
 }
 
 fn one_shot_filter(sandbox_id: &str) -> ListContainersOptions<String> {
@@ -500,78 +455,9 @@ impl OneShot for DockerOneShot {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use tokio::net::TcpListener;
 
     use super::*;
-
-    #[test]
-    fn the_build_context_is_re_rooted() {
-        let mut builder = tar::Builder::new(Vec::new());
-        let mut dir = tar::Header::new_gnu();
-        dir.set_entry_type(tar::EntryType::Directory);
-        dir.set_size(0);
-        dir.set_mode(0o755);
-        builder
-            .append_data(&mut dir, "action/", io::empty())
-            .expect("dir");
-        let mut file = tar::Header::new_gnu();
-        file.set_size(4);
-        file.set_mode(0o644);
-        builder
-            .append_data(&mut file, "action/Dockerfile", Cursor::new(b"FROM"))
-            .expect("file");
-        let archive = builder.into_inner().expect("tar");
-        let rerooted = strip_leading_component(&archive).expect("re-root");
-        let mut archive = tar::Archive::new(Cursor::new(rerooted));
-        let paths: Vec<String> = archive
-            .entries()
-            .expect("entries")
-            .map(|entry| {
-                entry
-                    .expect("entry")
-                    .path()
-                    .expect("path")
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect();
-        assert_eq!(paths, ["Dockerfile"]);
-    }
-
-    #[test]
-    fn build_context_links_keep_their_targets_after_re_rooting() {
-        let mut builder = tar::Builder::new(Vec::new());
-        let mut file = tar::Header::new_gnu();
-        file.set_size(4);
-        file.set_mode(0o644);
-        builder
-            .append_data(&mut file, "action/source", Cursor::new(b"data"))
-            .expect("file");
-        for (kind, path, target) in [
-            (tar::EntryType::Link, "action/hard", "action/source"),
-            (tar::EntryType::Symlink, "action/sub/soft", "../source"),
-        ] {
-            let mut header = tar::Header::new_gnu();
-            header.set_entry_type(kind);
-            header.set_size(0);
-            header.set_mode(0o777);
-            builder
-                .append_link(&mut header, path, target)
-                .expect("link");
-        }
-        let original = builder.into_inner().expect("archive");
-        let rewritten = strip_leading_component(&original).expect("re-root");
-        let mut archive = tar::Archive::new(rewritten.as_slice());
-        let links: Vec<_> = archive
-            .entries()
-            .expect("entries")
-            .map(|entry| entry.expect("entry"))
-            .filter_map(|entry| entry.link_name().expect("link name").map(Cow::into_owned))
-            .collect();
-        assert_eq!(links, [PathBuf::from("source"), PathBuf::from("../source")]);
-    }
 
     #[tokio::test]
     async fn cancelled_one_shots_do_not_prepare_an_image() {

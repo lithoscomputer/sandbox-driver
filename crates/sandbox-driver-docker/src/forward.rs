@@ -30,7 +30,8 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
-use crate::exec::{DockerExec, POSIX_SH, docker_kind};
+use crate::daemon::{POSIX_SH, docker_kind};
+use crate::exec::DockerExec;
 
 /// After the client has closed its side, how long the container side may
 /// still send (a response to a request the client half-closed after).
