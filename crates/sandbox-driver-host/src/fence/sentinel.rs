@@ -15,14 +15,15 @@ use std::{fs as sync_fs, io, slice};
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
-use sandbox_driver::{Error, ProviderError, ProviderKind, Result};
+use sandbox_driver::{Error, ExecResult, ProviderError, Result, Termination};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::runtime::Handle;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::spawn_blocking;
 use tokio::{fs, time};
 
-use crate::observation::group_is_live;
+use super::observation::group_is_live;
+use crate::host_kind;
 
 const POLL: Duration = Duration::from_millis(25);
 const DRAIN: Duration = Duration::from_secs(5);
@@ -182,11 +183,9 @@ impl ProcessGroups {
     ) -> Result<HostChild> {
         let mut state = self.state.lock().await;
         if !state.running {
-            return Err(ProviderError::new(
-                ProviderKind::try_new("host").expect("static kind"),
-                "cannot execute in a stopped sandbox",
-            )
-            .into());
+            return Err(
+                ProviderError::new(host_kind(), "cannot execute in a stopped sandbox").into(),
+            );
         }
         if state.generation.is_none() {
             let directory = self.root.join(fresh_id());
@@ -408,7 +407,7 @@ impl Drop for ProcessGroups {
 
 fn fence_leaked(pgids: &[i32]) -> Error {
     let mut error = ProviderError::new(
-        ProviderKind::try_new("host").expect("static kind"),
+        host_kind(),
         format!("process groups {pgids:?} did not drain; no signal was sent to saved ids"),
     );
     error.code = Some("fence_leaked".to_owned());
@@ -428,12 +427,29 @@ pub(crate) struct HostChild {
 }
 
 impl HostChild {
-    pub(crate) fn signal(&self, signal: Signal) {
-        let _ = self.group.signal(signal);
+    /// SIGTERMs the process group, once, and returns: the
+    /// [`sandbox_driver::ExecControls::term`] path. Whether the command
+    /// ends is the command's business; the caller escalates to `kill` if
+    /// it must.
+    pub(crate) fn term(&self) {
+        let _ = self.group.signal(Signal::SIGTERM);
     }
 
-    pub(crate) async fn kill(&mut self) -> io::Result<()> {
-        kill_owned_groups(slice::from_ref(&self.group)).await
+    /// SIGKILLs the process group and waits for the group to settle: the
+    /// [`sandbox_driver::ExecControls::kill`] path, the timeout, and a
+    /// failing sink. The sentinel stays pinned; only stop reaps it.
+    pub(crate) async fn kill(&mut self) {
+        let _ = kill_owned_groups(slice::from_ref(&self.group)).await;
+    }
+
+    /// Sends SIGTERM to the process group, waits `grace` for a graceful
+    /// exit, then SIGKILLs the group: the stdio handle's `terminate`.
+    pub(crate) async fn terminate(&mut self, grace: Duration) {
+        self.term();
+        if time::timeout(grace, self.wait()).await.is_ok() {
+            return;
+        }
+        self.kill().await;
     }
 
     pub(crate) async fn wait(&mut self) -> io::Result<ExitStatus> {
@@ -472,5 +488,115 @@ impl HostChild {
             .parse::<u8>()
             .ok()?;
         Some(ExitStatus::from_raw(i32::from(code) << 8))
+    }
+}
+
+/// The exec result for a status the sentinel reported. The sentinel echoes
+/// its workload's shell status, so a signal death arrives as `128 + N` and
+/// is decoded by [`ExecResult::from_shell_status`]; a signal that ended the
+/// sentinel itself takes precedence.
+pub(crate) fn exec_result(
+    termination: Termination,
+    status: ExitStatus,
+    duration: Duration,
+) -> ExecResult {
+    let mut result = ExecResult::from_shell_status(termination, status.code(), duration);
+    result.signal = status.signal().or(result.signal);
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::env;
+
+    use sandbox_driver::{Exec, ExecSpec, SandboxProvider, SandboxSource, SandboxSpec, SpawnSpec};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    use super::*;
+    use crate::{HostExec, HostProvider, registry};
+
+    async fn wait_for_group_exit(pgid: i32) {
+        time::timeout(Duration::from_secs(3), async {
+            while spawn_blocking(move || group_is_live(pgid))
+                .await
+                .expect("observe process group")
+            {
+                time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the final temporary owner releases its sentinel");
+    }
+
+    #[tokio::test]
+    async fn standalone_exec_releases_completed_process_groups_on_drop() {
+        let exec = HostExec::new(env::temp_dir(), BTreeMap::new(), false);
+        let result = exec.run(&ExecSpec::bash("echo $PPID")).await.unwrap();
+        let pgid = result.stdout_lossy().trim().parse().unwrap();
+        drop(exec);
+        wait_for_group_exit(pgid).await;
+    }
+
+    #[tokio::test]
+    async fn standalone_stdio_owns_its_process_after_the_executor_drops() {
+        let exec = HostExec::new(env::temp_dir(), BTreeMap::new(), false);
+        let mut process = exec
+            .spawn_stdio(&SpawnSpec::new("sh").args(["-c", "echo $PPID; exec cat"]))
+            .await
+            .unwrap();
+        drop(exec);
+        let mut output = BufReader::new(process.stdout);
+        let mut line = String::new();
+        output.read_line(&mut line).await.unwrap();
+        let pgid = line.trim().parse().unwrap();
+        process.stdin.write_all(b"still alive\n").await.unwrap();
+        line.clear();
+        time::timeout(Duration::from_secs(3), output.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(line, "still alive\n");
+        process.handle.terminate().await;
+        wait_for_group_exit(pgid).await;
+    }
+
+    #[tokio::test]
+    async fn only_durable_providers_keep_groups_after_the_last_handle_drops() {
+        for durable in [false, true] {
+            let root = env::temp_dir().join(registry::fresh_id());
+            let provider = if durable {
+                HostProvider::with_registry(&root).await.unwrap()
+            } else {
+                HostProvider::new()
+            };
+            let sandbox = provider
+                .create(&SandboxSpec::new(SandboxSource::HostDirectory), None)
+                .await
+                .unwrap();
+            let id = sandbox.id().clone();
+            let workspace = sandbox.working_directory().to_owned();
+            let result = sandbox
+                .exec()
+                .run(&ExecSpec::bash("echo $PPID"))
+                .await
+                .unwrap();
+            let pgid = result.stdout_lossy().trim().parse().unwrap();
+            drop(sandbox);
+            drop(provider);
+            if durable {
+                assert!(spawn_blocking(move || group_is_live(pgid)).await.unwrap());
+                HostProvider::with_registry(&root)
+                    .await
+                    .unwrap()
+                    .delete(&id, None)
+                    .await
+                    .unwrap();
+                fs::remove_dir_all(root).await.unwrap();
+            } else {
+                fs::remove_dir_all(workspace).await.unwrap();
+            }
+            wait_for_group_exit(pgid).await;
+        }
     }
 }

@@ -1,33 +1,24 @@
 use std::collections::BTreeMap;
-#[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::process::Stdio;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::{env, future, io};
 
 use async_trait::async_trait;
-#[cfg(unix)]
-use nix::sys::signal::Signal;
 use sandbox_driver::{
     Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputCaptureBuffer,
     OutputSanitization, OutputSanitizer, OutputSink, OutputStream, Result, SpawnSpec, StderrTail,
     StdioProcess, StdioProcessHandle, Termination, feed_stdin, run_with_stop_grace, stop_signal,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-use tokio::process::Child as HostChild;
 use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::{fs, time};
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::fence::{HostChild, ProcessGroups};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::fence::{HostChild, ProcessGroups, exec_result};
 use crate::registry;
 
 /// Bash sources this file at startup. Dropped from the inherited
@@ -115,7 +106,6 @@ pub(crate) fn effective_env(base_env: &BTreeMap<String, String>) -> BTreeMap<Str
 /// process ends. Process-record removal is best effort while Tokio is
 /// available.
 pub struct HostExec {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     groups:                     Arc<ProcessGroups>,
     working_dir:                PathBuf,
     base_env:                   BTreeMap<String, String>,
@@ -138,7 +128,6 @@ impl HostExec {
             working_dir,
             base_env,
             recreate_missing_workspace,
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Arc::new(ProcessGroups::new(
                 env::temp_dir()
                     .join("sandbox-driver-host-groups")
@@ -153,10 +142,9 @@ impl HostExec {
         working_dir: PathBuf,
         base_env: BTreeMap<String, String>,
         recreate_missing_workspace: bool,
-        #[cfg(any(target_os = "linux", target_os = "macos"))] groups: Arc<ProcessGroups>,
+        groups: Arc<ProcessGroups>,
     ) -> Self {
         Self {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
             groups,
             working_dir,
             base_env,
@@ -208,80 +196,8 @@ impl HostExec {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
         };
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            self.groups.spawn(program, args, configure).await
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            let mut command = Command::new(program);
-            command.args(args);
-            configure(&mut command);
-            #[cfg(unix)]
-            command.process_group(0);
-            command.kill_on_drop(true);
-            command
-                .spawn()
-                .map_err(|error| Error::io("spawning host command", error))
-        }
+        self.groups.spawn(program, args, configure).await
     }
-}
-
-#[cfg(unix)]
-fn signal_process_group(child: &HostChild, signal: Signal) {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    child.signal(signal);
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    if let Some(pid) = child.id() {
-        use nix::sys::signal::killpg;
-        use nix::unistd::Pid;
-        // A pid that does not fit i32 must skip the kill entirely: a
-        // zero pgid would signal the caller's own process group.
-        let Ok(pid) = i32::try_from(pid) else {
-            return;
-        };
-        let _ = killpg(Pid::from_raw(pid), signal);
-    }
-}
-
-/// Sends SIGTERM to the process group, waits `grace` for a graceful exit,
-/// then SIGKILLs the group and the child directly: the stdio handle's
-/// `terminate`.
-///
-/// The direct kill is the guarantee: a command that moved itself out of
-/// its process group makes the group signals miss entirely (killpg on
-/// an empty group is ESRCH), and the callers' subsequent `wait()` would
-/// hang forever. SIGKILL to the immediate child always lands, and
-/// `kill()` reaps it, so a completed terminate means a returned wait.
-async fn terminate_process_group(child: &mut HostChild, grace: Duration) {
-    #[cfg(unix)]
-    {
-        signal_process_group(child, Signal::SIGTERM);
-        if time::timeout(grace, child.wait()).await.is_ok() {
-            return;
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = grace;
-    kill_process_group(child).await;
-}
-
-/// SIGTERMs the process group, once, and returns: the
-/// [`ExecControls::term`] path. Whether the command ends is the
-/// command's business; the caller escalates to `kill` if it must.
-fn term_process_group(child: &HostChild) {
-    #[cfg(unix)]
-    signal_process_group(child, Signal::SIGTERM);
-    #[cfg(not(unix))]
-    let _ = child;
-}
-
-/// SIGKILLs the process group and the child directly: the
-/// [`ExecControls::kill`] path, the timeout, and a failing sink.
-async fn kill_process_group(child: &mut HostChild) {
-    #[cfg(unix)]
-    signal_process_group(child, Signal::SIGKILL);
-    let _ = child.kill().await;
 }
 
 enum PumpError {
@@ -461,7 +377,7 @@ impl HostExec {
                                 read_error = Some(error);
                             }
                             drain_truncated = true;
-                            kill_process_group(&mut child).await;
+                            child.kill().await;
                             break (Termination::Cancelled, None);
                         }
                     }
@@ -478,14 +394,14 @@ impl HostExec {
                     }
                     () = &mut termed, if !term_fired => {
                         term_fired = true;
-                        term_process_group(&child);
+                        child.term();
                     }
                     () = &mut killed => {
-                        kill_process_group(&mut child).await;
+                        child.kill().await;
                         break (Termination::Killed, None);
                     }
                     () = &mut timeout => {
-                        kill_process_group(&mut child).await;
+                        child.kill().await;
                         break (Termination::TimedOut, None);
                     }
                 }
@@ -515,16 +431,16 @@ impl HostExec {
                     tokio::select! {
                         biased;
                         () = &mut killed => {
-                            kill_process_group(&mut child).await;
+                            child.kill().await;
                             termination = Termination::Killed;
                         }
                         () = &mut timeout => {
-                            kill_process_group(&mut child).await;
+                            child.kill().await;
                             termination = Termination::TimedOut;
                         }
                         () = &mut termed, if !term_fired => {
                             term_fired = true;
-                            term_process_group(&child);
+                            child.term();
                             termination = Termination::Cancelled;
                         }
                         outcome = &mut pumps => {
@@ -532,7 +448,7 @@ impl HostExec {
                                 if let PumpError::Read(error) = error {
                                     read_error = Some(error);
                                 }
-                                kill_process_group(&mut child).await;
+                                child.kill().await;
                                 termination = Termination::Cancelled;
                                 drain_truncated = true;
                             }
@@ -575,23 +491,13 @@ impl HostExec {
         if let Some(error) = read_error {
             return Err(Error::io("reading exec output", error));
         }
-        let exit_code = status.code();
-        #[cfg(unix)]
-        let exit_signal = ExitStatusExt::signal(&status);
-        #[cfg(not(unix))]
-        let exit_signal: Option<i32> = None;
-
         let (stdout_bytes, mut stdout_stats) = stdout_capture.into_parts();
         let (stderr_bytes, mut stderr_stats) = stderr_capture.into_parts();
         if drain_truncated {
             stdout_stats.truncated = true;
             stderr_stats.truncated = true;
         }
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let mut result = ExecResult::from_shell_status(termination, exit_code, started.elapsed());
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let mut result = ExecResult::new(termination, exit_code, started.elapsed());
-        result.signal = exit_signal.or(result.signal);
+        let mut result = exec_result(termination, status, started.elapsed());
         result.stdout = stdout_bytes;
         result.stderr = stderr_bytes;
 
@@ -682,7 +588,7 @@ impl HostStdioHandle {
                         future::pending::<()>().await;
                     }
                 } => {
-                    terminate_process_group(&mut child, TERM_GRACE).await;
+                    child.terminate(TERM_GRACE).await;
                     let code = match child.wait().await {
                         Ok(status) => status.code(),
                         Err(error) => {
@@ -739,30 +645,11 @@ impl StdioProcessHandle for HostStdioHandle {
     }
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
-    use sandbox_driver::{SandboxProvider, SandboxSource, SandboxSpec};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::task::spawn_blocking;
-
     use super::*;
-    use crate::HostProvider;
-    use crate::observation::group_is_live;
-
-    async fn wait_for_group_exit(pgid: i32) {
-        time::timeout(Duration::from_secs(3), async {
-            while spawn_blocking(move || group_is_live(pgid))
-                .await
-                .expect("observe process group")
-            {
-                time::sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("the final temporary owner releases its sentinel");
-    }
 
     fn expected_seq(count: usize) -> Vec<u8> {
         let mut lines = String::new();
@@ -821,76 +708,5 @@ mod tests {
         assert!(streaming.stdout_capture.truncated);
         assert!(started.elapsed() < Duration::from_secs(5));
         drop(exec);
-    }
-
-    #[tokio::test]
-    async fn standalone_exec_releases_completed_process_groups_on_drop() {
-        let exec = HostExec::new(env::temp_dir(), BTreeMap::new(), false);
-        let result = exec.run(&ExecSpec::bash("echo $PPID")).await.unwrap();
-        let pgid = result.stdout_lossy().trim().parse().unwrap();
-        drop(exec);
-        wait_for_group_exit(pgid).await;
-    }
-
-    #[tokio::test]
-    async fn standalone_stdio_owns_its_process_after_the_executor_drops() {
-        let exec = HostExec::new(env::temp_dir(), BTreeMap::new(), false);
-        let mut process = exec
-            .spawn_stdio(&SpawnSpec::new("sh").args(["-c", "echo $PPID; exec cat"]))
-            .await
-            .unwrap();
-        drop(exec);
-        let mut output = BufReader::new(process.stdout);
-        let mut line = String::new();
-        output.read_line(&mut line).await.unwrap();
-        let pgid = line.trim().parse().unwrap();
-        process.stdin.write_all(b"still alive\n").await.unwrap();
-        line.clear();
-        time::timeout(Duration::from_secs(3), output.read_line(&mut line))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(line, "still alive\n");
-        process.handle.terminate().await;
-        wait_for_group_exit(pgid).await;
-    }
-
-    #[tokio::test]
-    async fn only_durable_providers_keep_groups_after_the_last_handle_drops() {
-        for durable in [false, true] {
-            let root = env::temp_dir().join(registry::fresh_id());
-            let provider = if durable {
-                HostProvider::with_registry(&root).await.unwrap()
-            } else {
-                HostProvider::new()
-            };
-            let sandbox = provider
-                .create(&SandboxSpec::new(SandboxSource::HostDirectory), None)
-                .await
-                .unwrap();
-            let id = sandbox.id().clone();
-            let workspace = sandbox.working_directory().to_owned();
-            let result = sandbox
-                .exec()
-                .run(&ExecSpec::bash("echo $PPID"))
-                .await
-                .unwrap();
-            let pgid = result.stdout_lossy().trim().parse().unwrap();
-            drop(sandbox);
-            drop(provider);
-            if durable {
-                assert!(spawn_blocking(move || group_is_live(pgid)).await.unwrap());
-                HostProvider::with_registry(&root)
-                    .await
-                    .unwrap()
-                    .delete(&id, None)
-                    .await
-                    .unwrap();
-                fs::remove_dir_all(root).await.unwrap();
-            } else {
-                fs::remove_dir_all(workspace).await.unwrap();
-            }
-            wait_for_group_exit(pgid).await;
-        }
     }
 }
