@@ -76,7 +76,7 @@ pub(super) async fn dispatch(
             state.own(async move {
                 // Anything but an input frame — the host's eof, a closed
                 // connection, a stray kind — ends the process's stdin.
-                while let Ok(Some((FrameKind::Stdin, payload))) = reader.read().await {
+                while let Some(payload) = reader.next_stdin().await {
                     if stdin.write_all(&payload).await.is_err() {
                         break;
                     }
@@ -150,7 +150,7 @@ pub(super) async fn dispatch(
             let Channel { mut reader, writer } = channel;
             let input_pty = Arc::clone(&pty);
             state.own(async move {
-                while let Ok(Some((FrameKind::Stdin, payload))) = reader.read().await {
+                while let Some(payload) = reader.next_stdin().await {
                     if input_pty.write_input(&payload).await.is_err() {
                         break;
                     }

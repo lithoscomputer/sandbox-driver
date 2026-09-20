@@ -4,17 +4,16 @@
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use sandbox_driver::{
     DirEntry, Error, FileMetadata, Filesystem, Result, SandboxId, TransportError,
 };
+use tokio::fs as tokio_fs;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::{fs as tokio_fs, time};
 
 use super::Client;
-use crate::channel::{Channel, FrameKind};
+use crate::channel::{self, Channel, FrameKind, WriteStall};
 use crate::methods as m;
 
 pub(super) struct SandboxFs {
@@ -38,35 +37,22 @@ impl SandboxFs {
         output: &mut (dyn AsyncWrite + Unpin + Send),
     ) -> Result<()> {
         let (channel, receiver) = self.client.listener.expect()?;
-        let accepted = Arc::new(AtomicBool::new(false));
-        let collect_accepted = Arc::clone(&accepted);
-        let collect = async move {
-            let Channel { mut reader, .. } = receiver.accept().await?;
-            collect_accepted.store(true, Ordering::SeqCst);
+        let collect = |Channel { mut reader, .. }: Channel| async move {
             loop {
                 match reader.read().await? {
                     Some((FrameKind::Stdout, payload)) => {
-                        let mut bytes = payload.as_slice();
-                        while !bytes.is_empty() {
-                            let written = time::timeout(
-                                self.client.limits.output_progress_timeout,
-                                output.write(bytes),
-                            )
-                            .await
-                            .map_err(|_| {
-                                Error::Transport(TransportError::new(
-                                    "file output made no progress",
-                                ))
-                            })?
-                            .map_err(|error| Error::io("writing downloaded file", error))?;
-                            if written == 0 {
-                                return Err(Error::io(
-                                    "writing downloaded file",
-                                    io::ErrorKind::WriteZero.into(),
-                                ));
-                            }
-                            bytes = &bytes[written..];
-                        }
+                        channel::write_with_progress(
+                            output,
+                            &payload,
+                            self.client.limits.output_progress_timeout,
+                        )
+                        .await
+                        .map_err(|stall| match stall {
+                            WriteStall::Timeout => Error::Transport(TransportError::new(
+                                "file output made no progress",
+                            )),
+                            WriteStall::Io(error) => Error::io("writing downloaded file", error),
+                        })?;
                     }
                     Some((FrameKind::Eof, _)) | None => return Ok(()),
                     Some(_) => {
@@ -86,11 +72,11 @@ impl SandboxFs {
             length,
         };
         self.client
-            .pump(
-                self.client.call::<_, m::Empty>(m::FS_READ, &params),
-                collect,
-                &accepted,
+            .call_with_channel(
                 m::FS_READ,
+                self.client.call::<_, m::Empty>(m::FS_READ, &params),
+                receiver,
+                collect,
             )
             .await?;
         Ok(())
@@ -104,11 +90,7 @@ impl SandboxFs {
         append: bool,
     ) -> Result<()> {
         let (channel, receiver) = self.client.listener.expect()?;
-        let accepted = Arc::new(AtomicBool::new(false));
-        let send_accepted = Arc::clone(&accepted);
-        let send = async move {
-            let Channel { mut writer, .. } = receiver.accept().await?;
-            send_accepted.store(true, Ordering::SeqCst);
+        let send = |Channel { mut writer, .. }: Channel| async move {
             let mut input = input.take(length);
             let mut buffer = vec![0; 64 * 1024];
             loop {
@@ -140,11 +122,11 @@ impl SandboxFs {
             content_length: Some(length),
         };
         self.client
-            .pump(
-                self.client.call::<_, m::Empty>(m::FS_WRITE, &params),
-                send,
-                &accepted,
+            .call_with_channel(
                 m::FS_WRITE,
+                self.client.call::<_, m::Empty>(m::FS_WRITE, &params),
+                receiver,
+                send,
             )
             .await?;
         Ok(())

@@ -21,6 +21,7 @@ use super::Client;
 use super::sandbox::SandboxHandle;
 use super::streams::follow_log_stream;
 use crate::channel::{ChannelListener, TrustedPeer};
+use crate::wire::is_method_not_found;
 use crate::{TransportDiagnostics, TransportLimits, methods as m};
 
 /// A provider served by a JSON-RPC plugin over a byte stream.
@@ -251,34 +252,35 @@ impl PluginProvider {
         outcome
     }
 
+    /// Attaches to or restores an existing sandbox by id: the two calls
+    /// differ only in their method.
+    async fn open_handle(
+        &self,
+        method: &str,
+        id: &SandboxId,
+        events: Option<EventContext>,
+    ) -> Result<Arc<dyn Sandbox>> {
+        let event_request = self.client.register_events(events.as_ref());
+        let outcome: Result<m::HandleInfo> = self
+            .client
+            .call(method, &m::AttachParams {
+                sandbox_id: id.as_str().to_owned(),
+                events:     event_request.clone(),
+            })
+            .await;
+        Ok(self.wrap_handle(outcome?, events))
+    }
+
     fn wrap_handle(
         &self,
         mut info: m::HandleInfo,
         events: Option<EventContext>,
     ) -> Arc<dyn Sandbox> {
         mask_wire_capabilities(&mut info.capabilities);
-        let id = info.status.id.clone();
         if let Some(context) = &events {
-            let mut contexts = self
-                .client
-                .event_contexts
-                .lock()
-                .expect("event contexts lock");
-            if contexts.len() >= self.client.limits.cached_handles {
-                if let Some(old) = contexts.keys().next().cloned() {
-                    contexts.remove(&old);
-                }
-            }
-            contexts.insert(id.as_str().to_owned(), context.clone());
+            self.client.remember_event_context(&info.status.id, context);
         }
-        Arc::new(SandboxHandle::new(
-            Arc::clone(&self.client),
-            id,
-            info.capabilities,
-            info.working_directory,
-            info.runtime_directory,
-            events,
-        ))
+        Arc::new(SandboxHandle::new(Arc::clone(&self.client), info, events))
     }
 }
 
@@ -313,15 +315,7 @@ impl sandbox_driver::SandboxProvider for PluginProvider {
         id: &SandboxId,
         events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
-        let event_request = self.client.register_events(events.as_ref());
-        let outcome: Result<m::HandleInfo> = self
-            .client
-            .call(m::SANDBOX_ATTACH, &m::AttachParams {
-                sandbox_id: id.as_str().to_owned(),
-                events:     event_request.clone(),
-            })
-            .await;
-        Ok(self.wrap_handle(outcome?, events))
+        self.open_handle(m::SANDBOX_ATTACH, id, events).await
     }
 
     async fn undelete(
@@ -329,15 +323,7 @@ impl sandbox_driver::SandboxProvider for PluginProvider {
         id: &SandboxId,
         events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
-        let event_request = self.client.register_events(events.as_ref());
-        let outcome: Result<m::HandleInfo> = self
-            .client
-            .call(m::SANDBOX_UNDELETE, &m::AttachParams {
-                sandbox_id: id.as_str().to_owned(),
-                events:     event_request.clone(),
-            })
-            .await;
-        Ok(self.wrap_handle(outcome?, events))
+        self.open_handle(m::SANDBOX_UNDELETE, id, events).await
     }
 
     async fn delete(&self, id: &SandboxId, events: Option<EventContext>) -> Result<()> {
@@ -371,7 +357,7 @@ impl sandbox_driver::SandboxProvider for PluginProvider {
             Ok(result) => Ok(result.health),
             // A plugin without provider/health answers -32601; that is
             // "no health check", not a failed one.
-            Err(Error::Provider(provider)) if provider.code.as_deref() == Some("-32601") => {
+            Err(error) if is_method_not_found(&error) => {
                 Ok(ProviderHealth::new(HealthStatus::Unknown))
             }
             Err(error) => Err(error),
@@ -394,6 +380,27 @@ impl sandbox_driver::SandboxProvider for PluginProvider {
 /// Snapshot service backed by the plugin.
 pub(super) struct ProviderSnapshots {
     client: Arc<Client>,
+}
+
+impl ProviderSnapshots {
+    /// A snapshot action that carries only the id and an event route.
+    async fn with_events(
+        &self,
+        method: &str,
+        id: &SnapshotId,
+        events: Option<EventContext>,
+    ) -> Result<()> {
+        let event_request = self.client.register_events(events.as_ref());
+        let outcome: Result<m::Empty> = self
+            .client
+            .call(method, &m::SnapshotIdParams {
+                snapshot_id: id.as_str().to_owned(),
+                events:      event_request.clone(),
+            })
+            .await;
+        outcome?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -438,16 +445,7 @@ impl SnapshotProvider for ProviderSnapshots {
     }
 
     async fn delete(&self, id: &SnapshotId, events: Option<EventContext>) -> Result<()> {
-        let event_request = self.client.register_events(events.as_ref());
-        let outcome: Result<m::Empty> = self
-            .client
-            .call(m::SNAPSHOT_DELETE, &m::SnapshotIdParams {
-                snapshot_id: id.as_str().to_owned(),
-                events:      event_request.clone(),
-            })
-            .await;
-        outcome?;
-        Ok(())
+        self.with_events(m::SNAPSHOT_DELETE, id, events).await
     }
 
     async fn build_logs(&self, id: &SnapshotId, follow: bool, sink: LogSink) -> Result<()> {
@@ -470,29 +468,11 @@ impl SnapshotProvider for ProviderSnapshots {
     }
 
     async fn activate(&self, id: &SnapshotId, events: Option<EventContext>) -> Result<()> {
-        let event_request = self.client.register_events(events.as_ref());
-        let outcome: Result<m::Empty> = self
-            .client
-            .call(m::SNAPSHOT_ACTIVATE, &m::SnapshotIdParams {
-                snapshot_id: id.as_str().to_owned(),
-                events:      event_request.clone(),
-            })
-            .await;
-        outcome?;
-        Ok(())
+        self.with_events(m::SNAPSHOT_ACTIVATE, id, events).await
     }
 
     async fn deactivate(&self, id: &SnapshotId, events: Option<EventContext>) -> Result<()> {
-        let event_request = self.client.register_events(events.as_ref());
-        let outcome: Result<m::Empty> = self
-            .client
-            .call(m::SNAPSHOT_DEACTIVATE, &m::SnapshotIdParams {
-                snapshot_id: id.as_str().to_owned(),
-                events:      event_request.clone(),
-            })
-            .await;
-        outcome?;
-        Ok(())
+        self.with_events(m::SNAPSHOT_DEACTIVATE, id, events).await
     }
 }
 

@@ -1,7 +1,6 @@
 //! Streaming exec, one-shot runs, and stdio processes: the operations
 //! whose bytes ride an exec-style data channel.
 
-use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -21,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
 use super::Client;
-use crate::channel::{Channel, ChannelReceiver, FrameKind, FrameWriter};
+use crate::channel::{self, Channel, ChannelReceiver, FrameKind, FrameWriter, WriteStall};
 use crate::methods as m;
 
 /// What an exec pump collected while the command ran.
@@ -33,24 +32,41 @@ struct PumpedOutput {
     sink_error: Option<Error>,
 }
 
+/// What the plugin has confirmed about an exec, read when a hard cancel
+/// abandons the operation before its result arrives.
+#[derive(Default)]
+pub(super) struct ExecProgress {
+    /// The plugin answered the kill request.
+    pub(super) stop_acknowledged:     AtomicBool,
+    /// The plugin's result said the command exited or was killed.
+    pub(super) termination_confirmed: AtomicBool,
+}
+
+impl ExecProgress {
+    fn incomplete(&self, operation: &'static str) -> IncompleteOperation {
+        let mut outcome = IncompleteOperation::new(operation);
+        outcome.stop_acknowledged = self.stop_acknowledged.load(Ordering::SeqCst);
+        outcome.termination_confirmed = self.termination_confirmed.load(Ordering::SeqCst);
+        outcome
+    }
+}
+
 /// Pumps one exec's channel: output frames go to the capture buffers and
 /// the caller's sink, stdin bytes go out as frames. Ends when the plugin
 /// sends its `Eof`.
 async fn pump_exec_channel(
-    client: Arc<Client>,
-    exec_id: String,
-    receiver: ChannelReceiver,
-    accepted: Arc<AtomicBool>,
+    client: &Arc<Client>,
+    exec_id: &str,
+    channel: Channel,
     stdin: Option<StdinReader>,
-    controls: ExecControls,
-    acknowledged: Arc<AtomicBool>,
+    controls: &ExecControls,
+    progress: &Arc<ExecProgress>,
 ) -> Result<PumpedOutput> {
-    let Channel { mut reader, writer } = receiver.accept().await?;
-    accepted.store(true, Ordering::SeqCst);
+    let Channel { mut reader, writer } = channel;
     // The server registers stop tokens before opening this channel. Waiting
     // for acceptance prevents an already-cancelled token overtaking exec.
     let _stop_task = client
-        .forward_stops(&exec_id, &controls, acknowledged)
+        .forward_stops(exec_id, controls, Arc::clone(progress))
         .map(AbortOnDropHandle::new);
     let input_error = Arc::new(Mutex::new(None));
     let _stdin_task = stdin.map(|reader| {
@@ -177,24 +193,14 @@ pub(super) async fn run_channel_exec<P: Serialize>(
         kill.cancelled().await;
         time::sleep(client.limits.hard_cancel_drain_timeout).await;
     };
-    let accepted = Arc::new(AtomicBool::new(false));
-    let acknowledged = Arc::new(AtomicBool::new(false));
-    let terminated = AtomicBool::new(false);
-    let pump = pump_exec_channel(
-        Arc::clone(client),
-        exec_id.to_owned(),
-        receiver,
-        Arc::clone(&accepted),
-        stdin,
-        controls.clone(),
-        Arc::clone(&acknowledged),
-    );
-    let execution = client.pump(
+    let progress = Arc::new(ExecProgress::default());
+    let execution = client.call_with_channel(
+        method,
         async {
             let result = client
                 .call::<_, m::ExecStreamResult>(method, params)
                 .await?;
-            terminated.store(
+            progress.termination_confirmed.store(
                 matches!(
                     result.result.termination,
                     Termination::Exited | Termination::Killed
@@ -203,17 +209,13 @@ pub(super) async fn run_channel_exec<P: Serialize>(
             );
             Ok(result)
         },
-        pump,
-        &accepted,
-        method,
+        receiver,
+        |channel| pump_exec_channel(client, exec_id, channel, stdin, &controls, &progress),
     );
     let (result, pumped) = tokio::select! {
         result = execution => result?,
         () = drain_deadline => {
-            let mut outcome = IncompleteOperation::new("hard cancellation drain");
-            outcome.stop_acknowledged = acknowledged.load(Ordering::SeqCst);
-            outcome.termination_confirmed = terminated.load(Ordering::SeqCst);
-            return Err(Error::Incomplete(outcome));
+            return Err(Error::Incomplete(progress.incomplete("hard cancellation drain")));
         },
     };
     let (stdout, mut stdout_stats) = pumped.stdout.into_parts();
@@ -308,27 +310,18 @@ impl Exec for SandboxExec {
                 loop {
                     match reader.read().await? {
                         Some((FrameKind::Stdout, payload)) => {
-                            let mut bytes = payload.as_slice();
-                            while !bytes.is_empty() {
-                                let count = time::timeout(
-                                    output_client.limits.output_progress_timeout,
-                                    stdout_writer.write(bytes),
-                                )
-                                .await
-                                .map_err(|_| {
-                                    Error::Incomplete(IncompleteOperation::new(
-                                        "stdio output progress",
-                                    ))
-                                })?
-                                .map_err(|error| Error::io("writing stdio output", error))?;
-                                if count == 0 {
-                                    return Err(Error::io(
-                                        "writing stdio output",
-                                        io::ErrorKind::WriteZero.into(),
-                                    ));
-                                }
-                                bytes = &bytes[count..];
-                            }
+                            channel::write_with_progress(
+                                &mut stdout_writer,
+                                &payload,
+                                output_client.limits.output_progress_timeout,
+                            )
+                            .await
+                            .map_err(|stall| match stall {
+                                WriteStall::Timeout => Error::Incomplete(IncompleteOperation::new(
+                                    "stdio output progress",
+                                )),
+                                WriteStall::Io(error) => Error::io("writing stdio output", error),
+                            })?;
                         }
                         Some((FrameKind::Stderr, payload)) => output_tail.push(&payload),
                         Some((FrameKind::Eof, _)) | None => return Ok(()),

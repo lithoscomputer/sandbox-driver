@@ -21,6 +21,7 @@ use super::fs::SandboxFs;
 use super::pty::SandboxPty;
 use super::streams::follow_log_stream;
 use crate::methods as m;
+use crate::wire::is_method_not_found;
 
 /// Preview-URL and SSH access backed by the plugin.
 pub(super) struct SandboxAccess {
@@ -65,7 +66,7 @@ impl PreviewUrls for SandboxAccess {
             Ok(_) => Ok(()),
             // A plugin predating the method holds nothing for a preview
             // URL, so there is nothing to release.
-            Err(Error::Provider(provider)) if provider.code.as_deref() == Some("-32601") => Ok(()),
+            Err(error) if is_method_not_found(&error) => Ok(()),
             Err(error) => Err(error),
         }
     }
@@ -142,12 +143,16 @@ pub(super) struct SandboxHandle {
 impl SandboxHandle {
     pub(super) fn new(
         client: Arc<Client>,
-        id: SandboxId,
-        capabilities: Capabilities,
-        working_directory: String,
-        runtime_directory: Option<String>,
+        info: m::HandleInfo,
         events: Option<EventContext>,
     ) -> Self {
+        let m::HandleInfo {
+            status,
+            capabilities,
+            working_directory,
+            runtime_directory,
+        } = info;
+        let id = status.id;
         Self {
             exec: SandboxExec {
                 client:     Arc::clone(&client),
@@ -288,20 +293,12 @@ impl Sandbox for SandboxHandle {
                 options:    options.into(),
             })
             .await?;
-        let id = info.status.id.clone();
         if let Some(context) = &self.events {
-            self.client
-                .event_contexts
-                .lock()
-                .expect("event contexts lock")
-                .insert(id.as_str().to_owned(), context.clone());
+            self.client.remember_event_context(&info.status.id, context);
         }
         Ok(Arc::new(Self::new(
             Arc::clone(&self.client),
-            id,
-            info.capabilities,
-            info.working_directory,
-            info.runtime_directory,
+            info,
             self.events.clone(),
         )))
     }
@@ -475,7 +472,7 @@ impl Git for SandboxGit {
             // A plugin predating `git/clone` served git through exec only;
             // the derived clone is what such a host ran before the method
             // existed, so the fallback changes nothing for it.
-            Err(Error::Provider(provider)) if provider.code.as_deref() == Some("-32601") => {
+            Err(error) if is_method_not_found(&error) => {
                 self.derived().clone_repo(url, target_path, options).await
             }
             Err(error) => Err(error),
