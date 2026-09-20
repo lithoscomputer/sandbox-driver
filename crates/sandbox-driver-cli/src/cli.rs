@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use sandbox_driver::{NetworkPolicy, SandboxKind};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -116,11 +117,30 @@ pub(crate) enum SandboxKindArg {
     VirtualMachine,
 }
 
+impl From<SandboxKindArg> for SandboxKind {
+    fn from(kind: SandboxKindArg) -> Self {
+        match kind {
+            SandboxKindArg::Container => Self::Container,
+            SandboxKindArg::VirtualMachine => Self::VirtualMachine,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum NetworkArg {
     ProviderDefault,
     AllowAll,
     Block,
+}
+
+impl From<NetworkArg> for NetworkPolicy {
+    fn from(network: NetworkArg) -> Self {
+        match network {
+            NetworkArg::ProviderDefault => Self::ProviderDefault,
+            NetworkArg::AllowAll => Self::AllowAll,
+            NetworkArg::Block => Self::Block,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
