@@ -1822,7 +1822,7 @@ impl LoggingProvider {
 
     fn wrap(&self, inner: Arc<dyn Sandbox>) -> Arc<dyn Sandbox> {
         let mut caps = inner.capabilities().clone();
-        caps.logs = self.caps.logs.clone();
+        caps.logs.clone_from(&self.caps.logs);
         Arc::new(LoggingSandbox {
             inner,
             caps,
