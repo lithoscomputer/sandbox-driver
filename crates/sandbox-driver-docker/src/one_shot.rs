@@ -94,21 +94,11 @@ impl DockerOneShot {
         Ok(())
     }
 
-    /// Builds an image from a Dockerfile inside the sandbox's workspace,
-    /// reading the context out through the archive API.
-    async fn build_image(
-        &self,
-        context: &str,
-        dockerfile: Option<&str>,
-        tag: &str,
-        reuse: bool,
-    ) -> Result<()> {
-        if reuse && image_present(&self.container.docker, tag).await? {
-            return Ok(());
-        }
-        let context_path = self.container.resolve(context);
+    /// Reads the build context out of the sandbox through the archive
+    /// API, re-rooted so its contents sit at the top level.
+    async fn download_context(&self, context: &str) -> Result<Vec<u8>> {
         let options = DownloadFromContainerOptions {
-            path: context_path.clone(),
+            path: self.container.resolve(context),
         };
         let mut stream = self
             .container
@@ -119,7 +109,21 @@ impl DockerOneShot {
             let chunk = chunk.map_err(|error| docker_error("reading build context", error))?;
             archive.extend_from_slice(&chunk);
         }
-        let context_tar = reroot(&archive)?;
+        reroot(&archive)
+    }
+
+    /// Builds an image from a Dockerfile inside the sandbox's workspace.
+    async fn build_image(
+        &self,
+        context: &str,
+        dockerfile: Option<&str>,
+        tag: &str,
+        reuse: bool,
+    ) -> Result<()> {
+        if reuse && image_present(&self.container.docker, tag).await? {
+            return Ok(());
+        }
+        let context_tar = self.download_context(context).await?;
         let options = BuildImageOptions {
             dockerfile: dockerfile.unwrap_or("Dockerfile").to_owned(),
             t: tag.to_owned(),
