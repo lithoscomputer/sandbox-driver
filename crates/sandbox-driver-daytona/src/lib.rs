@@ -63,6 +63,8 @@
 mod access;
 mod encoded_exec;
 mod exec;
+#[cfg(test)]
+mod fake_daytona;
 mod fs;
 mod git;
 mod labels;
