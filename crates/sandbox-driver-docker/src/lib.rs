@@ -59,6 +59,7 @@ mod fs;
 mod image;
 mod inspect;
 mod one_shot;
+mod output;
 mod provider;
 mod pty;
 mod sandbox;

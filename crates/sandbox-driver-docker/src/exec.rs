@@ -1,33 +1,26 @@
 use std::collections::BTreeMap;
-use std::pin::pin;
-use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::{future, io, process};
+use std::{io, process};
 
 use async_trait::async_trait;
 use bollard::container::LogOutput;
-use bollard::errors::Error as DockerApiError;
 use bollard::exec::CreateExecOptions;
-use futures_util::{Stream, StreamExt};
+use futures_util::StreamExt;
 use sandbox_driver::{
-    BASH_ENV_VAR, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
-    OutputCaptureBuffer, OutputSanitization, OutputSanitizer, OutputSink, OutputStream, Result,
+    BASH_ENV_VAR, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, Result,
     SpawnSpec, StderrTail, StdioProcess, StdioProcessHandle, Termination, feed_stdin,
-    run_with_stop_grace, stop_signal,
+    run_with_stop_grace,
 };
 use tokio::io::{AsyncWriteExt, duplex};
 use tokio::time;
-use tokio_util::sync::CancellationToken;
 
 use crate::container::{AttachedExec, ContainerRef, exit_code_of};
 use crate::daemon::{POSIX_SH, docker_error, shell_quote};
+use crate::output::{StopMode, StreamOutput, drain_with_stops};
 
 /// `$0` of the wrapper shell, so the user's argv starts at `$1`.
 const WRAPPER_NAME: &str = "sandbox-driver";
-/// Grace period for draining output after a kill request. Must exceed
-/// the watcher's poll interval.
-const KILL_DRAIN_GRACE: Duration = Duration::from_secs(10);
 /// Bound on retrying transient `inspect_exec` failures in stdio `wait`
 /// before giving up with `Termination::Unknown`: an end that was never
 /// observed is reported only when the daemon stays unreachable for the
@@ -40,108 +33,13 @@ const STOP_POLL_SLEEP_SECONDS: &str = "0.1";
 /// exec path has no ladder of its own: its caller escalates.
 const TERM_GRACE: Duration = Duration::from_secs(2);
 
-/// The signal the in-container watcher sends the command's process
-/// group. Rendered into the stop file the watcher polls; a `kill`
+/// The stop file's contents for `mode`; the in-container watcher reads
+/// it and signals the command's process group accordingly. A `kill`
 /// written after a `term` is honoured — the watcher keeps reading.
-#[derive(Clone, Copy, Debug)]
-enum StopMode {
-    /// SIGTERM the process group, once.
-    Term,
-    /// SIGKILL the process group.
-    Kill,
-}
-
-impl StopMode {
-    /// The stop file's contents.
-    fn render(self) -> &'static str {
-        match self {
-            Self::Term => "term",
-            Self::Kill => "kill",
-        }
-    }
-}
-
-/// Captures and sanitizes Docker output while forwarding it to the caller.
-/// Its drain future must be polled alongside stop handling: a blocked sink
-/// must not prevent a command from being killed.
-pub(crate) struct StreamOutput {
-    streams: [(OutputStream, OutputSanitizer, OutputCaptureBuffer); 2],
-}
-
-impl StreamOutput {
-    pub(crate) fn new(policy: OutputSanitization, limit: Option<usize>) -> Self {
-        Self {
-            streams: [OutputStream::Stdout, OutputStream::Stderr].map(|stream| {
-                (
-                    stream,
-                    OutputSanitizer::new(policy),
-                    OutputCaptureBuffer::new(limit),
-                )
-            }),
-        }
-    }
-
-    pub(crate) async fn drain(
-        &mut self,
-        mut output: impl Stream<Item = StdResult<LogOutput, DockerApiError>> + Unpin,
-        sink: Option<&OutputSink>,
-        sink_failed: &CancellationToken,
-    ) -> StdResult<(), DockerApiError> {
-        while let Some(chunk) = output.next().await {
-            let (index, bytes) = match chunk? {
-                LogOutput::StdOut { message } | LogOutput::Console { message } => (0, message),
-                LogOutput::StdErr { message } => (1, message),
-                LogOutput::StdIn { .. } => continue,
-            };
-            let (stream, sanitizer, capture) = &mut self.streams[index];
-            let bytes = sanitizer.push(&bytes);
-            capture.push(&bytes);
-            Self::emit(sink, *stream, bytes, sink_failed).await;
-        }
-        for (stream, sanitizer, capture) in &mut self.streams {
-            let bytes = sanitizer.finish();
-            capture.push(&bytes);
-            Self::emit(sink, *stream, bytes, sink_failed).await;
-        }
-        Ok(())
-    }
-
-    async fn emit(
-        sink: Option<&OutputSink>,
-        stream: OutputStream,
-        bytes: Vec<u8>,
-        sink_failed: &CancellationToken,
-    ) {
-        if !bytes.is_empty() && !sink_failed.is_cancelled() {
-            if let Some(sink) = sink {
-                if sink(stream, bytes).await.is_err() {
-                    sink_failed.cancel();
-                }
-            }
-        }
-    }
-
-    pub(crate) fn into_result(
-        self,
-        termination: Termination,
-        exit_code: Option<i32>,
-        duration: Duration,
-        truncated: bool,
-    ) -> ExecStreamingResult {
-        let [(_, _, stdout), (_, _, stderr)] = self.streams;
-        let (stdout, mut stdout_stats) = stdout.into_parts();
-        let (stderr, mut stderr_stats) = stderr.into_parts();
-        stdout_stats.truncated = truncated;
-        stderr_stats.truncated = truncated;
-        let mut result = ExecResult::from_shell_status(termination, exit_code, duration);
-        result.stdout = stdout;
-        result.stderr = stderr;
-        let mut streaming = ExecStreamingResult::new(result);
-        streaming.streams_separated = true;
-        streaming.live_streaming = true;
-        streaming.stdout_capture = stdout_stats;
-        streaming.stderr_capture = stderr_stats;
-        streaming
+fn stop_file_contents(mode: StopMode) -> &'static str {
+    match mode {
+        StopMode::Term => "term",
+        StopMode::Kill => "kill",
     }
 }
 
@@ -344,7 +242,7 @@ impl DockerExec {
 async fn request_stop(container: &ContainerRef, stop_file: &str, mode: StopMode) -> Result<()> {
     let command = format!(
         "mkdir -p /tmp/.sandbox-driver && printf '%s' {} > {}",
-        shell_quote(mode.render()),
+        shell_quote(stop_file_contents(mode)),
         shell_quote(stop_file)
     );
     let options = CreateExecOptions {
@@ -444,63 +342,15 @@ impl DockerExec {
 
         let mut captured =
             StreamOutput::new(spec.output_sanitization, controls.retained_output_limit);
-        let sink_failed = CancellationToken::new();
-        let mut termination = Termination::Exited;
-        let mut term_fired = false;
-        let mut kill_fired = false;
-        let mut drain_deadline: Option<Instant> = None;
-        let mut termed = pin!(stop_signal(controls.term.as_ref()));
-        let mut killed = pin!(stop_signal(controls.kill.as_ref()));
-        let (stream_result, truncated) = {
-            let mut drain = pin!(captured.drain(output, controls.sink.as_ref(), &sink_failed));
-            loop {
-                let timeout = async {
-                    match spec.timeout {
-                        Some(timeout) if !kill_fired => {
-                            time::sleep(timeout.saturating_sub(started.elapsed())).await;
-                        }
-                        _ => future::pending().await,
-                    }
-                };
-                let drain_timeout = async {
-                    match drain_deadline {
-                        Some(deadline) => time::sleep_until(deadline.into()).await,
-                        None => future::pending().await,
-                    }
-                };
-                tokio::select! {
-                    outcome = &mut drain => break (outcome, false),
-                    () = sink_failed.cancelled(), if !kill_fired => {
-                        termination = Termination::Cancelled;
-                        kill_fired = true;
-                        drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                        request_stop(&self.container, &stop_file, StopMode::Kill).await?;
-                    }
-                    () = &mut termed, if !term_fired && !kill_fired => {
-                        termination = Termination::Cancelled;
-                        term_fired = true;
-                        request_stop(&self.container, &stop_file, StopMode::Term).await?;
-                    }
-                    () = &mut killed, if !kill_fired => {
-                        termination = Termination::Killed;
-                        kill_fired = true;
-                        drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                        request_stop(&self.container, &stop_file, StopMode::Kill).await?;
-                    }
-                    () = timeout => {
-                        termination = Termination::TimedOut;
-                        kill_fired = true;
-                        drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                        request_stop(&self.container, &stop_file, StopMode::Kill).await?;
-                    }
-                    () = drain_timeout => break (Ok(()), true),
-                }
-            }
-        };
-        if sink_failed.is_cancelled() && !kill_fired {
-            termination = Termination::Cancelled;
-            request_stop(&self.container, &stop_file, StopMode::Kill).await?;
-        }
+        let outcome = drain_with_stops(
+            &mut captured,
+            output,
+            &controls,
+            spec.timeout,
+            started,
+            |mode| request_stop(&self.container, &stop_file, mode),
+        )
+        .await?;
 
         if let Some(stdin_task) = stdin_task {
             // The command is done, so unwritten stdin bytes are
@@ -517,9 +367,16 @@ impl DockerExec {
                 }
             }
         }
-        stream_result.map_err(|error| docker_error("reading exec output", error))?;
+        outcome
+            .stream
+            .map_err(|error| docker_error("reading exec output", error))?;
         let exit_code = self.container.exec_exit_code(&exec_id).await?;
-        Ok(captured.into_result(termination, exit_code, started.elapsed(), truncated))
+        Ok(captured.into_result(
+            outcome.termination,
+            exit_code,
+            started.elapsed(),
+            outcome.truncated,
+        ))
     }
 
     #[tracing::instrument(
