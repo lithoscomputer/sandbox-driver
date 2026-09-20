@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{self, ExitStatus};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
-use std::{fs as sync_fs, io, slice};
+use std::{fs as sync_fs, io, mem, slice};
 
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, killpg};
@@ -73,28 +73,71 @@ while :; do
 done
 "#;
 
+/// Whether a sentinel still pins its process-group id.
+enum Pin {
+    /// The unreaped sentinel is held: the id cannot be recycled, so signals
+    /// to the group are safe. Never wait or try_wait on it before stop: even
+    /// a zombie pins the id.
+    Held(Child),
+    /// Stop took the child to reap it. No handle can signal during this
+    /// window; the child comes back through [`PinnedGroup::restore`] if the
+    /// reap fails.
+    Reaping,
+    /// The sentinel was reaped or dropped. The id may be recycled, so it is
+    /// never signalled again.
+    Reaped,
+}
+
 struct PinnedGroup {
-    pgid:  i32,
-    // Never wait or try_wait before stop: even a zombie pins the id.
-    child: Mutex<Option<Child>>,
+    pgid: i32,
+    pin:  Mutex<Pin>,
 }
 
 impl PinnedGroup {
-    fn signal(&self, signal: Signal) -> io::Result<()> {
-        let child = self.child.lock().unwrap_or_else(PoisonError::into_inner);
-        if child.is_some() {
-            match killpg(Pid::from_raw(self.pgid), signal) {
-                Ok(()) | Err(Errno::ESRCH) => {}
-                Err(error) => return Err(error.into()),
-            }
+    /// Signals the group while its id is pinned. `None` when the group is
+    /// being reaped or was reaped: its id may be recycled, so it is neither
+    /// signalled nor worth observing.
+    fn signal(&self, signal: Signal) -> Option<io::Result<()>> {
+        let pin = self.pin.lock().unwrap_or_else(PoisonError::into_inner);
+        if !matches!(*pin, Pin::Held(_)) {
+            return None;
         }
-        Ok(())
+        Some(match killpg(Pid::from_raw(self.pgid), signal) {
+            Ok(()) | Err(Errno::ESRCH) => Ok(()),
+            Err(error) => Err(error.into()),
+        })
     }
 
+    fn is_pinned(&self) -> bool {
+        matches!(
+            *self.pin.lock().unwrap_or_else(PoisonError::into_inner),
+            Pin::Held(_)
+        )
+    }
+
+    /// Takes the held child for reaping, or `None` when nothing is held.
     fn take_for_reap(&self) -> Option<Child> {
-        let mut child = self.child.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut pin = self.pin.lock().unwrap_or_else(PoisonError::into_inner);
         // No other handle can signal after this removes its proof of ownership.
-        child.take()
+        match mem::replace(&mut *pin, Pin::Reaping) {
+            Pin::Held(child) => Some(child),
+            other => {
+                *pin = other;
+                None
+            }
+        }
+    }
+
+    /// Puts an unreaped child back, so a later stop can retry both
+    /// signalling and reaping.
+    fn restore(&self, child: Child) {
+        *self.pin.lock().unwrap_or_else(PoisonError::into_inner) = Pin::Held(child);
+    }
+
+    /// Records that the sentinel is gone: reaped here, or dropped for
+    /// Tokio to reap.
+    fn reaped(&self) {
+        *self.pin.lock().unwrap_or_else(PoisonError::into_inner) = Pin::Reaped;
     }
 }
 
@@ -107,14 +150,7 @@ async fn kill_owned_groups(groups: &[Arc<PinnedGroup>]) -> io::Result<()> {
     loop {
         let signals: Vec<_> = groups
             .iter()
-            .filter(|group| {
-                group
-                    .child
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .is_some()
-            })
-            .map(|group| (group.pgid, group.signal(Signal::SIGKILL)))
+            .filter_map(|group| Some((group.pgid, group.signal(Signal::SIGKILL)?)))
             .collect();
         let live = spawn_blocking(move || {
             let mut live = false;
@@ -143,9 +179,76 @@ struct Generation {
     groups:    Vec<Arc<PinnedGroup>>,
 }
 
+impl Generation {
+    /// The record paths for the next group in this generation: the sentinel
+    /// writes its group id to `group`, its workload's status to `status`,
+    /// and watches `marker` for a fence.
+    fn next_record_paths(&self) -> RecordPaths {
+        let seq = self.groups.len();
+        RecordPaths {
+            status: self.directory.join(format!("{seq}.status")),
+            group:  self.directory.join(format!("{seq}.group")),
+            marker: self.directory.join(FENCED),
+        }
+    }
+}
+
+/// The files one sentinel and its owner communicate through, in the order
+/// `SENTINEL_SCRIPT` reads them as `$1..$3`.
+struct RecordPaths {
+    status: PathBuf,
+    group:  PathBuf,
+    marker: PathBuf,
+}
+
+/// Admission and the current generation. The four combinations are all
+/// legal: `accepting_work` with a generation is a running sandbox with
+/// spawned work; `accepting_work` without one is running but idle (fresh,
+/// or drained by a start); not accepting with a generation is stopped but
+/// undrained, the retry state after a failed stop; not accepting without
+/// one is stopped and drained.
 struct GroupState {
-    running:    bool,
-    generation: Option<Generation>,
+    /// Whether `spawn` admits new work. Lifecycle code keeps this equal to
+    /// `SandboxState::Running`; it is not the sandbox state itself.
+    accepting_work: bool,
+    generation:     Option<Generation>,
+}
+
+impl GroupState {
+    /// The current generation, created on first use under `root`.
+    async fn generation_or_create(&mut self, root: &Path) -> Result<&mut Generation> {
+        if self.generation.is_none() {
+            let directory = root.join(fresh_id());
+            fs::create_dir_all(&directory)
+                .await
+                .map_err(|e| Error::io("creating process generation", e))?;
+            self.generation = Some(Generation {
+                directory,
+                groups: Vec::new(),
+            });
+        }
+        Ok(self
+            .generation
+            .as_mut()
+            .expect("generation initialized above"))
+    }
+}
+
+/// The sentinel invocation that runs `program` with `args` and reports
+/// through `paths`.
+fn sentinel_command(paths: &RecordPaths, program: &str, args: &[String]) -> Command {
+    let mut command = Command::new(sentinel_shell());
+    command
+        .arg("-c")
+        .arg(SENTINEL_SCRIPT)
+        .arg("sandbox-driver-sentinel")
+        .arg(&paths.status)
+        .arg(&paths.group)
+        .arg(&paths.marker)
+        .arg(process::id().to_string())
+        .arg(program)
+        .args(args);
+    command
 }
 
 pub(crate) struct ProcessGroups {
@@ -160,18 +263,18 @@ impl ProcessGroups {
             root,
             cleanup_on_drop,
             state: AsyncMutex::new(GroupState {
-                running,
-                generation: None,
+                accepting_work: running,
+                generation:     None,
             }),
         }
     }
 
     pub(crate) async fn start(&self) -> Result<()> {
         let mut state = self.state.lock().await;
-        if !state.running {
+        if !state.accepting_work {
             self.drain(&mut state).await?;
         }
-        state.running = true;
+        state.accepting_work = true;
         Ok(())
     }
 
@@ -182,40 +285,14 @@ impl ProcessGroups {
         configure: impl FnOnce(&mut Command),
     ) -> Result<HostChild> {
         let mut state = self.state.lock().await;
-        if !state.running {
+        if !state.accepting_work {
             return Err(
                 ProviderError::new(host_kind(), "cannot execute in a stopped sandbox").into(),
             );
         }
-        if state.generation.is_none() {
-            let directory = self.root.join(fresh_id());
-            fs::create_dir_all(&directory)
-                .await
-                .map_err(|e| Error::io("creating process generation", e))?;
-            state.generation = Some(Generation {
-                directory,
-                groups: Vec::new(),
-            });
-        }
-        let generation = state
-            .generation
-            .as_mut()
-            .expect("generation initialized above");
-        let seq = generation.groups.len();
-        let status_file = generation.directory.join(format!("{seq}.status"));
-        let group_file = generation.directory.join(format!("{seq}.group"));
-        let marker = generation.directory.join(FENCED);
-        let mut command = Command::new(sentinel_shell());
-        command
-            .arg("-c")
-            .arg(SENTINEL_SCRIPT)
-            .arg("sandbox-driver-sentinel")
-            .arg(&status_file)
-            .arg(&group_file)
-            .arg(&marker)
-            .arg(process::id().to_string())
-            .arg(program)
-            .args(args);
+        let generation = state.generation_or_create(&self.root).await?;
+        let paths = generation.next_record_paths();
+        let mut command = sentinel_command(&paths, program, args);
         configure(&mut command);
         command.process_group(0);
         command.kill_on_drop(false);
@@ -234,7 +311,7 @@ impl ProcessGroups {
         let stderr = child.stderr.take();
         let group = Arc::new(PinnedGroup {
             pgid,
-            child: Mutex::new(Some(child)),
+            pin: Mutex::new(Pin::Held(child)),
         });
         generation.groups.push(group.clone());
         Ok(HostChild {
@@ -243,73 +320,102 @@ impl ProcessGroups {
             stderr,
             group,
             _groups: self.clone(),
-            status_file,
+            status_file: paths.status,
         })
     }
 
     pub(crate) async fn stop(&self) -> Result<()> {
         let mut state = self.state.lock().await;
-        state.running = false;
+        state.accepting_work = false;
         self.drain(&mut state).await
     }
 
+    /// The recovery protocol, in order: fence every saved generation, kill
+    /// and reap the groups this handle owns, wait until every id is gone,
+    /// remove the generation records, and forget the generation. A failure
+    /// leaves the generation in place so a later stop or start retries.
     async fn drain(&self, state: &mut GroupState) -> Result<()> {
         let deadline = time::Instant::now() + DRAIN;
         let (generation_paths, mut pgids) = fence_saved_generations(&self.root).await?;
         if let Some(generation) = &mut state.generation {
-            // Kill every owned group before waiting for any. Persisted ids are
-            // never used here: each handle still owns its unreaped sentinel.
+            // Persisted ids are never used here: each handle still owns its
+            // unreaped sentinel.
             pgids.extend(generation.groups.iter().map(|group| group.pgid));
-            time::timeout_at(deadline, kill_owned_groups(&generation.groups))
-                .await
-                .map_err(|_| fence_leaked(&pgids))?
-                .map_err(|error| Error::io("killing host process group", error))?;
-            for group in &generation.groups {
-                let Some(mut child) = group.take_for_reap() else {
-                    continue;
-                };
-                let outcome = match time::timeout_at(deadline, child.wait()).await {
-                    Ok(result) => {
-                        result.map_err(|error| Error::io("reaping host process group", error))
-                    }
-                    Err(_) => Err(fence_leaked(&pgids)),
-                };
-                if let Err(error) = outcome {
-                    // The unreaped child still pins this id. Keep it so a
-                    // later stop can safely retry both signalling and reaping.
-                    *group.child.lock().unwrap_or_else(PoisonError::into_inner) = Some(child);
-                    return Err(error);
-                }
-            }
+            kill_and_reap_owned(generation, deadline, &pgids).await?;
         }
-        pgids.sort_unstable();
-        pgids.dedup();
-        loop {
-            pgids = spawn_blocking(move || {
-                pgids.retain(|id| group_is_live(*id));
-                pgids
-            })
-            .await
-            .map_err(|e| Error::io("observing process groups", io::Error::other(e)))?;
-            if pgids.is_empty() {
-                for directory in &generation_paths {
-                    match fs::remove_dir_all(directory).await {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                        Err(error) => {
-                            return Err(Error::io("removing drained process generation", error));
-                        }
-                    }
-                }
-                state.generation = None;
-                return Ok(());
+        await_groups_gone(pgids, deadline).await?;
+        remove_generation_dirs(&generation_paths).await?;
+        state.generation = None;
+        Ok(())
+    }
+}
+
+/// Kills every owned group before waiting for any, then reaps each held
+/// sentinel. `leaked` names every id the drain covers for the error. A
+/// sentinel that cannot be reaped in time is put back so a later stop can
+/// safely retry both signalling and reaping.
+async fn kill_and_reap_owned(
+    generation: &Generation,
+    deadline: time::Instant,
+    leaked: &[i32],
+) -> Result<()> {
+    time::timeout_at(deadline, kill_owned_groups(&generation.groups))
+        .await
+        .map_err(|_| fence_leaked(leaked))?
+        .map_err(|error| Error::io("killing host process group", error))?;
+    for group in &generation.groups {
+        let Some(mut child) = group.take_for_reap() else {
+            continue;
+        };
+        let outcome = match time::timeout_at(deadline, child.wait()).await {
+            Ok(result) => result.map_err(|error| Error::io("reaping host process group", error)),
+            Err(_) => Err(fence_leaked(leaked)),
+        };
+        if let Err(error) = outcome {
+            // The unreaped child still pins this id.
+            group.restore(child);
+            return Err(error);
+        }
+        group.reaped();
+    }
+    Ok(())
+}
+
+/// Observes, without signalling, until no member of any group in `pgids`
+/// is live, or the deadline passes.
+async fn await_groups_gone(mut pgids: Vec<i32>, deadline: time::Instant) -> Result<()> {
+    pgids.sort_unstable();
+    pgids.dedup();
+    loop {
+        pgids = spawn_blocking(move || {
+            pgids.retain(|id| group_is_live(*id));
+            pgids
+        })
+        .await
+        .map_err(|e| Error::io("observing process groups", io::Error::other(e)))?;
+        if pgids.is_empty() {
+            return Ok(());
+        }
+        if time::Instant::now() >= deadline {
+            return Err(fence_leaked(&pgids));
+        }
+        time::sleep(POLL).await;
+    }
+}
+
+/// Removes the record directories of drained generations; one that is
+/// already gone is not an error.
+async fn remove_generation_dirs(paths: &[PathBuf]) -> Result<()> {
+    for directory in paths {
+        match fs::remove_dir_all(directory).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Error::io("removing drained process generation", error));
             }
-            if time::Instant::now() >= deadline {
-                return Err(fence_leaked(&pgids));
-            }
-            time::sleep(POLL).await;
         }
     }
+    Ok(())
 }
 
 /// Marks every saved generation fenced and returns their directories with
@@ -385,16 +491,17 @@ impl Drop for ProcessGroups {
     fn drop(&mut self) {
         // Explicit stop already reaped the children and removed generation
         // records. Dropping a drained or unused handle needs no cleanup task.
-        if !self.cleanup_on_drop || self.state.get_mut().generation.is_none() {
+        if !self.cleanup_on_drop {
             return;
         }
-        if let Some(generation) = &self.state.get_mut().generation {
-            for group in &generation.groups {
-                // Signal only ids still pinned by our child handles. Tokio
-                // takes responsibility for reaping each dropped child.
-                let _ = group.signal(Signal::SIGKILL);
-                drop(group.take_for_reap());
-            }
+        let Some(generation) = &self.state.get_mut().generation else {
+            return;
+        };
+        for group in &generation.groups {
+            // Signal only ids still pinned by our child handles. Tokio
+            // takes responsibility for reaping each dropped child.
+            let _ = group.signal(Signal::SIGKILL);
+            group.reaped();
         }
         // Disposable process records have no recovery caller. Their removal
         // is best effort and must not block the thread dropping the owner.
@@ -457,13 +564,8 @@ impl HostChild {
             if let Some(status) = self.recorded_status().await {
                 return Ok(status);
             }
-            if self
-                .group
-                .child
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .is_none()
-            {
+            if !self.group.is_pinned() {
+                // Stop took or reaped the sentinel: the group was killed.
                 return Ok(ExitStatus::from_raw(9));
             }
             let pgid = self.group.pgid;
