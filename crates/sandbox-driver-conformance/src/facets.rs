@@ -3,7 +3,7 @@
 
 use std::process;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use sandbox_driver::{
     Capability, Error, ExecControls, ExecSpec, LogSink, LogSource, OneShotSpec, PtyOptions,
@@ -14,7 +14,9 @@ use tokio::net::TcpStream;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
-use crate::check::{CheckOutcome, PASS, SeenChunks, fail, require_on, skip};
+use crate::check::{
+    COMMAND_TIMEOUT, CheckOutcome, PASS, RecordedOutput, fail, require_on, scratch_port, skip,
+};
 use crate::{Conformance, Provision};
 
 /// A Bash script that answers one HTTP request on `port` with `body` and
@@ -52,21 +54,13 @@ pub(super) async fn preview_url_reaches_a_listening_port(ctx: &Conformance) -> C
         };
         let can_listen = sandbox
             .exec()
-            .run(
-                &ExecSpec::bash("command -v perl || command -v nc")
-                    .timeout(Duration::from_secs(30)),
-            )
+            .run(&ExecSpec::bash("command -v perl || command -v nc").timeout(COMMAND_TIMEOUT))
             .await
             .map_err(|error| format!("probe failed: {error}"))?;
         if !can_listen.success() {
             return skip("the sandbox has neither perl nor nc to listen with");
         }
-        // A port unlikely to collide with another sandbox on a shared
-        // machine (the Host provider's sandboxes share this machine's ports).
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        let port = 20_000 + u16::try_from((nanos ^ process::id()) % 40_000).unwrap_or(0);
+        let port = scratch_port();
         let body = "preview-ok";
         let script = one_request_server(port, body);
         let server_sandbox = Arc::clone(&sandbox);
@@ -337,7 +331,7 @@ pub(super) async fn services_wait_for_ports_and_list_them(ctx: &Conformance) -> 
                     "if command -v python3 >/dev/null 2>&1; then echo python3; \
                      elif command -v nc >/dev/null 2>&1; then echo nc; else echo none; fi",
                 )
-                .timeout(Duration::from_secs(30)),
+                .timeout(COMMAND_TIMEOUT),
             )
             .await
             .map_err(|error| format!("listener probe failed: {error}"))?;
@@ -503,16 +497,9 @@ pub(super) async fn one_shot_shares_the_sandbox_world(ctx: &Conformance) -> Chec
             .write("one-shot/in.txt", b"shared-in")
             .await
             .map_err(|error| format!("write failed: {error}"))?;
-        let chunks: SeenChunks = Arc::new(Mutex::new(Vec::new()));
-        let sink_chunks = Arc::clone(&chunks);
+        let recorded = RecordedOutput::new();
         let controls = ExecControls {
-            sink: Some(Arc::new(move |stream, chunk| {
-                let chunks = Arc::clone(&sink_chunks);
-                Box::pin(async move {
-                    chunks.lock().expect("chunks lock").push((stream, chunk));
-                    Ok(())
-                })
-            })),
+            sink: Some(recorded.sink(Duration::ZERO)),
             ..ExecControls::buffered()
         };
         let spec = OneShotSpec::registry(image)
@@ -536,16 +523,10 @@ pub(super) async fn one_shot_shares_the_sandbox_world(ctx: &Conformance) -> Chec
                 streaming.result.stderr_lossy()
             ));
         }
-        let seen: Vec<u8> = chunks
-            .lock()
-            .expect("chunks lock")
-            .iter()
-            .flat_map(|(_, chunk)| chunk.clone())
-            .collect();
-        if !String::from_utf8_lossy(&seen).contains("shared-in") {
+        let seen = recorded.text();
+        if !seen.contains("shared-in") {
             return fail(format!(
-                "the one-shot did not see the sandbox's file: {:?}",
-                String::from_utf8_lossy(&seen)
+                "the one-shot did not see the sandbox's file: {seen:?}"
             ));
         }
         let written = sandbox

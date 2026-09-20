@@ -8,18 +8,13 @@ use sandbox_driver::{Error, SandboxState, VolumeId, VolumeMount, wait_for_state}
 use tokio::time;
 
 use crate::Conformance;
-use crate::check::{CheckOutcome, PASS, fail, skip};
+use crate::check::{CheckOutcome, PASS, fail, nonce, skip};
 
 pub(super) async fn volume_round_trip(ctx: &Conformance) -> CheckOutcome {
     let Some(volumes) = ctx.provider.volumes() else {
         return skip("volumes service not declared");
     };
-    let name = format!("conformance-{}-{}", process::id(), {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.subsec_nanos())
-    });
+    let name = format!("conformance-{}-{}", process::id(), nonce());
     let id = match volumes
         .create(&sandbox_driver::VolumeSpec::new(name.clone()), None)
         .await
