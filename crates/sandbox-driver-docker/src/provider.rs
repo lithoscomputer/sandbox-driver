@@ -1,7 +1,7 @@
 //! The Docker provider: the daemon connection, image readiness, and the
 //! verbs that create, attach to, list, and delete sandboxes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -31,8 +31,7 @@ use crate::forward::DockerForwards;
 use crate::fs::DockerFs;
 use crate::image::{image_present, pull_image};
 use crate::inspect::{
-    is_internal_label, is_managed, map_state, normalized_container_name, sidecar_network_of,
-    status_from_inspect, workspace_of,
+    ContainerFacts, is_managed, map_state, sidecar_network_of, status_from_inspect,
 };
 use crate::one_shot::{self, DockerOneShot};
 use crate::pty::DockerPty;
@@ -149,17 +148,16 @@ impl DockerProvider {
 
     /// Builds a handle from Docker state alone: no exec runs here, so
     /// `attach` works on a stopped container too.
-    fn handle(
-        &self,
-        container_id: String,
-        name: Option<String>,
-        working_dir: String,
-        labels: BTreeMap<String, String>,
-        env: BTreeMap<String, String>,
-        network: Option<String>,
-        workspace: Option<Mount>,
-        events: EventEmitter,
-    ) -> Arc<DockerSandbox> {
+    fn handle(&self, facts: ContainerFacts, events: EventEmitter) -> Arc<DockerSandbox> {
+        let ContainerFacts {
+            id: container_id,
+            name,
+            working_dir,
+            labels,
+            env,
+            sidecar_network: network,
+            workspace,
+        } = facts;
         let pty = DockerPty::new(
             self.docker.clone(),
             container_id.clone(),
@@ -550,17 +548,8 @@ impl SandboxProvider for DockerProvider {
                         provider.code = Some("exited".to_owned());
                         return Err(sweep_on_error(Error::Provider(provider), Some(created.id.clone())).await);
                     }
-                    let workspace = workspace_of(&started, &working_dir);
-                    Ok(self.handle(
-                        created.id,
-                        spec.name.clone(),
-                        working_dir,
-                        spec.labels.clone(),
-                        spec.env.clone(),
-                        sidecar_network.clone(),
-                        workspace,
-                        handle_emitter,
-                    ) as Arc<dyn Sandbox>)
+                    let facts = ContainerFacts::from_inspect(&started, &created.id);
+                    Ok(self.handle(facts, handle_emitter) as Arc<dyn Sandbox>)
                 },
             )
             .await
@@ -590,33 +579,8 @@ impl SandboxProvider for DockerProvider {
                             id:       id.as_str().to_owned(),
                         });
                     }
-                    let config = inspect.config.as_ref();
-                    let labels = config.and_then(|config| config.labels.as_ref());
-                    let working_dir = config
-                        .and_then(|config| config.working_dir.clone())
-                        .unwrap_or_else(|| DEFAULT_WORKING_DIRECTORY.to_owned());
-                    let user_labels: BTreeMap<String, String> = labels
-                        .map(|labels| {
-                            labels
-                                .iter()
-                                .filter(|(key, _)| !is_internal_label(key))
-                                .map(|(key, value)| (key.clone(), value.clone()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let network = sidecar_network_of(&inspect);
-                    let workspace = workspace_of(&inspect, &working_dir);
-                    let container_id = inspect.id.clone().unwrap_or_else(|| id.as_str().to_owned());
-                    Ok(self.handle(
-                        container_id,
-                        normalized_container_name(inspect.name.as_deref()),
-                        working_dir,
-                        user_labels,
-                        BTreeMap::new(),
-                        network,
-                        workspace,
-                        handle_emitter,
-                    ) as Arc<dyn Sandbox>)
+                    let facts = ContainerFacts::from_inspect(&inspect, id.as_str());
+                    Ok(self.handle(facts, handle_emitter) as Arc<dyn Sandbox>)
                 },
             )
             .await

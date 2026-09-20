@@ -10,9 +10,9 @@ use bollard::container::{
     InspectContainerOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use sandbox_driver::{
-    Action, BASH_ENV_VAR, Capabilities, Error, EventEmitter, EventSubject, Exec, ExecSpec,
-    Filesystem, OneShot, PlatformInfo, PreviewUrls, ProviderError, Pty, ResourceKind, Result,
-    Sandbox, SandboxId, SandboxKind, SandboxState, SandboxStatus, ShellCommand,
+    Action, Capabilities, Error, EventEmitter, EventSubject, Exec, ExecSpec, Filesystem, OneShot,
+    PlatformInfo, PreviewUrls, ProviderError, Pty, ResourceKind, Result, Sandbox, SandboxId,
+    SandboxKind, SandboxState, SandboxStatus, ShellCommand,
 };
 
 use crate::access::DockerShellCommand;
@@ -22,7 +22,7 @@ use crate::daemon::{
 use crate::exec::DockerExec;
 use crate::forward::DockerForwards;
 use crate::fs::DockerFs;
-use crate::inspect::status_from_inspect;
+use crate::inspect::{configured_env, status_from_inspect};
 use crate::one_shot::{self, DockerOneShot};
 use crate::pty::DockerPty;
 use crate::{RUNTIME_DIRECTORY, SIDECAR_NETWORK_LABEL, sidecars};
@@ -93,27 +93,12 @@ impl Sandbox for DockerSandbox {
 
     #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.id), err)]
     async fn environment(&self) -> Result<BTreeMap<String, String>> {
-        // The container's effective env is the image's plus what create
-        // set, which the daemon records on `.Config.Env`. `BASH_ENV` is
-        // an internal blank and never part of the reported environment.
         let inspect = self
             .docker
             .inspect_container(self.id.as_str(), None::<InspectContainerOptions>)
             .await
             .map_err(|error| docker_error("inspecting container", error))?;
-        let entries = inspect
-            .config
-            .and_then(|config| config.env)
-            .unwrap_or_default();
-        let mut env = BTreeMap::new();
-        for entry in entries {
-            if let Some((key, value)) = entry.split_once('=') {
-                if key != BASH_ENV_VAR {
-                    env.insert(key.to_owned(), value.to_owned());
-                }
-            }
-        }
-        Ok(env)
+        Ok(configured_env(&inspect))
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.id), err)]
