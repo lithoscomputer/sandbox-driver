@@ -384,7 +384,10 @@ Rules:
 ## 7. Errors
 
 Error codes: `-32600` malformed request or params, `-32601` unknown
-method, `-32000` application failure. Application failures carry `data`:
+method, `-32000` application failure. `-32600` describes what the host
+sent; a plugin that cannot encode its own result answers `-32000` with
+no `data`, since that is the plugin's failure. Application failures
+carry `data`:
 
 ```json
 {

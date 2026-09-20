@@ -30,7 +30,9 @@ use tokio_util::task::AbortOnDropHandle;
 use self::registry::Registry;
 use self::sessions::{ServerPty, ServerStdio};
 use crate::channel::{self, Channel, ChannelRequest, DataTransport};
-use crate::wire::{CODE_INVALID_REQUEST, CODE_METHOD_NOT_FOUND, Message, WireError};
+use crate::wire::{
+    CODE_APPLICATION, CODE_INVALID_REQUEST, CODE_METHOD_NOT_FOUND, Message, WireError,
+};
 use crate::{ServerDiagnostics, TransportLimits, control, limits, methods as m};
 
 mod access;
@@ -600,7 +602,11 @@ impl EventObserver for ProtocolEventObserver {
 #[derive(Debug)]
 enum DispatchError {
     UnknownMethod,
+    /// The host's params did not decode.
     BadParams(serde_json::Error),
+    /// The plugin's own result did not encode: a plugin bug, never the
+    /// host's fault.
+    Internal(serde_json::Error),
     App(Error),
 }
 
@@ -628,6 +634,11 @@ impl DispatchError {
                 ),
                 data:    None,
             },
+            Self::Internal(error) => WireError {
+                code:    CODE_APPLICATION,
+                message: format!("plugin failed to encode the {method} result: {error}"),
+                data:    None,
+            },
             Self::App(error) => WireError::from_error(&error),
         }
     }
@@ -638,7 +649,7 @@ fn parse<T: DeserializeOwned>(params: Value) -> Result<T, DispatchError> {
 }
 
 fn to_value<T: Serialize>(value: &T) -> Result<Value, DispatchError> {
-    serde_json::to_value(value).map_err(DispatchError::BadParams)
+    serde_json::to_value(value).map_err(DispatchError::Internal)
 }
 
 #[tracing::instrument(skip_all, fields(method = method))]
@@ -729,4 +740,45 @@ fn initialize(state: &ServerState, params: Value) -> Result<Value, DispatchError
         },
         capabilities:     state.provider.capabilities().clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::Serializer;
+
+    use super::*;
+
+    struct Unencodable;
+
+    impl Serialize for Unencodable {
+        fn serialize<S: Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom(
+                "the plugin built a result it cannot encode",
+            ))
+        }
+    }
+
+    #[test]
+    fn a_result_the_plugin_cannot_encode_is_its_own_failure_not_the_hosts() {
+        let Err(error) = to_value(&Unencodable) else {
+            panic!("encoding must fail");
+        };
+        assert!(matches!(error, DispatchError::Internal(_)), "{error:?}");
+        let wire = error.into_wire("sandbox/describe");
+        assert_eq!(wire.code, CODE_APPLICATION);
+        assert!(
+            wire.message.contains("sandbox/describe"),
+            "{}",
+            wire.message
+        );
+
+        let Err(bad_params) = parse::<u32>(Value::String("not a number".to_owned())) else {
+            panic!("decoding must fail");
+        };
+        assert!(matches!(bad_params, DispatchError::BadParams(_)));
+        assert_eq!(
+            bad_params.into_wire("sandbox/describe").code,
+            CODE_INVALID_REQUEST
+        );
+    }
 }
