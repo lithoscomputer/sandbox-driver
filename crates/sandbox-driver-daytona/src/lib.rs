@@ -98,6 +98,18 @@ pub use crate::sandbox::DaytonaSandbox;
 pub(crate) const FALLBACK_WORKING_DIR: &str = "/home/daytona";
 pub(crate) const RUNTIME_DIRECTORY_PARENT: &str = "/tmp/sandbox-driver";
 pub(crate) const RUNTIME_DIRECTORY: &str = "/tmp/sandbox-driver/runtime";
+
+/// Resolves `path` against the sandbox working directory: an absolute
+/// path stands as given, a relative one is joined onto the working
+/// directory. Every facet applies this same rule, so the toolbox daemon
+/// never resolves a relative path against its own cwd.
+pub(crate) fn resolve_path(working_dir: &str, path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_owned()
+    } else {
+        format!("{}/{}", working_dir.trim_end_matches('/'), path)
+    }
+}
 pub(crate) const CREATE_TIMEOUT: Duration = Duration::from_secs(600);
 /// Dockerfile sources build the image during create; real builds exceed
 /// shorter budgets (fabro-sandbox landed on 30 minutes).
@@ -117,3 +129,18 @@ pub(crate) const SNAPSHOT_ACTIVATE_POLL: Duration = Duration::from_secs(5);
 /// paginated endpoints truncate an unpaged request to their own default
 /// page size, so listings must walk `total_pages` explicitly.
 pub(crate) const LIST_PAGE_SIZE: i32 = 100;
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_path;
+
+    #[test]
+    fn relative_paths_join_the_working_directory_and_absolute_paths_stand() {
+        assert_eq!(
+            resolve_path("/workspace/", "src/main.rs"),
+            "/workspace/src/main.rs"
+        );
+        assert_eq!(resolve_path("/workspace", "src"), "/workspace/src");
+        assert_eq!(resolve_path("/workspace", "/etc/hosts"), "/etc/hosts");
+    }
+}

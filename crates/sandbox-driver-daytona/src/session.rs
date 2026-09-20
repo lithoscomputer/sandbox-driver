@@ -47,10 +47,7 @@ pub(crate) struct Session {
 impl Session {
     pub(crate) async fn create(client: &DaytonaClient, sandbox: &SdkSandbox) -> Result<Self> {
         let endpoint = toolbox::endpoint(client, &sandbox.id).await?;
-        let process = sandbox
-            .process()
-            .await
-            .map_err(|error| daytona_error("connecting to the toolbox", error))?;
+        let process = toolbox::process_of(sandbox).await?;
         // Random nonce plus host pid: a session id can never collide
         // with one from a crashed or concurrent driver — including two
         // concurrent execs in one process on a coarse-clock platform,

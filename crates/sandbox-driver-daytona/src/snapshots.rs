@@ -19,7 +19,7 @@ use sandbox_driver::{
 use tokio::time;
 
 use crate::sdk::{
-    DaytonaClient, daytona_error, daytona_snapshot_class, generated_error, gigabytes,
+    DaytonaClient, daytona_error, daytona_snapshot_class, fetch_error, generated_error, gigabytes,
     is_generated_not_found, is_not_found, is_snapshot_deactivation_in_progress, map_snapshot_state,
     map_state, sandbox_kind_from_sandbox_class, sandbox_kind_from_snapshot_class, to_u64,
 };
@@ -297,16 +297,11 @@ impl SnapshotProvider for DaytonaSnapshots {
             .snapshot
             .get(id.as_str())
             .await
-            .map_err(|error| {
-                if is_not_found(&error) {
-                    Error::NotFound {
-                        resource: ResourceKind::Snapshot,
-                        id:       id.as_str().to_owned(),
-                    }
-                } else {
-                    daytona_error("fetching snapshot", error)
-                }
-            })?;
+            .map_err(fetch_error(
+                ResourceKind::Snapshot,
+                id.as_str(),
+                "fetching snapshot",
+            ))?;
         snapshot_status(dto)
     }
 
@@ -474,16 +469,17 @@ impl SnapshotProvider for DaytonaSnapshots {
                             return Err(generated_error("deactivating snapshot", error));
                         }
                     }
-                    let resolved = match self.client.snapshot.get(id.as_str()).await {
-                        Ok(dto) => dto.id,
-                        Err(error) if is_not_found(&error) => {
-                            return Err(Error::NotFound {
-                                resource: ResourceKind::Snapshot,
-                                id:       id.as_str().to_owned(),
-                            });
-                        }
-                        Err(error) => return Err(daytona_error("fetching snapshot", error)),
-                    };
+                    let resolved = self
+                        .client
+                        .snapshot
+                        .get(id.as_str())
+                        .await
+                        .map_err(fetch_error(
+                            ResourceKind::Snapshot,
+                            id.as_str(),
+                            "fetching snapshot",
+                        ))?
+                        .id;
                     snapshots_api::deactivate_snapshot(configuration, &resolved, organization)
                         .await
                         .map_err(|error| generated_error("deactivating snapshot", error))

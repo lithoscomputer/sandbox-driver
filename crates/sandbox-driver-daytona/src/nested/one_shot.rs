@@ -10,6 +10,7 @@ use sandbox_driver::{
     Error, ExecControls, ExecResult, ExecStreamingResult, OneShot, OneShotImage, OneShotSpec,
     OutputSink, Result, Termination, stop_signal,
 };
+use sandbox_driver_docker::is_missing_platform;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
@@ -20,17 +21,28 @@ use super::{
 };
 use crate::RUNTIME_DIRECTORY;
 
+/// A pull the registry refused for want of a matching platform manifest.
+/// The daemon's own message is what [`is_missing_platform`] recognizes;
+/// the nested CLI reports the same refusal in the command's output.
+fn missing_platform(error: &Error) -> bool {
+    if is_missing_platform(error) {
+        return true;
+    }
+    let Error::Exec(failure) = error else {
+        return false;
+    };
+    [failure.stdout(), failure.stderr()]
+        .into_iter()
+        .any(|output| String::from_utf8_lossy(output).contains("no matching manifest"))
+}
+
 impl NestedDocker {
     async fn prepare_action_image(&self, image: &OneShotImage) -> Result<String> {
         match image {
             OneShotImage::Registry { reference } => {
                 if let Err(error) = self.cli.pull(reference, None, None).await {
-                    if !error.to_string().contains("no matching manifest") {
-                        // Native CLI diagnostics live in the command's output.
-                        let missing = matches!(&error, Error::Exec(failure) if String::from_utf8_lossy(failure.stdout()).contains("no matching manifest") || String::from_utf8_lossy(failure.stderr()).contains("no matching manifest"));
-                        if !missing {
-                            return Err(error);
-                        }
+                    if !missing_platform(&error) {
+                        return Err(error);
                     }
                     self.cli
                         .pull(reference, None, Some("linux/amd64"))

@@ -20,21 +20,21 @@ use sandbox_driver::{
     SandboxProvider, SandboxSource, SandboxSpec, SandboxState, SandboxStatus, SnapshotCaps,
     SnapshotId, SnapshotProvider, SnapshotSource, SnapshotSpec, VolumeCaps, VolumeProvider,
 };
-use sandbox_driver_daytona_config::DaytonaProviderConfig;
+use sandbox_driver_daytona_config::{DaytonaProviderConfig, NestedDockerConfig};
 use serde::Deserialize;
 use tokio::time;
 
 use crate::labels::{MANAGED_LABEL, stored_labels};
 use crate::sandbox::{DaytonaSandbox, status_from_sdk};
 use crate::sdk::{
-    DaytonaClient, auto_delete_minutes, daytona_error, gigabytes, is_not_found, map_state, minutes,
-    sandbox_kind_from_sandbox_class, sandbox_kind_from_snapshot_class,
+    DaytonaClient, auto_delete_minutes, daytona_error, fetch_error, gigabytes, is_not_found,
+    map_state, minutes, sandbox_kind_from_sandbox_class, sandbox_kind_from_snapshot_class,
 };
 use crate::snapshots::DaytonaSnapshots;
 use crate::volumes::DaytonaVolumes;
 use crate::{
     CLEANUP_TIMEOUT, CREATE_POLL, CREATE_TIMEOUT, DOCKERFILE_CREATE_TIMEOUT, LIST_PAGE_SIZE,
-    RUNTIME_DIRECTORY, RUNTIME_DIRECTORY_PARENT, nested,
+    RUNTIME_DIRECTORY, RUNTIME_DIRECTORY_PARENT, nested, toolbox,
 };
 
 /// The current-key endpoint includes its effective organization, which the
@@ -325,6 +325,53 @@ impl DaytonaProvider {
         DaytonaSandbox::build(&self.client, &self.capabilities, sdk, events).await
     }
 
+    /// Every step after the sandbox exists: the kind check, the runtime
+    /// directories, the handle, and nested Docker provisioning. A failure
+    /// anywhere here leaves a billed sandbox behind, so `create` wraps
+    /// this one call in the cleanup.
+    async fn finish_create(
+        &self,
+        created: daytona_sdk::Sandbox,
+        spec: &SandboxSpec,
+        nested_docker: Option<&NestedDockerConfig>,
+        events: EventEmitter,
+    ) -> Result<Arc<DaytonaSandbox>> {
+        if let Some(requested) = spec.sandbox_kind {
+            let actual = created.sandbox_class.map(sandbox_kind_from_sandbox_class);
+            if actual != Some(requested) {
+                return Err(Error::invalid_spec(
+                    "sandbox_kind",
+                    format!("Daytona created a sandbox with kind {actual:?}, not {requested:?}"),
+                ));
+            }
+        }
+        initialize_directories(&created, spec.working_directory.as_deref()).await?;
+        let handle = self.handle(created, events).await?;
+        if let (Some(config), Some(nested)) = (nested_docker, handle.nested.as_ref()) {
+            nested.create(config, &spec.env).await?;
+        }
+        Ok(handle)
+    }
+
+    /// The sandbox `id` as a managed sandbox, or `NotFound`. A sandbox this
+    /// provider did not create carries no managed label and is reported
+    /// missing rather than handed out; `attach` and `undelete` both gate
+    /// on this one check.
+    async fn managed_sandbox(&self, id: &SandboxId) -> Result<daytona_sdk::Sandbox> {
+        let sdk = self.client.get(id.as_str()).await.map_err(fetch_error(
+            ResourceKind::Sandbox,
+            id.as_str(),
+            "fetching sandbox",
+        ))?;
+        if sdk.labels.get(MANAGED_LABEL).map(String::as_str) != Some("true") {
+            return Err(Error::NotFound {
+                resource: ResourceKind::Sandbox,
+                id:       id.as_str().to_owned(),
+            });
+        }
+        Ok(sdk)
+    }
+
     /// The snapshot `spec`'s image or Dockerfile source builds into, made
     /// active: found, reactivated, built, or waited for, with the work
     /// reported through `events`. The name is derived from the source and
@@ -376,16 +423,11 @@ impl DaytonaProvider {
             .snapshot
             .get(id.as_str())
             .await
-            .map_err(|error| {
-                if is_not_found(&error) {
-                    Error::NotFound {
-                        resource: ResourceKind::Snapshot,
-                        id:       id.as_str().to_owned(),
-                    }
-                } else {
-                    daytona_error("fetching snapshot kind", error)
-                }
-            })?;
+            .map_err(fetch_error(
+                ResourceKind::Snapshot,
+                id.as_str(),
+                "fetching snapshot kind",
+            ))?;
         let Some(actual) = snapshot.sandbox_class.map(sandbox_kind_from_snapshot_class) else {
             return Err(Error::invalid_spec(
                 "sandbox_kind",
@@ -406,10 +448,7 @@ async fn initialize_directories(
     sdk: &daytona_sdk::Sandbox,
     working_directory: Option<&str>,
 ) -> Result<()> {
-    let fs = sdk
-        .fs()
-        .await
-        .map_err(|error| daytona_error("connecting to the toolbox", error))?;
+    let fs = toolbox::fs_of(sdk).await?;
     if let Some(working_directory) = working_directory {
         fs.create_folder(working_directory, Some("0755"))
             .await
@@ -696,36 +735,14 @@ impl SandboxProvider for DaytonaProvider {
                     let event_id = SandboxId::try_new(created.id.clone())
                         .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
                     reporter.set_subject(EventSubject::sandbox(Some(event_id)));
-                    if let Some(requested) = spec.sandbox_kind {
-                        let actual = created.sandbox_class.map(sandbox_kind_from_sandbox_class);
-                        if actual != Some(requested) {
-                            let id = created.id.clone();
-                            let error = Error::invalid_spec(
-                                "sandbox_kind",
-                                format!(
-                                    "Daytona created a sandbox with kind {actual:?}, not \
-                                     {requested:?}"
-                                ),
-                            );
-                            return Err(self.cleanup_failed_create(&id, error).await);
-                        }
-                    }
-                    if let Err(error) =
-                        initialize_directories(&created, spec.working_directory.as_deref()).await
-                    {
-                        return Err(self.cleanup_failed_create(&created.id, error).await);
-                    }
                     let sdk_id = created.id.clone();
-                    let handle = match self.handle(created, handle_emitter).await {
-                        Ok(handle) => handle,
-                        Err(error) => return Err(self.cleanup_failed_create(&sdk_id, error).await),
-                    };
-                    if let (Some(config), Some(nested)) = (&nested_docker, handle.nested.as_ref()) {
-                        if let Err(error) = nested.create(config, &spec.env).await {
-                            return Err(self.cleanup_failed_create(&sdk_id, error).await);
-                        }
+                    match self
+                        .finish_create(created, spec, nested_docker.as_ref(), handle_emitter)
+                        .await
+                    {
+                        Ok(handle) => Ok(handle as Arc<dyn Sandbox>),
+                        Err(error) => Err(self.cleanup_failed_create(&sdk_id, error).await),
                     }
-                    Ok(handle as Arc<dyn Sandbox>)
                 },
             )
             .await
@@ -748,22 +765,7 @@ impl SandboxProvider for DaytonaProvider {
                 EventSubject::sandbox(Some(id.clone())),
                 Action::Attach,
                 |_| async move {
-                    let sdk = match self.client.get(id.as_str()).await {
-                        Ok(sdk) => sdk,
-                        Err(error) if is_not_found(&error) => {
-                            return Err(Error::NotFound {
-                                resource: ResourceKind::Sandbox,
-                                id:       id.as_str().to_owned(),
-                            });
-                        }
-                        Err(error) => return Err(daytona_error("fetching sandbox", error)),
-                    };
-                    if sdk.labels.get(MANAGED_LABEL).map(String::as_str) != Some("true") {
-                        return Err(Error::NotFound {
-                            resource: ResourceKind::Sandbox,
-                            id:       id.as_str().to_owned(),
-                        });
-                    }
+                    let sdk = self.managed_sandbox(id).await?;
                     Ok(self.handle(sdk, handle_emitter).await? as Arc<dyn Sandbox>)
                 },
             )
@@ -789,22 +791,7 @@ impl SandboxProvider for DaytonaProvider {
                 |_| async move {
                     // Daytona names this "recover": a deleted sandbox stays
                     // restorable for 24 hours.
-                    let mut sdk = match self.client.get(id.as_str()).await {
-                        Ok(sdk) => sdk,
-                        Err(error) if is_not_found(&error) => {
-                            return Err(Error::NotFound {
-                                resource: ResourceKind::Sandbox,
-                                id:       id.as_str().to_owned(),
-                            });
-                        }
-                        Err(error) => return Err(daytona_error("fetching sandbox", error)),
-                    };
-                    if sdk.labels.get(MANAGED_LABEL).map(String::as_str) != Some("true") {
-                        return Err(Error::NotFound {
-                            resource: ResourceKind::Sandbox,
-                            id:       id.as_str().to_owned(),
-                        });
-                    }
+                    let mut sdk = self.managed_sandbox(id).await?;
                     sdk.recover()
                         .await
                         .map_err(|error| daytona_error("undeleting sandbox", error))?;
@@ -929,7 +916,7 @@ impl SandboxProvider for DaytonaProvider {
 
 #[cfg(test)]
 mod tests {
-    use sandbox_driver_daytona_config::{DockerExecutionTarget, NestedDockerConfig};
+    use sandbox_driver_daytona_config::DockerExecutionTarget;
 
     use super::*;
     use crate::labels::{TARGET_LABEL, WORKING_DIRECTORY_LABEL};

@@ -13,7 +13,7 @@ use daytona_api_client::models::{
 };
 use daytona_sdk::{Client, DaytonaError};
 use sandbox_driver::{
-    AuthError, Error, ProviderError, ProviderKind, Result, SandboxKind, SandboxState,
+    AuthError, Error, ProviderError, ProviderKind, ResourceKind, Result, SandboxKind, SandboxState,
     SnapshotState, VolumeState,
 };
 
@@ -21,6 +21,24 @@ pub(crate) type DaytonaClient = Arc<Client>;
 
 pub(crate) fn is_not_found(error: &DaytonaError) -> bool {
     matches!(error, DaytonaError::NotFound { .. })
+}
+
+/// The error mapping for fetching one resource by id: the SDK's not-found
+/// becomes the typed [`Error::NotFound`] for `resource`, anything else is
+/// a provider error under `context`.
+pub(crate) fn fetch_error(
+    resource: ResourceKind,
+    id: &str,
+    context: &'static str,
+) -> impl FnOnce(DaytonaError) -> Error {
+    let id = id.to_owned();
+    move |error| {
+        if is_not_found(&error) {
+            Error::NotFound { resource, id }
+        } else {
+            daytona_error(context, error)
+        }
+    }
 }
 
 /// A lifecycle action racing an in-flight state change: Daytona rejects
@@ -282,6 +300,25 @@ mod tests {
             400,
             "Bad request"
         )));
+    }
+
+    #[test]
+    fn fetch_errors_type_not_found_and_keep_the_context_otherwise() {
+        let missing =
+            fetch_error(ResourceKind::Volume, "vol-1", "fetching volume")(DaytonaError::NotFound {
+                message: "gone".to_owned(),
+                headers: StdHashMap::new(),
+            });
+        assert!(matches!(
+            missing,
+            Error::NotFound { resource: ResourceKind::Volume, id } if id == "vol-1"
+        ));
+        let failed =
+            fetch_error(ResourceKind::Volume, "vol-1", "fetching volume")(api_error(500, "boom"));
+        let Error::Provider(provider) = failed else {
+            panic!("expected a provider error");
+        };
+        assert_eq!(provider.message, "fetching volume");
     }
 
     #[test]

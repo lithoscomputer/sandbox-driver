@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use crate::sdk::{DaytonaClient, daytona_error};
 use crate::session::{Session, dedup_capture, missing_suffix, wait_for_completion};
 use crate::shell::{exec_line, shell_quote};
-use crate::{encoded_exec, stdio, toolbox};
+use crate::{encoded_exec, resolve_path, stdio, toolbox};
 
 #[derive(Deserialize)]
 struct BufferedResponse {
@@ -82,14 +82,7 @@ impl StdinFile {
                 max_bytes: sandbox_driver::DEFAULT_BUFFER_BYTES,
             });
         }
-        let sandbox = client
-            .get(sandbox_id)
-            .await
-            .map_err(|error| daytona_error("fetching sandbox", error))?;
-        let fs = sandbox
-            .fs()
-            .await
-            .map_err(|error| daytona_error("connecting to the toolbox", error))?;
+        let fs = toolbox::fs(client, sandbox_id).await?;
         // Random nonce plus host pid: unique even across concurrent
         // execs in one process, so a stale file from a crashed driver
         // can never feed a later command.
@@ -220,11 +213,10 @@ impl DaytonaTransport {
     /// working directory, matching the fs facet — the toolbox daemon
     /// would otherwise resolve it against its own cwd.
     fn resolve_dir(&self, dir: Option<&str>) -> String {
-        match dir {
-            None => self.working_dir.clone(),
-            Some(dir) if dir.starts_with('/') => dir.to_owned(),
-            Some(dir) => format!("{}/{}", self.working_dir.trim_end_matches('/'), dir),
-        }
+        dir.map_or_else(
+            || self.working_dir.clone(),
+            |dir| resolve_path(&self.working_dir, dir),
+        )
     }
 
     fn compose(spec: &ExecSpec, stdin_path: Option<&str>) -> String {
@@ -420,11 +412,7 @@ impl DaytonaTransport {
         controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
         let started = Instant::now();
-        let sandbox = self
-            .client
-            .get(&self.sandbox_id)
-            .await
-            .map_err(|error| daytona_error("fetching sandbox", error))?;
+        let sandbox = toolbox::sandbox(&self.client, &self.sandbox_id).await?;
 
         let mut stdin_file = match &spec.stdin {
             Some(bytes) => Some(StdinFile::create(&self.client, &self.sandbox_id, bytes).await?),
@@ -457,12 +445,12 @@ impl DaytonaTransport {
         let command_id = session_exec.cmd_id.clone();
 
         // The stream task needs its own service and 'static state.
-        let stream_process = match sandbox.process().await {
+        let stream_process = match toolbox::process_of(&sandbox).await {
             Ok(process) => process,
             Err(error) => {
                 session.close().await;
                 close_stdin(&mut stdin_file).await;
-                return Err(daytona_error("connecting to the toolbox", error));
+                return Err(error);
             }
         };
         let stdout_seen = Arc::new(Mutex::new(OutputCaptureBuffer::new(

@@ -27,6 +27,7 @@ use crate::exec::{build_session_script, wrap_session_script};
 use crate::sdk::{DaytonaClient, daytona_error};
 use crate::session::Session;
 use crate::shell::exec_line;
+use crate::toolbox;
 
 /// Buffered bytes per stdio pipe.
 const PIPE_CAPACITY: usize = 64 * 1024;
@@ -39,10 +40,7 @@ pub(crate) async fn spawn(
     cwd: &str,
     spec: &SpawnSpec,
 ) -> Result<StdioProcess> {
-    let sandbox = client
-        .get(sandbox_id)
-        .await
-        .map_err(|error| daytona_error("fetching sandbox", error))?;
+    let sandbox = toolbox::sandbox(client, sandbox_id).await?;
 
     let mut session = Session::create(client, &sandbox).await?;
     let command = exec_line(&spec.launch_env(), &spec.program, &spec.args);
@@ -56,18 +54,18 @@ pub(crate) async fn spawn(
     };
     let command_id = started.cmd_id;
 
-    let stream_process = match sandbox.process().await {
+    let stream_process = match toolbox::process_of(&sandbox).await {
         Ok(process) => process,
         Err(error) => {
             session.close().await;
-            return Err(daytona_error("connecting to the toolbox", error));
+            return Err(error);
         }
     };
-    let input_process = match sandbox.process().await {
+    let input_process = match toolbox::process_of(&sandbox).await {
         Ok(process) => process,
         Err(error) => {
             session.close().await;
-            return Err(daytona_error("connecting to the toolbox", error));
+            return Err(error);
         }
     };
 
