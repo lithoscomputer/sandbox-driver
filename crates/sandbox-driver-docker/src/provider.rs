@@ -7,8 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bollard::Docker;
 use bollard::container::{
-    Config, CreateContainerOptions, InspectContainerOptions, ListContainersOptions,
-    RemoveContainerOptions, StartContainerOptions,
+    Config, CreateContainerOptions, ListContainersOptions, StartContainerOptions,
 };
 use bollard::models::{
     ContainerInspectResponse, EndpointSettings, HostConfig, Mount, MountTypeEnum,
@@ -25,7 +24,8 @@ use serde::Deserialize;
 
 use crate::access::DockerShellCommand;
 use crate::config::{DockerProviderConfig, RegistryAuth};
-use crate::daemon::{POSIX_SH, docker_error, docker_kind, is_conflict, is_not_found, shell_quote};
+use crate::container::{ContainerRef, inspect_container, remove_container_forced, remove_sandbox};
+use crate::daemon::{POSIX_SH, docker_error, docker_kind, is_conflict, shell_quote};
 use crate::exec::DockerExec;
 use crate::forward::DockerForwards;
 use crate::fs::DockerFs;
@@ -33,7 +33,7 @@ use crate::image::{image_present, pull_image};
 use crate::inspect::{
     ContainerFacts, is_managed, map_state, sidecar_network_of, status_from_inspect,
 };
-use crate::one_shot::{self, DockerOneShot};
+use crate::one_shot::DockerOneShot;
 use crate::pty::DockerPty;
 use crate::sandbox::DockerSandbox;
 use crate::{
@@ -131,26 +131,14 @@ impl DockerProvider {
         err
     )]
     async fn inspect(&self, container_id: &str) -> Result<ContainerInspectResponse> {
-        self.docker
-            .inspect_container(container_id, None::<InspectContainerOptions>)
-            .await
-            .map_err(|error| {
-                if is_not_found(&error) {
-                    Error::NotFound {
-                        resource: ResourceKind::Sandbox,
-                        id:       container_id.to_owned(),
-                    }
-                } else {
-                    docker_error("inspecting container", error)
-                }
-            })
+        inspect_container(&self.docker, container_id).await
     }
 
     /// Builds a handle from Docker state alone: no exec runs here, so
     /// `attach` works on a stopped container too.
     fn handle(&self, facts: ContainerFacts, events: EventEmitter) -> Arc<DockerSandbox> {
         let ContainerFacts {
-            id: container_id,
+            id,
             name,
             working_dir,
             labels,
@@ -158,39 +146,20 @@ impl DockerProvider {
             sidecar_network: network,
             workspace,
         } = facts;
-        let pty = DockerPty::new(
-            self.docker.clone(),
-            container_id.clone(),
-            working_dir.clone(),
-        );
-        let one_shot = workspace.map(|workspace| {
-            DockerOneShot::new(
-                self.docker.clone(),
-                container_id.clone(),
-                working_dir.clone(),
-                workspace,
-            )
-        });
-        let shell_command = DockerShellCommand::new(container_id.clone(), working_dir.clone());
-        let exec = Arc::new(DockerExec::new(
-            self.docker.clone(),
-            container_id.clone(),
-            working_dir.clone(),
-            env,
-        ));
-        let fs = DockerFs::new(
-            self.docker.clone(),
-            container_id.clone(),
-            working_dir.clone(),
-            Arc::clone(&exec) as Arc<dyn Exec>,
-        );
+        let container = ContainerRef::new(self.docker.clone(), id, working_dir);
+        let pty = DockerPty::new(container.clone());
+        let one_shot = workspace.map(|workspace| DockerOneShot::new(container.clone(), workspace));
+        let shell_command =
+            DockerShellCommand::new(container.id.clone(), container.working_dir.clone());
+        let exec = Arc::new(DockerExec::new(container.clone(), env));
+        let fs = DockerFs::new(container.clone(), Arc::clone(&exec) as Arc<dyn Exec>);
         let forwards = DockerForwards::new(Arc::clone(&exec));
         Arc::new(DockerSandbox {
-            id: SandboxId::try_new(container_id).expect("container id is a valid sandbox id"),
+            id: SandboxId::try_new(container.id.clone())
+                .expect("container id is a valid sandbox id"),
             name,
             capabilities: self.capabilities.clone(),
-            docker: self.docker.clone(),
-            working_dir,
+            container,
             labels,
             exec,
             fs,
@@ -462,21 +431,18 @@ impl SandboxProvider for DockerProvider {
                                     return error;
                                 }
                             }
-                            if let Err(cleanup_error) = self.docker.remove_container(
+                            if let Err(cleanup_error) = remove_container_forced(
+                                &self.docker,
                                 &container,
-                                Some(RemoveContainerOptions {
-                                    force: true,
-                                    v: true,
-                                    ..Default::default()
-                                }),
-                            ).await {
-                                if !is_not_found(&cleanup_error) {
-                                    tracing::warn!(
-                                        provider_kind = "docker",
-                                        error = %docker_error("removing failed sandbox", cleanup_error),
-                                        "failed sandbox cleanup failed"
-                                    );
-                                }
+                                "removing failed sandbox",
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    provider_kind = "docker",
+                                    error = %cleanup_error,
+                                    "failed sandbox cleanup failed"
+                                );
                             }
                         }
                         error
@@ -613,26 +579,7 @@ impl SandboxProvider for DockerProvider {
                     }
                     let network = sidecar_network_of(&inspect);
                     let container_id = inspect.id.clone().unwrap_or_else(|| id.as_str().to_owned());
-                    // One-shot containers hold the workspace volume too, so
-                    // they go first and the volume goes with its last user.
-                    one_shot::sweep(&self.docker, &container_id).await?;
-                    if let Some(network) = &network {
-                        sidecars::sweep(&self.docker, network, Some(&container_id)).await?;
-                    }
-                    let options = RemoveContainerOptions {
-                        force: true,
-                        v: true,
-                        ..Default::default()
-                    };
-                    match self
-                        .docker
-                        .remove_container(&container_id, Some(options))
-                        .await
-                    {
-                        Ok(()) => Ok(()),
-                        Err(error) if is_not_found(&error) => Ok(()),
-                        Err(error) => Err(docker_error("removing container", error)),
-                    }
+                    remove_sandbox(&self.docker, &container_id, network.as_deref()).await
                 },
             )
             .await

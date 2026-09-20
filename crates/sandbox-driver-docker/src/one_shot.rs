@@ -22,8 +22,7 @@ use async_trait::async_trait;
 use bollard::Docker;
 use bollard::container::{
     AttachContainerOptions, Config, CreateContainerOptions, DownloadFromContainerOptions,
-    KillContainerOptions, ListContainersOptions, RemoveContainerOptions, StartContainerOptions,
-    WaitContainerOptions,
+    KillContainerOptions, ListContainersOptions, StartContainerOptions, WaitContainerOptions,
 };
 use bollard::errors::Error as DockerApiError;
 use bollard::image::BuildImageOptions;
@@ -36,6 +35,7 @@ use sandbox_driver::{
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
+use crate::container::{ContainerRef, remove_container_forced};
 use crate::daemon::{docker_error, docker_kind, is_conflict, is_not_found};
 use crate::exec::StreamOutput;
 use crate::fs::tar::reroot;
@@ -53,24 +53,15 @@ const KILL_DRAIN_GRACE: Duration = Duration::from_secs(10);
 
 /// The one-shot facet of one Docker sandbox.
 pub(crate) struct DockerOneShot {
-    docker:       Docker,
-    container_id: String,
-    working_dir:  String,
+    container: ContainerRef,
     /// The shared workspace mount, including the sandbox's access mode.
-    workspace:    Mount,
+    workspace: Mount,
 }
 
 impl DockerOneShot {
-    pub(crate) fn new(
-        docker: Docker,
-        container_id: String,
-        working_dir: String,
-        workspace: Mount,
-    ) -> Self {
+    pub(crate) fn new(container: ContainerRef, workspace: Mount) -> Self {
         Self {
-            docker,
-            container_id,
-            working_dir,
+            container,
             workspace,
         }
     }
@@ -78,18 +69,23 @@ impl DockerOneShot {
     /// Pulls a registry image, retrying once for the fallback platform
     /// when the daemon's own has no manifest.
     async fn ensure_registry_image(&self, reference: &str) -> Result<()> {
-        if image_present(&self.docker, reference).await? {
+        if image_present(&self.container.docker, reference).await? {
             return Ok(());
         }
-        let Err(error) = pull_image(&self.docker, reference, None, None).await else {
+        let Err(error) = pull_image(&self.container.docker, reference, None, None).await else {
             return Ok(());
         };
         if !is_missing_platform(&error) {
             return Err(error);
         }
-        pull_image(&self.docker, reference, None, Some(FALLBACK_PLATFORM))
-            .await
-            .map_err(|_| error)?;
+        pull_image(
+            &self.container.docker,
+            reference,
+            None,
+            Some(FALLBACK_PLATFORM),
+        )
+        .await
+        .map_err(|_| error)?;
         tracing::warn!(
             provider_kind = "docker",
             platform = FALLBACK_PLATFORM,
@@ -107,20 +103,17 @@ impl DockerOneShot {
         tag: &str,
         reuse: bool,
     ) -> Result<()> {
-        if reuse && image_present(&self.docker, tag).await? {
+        if reuse && image_present(&self.container.docker, tag).await? {
             return Ok(());
         }
-        let context_path = if context.starts_with('/') {
-            context.to_owned()
-        } else {
-            format!("{}/{}", self.working_dir.trim_end_matches('/'), context)
-        };
+        let context_path = self.container.resolve(context);
         let options = DownloadFromContainerOptions {
             path: context_path.clone(),
         };
         let mut stream = self
+            .container
             .docker
-            .download_from_container(&self.container_id, Some(options));
+            .download_from_container(&self.container.id, Some(options));
         let mut archive = Vec::new();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|error| docker_error("reading build context", error))?;
@@ -134,6 +127,7 @@ impl DockerOneShot {
             ..Default::default()
         };
         let mut build = self
+            .container
             .docker
             .build_image(options, None, Some(context_tar.into()));
         while let Some(info) = build.next().await {
@@ -170,6 +164,7 @@ impl DockerOneShot {
 
     async fn signal(&self, container: &str, signal: &str) {
         let outcome = self
+            .container
             .docker
             .kill_container(container, Some(KillContainerOptions { signal }))
             .await;
@@ -221,21 +216,7 @@ pub(crate) async fn sweep(docker: &Docker, sandbox_id: &str) -> Result<()> {
         .map_err(|error| docker_error("listing one-shot containers", error))?;
     for container in containers {
         if let Some(id) = container.id {
-            match docker
-                .remove_container(
-                    &id,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        v: true,
-                        ..Default::default()
-                    }),
-                )
-                .await
-            {
-                Ok(()) => {}
-                Err(error) if is_not_found(&error) => {}
-                Err(error) => return Err(docker_error("removing one-shot container", error)),
-            }
+            remove_container_forced(docker, &id, "removing one-shot container").await?;
         }
     }
     Ok(())
@@ -245,7 +226,7 @@ pub(crate) async fn sweep(docker: &Docker, sandbox_id: &str) -> Result<()> {
 impl OneShot for DockerOneShot {
     #[tracing::instrument(
         skip_all,
-        fields(provider_kind = "docker", sandbox_id = %self.container_id),
+        fields(provider_kind = "docker", sandbox_id = %self.container.id),
         err
     )]
     async fn run(&self, spec: &OneShotSpec, controls: ExecControls) -> Result<ExecStreamingResult> {
@@ -281,9 +262,9 @@ impl OneShot for DockerOneShot {
 
         let mut labels = HashMap::new();
         labels.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
-        labels.insert(ONE_SHOT_LABEL.to_owned(), self.container_id.clone());
+        labels.insert(ONE_SHOT_LABEL.to_owned(), self.container.id.clone());
         let host_config = HostConfig {
-            network_mode: Some(format!("container:{}", self.container_id)),
+            network_mode: Some(format!("container:{}", self.container.id)),
             mounts: Some(vec![self.workspace.clone()]),
             init: Some(true),
             ..Default::default()
@@ -301,7 +282,7 @@ impl OneShot for DockerOneShot {
             working_dir: Some(
                 spec.working_dir
                     .clone()
-                    .unwrap_or_else(|| self.working_dir.clone()),
+                    .unwrap_or_else(|| self.container.working_dir.clone()),
             ),
             labels: Some(labels),
             host_config: Some(host_config),
@@ -310,25 +291,19 @@ impl OneShot for DockerOneShot {
             ..Default::default()
         };
         let created = self
+            .container
             .docker
             .create_container(None::<CreateContainerOptions<String>>, config)
             .await
             .map_err(|error| docker_error("creating one-shot container", error))?;
         let container = created.id;
         let remove = |docker: Docker, container: String| async move {
-            let _ = docker
-                .remove_container(
-                    &container,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        v: true,
-                        ..Default::default()
-                    }),
-                )
-                .await;
+            let _ =
+                remove_container_forced(&docker, &container, "removing one-shot container").await;
         };
 
         let attached = match self
+            .container
             .docker
             .attach_container(
                 &container,
@@ -343,17 +318,18 @@ impl OneShot for DockerOneShot {
         {
             Ok(attached) => attached,
             Err(error) => {
-                remove(self.docker.clone(), container).await;
+                remove(self.container.docker.clone(), container).await;
                 return Err(docker_error("attaching one-shot container", error));
             }
         };
         let output = attached.output;
         if let Err(error) = self
+            .container
             .docker
             .start_container(&container, None::<StartContainerOptions<String>>)
             .await
         {
-            remove(self.docker.clone(), container).await;
+            remove(self.container.docker.clone(), container).await;
             return Err(docker_error("starting one-shot container", error));
         }
 
@@ -421,7 +397,7 @@ impl OneShot for DockerOneShot {
         // deadline abandoned may still be running, and the removal below
         // ends it.
         let exit_code = if stream_result.is_ok() {
-            let mut wait = self.docker.wait_container(
+            let mut wait = self.container.docker.wait_container(
                 &container,
                 Some(WaitContainerOptions {
                     condition: "not-running",
@@ -439,7 +415,7 @@ impl OneShot for DockerOneShot {
         } else {
             None
         };
-        remove(self.docker.clone(), container).await;
+        remove(self.container.docker.clone(), container).await;
         stream_result.map_err(|error| docker_error("reading one-shot output", error))?;
 
         // A container that vanished under the run — the sandbox's stop or
@@ -465,9 +441,7 @@ mod tests {
             Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
                 .expect("client");
         let runner = DockerOneShot::new(
-            docker,
-            "missing".to_owned(),
-            "/workspace".to_owned(),
+            ContainerRef::new(docker, "missing".to_owned(), "/workspace".to_owned()),
             Mount::default(),
         );
         let token = CancellationToken::new();
@@ -508,9 +482,7 @@ mod tests {
         )
         .expect("client");
         let runner = DockerOneShot::new(
-            docker,
-            "missing".to_owned(),
-            "/workspace".to_owned(),
+            ContainerRef::new(docker, "missing".to_owned(), "/workspace".to_owned()),
             Mount::default(),
         );
         let spec = OneShotSpec::registry("unreachable").timeout(Duration::from_millis(20));

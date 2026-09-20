@@ -19,7 +19,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bollard::Docker;
 use bollard::container::{DownloadFromContainerOptions, UploadToContainerOptions};
 use bollard::errors::Error as DockerApiError;
 use futures_util::{StreamExt, stream};
@@ -34,44 +33,28 @@ use self::tar::{
     Owner, TRANSFER_CHUNK_BYTES, TarScanner, directory_archive, file_archive_header,
     send_file_archive,
 };
+use crate::container::ContainerRef;
 use crate::daemon::{docker_error, is_not_found};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) struct DockerFs {
-    docker:       Docker,
-    container_id: String,
-    working_dir:  String,
-    exec:         Arc<dyn Exec>,
-    derived:      DerivedFs,
+    container: ContainerRef,
+    exec:      Arc<dyn Exec>,
+    derived:   DerivedFs,
     /// The container user's numeric identity, for what the archive
     /// uploads create. Cached after a successful lookup.
-    owner:        OnceCell<Owner>,
+    owner:     OnceCell<Owner>,
 }
 
 impl DockerFs {
-    pub(crate) fn new(
-        docker: Docker,
-        container_id: String,
-        working_dir: String,
-        exec: Arc<dyn Exec>,
-    ) -> Self {
+    pub(crate) fn new(container: ContainerRef, exec: Arc<dyn Exec>) -> Self {
         let derived = DerivedFs::new(Arc::clone(&exec));
         Self {
-            docker,
-            container_id,
-            working_dir,
+            container,
             exec,
             derived,
             owner: OnceCell::new(),
-        }
-    }
-
-    fn resolve(&self, path: &str) -> String {
-        if path.starts_with('/') {
-            path.to_owned()
-        } else {
-            format!("{}/{}", self.working_dir.trim_end_matches('/'), path)
         }
     }
 
@@ -80,8 +63,9 @@ impl DockerFs {
             path:                     parent.to_owned(),
             no_overwrite_dir_non_dir: "false".to_owned(),
         };
-        self.docker
-            .upload_to_container(&self.container_id, Some(options), archive.into())
+        self.container
+            .docker
+            .upload_to_container(&self.container.id, Some(options), archive.into())
             .await
     }
 
@@ -140,8 +124,9 @@ impl DockerFs {
             path: container_path.to_owned(),
         };
         let mut stream = self
+            .container
             .docker
-            .download_from_container(&self.container_id, Some(options));
+            .download_from_container(&self.container.id, Some(options));
         let mut scanner = TarScanner::new(offset, length);
         'archive: while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|error| {
@@ -176,7 +161,7 @@ impl DockerFs {
         length: Option<u64>,
         output: &mut (dyn AsyncWrite + Unpin + Send),
     ) -> Result<()> {
-        let container_path = self.resolve(path);
+        let container_path = self.container.resolve(path);
         if self
             .read_archived_to(&container_path, offset, length, output)
             .await?
@@ -256,7 +241,7 @@ fn is_runtime_path(container_path: &str) -> bool {
 impl Filesystem for DockerFs {
     #[tracing::instrument(
         skip_all,
-        fields(provider_kind = "docker", sandbox_id = %self.container_id),
+        fields(provider_kind = "docker", sandbox_id = %self.container.id),
         err
     )]
     async fn read(&self, path: &str) -> Result<Vec<u8>> {
@@ -265,7 +250,7 @@ impl Filesystem for DockerFs {
 
     #[tracing::instrument(
         skip_all,
-        fields(provider_kind = "docker", sandbox_id = %self.container_id, offset),
+        fields(provider_kind = "docker", sandbox_id = %self.container.id, offset),
         err
     )]
     async fn read_range(&self, path: &str, offset: u64, length: Option<u64>) -> Result<Vec<u8>> {
@@ -290,7 +275,7 @@ impl Filesystem for DockerFs {
         skip_all,
         fields(
             provider_kind = "docker",
-            sandbox_id = %self.container_id,
+            sandbox_id = %self.container.id,
             byte_count = content.len()
         ),
         err
@@ -307,7 +292,7 @@ impl Filesystem for DockerFs {
         input: &mut (dyn AsyncRead + Unpin + Send),
         length: u64,
     ) -> Result<()> {
-        let container_path = self.resolve(path);
+        let container_path = self.container.resolve(path);
         let (parent, file_name) = split_container_path(&container_path)?;
         let (file_mode, dir_mode) = if is_runtime_path(&container_path) {
             (0o600, 0o700)
@@ -322,9 +307,10 @@ impl Filesystem for DockerFs {
             receiver.recv().await.map(|bytes| (bytes, receiver))
         });
         let upload = async {
-            self.docker
+            self.container
+                .docker
                 .upload_to_container_streaming(
-                    &self.container_id,
+                    &self.container.id,
                     Some(UploadToContainerOptions {
                         path:                     parent,
                         no_overwrite_dir_non_dir: "false".to_owned(),
@@ -342,45 +328,45 @@ impl Filesystem for DockerFs {
 
     #[tracing::instrument(
         skip_all,
-        fields(provider_kind = "docker", sandbox_id = %self.container_id, recursive),
+        fields(provider_kind = "docker", sandbox_id = %self.container.id, recursive),
         err
     )]
     async fn delete(&self, path: &str, recursive: bool) -> Result<()> {
         self.derived.delete(path, recursive).await
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container_id), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container.id), err)]
     async fn exists(&self, path: &str) -> Result<bool> {
         self.derived.exists(path).await
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container_id), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container.id), err)]
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
         self.derived.metadata(path).await
     }
 
     #[tracing::instrument(
         skip_all,
-        fields(provider_kind = "docker", sandbox_id = %self.container_id, depth),
+        fields(provider_kind = "docker", sandbox_id = %self.container.id, depth),
         err
     )]
     async fn list_dir(&self, path: &str, depth: usize) -> Result<Vec<DirEntry>> {
         self.derived.list_dir(path, depth).await
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container_id), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container.id), err)]
     async fn create_dir(&self, path: &str) -> Result<()> {
         self.derived.create_dir(path).await
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container_id), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container.id), err)]
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
         self.derived.rename(from, to).await
     }
 
     #[tracing::instrument(
         skip_all,
-        fields(provider_kind = "docker", sandbox_id = %self.container_id, mode),
+        fields(provider_kind = "docker", sandbox_id = %self.container.id, mode),
         err
     )]
     async fn set_permissions(&self, path: &str, mode: u32) -> Result<()> {
@@ -391,7 +377,7 @@ impl Filesystem for DockerFs {
         skip_all,
         fields(
             provider_kind = "docker",
-            sandbox_id = %self.container_id,
+            sandbox_id = %self.container.id,
             byte_count = content.len()
         ),
         err
@@ -400,7 +386,7 @@ impl Filesystem for DockerFs {
         self.derived.write_append(path, content).await
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container_id), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container.id), err)]
     async fn upload(&self, local: &Path, remote: &str) -> Result<()> {
         let mut input = fs::File::open(local)
             .await
@@ -413,7 +399,7 @@ impl Filesystem for DockerFs {
         self.write_from(remote, &mut input, length).await
     }
 
-    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container_id), err)]
+    #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.container.id), err)]
     async fn download(&self, remote: &str, local: &Path) -> Result<()> {
         if let Some(parent) = local.parent() {
             fs::create_dir_all(parent)
@@ -431,6 +417,7 @@ impl Filesystem for DockerFs {
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    use bollard::Docker;
     use sandbox_driver::{ExecControls, ExecResult, ExecStreamingResult, Termination};
 
     use super::*;
@@ -488,13 +475,13 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 transport_failure,
             });
-            let fs = DockerFs::new(
+            let container = ContainerRef::new(
                 Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
                     .expect("docker client"),
                 "test-container".to_owned(),
                 "/workspace".to_owned(),
-                exec.clone(),
             );
+            let fs = DockerFs::new(container, exec.clone());
             let fallback = fs.owner().await;
             assert_eq!((fallback.uid, fallback.gid), (0, 0));
 
