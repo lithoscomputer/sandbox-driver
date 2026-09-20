@@ -4,16 +4,15 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use sandbox_driver::{ExecControls, ExecSpec, OutputSanitization, Termination};
+use sandbox_driver::{Capability, ExecControls, ExecSpec, OutputSanitization, Termination};
 
-use crate::Conformance;
-use crate::check::{CheckOutcome, PASS, SeenChunks, cleanup, fail};
+use crate::check::{CheckOutcome, PASS, SeenChunks, fail};
+use crate::{Conformance, Provision};
 
 /// A relative exec `working_dir` resolves against the sandbox working
 /// directory on every provider.
 pub(super) async fn relative_working_dir_resolves(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.with_ready(|sandbox| async move {
         let mkdir = sandbox
             .exec()
             .run(
@@ -44,15 +43,12 @@ pub(super) async fn relative_working_dir_resolves(ctx: &Conformance) -> CheckOut
             return fail(format!("pwd is {pwd:?}, expected {expected:?}"));
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 pub(super) async fn exec_reports_exit_codes(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.with_ready(|sandbox| async move {
         let result = sandbox
             .exec()
             .run(&ExecSpec::bash("exit 7").timeout(Duration::from_secs(30)))
@@ -65,15 +61,12 @@ pub(super) async fn exec_reports_exit_codes(ctx: &Conformance) -> CheckOutcome {
             return fail(format!("expected Exited, got {:?}", result.termination));
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 pub(super) async fn exec_env_vars_apply(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.with_ready(|sandbox| async move {
         let spec = ExecSpec::bash("printf '%s' \"$CONFORMANCE_VALUE\"")
             .env_var("CONFORMANCE_VALUE", "expected-value")
             .timeout(Duration::from_secs(30));
@@ -109,10 +102,8 @@ pub(super) async fn exec_env_vars_apply(ctx: &Conformance) -> CheckOutcome {
             ));
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 /// The exec contract: arguments reach the program unchanged. A provider
@@ -121,8 +112,7 @@ pub(super) async fn exec_env_vars_apply(ctx: &Conformance) -> CheckOutcome {
 /// file named in the spec env never runs ahead of a `bash -c` script, on
 /// every provider, however the provider composes the environment.
 pub(super) async fn bash_helper_ignores_a_caller_bash_env(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.with_ready(|sandbox| async move {
         sandbox
             .fs()
             .write("conformance-startup.sh", b"echo INJECTED\n")
@@ -150,15 +140,12 @@ pub(super) async fn bash_helper_ignores_a_caller_bash_env(ctx: &Conformance) -> 
             ));
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 pub(super) async fn exec_argv_is_literal(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.with_ready(|sandbox| async move {
         let hostile = "$CONFORMANCE_VALUE `id` $(id) * ; it's \"quoted\"";
         let spec = ExecSpec::new("printf")
             .args(["%s|%s", hostile, "second arg"])
@@ -177,17 +164,14 @@ pub(super) async fn exec_argv_is_literal(ctx: &Conformance) -> CheckOutcome {
             ));
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 pub(super) async fn exec_output_is_binary_safe(ctx: &Conformance) -> CheckOutcome {
     use std::fmt::Write as _;
 
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.with_ready(|sandbox| async move {
         // All byte values, repeated across transport chunk boundaries, with
         // adjacent NULs and no final newline. No text conversion is lossless.
         let mut octal = String::new();
@@ -206,15 +190,12 @@ pub(super) async fn exec_output_is_binary_safe(ctx: &Conformance) -> CheckOutcom
             return fail(format!("binary output mangled: {:?}", result.stdout));
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 pub(super) async fn exec_output_sanitization_is_consistent(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.with_ready(|sandbox| async move {
         let command = "printf '\\033[31mred\\033[0m\\007\\001\\n'";
 
         let raw = sandbox
@@ -287,18 +268,13 @@ pub(super) async fn exec_output_sanitization_is_consistent(ctx: &Conformance) ->
             ));
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 pub(super) async fn exec_stdin_round_trips(ctx: &Conformance) -> CheckOutcome {
-    if !ctx.caps().exec.stdin {
-        return Ok(Some("capability exec.stdin not declared".to_owned()));
-    }
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.require(Capability::ExecStdin)?;
+    ctx.with_ready(|sandbox| async move {
         let spec = ExecSpec::new("cat")
             .stdin(b"stdin-payload".to_vec())
             .timeout(Duration::from_secs(30));
@@ -311,15 +287,12 @@ pub(super) async fn exec_stdin_round_trips(ctx: &Conformance) -> CheckOutcome {
             return fail(format!("stdin not delivered: {:?}", result.stdout_lossy()));
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 pub(super) async fn exec_reports_a_foreign_signal(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.with_ready(|sandbox| async move {
         // The command signals its own process; the provider reports the
         // signal number even though the shell only sees `128 + N`.
         let spec = ExecSpec::bash("kill -TERM $$; sleep 5").timeout(Duration::from_secs(30));
@@ -335,25 +308,16 @@ pub(super) async fn exec_reports_a_foreign_signal(ctx: &Conformance) -> CheckOut
             ));
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 pub(super) async fn exec_reports_environment(ctx: &Conformance) -> CheckOutcome {
-    if !ctx.caps().exec.environment {
-        return Ok(Some("capability exec.environment not declared".to_owned()));
-    }
+    ctx.require(Capability::ExecEnvironment)?;
     let mut spec = ctx.specs.spec();
     spec.env
         .insert("CONFORMANCE_ENV".to_owned(), "present".to_owned());
-    let sandbox = ctx
-        .provider
-        .create(&spec, None)
-        .await
-        .map_err(|error| format!("create failed: {error}"))?;
-    let outcome = async {
+    ctx.with_sandbox(Provision::CreatedFrom(&spec), |sandbox| async move {
         let env = sandbox
             .environment()
             .await
@@ -362,8 +326,6 @@ pub(super) async fn exec_reports_environment(ctx: &Conformance) -> CheckOutcome 
             return fail("spec env not reflected in the effective environment");
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }

@@ -5,22 +5,17 @@ use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use sandbox_driver::{ExecControls, ExecSpec, OutputStream, StdinSource};
+use sandbox_driver::{Capability, ExecControls, ExecSpec, OutputStream, StdinSource};
 use tokio::time;
 
 use crate::Conformance;
-use crate::check::{CheckOutcome, PASS, SeenChunks, cleanup, fail, numbered_lines};
+use crate::check::{CheckOutcome, PASS, SeenChunks, fail, numbered_lines, skip};
 
 pub(super) async fn exec_streams_stdin(ctx: &Conformance) -> CheckOutcome {
-    if !ctx.caps().exec.stdin_stream {
-        return Ok(Some("capability exec.stdin_stream not declared".to_owned()));
-    }
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.require(Capability::ExecStdinStream)?;
+    ctx.with_ready(|sandbox| async move {
         if !sandbox.capabilities().exec.stdin_stream {
-            return Ok(Some(
-                "exec.stdin_stream not declared for this sandbox".to_owned(),
-            ));
+            return skip("exec.stdin_stream not declared for this sandbox");
         }
         let source = StdinSource::new(Cursor::new(b"streamed".to_vec()));
         let controls = ExecControls {
@@ -40,15 +35,12 @@ pub(super) async fn exec_streams_stdin(ctx: &Conformance) -> CheckOutcome {
             ));
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 pub(super) async fn exec_streaming_is_honest(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.with_ready(|sandbox| async move {
         let chunks: SeenChunks = Arc::new(Mutex::new(Vec::new()));
         let sink_chunks = Arc::clone(&chunks);
         let controls = ExecControls {
@@ -100,10 +92,8 @@ pub(super) async fn exec_streaming_is_honest(ctx: &Conformance) -> CheckOutcome 
             }
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 /// Every line of a large output reaches a slow sink, in order, with no
@@ -112,12 +102,9 @@ pub(super) async fn exec_streaming_is_honest(ctx: &Conformance) -> CheckOutcome 
 pub(super) async fn exec_streams_large_output_in_order(ctx: &Conformance) -> CheckOutcome {
     const LINES: usize = 20_000;
     if !ctx.caps().exec.live_streaming {
-        return Ok(Some(
-            "capability exec.live_streaming not declared".to_owned(),
-        ));
+        return skip("capability exec.live_streaming not declared");
     }
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.with_ready(|sandbox| async move {
         let seen: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let sink_seen = Arc::clone(&seen);
         let controls = ExecControls {
@@ -162,17 +149,14 @@ pub(super) async fn exec_streams_large_output_in_order(ctx: &Conformance) -> Che
             ));
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 /// Output is bytes, not lines: a final line without a newline arrives
 /// exactly as written, buffered and streamed alike.
 pub(super) async fn exec_output_keeps_a_partial_last_line(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.with_ready(|sandbox| async move {
         let spec = ExecSpec::bash("printf 'a\\nb'").timeout(Duration::from_secs(30));
         let buffered = sandbox
             .exec()
@@ -221,15 +205,12 @@ pub(super) async fn exec_output_keeps_a_partial_last_line(ctx: &Conformance) -> 
             ));
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 pub(super) async fn exec_retention_accounting_is_consistent(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.with_ready(|sandbox| async move {
         let controls = ExecControls {
             retained_output_limit: Some(512),
             ..ExecControls::buffered()
@@ -254,10 +235,8 @@ pub(super) async fn exec_retention_accounting_is_consistent(ctx: &Conformance) -
             ));
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 /// One slow consumer of one stream must not stall other execs on the
@@ -266,12 +245,9 @@ pub(super) async fn exec_retention_accounting_is_consistent(ctx: &Conformance) -
 /// sink must see only its own exec's output, in order.
 pub(super) async fn concurrent_streams_do_not_starve_each_other(ctx: &Conformance) -> CheckOutcome {
     if !ctx.caps().exec.live_streaming {
-        return Ok(Some(
-            "capability exec.live_streaming not declared".to_owned(),
-        ));
+        return skip("capability exec.live_streaming not declared");
     }
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.with_ready(|sandbox| async move {
         // Slow stream: a line every 50ms, consumed at 600ms/chunk, so a
         // shared-pipe client accumulates a deep backlog quickly.
         let slow_chunks: SeenChunks = Arc::new(Mutex::new(Vec::new()));
@@ -393,9 +369,7 @@ pub(super) async fn concurrent_streams_do_not_starve_each_other(ctx: &Conformanc
         if last != 20 {
             return fail(format!("slow stream incomplete: last line slow-{last}"));
         }
-        Ok(None)
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+        PASS
+    })
+    .await
 }

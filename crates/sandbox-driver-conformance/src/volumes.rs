@@ -8,11 +8,11 @@ use sandbox_driver::{Error, SandboxState, VolumeId, VolumeMount, wait_for_state}
 use tokio::time;
 
 use crate::Conformance;
-use crate::check::{CheckOutcome, PASS, fail};
+use crate::check::{CheckOutcome, PASS, fail, skip};
 
 pub(super) async fn volume_round_trip(ctx: &Conformance) -> CheckOutcome {
     let Some(volumes) = ctx.provider.volumes() else {
-        return Ok(Some("volumes service not declared".to_owned()));
+        return skip("volumes service not declared");
     };
     let name = format!("conformance-{}-{}", process::id(), {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -31,10 +31,10 @@ pub(super) async fn volume_round_trip(ctx: &Conformance) -> CheckOutcome {
             if provider.code.as_deref() == Some("403")
                 || provider.code.as_deref() == Some("401") =>
         {
-            return Ok(Some("credential lacks volume permissions".to_owned()));
+            return skip("credential lacks volume permissions");
         }
         Err(Error::Auth(_)) => {
-            return Ok(Some("credential lacks volume permissions".to_owned()));
+            return skip("credential lacks volume permissions");
         }
         Err(error) => return fail(format!("volume create failed: {error}")),
     };
@@ -112,8 +112,8 @@ async fn mounted_volume_survives_sandbox_deletion(
         .write(FILE_PATH, &payload)
         .await
         .map_err(|error| format!("write mounted volume failed: {error}"));
-    let deleted = first
-        .delete()
+    let deleted = ctx
+        .delete(&first)
         .await
         .map_err(|error| format!("delete first volume sandbox failed: {error}"));
     written?;
@@ -141,8 +141,8 @@ async fn mounted_volume_survives_sandbox_deletion(
         PASS
     }
     .await;
-    let deleted = second
-        .delete()
+    let deleted = ctx
+        .delete(&second)
         .await
         .map_err(|error| format!("delete second volume sandbox failed: {error}"));
     outcome?;

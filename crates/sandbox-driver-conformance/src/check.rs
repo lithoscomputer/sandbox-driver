@@ -5,26 +5,52 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use sandbox_driver::{OutputStream, Sandbox};
+use sandbox_driver::{Capabilities, Capability, OutputStream};
 
 use crate::Conformance;
 
 pub(crate) type SeenChunks = Arc<Mutex<Vec<(OutputStream, Vec<u8>)>>>;
 
 pub(crate) type CheckFn =
-    fn(&Conformance) -> Pin<Box<dyn Future<Output = Result<Option<String>, String>> + Send + '_>>;
+    fn(&Conformance) -> Pin<Box<dyn Future<Output = CheckOutcome> + Send + '_>>;
 
-/// `Ok(None)` = passed, `Ok(Some(reason))` = skipped, `Err` = failed.
-pub(crate) type CheckOutcome = Result<Option<String>, String>;
-
-pub(crate) fn fail(message: impl Into<String>) -> CheckOutcome {
-    Err(message.into())
+/// Why a check did not pass. A `String` converts into `Failed`, so the
+/// `map_err(|error| format!(..))?` lines in the checks keep working, and
+/// a skip is an error too, so it can be raised with `?` from any depth.
+#[derive(Debug)]
+pub(crate) enum Verdict {
+    Skipped(String),
+    Failed(String),
 }
 
-pub(crate) const PASS: CheckOutcome = Ok(None);
+impl From<String> for Verdict {
+    fn from(reason: String) -> Self {
+        Self::Failed(reason)
+    }
+}
 
-pub(crate) async fn cleanup(sandbox: &Arc<dyn Sandbox>) {
-    let _ = sandbox.delete().await;
+/// `Ok(())` = passed; the error says whether the check skipped or failed.
+pub(crate) type CheckOutcome = Result<(), Verdict>;
+
+pub(crate) fn fail<T>(message: impl Into<String>) -> Result<T, Verdict> {
+    Err(Verdict::Failed(message.into()))
+}
+
+pub(crate) fn skip<T>(reason: impl Into<String>) -> Result<T, Verdict> {
+    Err(Verdict::Skipped(reason.into()))
+}
+
+pub(crate) const PASS: CheckOutcome = Ok(());
+
+/// Skips unless `caps` declares `capability`. The provider-level form is
+/// [`Conformance::require`]; this one judges a sandbox's own set, which
+/// a provider may narrow by sandbox class.
+pub(crate) fn require_on(caps: &Capabilities, capability: Capability) -> Result<(), Verdict> {
+    if caps.supports(capability) {
+        Ok(())
+    } else {
+        skip(format!("capability {capability} not declared"))
+    }
 }
 
 pub(crate) const SIGKILL: i32 = 9;

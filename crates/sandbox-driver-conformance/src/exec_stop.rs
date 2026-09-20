@@ -3,16 +3,15 @@
 
 use std::time::{Duration, Instant};
 
-use sandbox_driver::{ExecControls, ExecSpec, Termination};
+use sandbox_driver::{Capability, ExecControls, ExecSpec, Termination};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 use crate::Conformance;
-use crate::check::{CheckOutcome, PASS, SIGKILL, SIGTERM, cleanup, fail};
+use crate::check::{CheckOutcome, PASS, SIGKILL, SIGTERM, fail};
 
 pub(super) async fn exec_timeout_terminates(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.with_ready(|sandbox| async move {
         let started = Instant::now();
         let spec = ExecSpec::new("sleep")
             .arg("300")
@@ -43,10 +42,8 @@ pub(super) async fn exec_timeout_terminates(ctx: &Conformance) -> CheckOutcome {
             }
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 pub(super) async fn exec_term_terminates(ctx: &Conformance) -> CheckOutcome {
@@ -81,11 +78,8 @@ pub(super) async fn exec_kill_terminates(ctx: &Conformance) -> CheckOutcome {
 /// kill. A provider that cannot deliver a signal ends the command on the
 /// term and reports `Cancelled`; that is honest too.
 pub(super) async fn exec_term_does_not_escalate(ctx: &Conformance) -> CheckOutcome {
-    if !ctx.caps().exec.stop {
-        return Ok(Some("capability exec.stop not declared".to_owned()));
-    }
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.require(Capability::ExecStop)?;
+    ctx.with_ready(|sandbox| async move {
         let term = CancellationToken::new();
         let kill = CancellationToken::new();
         let (term_after, kill_after) = (term.clone(), kill.clone());
@@ -135,10 +129,8 @@ pub(super) async fn exec_term_does_not_escalate(ctx: &Conformance) -> CheckOutco
             }
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 /// With a stop grace, the provider's own timeout runs the ladder: TERM
@@ -147,11 +139,8 @@ pub(super) async fn exec_term_does_not_escalate(ctx: &Conformance) -> CheckOutco
 /// result still says it timed out. A provider that cannot deliver a
 /// signal ends the command on the TERM; that is honest too.
 pub(super) async fn exec_stop_grace_escalates_a_timeout(ctx: &Conformance) -> CheckOutcome {
-    if !ctx.caps().exec.stop {
-        return Ok(Some("capability exec.stop not declared".to_owned()));
-    }
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.require(Capability::ExecStop)?;
+    ctx.with_ready(|sandbox| async move {
         let started = Instant::now();
         let spec = ExecSpec::bash("trap '' TERM; sleep 300")
             .timeout(Duration::from_secs(2))
@@ -190,21 +179,16 @@ pub(super) async fn exec_stop_grace_escalates_a_timeout(ctx: &Conformance) -> Ch
             return fail("graceful timeout enforcement took over a minute");
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 /// With a stop grace, a caller's `term` is the first rung of the ladder:
 /// the provider KILLs on its own once the grace has passed, with no
 /// caller `kill`, and the result names the kill.
 pub(super) async fn exec_stop_grace_escalates_a_term(ctx: &Conformance) -> CheckOutcome {
-    if !ctx.caps().exec.stop {
-        return Ok(Some("capability exec.stop not declared".to_owned()));
-    }
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.require(Capability::ExecStop)?;
+    ctx.with_ready(|sandbox| async move {
         let term = CancellationToken::new();
         let term_after = term.clone();
         tokio::spawn(async move {
@@ -251,10 +235,8 @@ pub(super) async fn exec_stop_grace_escalates_a_term(ctx: &Conformance) -> Check
             }
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 /// Fires the stop token `build` places half a second into a long sleep
@@ -267,11 +249,8 @@ async fn exec_stop_terminates(
     accepted: Termination,
     accepted_signal: i32,
 ) -> CheckOutcome {
-    if !ctx.caps().exec.stop {
-        return Ok(Some("capability exec.stop not declared".to_owned()));
-    }
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.require(Capability::ExecStop)?;
+    ctx.with_ready(|sandbox| async move {
         let token = CancellationToken::new();
         let stop_after = token.clone();
         tokio::spawn(async move {
@@ -298,8 +277,6 @@ async fn exec_stop_terminates(
             }
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }

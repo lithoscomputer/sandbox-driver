@@ -4,11 +4,10 @@
 use sandbox_driver::{Capability, Error, GrepOptions, Search};
 
 use crate::Conformance;
-use crate::check::{CheckOutcome, PASS, cleanup, fail};
+use crate::check::{CheckOutcome, PASS, fail, require_on};
 
 pub(super) async fn fs_round_trips(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.with_ready(|sandbox| async move {
         let fs = sandbox.fs();
         let payload = [0u8, 1, 2, 255, 254, 253];
         fs.write("conformance/dir/file.bin", &payload)
@@ -111,10 +110,8 @@ pub(super) async fn fs_round_trips(ctx: &Conformance) -> CheckOutcome {
             .await
             .map_err(|error| format!("delete of a missing path failed: {error}"))?;
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 /// Grep must return matches whether the target is a directory or a
@@ -122,11 +119,8 @@ pub(super) async fn fs_round_trips(ctx: &Conformance) -> CheckOutcome {
 /// operand, and a provider (or the derived implementation) must not let
 /// that change the result shape.
 pub(super) async fn search_greps_directories_and_single_files(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
-        if !sandbox.capabilities().supports(Capability::Search) {
-            return Ok(Some("capability search not declared".to_owned()));
-        }
+    ctx.with_ready(|sandbox| async move {
+        require_on(sandbox.capabilities(), Capability::Search)?;
         sandbox
             .fs()
             .write(
@@ -154,15 +148,12 @@ pub(super) async fn search_greps_directories_and_single_files(ctx: &Conformance)
             }
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 pub(super) async fn fs_range_and_append_round_trip(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.with_ready(|sandbox| async move {
         let fs = sandbox.fs();
         fs.write("conformance-range/base.bin", b"0123456789")
             .await
@@ -210,17 +201,14 @@ pub(super) async fn fs_range_and_append_round_trip(ctx: &Conformance) -> CheckOu
             .await
             .map_err(|error| format!("cleanup delete failed: {error}"))?;
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 /// Reading a file that does not exist is `NotFound`, so a caller can
 /// treat absence as a value instead of parsing provider errors.
 pub(super) async fn fs_missing_file_is_not_found(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.with_ready(|sandbox| async move {
         match sandbox.fs().read("conformance-missing/nope.txt").await {
             Err(Error::NotFound { .. }) => {}
             Err(other) => return fail(format!("expected NotFound, got: {other}")),
@@ -235,8 +223,6 @@ pub(super) async fn fs_missing_file_is_not_found(ctx: &Conformance) -> CheckOutc
             Err(other) => fail(format!("expected NotFound from read_range, got: {other}")),
             Ok(bytes) => fail(format!("a missing file read_range {} bytes", bytes.len())),
         }
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
