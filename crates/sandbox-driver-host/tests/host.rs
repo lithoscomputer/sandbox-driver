@@ -12,8 +12,8 @@ use sandbox_driver::{
     Action, Capability, Error, Event, EventBody, EventContext, EventObserver, ExecControls,
     ExecSpec, Git, GitCheckoutOptions, GitCommitOptions, GrepOptions, NetworkPolicy, OutputStream,
     OwnedProvider, Ownership, SandboxFilter, SandboxId, SandboxProvider, SandboxSource,
-    SandboxSpec, Search, SpawnSpec, StdioProcessHandle, Termination, WaitOptions, WalkOptions,
-    WorkspaceOwnership, activate,
+    SandboxSpec, SandboxState, Search, SpawnSpec, StdioProcessHandle, Termination, WaitOptions,
+    WalkOptions, WorkspaceOwnership, activate,
 };
 use sandbox_driver_host::HostProvider;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1079,4 +1079,69 @@ async fn designated_directories_attach_by_a_path_derived_id_from_any_provider() 
     created.delete().await.expect("delete designated");
     managed.delete().await.expect("delete managed");
     let _ = tokio_fs::remove_dir_all(&dir).await;
+}
+
+/// A lifecycle change that cannot be persisted leaves nothing half moved:
+/// the live state keeps its old value, and whether the sandbox admits work
+/// follows that state, so the caller can retry once the record is writable.
+#[tokio::test]
+async fn a_failed_persist_leaves_admission_with_the_live_state() {
+    let root = env::temp_dir().join(format!("host-persist-{}", process::id()));
+    let provider = HostProvider::with_registry(root.join("registry"))
+        .await
+        .expect("registry");
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+    let record = tokio_fs::canonicalize(root.join("registry"))
+        .await
+        .expect("registry root")
+        .join(sandbox.id().as_str())
+        .join("record.json");
+    // A directory in the record's place cannot be renamed over, so the
+    // atomic publish of the new record fails after the process groups moved.
+    let block_persist = || async {
+        tokio_fs::remove_file(&record).await.expect("remove record");
+        tokio_fs::create_dir(&record).await.expect("block record");
+    };
+    let unblock_persist = || async {
+        tokio_fs::remove_dir(&record).await.expect("unblock record");
+    };
+
+    block_persist().await;
+    let stopped = sandbox.stop().await;
+    assert!(matches!(stopped, Err(Error::Io { .. })), "{stopped:?}");
+    assert_eq!(
+        sandbox.describe().await.expect("describe").state,
+        SandboxState::Running
+    );
+    let result = sandbox
+        .exec()
+        .run(&ExecSpec::bash("exit 0"))
+        .await
+        .expect("a sandbox still reported Running admits work");
+    assert!(result.success());
+    unblock_persist().await;
+    sandbox
+        .stop()
+        .await
+        .expect("stop persists once the record is writable");
+
+    block_persist().await;
+    let started = sandbox.start().await;
+    assert!(matches!(started, Err(Error::Io { .. })), "{started:?}");
+    assert_eq!(
+        sandbox.describe().await.expect("describe").state,
+        SandboxState::Stopped
+    );
+    let refused = sandbox.exec().run(&ExecSpec::bash("exit 0")).await;
+    assert!(
+        matches!(&refused, Err(Error::Provider(error)) if error.message.contains("stopped")),
+        "a sandbox still reported Stopped refuses work: {refused:?}"
+    );
+    unblock_persist().await;
+    sandbox
+        .start()
+        .await
+        .expect("start persists once the record is writable");
+    sandbox.delete().await.expect("delete");
+    tokio_fs::remove_dir_all(root).await.expect("cleanup");
 }
