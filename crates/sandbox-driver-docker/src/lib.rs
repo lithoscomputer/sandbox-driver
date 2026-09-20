@@ -94,6 +94,7 @@ use crate::exec::{
 use crate::forward::DockerForwards;
 use crate::fs::DockerFs;
 use crate::one_shot::DockerOneShot;
+pub use crate::one_shot::is_missing_platform;
 use crate::pty::DockerPty;
 
 pub(crate) const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";

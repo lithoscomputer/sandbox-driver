@@ -7,7 +7,7 @@ use sandbox_driver::{
     VolumeId, VolumeProvider, VolumeSpec, VolumeState, VolumeStatus,
 };
 
-use crate::sdk::{DaytonaClient, daytona_error, is_not_found, map_volume_state};
+use crate::sdk::{DaytonaClient, daytona_error, fetch_error, is_not_found, map_volume_state};
 
 fn volume_status(dto: VolumeDto) -> Result<VolumeStatus> {
     let id = VolumeId::try_new(dto.id)
@@ -54,16 +54,16 @@ impl VolumeProvider for DaytonaVolumes {
         err
     )]
     async fn get(&self, id: &VolumeId) -> Result<VolumeStatus> {
-        let dto = self.client.volume.get(id.as_str()).await.map_err(|error| {
-            if is_not_found(&error) {
-                Error::NotFound {
-                    resource: ResourceKind::Volume,
-                    id:       id.as_str().to_owned(),
-                }
-            } else {
-                daytona_error("fetching volume", error)
-            }
-        })?;
+        let dto = self
+            .client
+            .volume
+            .get(id.as_str())
+            .await
+            .map_err(fetch_error(
+                ResourceKind::Volume,
+                id.as_str(),
+                "fetching volume",
+            ))?;
         volume_status(dto)
     }
 

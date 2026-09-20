@@ -32,7 +32,7 @@ use self::exec::NestedExec;
 use self::fs::NestedFs;
 use self::operation::{run_command, run_owned};
 use crate::sdk::DaytonaClient;
-use crate::{DaytonaExec, DaytonaFs, DaytonaPty, RUNTIME_DIRECTORY};
+use crate::{DaytonaExec, DaytonaFs, DaytonaPty, RUNTIME_DIRECTORY, resolve_path};
 
 pub(super) const CONTAINER_NAME: &str = "sandbox-driver-workspace";
 const NETWORK: &str = "sandbox-driver-services";
@@ -115,11 +115,7 @@ impl DockerCli {
     }
 
     pub(super) fn resolve(&self, path: &str) -> String {
-        if path.starts_with('/') {
-            path.to_owned()
-        } else {
-            format!("{}/{}", self.working_dir.trim_end_matches('/'), path)
-        }
+        resolve_path(&self.working_dir, path)
     }
 
     pub(super) async fn inspect(&self, container: &str) -> Result<Value> {

@@ -187,7 +187,11 @@ impl DockerOneShot {
     }
 }
 
-fn is_missing_platform(error: &Error) -> bool {
+/// Whether `error`, or any error in its source chain, is a registry's
+/// refusal to serve an image for the requested platform ("no matching
+/// manifest"). Callers retry the pull with an explicit platform.
+#[must_use]
+pub fn is_missing_platform(error: &Error) -> bool {
     let mut source: Option<&(dyn StdError + 'static)> = Some(error);
     while let Some(current) = source {
         if current.to_string().contains("no matching manifest") {

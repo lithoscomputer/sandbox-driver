@@ -14,6 +14,7 @@ use sandbox_driver::{Pty, PtyOptions, PtySession, PtySize, Result};
 use tokio::sync::{Mutex, RwLock, mpsc};
 
 use crate::sdk::{DaytonaClient, daytona_error};
+use crate::{resolve_path, toolbox};
 
 /// The PTY facet of one Daytona sandbox.
 pub struct DaytonaPty {
@@ -32,11 +33,10 @@ impl DaytonaPty {
     }
 
     fn resolve_dir(&self, dir: Option<&str>) -> String {
-        match dir {
-            None => self.working_dir.clone(),
-            Some(dir) if dir.starts_with('/') => dir.to_owned(),
-            Some(dir) => format!("{}/{}", self.working_dir.trim_end_matches('/'), dir),
-        }
+        dir.map_or_else(
+            || self.working_dir.clone(),
+            |dir| resolve_path(&self.working_dir, dir),
+        )
     }
 }
 
@@ -54,15 +54,7 @@ impl Pty for DaytonaPty {
         err
     )]
     async fn open(&self, options: &PtyOptions) -> Result<Box<dyn PtySession>> {
-        let sandbox = self
-            .client
-            .get(&self.sandbox_id)
-            .await
-            .map_err(|error| daytona_error("fetching sandbox", error))?;
-        let process = sandbox
-            .process()
-            .await
-            .map_err(|error| daytona_error("connecting to the toolbox", error))?;
+        let process = toolbox::process(&self.client, &self.sandbox_id).await?;
 
         // Random nonce plus host pid, like sessions: never collides with
         // a concurrent or crashed driver's terminal.

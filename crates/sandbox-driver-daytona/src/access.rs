@@ -7,6 +7,7 @@ use sandbox_driver::{
 };
 
 use crate::sdk::{DaytonaClient, daytona_error};
+use crate::toolbox;
 
 const WEB_TERMINAL_PORT: u16 = 22_222;
 const VNC_PORT: u16 = 6_080;
@@ -24,10 +25,7 @@ impl DaytonaAccess {
     }
 
     async fn sdk(&self) -> Result<daytona_sdk::Sandbox> {
-        self.client
-            .get(&self.sandbox_id)
-            .await
-            .map_err(|error| daytona_error("fetching sandbox", error))
+        toolbox::sandbox(&self.client, &self.sandbox_id).await
     }
 }
 
