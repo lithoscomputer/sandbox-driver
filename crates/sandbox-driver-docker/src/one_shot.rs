@@ -32,7 +32,7 @@ use bollard::models::{HostConfig, Mount};
 use futures_util::{Stream, StreamExt};
 use sandbox_driver::{
     Error, ExecControls, ExecStreamingResult, OneShot, OneShotImage, OneShotSpec, ProviderError,
-    Result, Termination, stop_signal,
+    Result, StopLevel, Termination, stop_signal,
 };
 use tokio::time;
 
@@ -40,7 +40,7 @@ use crate::container::{ContainerRef, remove_container_forced};
 use crate::daemon::{docker_error, docker_kind, is_conflict, is_not_found};
 use crate::fs::tar::reroot;
 use crate::image::{image_present, pull_image};
-use crate::output::{KILL_DRAIN_GRACE, StopMode, StreamOutput, drain_with_stops};
+use crate::output::{KILL_DRAIN_GRACE, StreamOutput, drain_with_stops};
 use crate::{MANAGED_LABEL, non_empty};
 
 /// The label every one-shot container carries, naming the sandbox it
@@ -288,10 +288,10 @@ impl OneShotContainer {
     /// Never fails: a container already gone or stopped has nothing to
     /// do, and any other failure is logged, since the removal at the end
     /// of the run ends the container regardless.
-    async fn stop(&self, mode: StopMode) -> Result<()> {
-        let signal = match mode {
-            StopMode::Term => "SIGTERM",
-            StopMode::Kill => "SIGKILL",
+    async fn stop(&self, level: StopLevel) -> Result<()> {
+        let signal = match level {
+            StopLevel::Term => "SIGTERM",
+            StopLevel::Kill => "SIGKILL",
         };
         let outcome = self
             .docker
@@ -416,9 +416,9 @@ impl OneShot for DockerOneShot {
             &mut captured,
             output,
             &controls,
-            spec.timeout,
-            started,
-            |mode| container.stop(mode),
+            spec.timeout
+                .map(|timeout| timeout.saturating_sub(started.elapsed())),
+            |level| container.stop(level),
         )
         .await
         {

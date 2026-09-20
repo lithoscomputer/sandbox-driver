@@ -1,7 +1,7 @@
 //! Execute Docker CLI commands through Daytona's byte-preserving exec facet.
 
 use std::fmt::Write as _;
-use std::future::pending;
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use sandbox_driver::{
     BASH_ENV_VAR, Capability, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
     OutputSink, Pty, PtyOptions, PtySession, PtySize, Result, SpawnSpec, StdioProcess,
-    StdioProcessHandle, StopLevel, Termination, run_with_stop_grace, stop_signal,
+    StdioProcessHandle, StopLevel, Termination, drain_with_stops, run_with_stop_grace,
 };
 use sandbox_driver_docker::DockerExec;
 use tokio::runtime::Handle;
@@ -228,77 +228,48 @@ impl NestedExec {
             sink
         });
         let transport_kill = CancellationToken::new();
-        let run = self.cli.exec.run_streaming(&command, ExecControls {
+        let mut run = pin!(self.cli.exec.run_streaming(&command, ExecControls {
             sink,
             kill: Some(transport_kill.clone()),
             retained_output_limit: controls.retained_output_limit,
             ..ExecControls::default()
-        });
-        tokio::pin!(run);
-        let deadline = async {
-            match spec.timeout {
-                Some(duration) => time::sleep(duration).await,
-                None => pending().await,
-            }
+        }));
+        let outcome = drain_with_stops(
+            run.as_mut(),
+            &sink_failed,
+            &controls,
+            spec.timeout,
+            DRAIN_GRACE,
+            |level| job.stop(level),
+        )
+        .await?;
+        let mut result = if let Some(result) = outcome.drained {
+            result?
+        } else {
+            // The job was killed and its output still has not closed:
+            // end the native transport and give it one more bounded wait.
+            transport_kill.cancel();
+            time::timeout(STOP_TIMEOUT * 3, &mut run)
+                .await
+                .map_err(|_| {
+                    Error::io(
+                        "draining nested job output",
+                        io::Error::other("output did not close after the job was killed"),
+                    )
+                })??
         };
-        tokio::pin!(deadline);
-        let mut termination = Termination::Exited;
-        let mut hard_stop = false;
-        let mut drain_deadline = None;
-        let mut transport_stopped = false;
-        loop {
-            tokio::select! {
-                result = &mut run => {
-                    let mut result = result?;
-                    if (result.result.termination != Termination::Exited || sink_failed.is_cancelled()) && !hard_stop {
-                        job.stop(StopLevel::Kill).await?;
-                    }
-                    if sink_failed.is_cancelled() && termination == Termination::Exited {
-                        termination = Termination::Cancelled;
-                    }
-                    job.finished.store(true, Ordering::Release);
-                    if termination != Termination::Exited {
-                        result.result.termination = termination;
-                    }
-                    return Ok(result);
-                }
-                () = stop_signal(controls.kill.as_ref()), if !hard_stop => {
-                    job.stop(StopLevel::Kill).await?;
-                    termination = Termination::Killed;
-                    hard_stop = true;
-                    drain_deadline = Some(time::Instant::now() + DRAIN_GRACE);
-                }
-                () = stop_signal(controls.term.as_ref()), if termination == Termination::Exited => {
-                    job.stop(StopLevel::Term).await?;
-                    termination = Termination::Cancelled;
-                }
-                () = &mut deadline, if !hard_stop => {
-                    job.stop(StopLevel::Kill).await?;
-                    termination = Termination::TimedOut;
-                    hard_stop = true;
-                    drain_deadline = Some(time::Instant::now() + DRAIN_GRACE);
-                }
-                () = sink_failed.cancelled(), if !hard_stop => {
-                    job.stop(StopLevel::Kill).await?;
-                    termination = Termination::Cancelled;
-                    hard_stop = true;
-                    drain_deadline = Some(time::Instant::now() + DRAIN_GRACE);
-                }
-                () = async {
-                    match drain_deadline {
-                        Some(deadline) => time::sleep_until(deadline).await,
-                        None => pending().await,
-                    }
-                } => {
-                    if transport_stopped {
-                        return Err(Error::io("draining nested job output", io::Error::other("output did not close after the job was killed")));
-                    }
-                    transport_kill.cancel();
-                    transport_stopped = true;
-                    drain_deadline = Some(time::Instant::now() + STOP_TIMEOUT * 3);
-                }
-            }
+        // A transport that ended without the job exiting leaves the job
+        // running unless a kill already went out.
+        if result.result.termination != Termination::Exited
+            && outcome.stop_sent != Some(StopLevel::Kill)
+        {
+            job.stop(StopLevel::Kill).await?;
         }
+        job.finished.store(true, Ordering::Release);
+        if outcome.termination != Termination::Exited {
+            result.result.termination = outcome.termination;
+        }
+        Ok(result)
     }
 
     async fn spawn_stdio_raw(&self, spec: &SpawnSpec) -> Result<StdioProcess> {

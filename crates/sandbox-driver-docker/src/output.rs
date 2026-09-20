@@ -1,59 +1,23 @@
 //! Output of a Docker exec or one-shot container: captured and sanitized
-//! while it streams to the caller, and drained under the stop ladder
-//! every Docker command shares.
+//! while it streams to the caller, and drained under the stop race every
+//! Docker command shares with the other providers.
 
-use std::future;
 use std::pin::pin;
 use std::result::Result as StdResult;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bollard::container::LogOutput;
 use bollard::errors::Error as DockerApiError;
 use futures_util::{Stream, StreamExt};
 use sandbox_driver::{
     ExecControls, ExecResult, ExecStreamingResult, OutputCaptureBuffer, OutputSanitization,
-    OutputSanitizer, OutputSink, OutputStream, Result, Termination, stop_signal,
+    OutputSanitizer, OutputSink, OutputStream, Result, StopLevel, Termination,
 };
-use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 /// Grace period for draining output after a kill request. Must exceed
 /// the exec watcher's poll interval.
 pub(crate) const KILL_DRAIN_GRACE: Duration = Duration::from_secs(10);
-
-/// How a running command is asked to stop. `Term` is sent once and the
-/// command keeps draining; `Kill` ends it and starts the drain grace.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StopMode {
-    /// SIGTERM the command, once.
-    Term,
-    /// SIGKILL the command.
-    Kill,
-}
-
-/// Where the stop ladder stands. A kill always carries its drain
-/// deadline, so "kill sent" and "draining" cannot disagree.
-#[derive(Clone, Copy, Debug)]
-enum StopPhase {
-    /// Nothing has been asked of the command.
-    Running,
-    /// A term went out; a kill may still follow.
-    TermSent,
-    /// A kill went out; output is drained until `drain_until` at most.
-    KillSent { drain_until: Instant },
-}
-
-impl StopPhase {
-    fn kill_sent(self) -> bool {
-        matches!(self, Self::KillSent { .. })
-    }
-
-    fn after_kill() -> Self {
-        Self::KillSent {
-            drain_until: Instant::now() + KILL_DRAIN_GRACE,
-        }
-    }
-}
 
 /// How a drain ended: why the command stopped, whether the drain grace
 /// ran out with output still pending, and how the stream itself ended.
@@ -63,83 +27,37 @@ pub(crate) struct DrainOutcome {
     pub(crate) stream:      StdResult<(), DockerApiError>,
 }
 
-/// Drains `output` into `captured` while racing the caller's term and
-/// kill signals, the operation `timeout` measured from `started`, and a
-/// sink that stops accepting output. Each of those asks the command to
-/// stop through `stop`; a kill starts [`KILL_DRAIN_GRACE`], after which
-/// the drain is abandoned and reported truncated. A `stop` that fails
-/// ends the drain with its error.
+/// Drains `output` into `captured` under [`sandbox_driver::drain_with_stops`]
+/// with the operation `timeout` that remains and [`KILL_DRAIN_GRACE`]; a
+/// drain the grace abandoned is reported truncated with its stream intact.
 pub(crate) async fn drain_with_stops<F, Fut>(
     captured: &mut StreamOutput,
     output: impl Stream<Item = StdResult<LogOutput, DockerApiError>> + Unpin,
     controls: &ExecControls,
     timeout: Option<Duration>,
-    started: Instant,
-    mut stop: F,
+    stop: F,
 ) -> Result<DrainOutcome>
 where
-    F: FnMut(StopMode) -> Fut,
+    F: FnMut(StopLevel) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
     let sink_failed = CancellationToken::new();
-    let mut termination = Termination::Exited;
-    let mut phase = StopPhase::Running;
-    let mut termed = pin!(stop_signal(controls.term.as_ref()));
-    let mut killed = pin!(stop_signal(controls.kill.as_ref()));
-    let (stream, truncated) = {
-        let mut drain = pin!(captured.drain(output, controls.sink.as_ref(), &sink_failed));
-        loop {
-            let deadline = async {
-                match timeout {
-                    Some(timeout) if !phase.kill_sent() => {
-                        time::sleep(timeout.saturating_sub(started.elapsed())).await;
-                    }
-                    _ => future::pending().await,
-                }
-            };
-            let drain_timeout = async {
-                match phase {
-                    StopPhase::KillSent { drain_until } => {
-                        time::sleep_until(drain_until.into()).await;
-                    }
-                    StopPhase::Running | StopPhase::TermSent => future::pending().await,
-                }
-            };
-            tokio::select! {
-                outcome = &mut drain => break (outcome, false),
-                () = sink_failed.cancelled(), if !phase.kill_sent() => {
-                    termination = Termination::Cancelled;
-                    phase = StopPhase::after_kill();
-                    stop(StopMode::Kill).await?;
-                }
-                () = &mut termed, if matches!(phase, StopPhase::Running) => {
-                    termination = Termination::Cancelled;
-                    phase = StopPhase::TermSent;
-                    stop(StopMode::Term).await?;
-                }
-                () = &mut killed, if !phase.kill_sent() => {
-                    termination = Termination::Killed;
-                    phase = StopPhase::after_kill();
-                    stop(StopMode::Kill).await?;
-                }
-                () = deadline => {
-                    termination = Termination::TimedOut;
-                    phase = StopPhase::after_kill();
-                    stop(StopMode::Kill).await?;
-                }
-                () = drain_timeout => break (Ok(()), true),
-            }
-        }
+    let mut drain = pin!(captured.drain(output, controls.sink.as_ref(), &sink_failed));
+    let outcome = sandbox_driver::drain_with_stops(
+        drain.as_mut(),
+        &sink_failed,
+        controls,
+        timeout,
+        KILL_DRAIN_GRACE,
+        stop,
+    )
+    .await?;
+    let (stream, truncated) = match outcome.drained {
+        Some(stream) => (stream, false),
+        None => (Ok(()), true),
     };
-    // A sink that failed as the stream ended never got its kill: send
-    // it, so the command does not outlive the caller that stopped
-    // listening.
-    if sink_failed.is_cancelled() && !phase.kill_sent() {
-        termination = Termination::Cancelled;
-        stop(StopMode::Kill).await?;
-    }
     Ok(DrainOutcome {
-        termination,
+        termination: outcome.termination,
         truncated,
         stream,
     })
