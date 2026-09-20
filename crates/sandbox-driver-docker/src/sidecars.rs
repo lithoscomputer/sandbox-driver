@@ -35,10 +35,11 @@ use sandbox_driver::{Error, ProviderError, Result};
 use tokio::time;
 
 use crate::config::{Sidecar, to_health_config};
-use crate::exec::{
+use crate::daemon::{
     docker_error, docker_kind, is_not_found, is_not_modified, tolerate_not_modified,
 };
-use crate::{MANAGED_LABEL, image_present, non_empty, pull_image};
+use crate::image::{image_present, pull_image};
+use crate::{MANAGED_LABEL, non_empty};
 
 /// The label every sidecar carries, naming its network.
 pub(crate) const NETWORK_LABEL: &str = "sh.sandbox-driver.network";

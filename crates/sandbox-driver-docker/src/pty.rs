@@ -1,21 +1,21 @@
 use std::collections::BTreeMap;
 use std::pin::Pin;
+use std::process;
 use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{io, process};
 
 use async_trait::async_trait;
-use bollard::Docker;
 use bollard::container::LogOutput;
 use bollard::errors::Error as DockerApiError;
-use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecOptions, StartExecResults};
+use bollard::exec::{CreateExecOptions, ResizeExecOptions};
 use futures_util::{Stream, StreamExt};
 use sandbox_driver::{BASH_ENV_VAR, Error, Pty, PtyOptions, PtySession, PtySize, Result};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-use crate::exec::{docker_error, shell_quote};
+use crate::container::{AttachedExec, ContainerRef};
+use crate::daemon::{docker_error, shell_quote};
 
 const DEFAULT_TERM: &str = "xterm-256color";
 const DEFAULT_LANG: &str = "C.UTF-8";
@@ -25,27 +25,15 @@ type DockerOutput = Pin<Box<dyn Stream<Item = StdResult<LogOutput, DockerApiErro
 
 /// Interactive terminal access for one Docker container.
 pub(crate) struct DockerPty {
-    docker:       Docker,
-    container_id: String,
-    working_dir:  String,
-    counter:      AtomicU64,
+    container: ContainerRef,
+    counter:   AtomicU64,
 }
 
 impl DockerPty {
-    pub(crate) fn new(docker: Docker, container_id: String, working_dir: String) -> Self {
+    pub(crate) fn new(container: ContainerRef) -> Self {
         Self {
-            docker,
-            container_id,
-            working_dir,
+            container,
             counter: AtomicU64::new(0),
-        }
-    }
-
-    fn resolve_dir(&self, dir: Option<&str>) -> String {
-        match dir {
-            None => self.working_dir.clone(),
-            Some(dir) if dir.starts_with('/') => dir.to_owned(),
-            Some(dir) => format!("{}/{}", self.working_dir.trim_end_matches('/'), dir),
         }
     }
 
@@ -68,7 +56,7 @@ impl Pty for DockerPty {
         skip_all,
         fields(
             provider_kind = "docker",
-            sandbox_id = %self.container_id,
+            sandbox_id = %self.container.id,
             rows = options.size.rows,
             cols = options.size.cols,
             env_count = options.env.len()
@@ -77,28 +65,16 @@ impl Pty for DockerPty {
     )]
     async fn open(&self, options: &PtyOptions) -> Result<Box<dyn PtySession>> {
         let pid_file = self.pid_file();
-        let working_dir = self.resolve_dir(options.working_dir.as_deref());
+        let working_dir = self.container.resolve_dir(options.working_dir.as_deref());
         let create = terminal_exec_options(&working_dir, &pid_file, &options.env);
-        let exec = self
-            .docker
-            .create_exec(&self.container_id, create)
-            .await
-            .map_err(|error| docker_error("creating pty exec", error))?;
-        let start = self
-            .docker
-            .start_exec(&exec.id, None::<StartExecOptions>)
-            .await
-            .map_err(|error| docker_error("starting pty exec", error))?;
-        let StartExecResults::Attached { output, input } = start else {
-            return Err(Error::io(
-                "starting pty exec",
-                io::Error::other("pty exec started detached"),
-            ));
-        };
+        let AttachedExec {
+            id: exec_id,
+            output,
+            input,
+        } = self.container.start_attached(create, "pty exec").await?;
         let session = DockerPtySession {
-            docker: self.docker.clone(),
-            container_id: self.container_id.clone(),
-            exec_id: exec.id,
+            container: self.container.clone(),
+            exec_id,
             pid_file,
             input: Mutex::new(Some(input)),
             output: Mutex::new(Some(output)),
@@ -115,13 +91,12 @@ impl Pty for DockerPty {
 }
 
 struct DockerPtySession {
-    docker:       Docker,
-    container_id: String,
-    exec_id:      String,
-    pid_file:     String,
-    input:        Mutex<Option<DockerInput>>,
-    output:       Mutex<Option<DockerOutput>>,
-    closed:       AtomicBool,
+    container: ContainerRef,
+    exec_id:   String,
+    pid_file:  String,
+    input:     Mutex<Option<DockerInput>>,
+    output:    Mutex<Option<DockerOutput>>,
+    closed:    AtomicBool,
 }
 
 impl DockerPtySession {
@@ -144,31 +119,24 @@ impl DockerPtySession {
              kill -KILL -- \"$pid\" 2>/dev/null || true; fi ;; \
              esac; fi"
         );
-        let cleanup = self
-            .docker
-            .create_exec(&self.container_id, CreateExecOptions {
-                attach_stdout: Some(true),
-                attach_stderr: Some(true),
-                tty: Some(false),
-                // Bash, not sh: dash's `kill` builtin rejects the `--`
-                // separator the group kills need ("Illegal number: -"),
-                // and a PTY session is an interactive bash already.
-                cmd: Some(vec!["bash".to_owned(), "-c".to_owned(), command]),
-                working_dir: Some("/".to_owned()),
-                env: Some(vec![format!("{BASH_ENV_VAR}=")]),
-                ..Default::default()
-            })
-            .await
-            .map_err(|error| docker_error("creating pty cleanup exec", error))?;
-        let start = self
-            .docker
-            .start_exec(&cleanup.id, None::<StartExecOptions>)
-            .await
-            .map_err(|error| docker_error("starting pty cleanup exec", error))?;
-        if let StartExecResults::Attached { mut output, .. } = start {
-            while let Some(chunk) = output.next().await {
-                chunk.map_err(|error| docker_error("reading pty cleanup output", error))?;
-            }
+        let options = CreateExecOptions {
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            tty: Some(false),
+            // Bash, not sh: dash's `kill` builtin rejects the `--`
+            // separator the group kills need ("Illegal number: -"),
+            // and a PTY session is an interactive bash already.
+            cmd: Some(vec!["bash".to_owned(), "-c".to_owned(), command]),
+            working_dir: Some("/".to_owned()),
+            env: Some(vec![format!("{BASH_ENV_VAR}=")]),
+            ..Default::default()
+        };
+        let AttachedExec { mut output, .. } = self
+            .container
+            .start_attached(options, "pty cleanup exec")
+            .await?;
+        while let Some(chunk) = output.next().await {
+            chunk.map_err(|error| docker_error("reading pty cleanup output", error))?;
         }
         Ok(())
     }
@@ -211,7 +179,8 @@ impl PtySession for DockerPtySession {
         err
     )]
     async fn resize(&self, size: PtySize) -> Result<()> {
-        self.docker
+        self.container
+            .docker
             .resize_exec(&self.exec_id, ResizeExecOptions {
                 height: size.rows,
                 width:  size.cols,

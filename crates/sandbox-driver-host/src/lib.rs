@@ -44,11 +44,8 @@
 
 mod access;
 mod exec;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod fence;
 mod fs;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-mod observation;
 mod registry;
 
 use std::collections::{BTreeMap, HashMap};
@@ -71,12 +68,16 @@ use tokio::sync::Mutex;
 use crate::access::HostPreview;
 pub use crate::exec::HostExec;
 use crate::exec::effective_env;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::fence::ProcessGroups;
 pub use crate::fs::HostFs;
 use crate::registry::Record;
 
 type HandleRegistry = Mutex<HashMap<SandboxId, Arc<HostSandbox>>>;
+
+/// The provider kind every Host error and event reports.
+pub(crate) fn host_kind() -> ProviderKind {
+    ProviderKind::try_new("host").expect("static kind is valid")
+}
 
 /// A directory-backed provider. Use [`Self::with_registry`] to preserve
 /// sandbox identity across provider or plugin restarts.
@@ -119,7 +120,7 @@ impl HostProvider {
 
     fn at(root: PathBuf, cleanup_on_drop: bool) -> Self {
         Self {
-            kind: ProviderKind::try_new("host").expect("static kind is valid"),
+            kind: host_kind(),
             capabilities: host_capabilities(),
             root,
             cleanup_on_drop,
@@ -588,7 +589,6 @@ impl SandboxProvider for HostProvider {
 pub struct HostSandbox {
     registry:          Weak<HandleRegistry>,
     root:              PathBuf,
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     groups:            Arc<ProcessGroups>,
     /// Identity and metadata exactly as the registry stores them. Its
     /// `state` is the value last written to disk; `state` below is the
@@ -612,9 +612,6 @@ impl HostSandbox {
         cleanup_on_drop: bool,
         registry: Weak<HandleRegistry>,
     ) -> Result<Self> {
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let _ = cleanup_on_drop;
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let groups = Arc::new(ProcessGroups::new(
             registry::resource_dir(&root, &record.id)?.join("groups"),
             record.state == SandboxState::Running,
@@ -624,13 +621,11 @@ impl HostSandbox {
             record.workspace.clone(),
             record.env.clone(),
             record.ownership == WorkspaceOwnership::Managed,
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
             groups.clone(),
         );
         Ok(Self {
             registry,
             root,
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
             groups,
             capabilities,
             working_directory: record.workspace.to_string_lossy().into_owned(),
@@ -654,7 +649,6 @@ impl HostSandbox {
         Self {
             registry: self.registry.clone(),
             root: self.root.clone(),
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
             groups: self.groups.clone(),
             record: self.record.clone(),
             capabilities: self.capabilities.clone(),
@@ -736,7 +730,6 @@ impl Sandbox for HostSandbox {
                     if *state == SandboxState::Deleted {
                         return Err(registry::missing(&self.record.id));
                     }
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
                     self.groups.start().await?;
                     self.persist(SandboxState::Running).await?;
                     *state = SandboxState::Running;
@@ -760,7 +753,6 @@ impl Sandbox for HostSandbox {
                         self.remove_cached_handle().await;
                         return Ok(());
                     }
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
                     self.groups.stop().await?;
                     self.persist(SandboxState::Stopped).await?;
                     *state = SandboxState::Stopped;
@@ -783,7 +775,6 @@ impl Sandbox for HostSandbox {
                         self.remove_cached_handle().await;
                         return Ok(());
                     }
-                    #[cfg(any(target_os = "linux", target_os = "macos"))]
                     self.groups.stop().await?;
                     if self.record.ownership == WorkspaceOwnership::Managed {
                         match tokio_fs::remove_dir_all(&self.record.workspace).await {
