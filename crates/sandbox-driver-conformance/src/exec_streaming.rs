@@ -2,14 +2,15 @@
 //! partial last lines, retention accounting, and concurrent streams.
 
 use std::io::Cursor;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sandbox_driver::{Capability, ExecControls, ExecSpec, OutputStream, StdinSource};
 use tokio::time;
 
 use crate::Conformance;
-use crate::check::{CheckOutcome, PASS, SeenChunks, fail, numbered_lines, skip};
+use crate::check::{
+    COMMAND_TIMEOUT, CheckOutcome, PASS, RecordedOutput, fail, numbered_lines, skip,
+};
 
 pub(super) async fn exec_streams_stdin(ctx: &Conformance) -> CheckOutcome {
     ctx.require(Capability::ExecStdinStream)?;
@@ -22,7 +23,7 @@ pub(super) async fn exec_streams_stdin(ctx: &Conformance) -> CheckOutcome {
             stdin: Some(source),
             ..ExecControls::buffered()
         };
-        let spec = ExecSpec::new("cat").timeout(Duration::from_secs(30));
+        let spec = ExecSpec::new("cat").timeout(COMMAND_TIMEOUT);
         let streaming = sandbox
             .exec()
             .run_streaming(&spec, controls)
@@ -41,20 +42,12 @@ pub(super) async fn exec_streams_stdin(ctx: &Conformance) -> CheckOutcome {
 
 pub(super) async fn exec_streaming_is_honest(ctx: &Conformance) -> CheckOutcome {
     ctx.with_ready(|sandbox| async move {
-        let chunks: SeenChunks = Arc::new(Mutex::new(Vec::new()));
-        let sink_chunks = Arc::clone(&chunks);
+        let recorded = RecordedOutput::new();
         let controls = ExecControls {
-            sink: Some(Arc::new(move |stream, chunk| {
-                let chunks = Arc::clone(&sink_chunks);
-                Box::pin(async move {
-                    chunks.lock().expect("chunks lock").push((stream, chunk));
-                    Ok(())
-                })
-            })),
+            sink: Some(recorded.sink(Duration::ZERO)),
             ..ExecControls::buffered()
         };
-        let spec =
-            ExecSpec::bash("echo to-stdout; echo to-stderr >&2").timeout(Duration::from_secs(30));
+        let spec = ExecSpec::bash("echo to-stdout; echo to-stderr >&2").timeout(COMMAND_TIMEOUT);
         let streaming = sandbox
             .exec()
             .run_streaming(&spec, controls)
@@ -75,18 +68,11 @@ pub(super) async fn exec_streaming_is_honest(ctx: &Conformance) -> CheckOutcome 
             return fail("result claims streams_separated but the capability is not declared");
         }
 
-        let seen = chunks.lock().expect("chunks lock").clone();
-        let all: Vec<u8> = seen.iter().flat_map(|(_, chunk)| chunk.clone()).collect();
-        let text = String::from_utf8_lossy(&all);
-        if !text.contains("to-stdout") {
+        if !recorded.text().contains("to-stdout") {
             return fail("sink never saw stdout output");
         }
         if streaming.streams_separated {
-            let stderr: Vec<u8> = seen
-                .iter()
-                .filter(|(stream, _)| *stream == OutputStream::Stderr)
-                .flat_map(|(_, chunk)| chunk.clone())
-                .collect();
+            let stderr = recorded.stream(OutputStream::Stderr);
             if !String::from_utf8_lossy(&stderr).contains("to-stderr") {
                 return fail("streams_separated is set but stderr never arrived on stderr");
             }
@@ -105,21 +91,11 @@ pub(super) async fn exec_streams_large_output_in_order(ctx: &Conformance) -> Che
         return skip("capability exec.live_streaming not declared");
     }
     ctx.with_ready(|sandbox| async move {
-        let seen: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink_seen = Arc::clone(&seen);
+        // A consumer that is busy between chunks, like a host writing a
+        // log under load.
+        let recorded = RecordedOutput::new();
         let controls = ExecControls {
-            sink: Some(Arc::new(move |stream, chunk| {
-                let seen = Arc::clone(&sink_seen);
-                Box::pin(async move {
-                    // A consumer that is busy between chunks, like a host
-                    // writing a log under load.
-                    time::sleep(Duration::from_millis(5)).await;
-                    if stream == OutputStream::Stdout {
-                        seen.lock().expect("seen lock").extend_from_slice(&chunk);
-                    }
-                    Ok(())
-                })
-            })),
+            sink: Some(recorded.sink(Duration::from_millis(5))),
             retained_output_limit: Some(0),
             ..ExecControls::buffered()
         };
@@ -139,7 +115,7 @@ pub(super) async fn exec_streams_large_output_in_order(ctx: &Conformance) -> Che
             return fail("stdout was reported truncated");
         }
         let expected = numbered_lines(LINES);
-        let seen = seen.lock().expect("seen lock").clone();
+        let seen = recorded.stdout();
         if seen != expected {
             let lines = seen.split(|byte| *byte == b'\n').count().saturating_sub(1);
             return fail(format!(
@@ -157,7 +133,7 @@ pub(super) async fn exec_streams_large_output_in_order(ctx: &Conformance) -> Che
 /// exactly as written, buffered and streamed alike.
 pub(super) async fn exec_output_keeps_a_partial_last_line(ctx: &Conformance) -> CheckOutcome {
     ctx.with_ready(|sandbox| async move {
-        let spec = ExecSpec::bash("printf 'a\\nb'").timeout(Duration::from_secs(30));
+        let spec = ExecSpec::bash("printf 'a\\nb'").timeout(COMMAND_TIMEOUT);
         let buffered = sandbox
             .exec()
             .run(&spec)
@@ -173,18 +149,9 @@ pub(super) async fn exec_output_keeps_a_partial_last_line(ctx: &Conformance) -> 
         if !ctx.caps().exec.live_streaming {
             return PASS;
         }
-        let seen: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink_seen = Arc::clone(&seen);
+        let recorded = RecordedOutput::new();
         let controls = ExecControls {
-            sink: Some(Arc::new(move |stream, chunk| {
-                let seen = Arc::clone(&sink_seen);
-                Box::pin(async move {
-                    if stream == OutputStream::Stdout {
-                        seen.lock().expect("seen lock").extend_from_slice(&chunk);
-                    }
-                    Ok(())
-                })
-            })),
+            sink: Some(recorded.sink(Duration::ZERO)),
             retained_output_limit: Some(0),
             ..ExecControls::buffered()
         };
@@ -196,7 +163,7 @@ pub(super) async fn exec_output_keeps_a_partial_last_line(ctx: &Conformance) -> 
         if !streaming.result.success() {
             return fail("streaming command failed");
         }
-        let seen = seen.lock().expect("seen lock").clone();
+        let seen = recorded.stdout();
         if seen != b"a\nb" {
             return fail(format!(
                 "streamed stdout was {:?}, expected {:?}",
@@ -250,17 +217,9 @@ pub(super) async fn concurrent_streams_do_not_starve_each_other(ctx: &Conformanc
     ctx.with_ready(|sandbox| async move {
         // Slow stream: a line every 50ms, consumed at 600ms/chunk, so a
         // shared-pipe client accumulates a deep backlog quickly.
-        let slow_chunks: SeenChunks = Arc::new(Mutex::new(Vec::new()));
-        let slow_sink_chunks = Arc::clone(&slow_chunks);
+        let slow_recorded = RecordedOutput::new();
         let slow_controls = ExecControls {
-            sink: Some(Arc::new(move |stream, chunk| {
-                let chunks = Arc::clone(&slow_sink_chunks);
-                Box::pin(async move {
-                    time::sleep(Duration::from_millis(600)).await;
-                    chunks.lock().expect("chunks lock").push((stream, chunk));
-                    Ok(())
-                })
-            })),
+            sink: Some(slow_recorded.sink(Duration::from_millis(600))),
             ..ExecControls::buffered()
         };
         let slow_spec = ExecSpec::bash("for i in $(seq 1 20); do echo slow-$i; sleep 0.05; done")
@@ -281,21 +240,14 @@ pub(super) async fn concurrent_streams_do_not_starve_each_other(ctx: &Conformanc
         }
 
         // Fast exec with its own sink, plus a describe, both timed.
-        let fast_chunks: SeenChunks = Arc::new(Mutex::new(Vec::new()));
-        let fast_sink_chunks = Arc::clone(&fast_chunks);
+        let fast_recorded = RecordedOutput::new();
         let fast_controls = ExecControls {
-            sink: Some(Arc::new(move |stream, chunk| {
-                let chunks = Arc::clone(&fast_sink_chunks);
-                Box::pin(async move {
-                    chunks.lock().expect("chunks lock").push((stream, chunk));
-                    Ok(())
-                })
-            })),
+            sink: Some(fast_recorded.sink(Duration::ZERO)),
             ..ExecControls::buffered()
         };
         let fast_spec = ExecSpec::new("echo")
             .arg("fast-done")
-            .timeout(Duration::from_secs(30));
+            .timeout(COMMAND_TIMEOUT);
         let race_started = Instant::now();
         let mut fast_and_describe = std::pin::pin!(async {
             tokio::join!(
@@ -326,13 +278,7 @@ pub(super) async fn concurrent_streams_do_not_starve_each_other(ctx: &Conformanc
         }
 
         // Cross-contamination and ordering.
-        let fast_seen: Vec<u8> = fast_chunks
-            .lock()
-            .expect("chunks lock")
-            .iter()
-            .flat_map(|(_, chunk)| chunk.clone())
-            .collect();
-        let fast_text = String::from_utf8_lossy(&fast_seen);
+        let fast_text = fast_recorded.text();
         if !fast_text.contains("fast-done") || fast_text.contains("slow-") {
             return fail(format!("fast sink saw wrong output: {fast_text:?}"));
         }
@@ -346,13 +292,7 @@ pub(super) async fn concurrent_streams_do_not_starve_each_other(ctx: &Conformanc
         if !slow.result.success() {
             return fail("slow exec did not succeed".to_owned());
         }
-        let slow_seen: Vec<u8> = slow_chunks
-            .lock()
-            .expect("chunks lock")
-            .iter()
-            .flat_map(|(_, chunk)| chunk.clone())
-            .collect();
-        let slow_text = String::from_utf8_lossy(&slow_seen);
+        let slow_text = slow_recorded.text();
         if slow_text.contains("fast-done") {
             return fail("slow sink saw the fast exec's output".to_owned());
         }

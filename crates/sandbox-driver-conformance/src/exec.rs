@@ -1,36 +1,31 @@
 //! Buffered exec: exit codes, environment, literal argv, binary-safe
 //! output, sanitization, and stdin.
 
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sandbox_driver::{Capability, ExecControls, ExecSpec, OutputSanitization, Termination};
 
-use crate::check::{CheckOutcome, PASS, SeenChunks, fail};
+use crate::check::{COMMAND_TIMEOUT, CheckOutcome, PASS, RecordedOutput, fail, run_ok};
 use crate::{Conformance, Provision};
 
 /// A relative exec `working_dir` resolves against the sandbox working
 /// directory on every provider.
 pub(super) async fn relative_working_dir_resolves(ctx: &Conformance) -> CheckOutcome {
     ctx.with_ready(|sandbox| async move {
-        let mkdir = sandbox
-            .exec()
-            .run(
-                &ExecSpec::new("mkdir")
-                    .args(["-p", "cwd-probe"])
-                    .timeout(Duration::from_secs(30)),
-            )
-            .await
-            .map_err(|error| format!("mkdir failed: {error}"))?;
-        if !mkdir.success() {
-            return fail(format!("mkdir failed: {}", mkdir.stderr_lossy()));
-        }
+        run_ok(
+            sandbox.as_ref(),
+            "mkdir",
+            &ExecSpec::new("mkdir")
+                .args(["-p", "cwd-probe"])
+                .timeout(COMMAND_TIMEOUT),
+        )
+        .await?;
         let result = sandbox
             .exec()
             .run(
                 &ExecSpec::new("pwd")
                     .working_dir("cwd-probe")
-                    .timeout(Duration::from_secs(30)),
+                    .timeout(COMMAND_TIMEOUT),
             )
             .await
             .map_err(|error| format!("exec failed: {error}"))?;
@@ -51,7 +46,7 @@ pub(super) async fn exec_reports_exit_codes(ctx: &Conformance) -> CheckOutcome {
     ctx.with_ready(|sandbox| async move {
         let result = sandbox
             .exec()
-            .run(&ExecSpec::bash("exit 7").timeout(Duration::from_secs(30)))
+            .run(&ExecSpec::bash("exit 7").timeout(COMMAND_TIMEOUT))
             .await
             .map_err(|error| format!("exec failed: {error}"))?;
         if result.exit_code != Some(7) {
@@ -69,7 +64,7 @@ pub(super) async fn exec_env_vars_apply(ctx: &Conformance) -> CheckOutcome {
     ctx.with_ready(|sandbox| async move {
         let spec = ExecSpec::bash("printf '%s' \"$CONFORMANCE_VALUE\"")
             .env_var("CONFORMANCE_VALUE", "expected-value")
-            .timeout(Duration::from_secs(30));
+            .timeout(COMMAND_TIMEOUT);
         let result = sandbox
             .exec()
             .run(&spec)
@@ -88,7 +83,7 @@ pub(super) async fn exec_env_vars_apply(ctx: &Conformance) -> CheckOutcome {
         let spec = ExecSpec::new("printenv")
             .arg("CONFORMANCE-DASHED")
             .env_var("CONFORMANCE-DASHED", "dashed-value")
-            .timeout(Duration::from_secs(30));
+            .timeout(COMMAND_TIMEOUT);
         let result = sandbox
             .exec()
             .run(&spec)
@@ -121,7 +116,7 @@ pub(super) async fn bash_helper_ignores_a_caller_bash_env(ctx: &Conformance) -> 
         let root = sandbox.working_directory().trim_end_matches('/');
         let spec = ExecSpec::bash("echo ran")
             .env_var("BASH_ENV", format!("{root}/conformance-startup.sh"))
-            .timeout(Duration::from_secs(30));
+            .timeout(COMMAND_TIMEOUT);
         let result = sandbox
             .exec()
             .run(&spec)
@@ -150,7 +145,7 @@ pub(super) async fn exec_argv_is_literal(ctx: &Conformance) -> CheckOutcome {
         let spec = ExecSpec::new("printf")
             .args(["%s|%s", hostile, "second arg"])
             .env_var("CONFORMANCE_VALUE", "expanded")
-            .timeout(Duration::from_secs(30));
+            .timeout(COMMAND_TIMEOUT);
         let result = sandbox
             .exec()
             .run(&spec)
@@ -180,7 +175,7 @@ pub(super) async fn exec_output_is_binary_safe(ctx: &Conformance) -> CheckOutcom
         }
         let command = format!("for i in {{1..8}}; do printf '{octal}'; done; printf '\\0\\0x'");
         let expected: Vec<u8> = (0..=255).cycle().take(2048).chain([0, 0, b'x']).collect();
-        let spec = ExecSpec::bash(command).timeout(Duration::from_secs(30));
+        let spec = ExecSpec::bash(command).timeout(COMMAND_TIMEOUT);
         let result = sandbox
             .exec()
             .run(&spec)
@@ -219,22 +214,15 @@ pub(super) async fn exec_output_sanitization_is_consistent(ctx: &Conformance) ->
             ));
         }
 
-        let chunks: SeenChunks = Arc::new(Mutex::new(Vec::new()));
-        let sink_chunks = Arc::clone(&chunks);
+        let recorded = RecordedOutput::new();
         let controls = ExecControls {
-            sink: Some(Arc::new(move |stream, chunk| {
-                let chunks = Arc::clone(&sink_chunks);
-                Box::pin(async move {
-                    chunks.lock().expect("chunks lock").push((stream, chunk));
-                    Ok(())
-                })
-            })),
+            sink: Some(recorded.sink(Duration::ZERO)),
             ..ExecControls::buffered()
         };
         let spec =
             ExecSpec::bash("printf '\\033'; sleep 0.05; printf '[31mred\\033[0m\\007\\001\\n'")
                 .output_sanitization(OutputSanitization::StripAll)
-                .timeout(Duration::from_secs(30));
+                .timeout(COMMAND_TIMEOUT);
         let all = sandbox
             .exec()
             .run_streaming(&spec, controls)
@@ -252,12 +240,7 @@ pub(super) async fn exec_output_sanitization_is_consistent(ctx: &Conformance) ->
                 all.result.stdout
             ));
         }
-        let streamed: Vec<u8> = chunks
-            .lock()
-            .expect("chunks lock")
-            .iter()
-            .flat_map(|(_, chunk)| chunk.clone())
-            .collect();
+        let streamed = recorded.bytes();
         if streamed != b"red\n" {
             return fail(format!("StripAll sink saw wrong output: {streamed:?}"));
         }
@@ -277,7 +260,7 @@ pub(super) async fn exec_stdin_round_trips(ctx: &Conformance) -> CheckOutcome {
     ctx.with_ready(|sandbox| async move {
         let spec = ExecSpec::new("cat")
             .stdin(b"stdin-payload".to_vec())
-            .timeout(Duration::from_secs(30));
+            .timeout(COMMAND_TIMEOUT);
         let result = sandbox
             .exec()
             .run(&spec)
@@ -295,7 +278,7 @@ pub(super) async fn exec_reports_a_foreign_signal(ctx: &Conformance) -> CheckOut
     ctx.with_ready(|sandbox| async move {
         // The command signals its own process; the provider reports the
         // signal number even though the shell only sees `128 + N`.
-        let spec = ExecSpec::bash("kill -TERM $$; sleep 5").timeout(Duration::from_secs(30));
+        let spec = ExecSpec::bash("kill -TERM $$; sleep 5").timeout(COMMAND_TIMEOUT);
         let result = sandbox
             .exec()
             .run(&spec)

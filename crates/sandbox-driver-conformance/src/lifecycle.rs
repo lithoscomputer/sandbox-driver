@@ -13,7 +13,7 @@ use sandbox_driver::{
 use tokio::sync::Notify;
 use tokio::time;
 
-use crate::check::{CheckOutcome, PASS, fail, skip};
+use crate::check::{COMMAND_TIMEOUT, CheckOutcome, PASS, fail, run_ok, skip};
 use crate::{Conformance, Provision};
 
 #[derive(Default)]
@@ -221,7 +221,7 @@ pub(super) async fn working_directory_is_effective(ctx: &Conformance) -> CheckOu
         }
         let result = sandbox
             .exec()
-            .run(&ExecSpec::new("pwd").timeout(Duration::from_secs(30)))
+            .run(&ExecSpec::new("pwd").timeout(COMMAND_TIMEOUT))
             .await
             .map_err(|error| format!("exec failed: {error}"))?;
         let pwd = result.stdout_lossy().trim().to_owned();
@@ -242,7 +242,7 @@ pub(super) async fn working_directory_is_effective(ctx: &Conformance) -> CheckOu
         }
         let attached_result = attached
             .exec()
-            .run(&ExecSpec::new("pwd").timeout(Duration::from_secs(30)))
+            .run(&ExecSpec::new("pwd").timeout(COMMAND_TIMEOUT))
             .await
             .map_err(|error| format!("attached exec failed: {error}"))?;
         let attached_pwd = attached_result.stdout_lossy().trim().to_owned();
@@ -335,11 +335,7 @@ pub(super) async fn pause_resume_cycle(ctx: &Conformance) -> CheckOutcome {
         // The sandbox must still work after the cycle.
         let result = sandbox
             .exec()
-            .run(
-                &ExecSpec::new("echo")
-                    .arg("alive")
-                    .timeout(Duration::from_secs(30)),
-            )
+            .run(&ExecSpec::new("echo").arg("alive").timeout(COMMAND_TIMEOUT))
             .await
             .map_err(|error| format!("exec after resume failed: {error}"))?;
         if !result.success() {
@@ -357,31 +353,22 @@ pub(super) async fn fork_preserves_live_process_state(ctx: &Conformance) -> Chec
             return skip("lifecycle.fork masked for this sandbox's class");
         }
 
-        let prepare = sandbox
-            .exec()
-            .run(
-                &ExecSpec::bash(
-                    "printf preserved > /tmp/sandbox-driver-fork-marker; \
-                     nohup sh -c 'echo $$ > /tmp/sandbox-driver-fork-pid; \
-                     while :; do sleep 1; done' </dev/null >/dev/null 2>&1 & \
-                     for i in 1 2 3 4 5; do \
-                         test -s /tmp/sandbox-driver-fork-pid && break; sleep 1; \
-                     done; \
-                     cat /tmp/sandbox-driver-fork-pid",
-                )
-                .timeout(Duration::from_secs(30)),
+        let prepare = run_ok(
+            sandbox.as_ref(),
+            "fork process setup",
+            &ExecSpec::bash(
+                "printf preserved > /tmp/sandbox-driver-fork-marker; \
+                 nohup sh -c 'echo $$ > /tmp/sandbox-driver-fork-pid; \
+                 while :; do sleep 1; done' </dev/null >/dev/null 2>&1 & \
+                 for i in 1 2 3 4 5; do \
+                     test -s /tmp/sandbox-driver-fork-pid && break; sleep 1; \
+                 done; \
+                 cat /tmp/sandbox-driver-fork-pid",
             )
-            .await;
-        let source_pid = match prepare {
-            Ok(result) if result.success() => result.stdout_lossy().trim().to_owned(),
-            Ok(result) => {
-                return fail(format!(
-                    "fork process setup failed: {}",
-                    result.stderr_lossy()
-                ));
-            }
-            Err(error) => return fail(format!("fork process setup failed: {error}")),
-        };
+            .timeout(COMMAND_TIMEOUT),
+        )
+        .await?;
+        let source_pid = prepare.stdout_lossy().trim().to_owned();
 
         let forked = sandbox
             .fork(&sandbox_driver::ForkOptions::default())
@@ -415,7 +402,7 @@ async fn check_fork(forked: &Arc<dyn Sandbox>, source_pid: &str) -> CheckOutcome
                  kill -0 \"$pid\"; printf '%s ' \"$pid\"; \
                  cat /tmp/sandbox-driver-fork-marker",
             )
-            .timeout(Duration::from_secs(30)),
+            .timeout(COMMAND_TIMEOUT),
         )
         .await
         .map_err(|error| format!("checking forked process failed: {error}"))?;
@@ -529,10 +516,7 @@ pub(super) async fn create_emits_terminal_events(ctx: &Conformance) -> CheckOutc
     ) {
         return fail("create completion does not identify the created sandbox");
     }
-    if seen.windows(2).any(|pair| {
-        pair[0].source_id() != pair[1].source_id()
-            || pair[0].sequence().checked_add(1) != Some(pair[1].sequence())
-    }) {
+    if !is_contiguous(&seen) {
         return fail("create event source or sequence is not continuous");
     }
     let delete_events: Vec<&Event> = all_seen
@@ -565,31 +549,51 @@ pub(super) async fn create_emits_terminal_events(ctx: &Conformance) -> CheckOutc
     };
     if !matches!(delete_started.body, EventBody::OperationStarted {
         action: Action::Delete,
-    }) || !matches!(delete_terminal.body, EventBody::OperationCompleted {
+    }) {
+        return fail(format!("first delete event was {:?}", delete_started.body));
+    }
+    if !matches!(delete_terminal.body, EventBody::OperationCompleted {
         action: Action::Delete,
         ..
-    }) || delete_started.operation_id != delete_terminal.operation_id
-        || delete_events
-            .iter()
-            .any(|event| event.operation_id != delete_started.operation_id)
-        || delete_events
-            .iter()
-            .filter(|event| matches!(event.body, EventBody::OperationStarted { .. }))
-            .count()
-            != 1
-        || delete_events
-            .iter()
-            .filter(|event| event.body.is_terminal())
-            .count()
-            != 1
-    {
-        return fail("delete start and completion are not a paired operation");
-    }
-    if all_seen.windows(2).any(|pair| {
-        pair[0].source_id() != pair[1].source_id()
-            || pair[0].sequence().checked_add(1) != Some(pair[1].sequence())
     }) {
+        return fail(format!(
+            "last delete event was not completed: {:?}",
+            delete_terminal.body
+        ));
+    }
+    if delete_events
+        .iter()
+        .any(|event| event.operation_id != delete_started.operation_id)
+    {
+        return fail("delete events do not share one operation id");
+    }
+    let starts = delete_events
+        .iter()
+        .filter(|event| matches!(event.body, EventBody::OperationStarted { .. }))
+        .count();
+    if starts != 1 {
+        return fail(format!("delete emitted {starts} start events, expected 1"));
+    }
+    let terminals = delete_events
+        .iter()
+        .filter(|event| event.body.is_terminal())
+        .count();
+    if terminals != 1 {
+        return fail(format!(
+            "delete emitted {terminals} terminal events, expected 1"
+        ));
+    }
+    if !is_contiguous(&all_seen) {
         return fail("event source or sequence changed across create and delete");
     }
     PASS
+}
+
+/// Consecutive events come from one source and their sequence numbers
+/// step by one.
+fn is_contiguous(events: &[Event]) -> bool {
+    events.windows(2).all(|pair| {
+        pair[0].source_id() == pair[1].source_id()
+            && pair[0].sequence().checked_add(1) == Some(pair[1].sequence())
+    })
 }

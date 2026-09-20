@@ -9,7 +9,7 @@ use sandbox_driver::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::check::{CheckOutcome, PASS, fail, skip};
+use crate::check::{COMMAND_TIMEOUT, CheckOutcome, PASS, fail, skip};
 use crate::{Conformance, Provision};
 
 pub(super) async fn unsupported_actions_say_so(ctx: &Conformance) -> CheckOutcome {
@@ -154,61 +154,100 @@ pub(super) async fn snapshot_modes_are_honest(ctx: &Conformance) -> CheckOutcome
 pub(super) async fn services_match_capabilities(ctx: &Conformance) -> CheckOutcome {
     let caps = ctx.caps();
     let mut wrong: Vec<String> = Vec::new();
-    if caps.snapshots.is_some() != ctx.provider.snapshots().is_some() {
-        wrong.push(format!(
-            "snapshots service presence ({}) disagrees with capabilities ({})",
+    let services = [
+        (
+            "snapshots",
+            caps.snapshots.is_some(),
             ctx.provider.snapshots().is_some(),
-            caps.snapshots.is_some()
-        ));
-    }
-    if caps.volumes.is_some() != ctx.provider.volumes().is_some() {
-        wrong.push(format!(
-            "volumes service presence ({}) disagrees with capabilities ({})",
+        ),
+        (
+            "volumes",
+            caps.volumes.is_some(),
             ctx.provider.volumes().is_some(),
-            caps.volumes.is_some()
-        ));
+        ),
+    ];
+    for (service, declared, present) in services {
+        if declared != present {
+            wrong.push(format!(
+                "{service} service presence ({present}) disagrees with capabilities ({declared})"
+            ));
+        }
     }
     let sandbox = ctx.create().await?;
     ctx.lease(&sandbox);
     let sandbox_caps = sandbox.capabilities();
-    if sandbox_caps.access.preview_urls != sandbox.preview_urls().is_some() {
-        wrong.push("preview_urls facet presence disagrees with capabilities".to_owned());
-    }
-    if sandbox_caps.access.ssh != sandbox.ssh().is_some() {
-        wrong.push("ssh facet presence disagrees with capabilities".to_owned());
-    }
-    if sandbox_caps.access.shell_command != sandbox.shell_command().is_some() {
-        wrong.push("shell_command facet presence disagrees with capabilities".to_owned());
-    }
-    if sandbox_caps.pty.is_some() != sandbox.pty().is_some() {
-        wrong.push("pty facet presence disagrees with capabilities".to_owned());
-    }
-    if sandbox_caps.logs.is_some() != sandbox.logs().is_some() {
-        wrong.push("logs facet presence disagrees with capabilities".to_owned());
-    }
-    if sandbox_caps.supports(Capability::Search) != sandbox.search().is_some() {
-        wrong.push("search facet presence disagrees with capabilities".to_owned());
-    }
-    if sandbox_caps.search.native != sandbox.provider_search().is_some() {
-        wrong.push("search provider override disagrees with search.native".to_owned());
-    }
-    if sandbox_caps.supports(Capability::Git) != sandbox.git().is_some() {
-        wrong.push("git facet presence disagrees with capabilities".to_owned());
-    }
-    if sandbox_caps.git.native != sandbox.provider_git().is_some() {
-        wrong.push("git provider override disagrees with git.native".to_owned());
-    }
-    if sandbox_caps.supports(Capability::Services) != sandbox.services().is_some() {
-        wrong.push("services facet presence disagrees with capabilities".to_owned());
-    }
-    if sandbox_caps.services.native != sandbox.provider_services().is_some() {
-        wrong.push("services provider override disagrees with services.native".to_owned());
-    }
-    if sandbox_caps.access.web_terminal != sandbox.web_terminal().is_some() {
-        wrong.push("web_terminal facet presence disagrees with capabilities".to_owned());
-    }
-    if sandbox_caps.access.vnc != sandbox.vnc().is_some() {
-        wrong.push("vnc facet presence disagrees with capabilities".to_owned());
+    // (what disagrees, declared, present)
+    let facets = [
+        (
+            "preview_urls facet presence disagrees with capabilities",
+            sandbox_caps.access.preview_urls,
+            sandbox.preview_urls().is_some(),
+        ),
+        (
+            "ssh facet presence disagrees with capabilities",
+            sandbox_caps.access.ssh,
+            sandbox.ssh().is_some(),
+        ),
+        (
+            "shell_command facet presence disagrees with capabilities",
+            sandbox_caps.access.shell_command,
+            sandbox.shell_command().is_some(),
+        ),
+        (
+            "pty facet presence disagrees with capabilities",
+            sandbox_caps.pty.is_some(),
+            sandbox.pty().is_some(),
+        ),
+        (
+            "logs facet presence disagrees with capabilities",
+            sandbox_caps.logs.is_some(),
+            sandbox.logs().is_some(),
+        ),
+        (
+            "search facet presence disagrees with capabilities",
+            sandbox_caps.supports(Capability::Search),
+            sandbox.search().is_some(),
+        ),
+        (
+            "search provider override disagrees with search.native",
+            sandbox_caps.search.native,
+            sandbox.provider_search().is_some(),
+        ),
+        (
+            "git facet presence disagrees with capabilities",
+            sandbox_caps.supports(Capability::Git),
+            sandbox.git().is_some(),
+        ),
+        (
+            "git provider override disagrees with git.native",
+            sandbox_caps.git.native,
+            sandbox.provider_git().is_some(),
+        ),
+        (
+            "services facet presence disagrees with capabilities",
+            sandbox_caps.supports(Capability::Services),
+            sandbox.services().is_some(),
+        ),
+        (
+            "services provider override disagrees with services.native",
+            sandbox_caps.services.native,
+            sandbox.provider_services().is_some(),
+        ),
+        (
+            "web_terminal facet presence disagrees with capabilities",
+            sandbox_caps.access.web_terminal,
+            sandbox.web_terminal().is_some(),
+        ),
+        (
+            "vnc facet presence disagrees with capabilities",
+            sandbox_caps.access.vnc,
+            sandbox.vnc().is_some(),
+        ),
+    ];
+    for (message, declared, present) in facets {
+        if declared != present {
+            wrong.push(message.to_owned());
+        }
     }
     ctx.cleanup(&sandbox).await;
     if wrong.is_empty() {
@@ -309,7 +348,7 @@ pub(super) async fn exec_rejects_undeclared_stdin_and_stop(ctx: &Conformance) ->
         if !caps.exec.stdin {
             let spec = ExecSpec::new("cat")
                 .stdin(b"dropped?".to_vec())
-                .timeout(Duration::from_secs(30));
+                .timeout(COMMAND_TIMEOUT);
             match sandbox
                 .exec()
                 .run_streaming(&spec, ExecControls::buffered())
@@ -329,7 +368,7 @@ pub(super) async fn exec_rejects_undeclared_stdin_and_stop(ctx: &Conformance) ->
                 term: Some(CancellationToken::new()),
                 ..ExecControls::buffered()
             };
-            let spec = ExecSpec::new("true").timeout(Duration::from_secs(30));
+            let spec = ExecSpec::new("true").timeout(COMMAND_TIMEOUT);
             match sandbox.exec().run_streaming(&spec, controls).await {
                 Err(Error::Unsupported {
                     capability: Capability::ExecStop,
