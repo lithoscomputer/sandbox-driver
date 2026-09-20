@@ -7,8 +7,6 @@ use sandbox_driver::{Error, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::methods as m;
-
 /// Limits for one client/plugin connection. These defaults are validation
 /// targets, not a measured capacity claim. Both peers enforce their own limits.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -108,34 +106,4 @@ pub(crate) fn acquire(budget: &Arc<Semaphore>, limit: &str) -> Result<OwnedSemap
         .map_err(|_| Error::Overloaded {
             limit: limit.into(),
         })
-}
-
-pub(crate) fn reserved(method: &str) -> bool {
-    matches!(
-        method,
-        m::EXEC_STOP
-            | m::EXEC_STDIO_TERMINATE
-            | m::PTY_CLOSE
-            | m::STREAM_CANCEL
-            | m::SHUTDOWN
-            | m::SANDBOX_STOP
-            | m::SANDBOX_DELETE
-            | m::ACCESS_PREVIEW_RELEASE
-            | m::TRANSPORT_DIAGNOSTICS
-            | m::PROVIDER_HEALTH
-    )
-}
-
-pub(crate) fn uses_io(method: &str) -> bool {
-    matches!(
-        method,
-        m::EXEC_STREAM
-            | m::ONE_SHOT_RUN
-            | m::EXEC_STDIO_OPEN
-            | m::PTY_OPEN
-            | m::LOGS_FOLLOW
-            | m::FS_READ
-            | m::FS_WRITE
-            | m::SNAPSHOT_BUILD_LOGS
-    )
 }

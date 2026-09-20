@@ -15,6 +15,7 @@ use sandbox_driver::{
     SandboxSpec, SandboxState, SandboxStatus, SearchCaps, ServiceCaps, SnapshotId, SnapshotMode,
     SnapshotSource, SnapshotSpec, Termination,
 };
+use sandbox_driver_protocol::WireError;
 use sandbox_driver_protocol::methods::{
     ExecStreamResult, ForkOptionsDto, FsWriteParams, GitCloneParams, HealthResult,
     SandboxSnapshotOptionsDto, SandboxSpecDto, SnapshotSourceDto, SnapshotSpecDto,
@@ -428,4 +429,288 @@ fn git_clone_requests_default_their_options_and_redact_their_url() {
     assert_eq!(request.options.depth, Some(1));
     let debug = format!("{request:?}");
     assert!(!debug.contains("hunter2"), "debug: {debug}");
+}
+
+/// An application error as an independently written peer sends it: the
+/// section 7 `report` plus the kind's `detail` fields, with a field from
+/// the future in each detail. Every kind in the table must decode to its
+/// typed error from this era JSON.
+fn wire_error(kind: &str, retryable: bool, causes: &[&str], detail: &serde_json::Value) -> Error {
+    let json = serde_json::json!({
+        "code": -32000,
+        "message": format!("a {kind} failure"),
+        "data": {
+            "report": {"kind": kind, "message": format!("a {kind} failure"),
+                        "retryable": retryable, "causes": causes},
+            "detail": detail
+        }
+    });
+    serde_json::from_value::<WireError>(json)
+        .expect("era error decodes")
+        .into_error()
+}
+
+#[test]
+fn every_error_kind_decodes_from_its_era_detail() {
+    use std::error::Error as _;
+
+    let unsupported = wire_error(
+        "unsupported",
+        false,
+        &[],
+        &serde_json::json!({
+            "capability": "lifecycle.pause", "future_field": 1
+        }),
+    );
+    assert!(matches!(unsupported, Error::Unsupported {
+        capability: Capability::LifecyclePause,
+    }));
+
+    let not_found = wire_error(
+        "not_found",
+        false,
+        &[],
+        &serde_json::json!({
+            "resource": "sandbox", "id": "sb-1", "future_field": 1
+        }),
+    );
+    assert!(
+        matches!(not_found, Error::NotFound { resource: ResourceKind::Sandbox, id }
+        if id == "sb-1")
+    );
+
+    let not_owned = wire_error(
+        "not_owned",
+        false,
+        &[],
+        &serde_json::json!({
+            "resource": "snapshot", "id": "snap-1"
+        }),
+    );
+    assert!(
+        matches!(not_owned, Error::NotOwned { resource: ResourceKind::Snapshot, id }
+        if id == "snap-1")
+    );
+
+    let invalid_spec = wire_error(
+        "invalid_spec",
+        false,
+        &[],
+        &serde_json::json!({
+            "field": "source", "reason": "must be an image"
+        }),
+    );
+    assert!(matches!(invalid_spec, Error::InvalidSpec { field, reason }
+        if field == "source" && reason == "must be an image"));
+
+    let invalid_state = wire_error(
+        "invalid_state",
+        false,
+        &[],
+        &serde_json::json!({
+            "current": "paused", "action": "stop"
+        }),
+    );
+    assert!(matches!(invalid_state, Error::InvalidState {
+        current: SandboxState::Paused,
+        action:  Action::Stop,
+    }));
+
+    let timeout = wire_error(
+        "timeout",
+        false,
+        &[],
+        &serde_json::json!({
+            "operation": "creating sandbox", "elapsed": {"secs": 7, "nanos": 0}
+        }),
+    );
+    assert!(matches!(timeout, Error::Timeout { operation, elapsed }
+        if operation == "creating sandbox" && elapsed == Duration::from_secs(7)));
+
+    let auth = wire_error(
+        "auth",
+        false,
+        &["remote rejected token"],
+        &serde_json::json!({
+            "auth": {"provider": "test", "reason": "token expired", "future_field": 1}
+        }),
+    );
+    let Error::Auth(auth) = auth else {
+        panic!("expected auth: {auth:?}");
+    };
+    assert_eq!(auth.provider.as_str(), "test");
+    assert_eq!(auth.reason, "token expired");
+    assert_eq!(
+        auth.source().expect("remote cause").to_string(),
+        "remote rejected token"
+    );
+
+    let rate_limited = wire_error(
+        "rate_limited",
+        true,
+        &[],
+        &serde_json::json!({
+            "retry_after": {"secs": 0, "nanos": 250_000_000}
+        }),
+    );
+    assert!(matches!(rate_limited, Error::RateLimited { retry_after }
+        if retry_after == Some(Duration::from_millis(250))));
+    let rate_limited = wire_error("rate_limited", true, &[], &serde_json::json!({}));
+    assert!(matches!(rate_limited, Error::RateLimited {
+        retry_after: None,
+    }));
+
+    let overloaded = wire_error(
+        "overloaded",
+        true,
+        &[],
+        &serde_json::json!({
+            "limit": "active_io", "not_started": true
+        }),
+    );
+    assert!(matches!(overloaded, Error::Overloaded { limit } if limit == "active_io"));
+
+    let limit = wire_error(
+        "limit_exceeded",
+        false,
+        &[],
+        &serde_json::json!({
+            "limit": "buffered_value_bytes", "max_bytes": 4
+        }),
+    );
+    assert!(matches!(limit, Error::LimitExceeded { limit, max_bytes: 4 }
+        if limit == "buffered_value_bytes"));
+
+    let incomplete = wire_error(
+        "incomplete",
+        false,
+        &[],
+        &serde_json::json!({
+            "incomplete": {"operation": "hard cancellation drain", "output_abandoned": true,
+                           "stop_acknowledged": true, "termination_confirmed": false,
+                           "cleanup_confirmed": false, "future_field": 1}
+        }),
+    );
+    let Error::Incomplete(incomplete) = incomplete else {
+        panic!("expected incomplete: {incomplete:?}");
+    };
+    assert_eq!(incomplete.operation, "hard cancellation drain");
+    assert!(incomplete.stop_acknowledged && !incomplete.termination_confirmed);
+
+    let provider = wire_error(
+        "provider",
+        true,
+        &["daemon disconnected"],
+        &serde_json::json!({
+            "provider": {"provider": "test", "message": "listing sandboxes",
+                         "code": "backend_unavailable", "retryable": true, "detail": null}
+        }),
+    );
+    let Error::Provider(provider) = provider else {
+        panic!("expected provider: {provider:?}");
+    };
+    assert_eq!(provider.code.as_deref(), Some("backend_unavailable"));
+    assert!(provider.retryable);
+    assert_eq!(
+        provider.source().expect("remote cause").to_string(),
+        "daemon disconnected"
+    );
+
+    let exec = wire_error(
+        "exec",
+        false,
+        &[],
+        &serde_json::json!({
+            "exec": {"label": "probe", "termination": "exited", "exit_code": 3,
+                     "stdout_b64": "b3V0", "stderr_b64": "ZXJy"}
+        }),
+    );
+    let Error::Exec(failure) = exec else {
+        panic!("expected exec: {exec:?}");
+    };
+    assert_eq!(failure.label(), "probe");
+    assert_eq!(failure.exit_code(), Some(3));
+    assert_eq!(failure.stdout(), b"out");
+    assert_eq!(failure.duration(), None, "duration_ms is additive");
+
+    let git = wire_error(
+        "git",
+        false,
+        &[],
+        &serde_json::json!({
+            "git": {"operation": "git clone", "kind": "ref_not_found",
+                    "exec": {"label": "git fetch", "termination": "exited", "exit_code": 128,
+                             "stdout_b64": "", "stderr_b64": "ZmF0YWw="}}
+        }),
+    );
+    let Error::Git(failure) = git else {
+        panic!("expected git: {git:?}");
+    };
+    assert_eq!(failure.operation(), "git clone");
+    assert_eq!(failure.kind(), GitFailureKind::RefNotFound);
+    assert_eq!(
+        failure.output().expect("command output").exit_code(),
+        Some(128)
+    );
+
+    let io = wire_error(
+        "io",
+        false,
+        &["binary disappeared"],
+        &serde_json::json!({
+            "io_context": "reading plugin executable"
+        }),
+    );
+    assert!(matches!(io, Error::Io { context, source }
+        if context == "reading plugin executable" && source.to_string() == "binary disappeared"));
+
+    let transport = wire_error(
+        "transport",
+        false,
+        &["pipe closed"],
+        &serde_json::json!({
+            "transport_context": "reading plugin response"
+        }),
+    );
+    let Error::Transport(transport) = transport else {
+        panic!("expected transport: {transport:?}");
+    };
+    assert_eq!(transport.context, "reading plugin response");
+    assert_eq!(
+        transport.source().expect("remote cause").to_string(),
+        "pipe closed"
+    );
+}
+
+/// A kind from the future, or a detail missing the fields its kind
+/// needs, still reaches the caller as a provider error that keeps the
+/// report's kind and retryable flag.
+#[test]
+fn unknown_or_underspecified_error_kinds_fall_back_to_the_report() {
+    let future = wire_error(
+        "a_kind_from_the_future",
+        true,
+        &[],
+        &serde_json::json!({
+            "anything": true
+        }),
+    );
+    let Error::Provider(provider) = future else {
+        panic!("expected provider fallback: {future:?}");
+    };
+    assert_eq!(provider.code.as_deref(), Some("a_kind_from_the_future"));
+    assert!(provider.retryable);
+
+    let underspecified = wire_error(
+        "not_found",
+        false,
+        &[],
+        &serde_json::json!({
+            "resource": "sandbox"
+        }),
+    );
+    let Error::Provider(provider) = underspecified else {
+        panic!("expected provider fallback: {underspecified:?}");
+    };
+    assert_eq!(provider.code.as_deref(), Some("not_found"));
 }
