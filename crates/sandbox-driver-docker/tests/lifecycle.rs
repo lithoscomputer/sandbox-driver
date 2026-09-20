@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bollard::Docker;
-use sandbox_driver::{SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec};
+use sandbox_driver::{
+    Error, SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec,
+};
 use sandbox_driver_docker::DockerProvider;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -252,6 +254,38 @@ async fn delete_retries_a_network_failure_after_disconnecting_the_sandbox() {
         1
     );
     assert!(requests.last().unwrap().contains("/containers/main?"));
+}
+
+/// A handle whose container vanished reports `NotFound` from every verb
+/// that inspects it first, as the provider's own inspect does.
+#[tokio::test]
+async fn a_vanished_container_is_not_found_by_environment_and_start() {
+    let gone = Arc::new(AtomicBool::new(false));
+    let seen_gone = gone.clone();
+    let daemon = Daemon::new(move |request| {
+        if request.contains("/containers/main/json") {
+            if seen_gone.load(Ordering::SeqCst) {
+                (404, json!({"message": "no such container"}))
+            } else {
+                (200, inspect(true))
+            }
+        } else {
+            (204, Value::Null)
+        }
+    })
+    .await;
+    let sandbox = daemon
+        .provider
+        .attach(&SandboxId::try_new("main").unwrap(), None)
+        .await
+        .unwrap();
+    gone.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        sandbox.environment().await,
+        Err(Error::NotFound { .. })
+    ));
+    assert!(matches!(sandbox.start().await, Err(Error::NotFound { .. })));
+    daemon.finish().await;
 }
 
 #[tokio::test]

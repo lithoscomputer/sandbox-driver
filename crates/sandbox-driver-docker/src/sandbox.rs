@@ -5,24 +5,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bollard::Docker;
-use bollard::container::{
-    InspectContainerOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
-};
+use bollard::container::{StartContainerOptions, StopContainerOptions};
+use bollard::models::ContainerInspectResponse;
 use sandbox_driver::{
-    Action, BASH_ENV_VAR, Capabilities, Error, EventEmitter, EventSubject, Exec, ExecSpec,
-    Filesystem, OneShot, PlatformInfo, PreviewUrls, ProviderError, Pty, ResourceKind, Result,
-    Sandbox, SandboxId, SandboxKind, SandboxState, SandboxStatus, ShellCommand,
+    Action, Capabilities, Error, EventEmitter, EventSubject, Exec, ExecSpec, Filesystem, OneShot,
+    PlatformInfo, PreviewUrls, ProviderError, Pty, ResourceKind, Result, Sandbox, SandboxId,
+    SandboxKind, SandboxState, SandboxStatus, ShellCommand,
 };
 
 use crate::access::DockerShellCommand;
+use crate::container::{ContainerRef, remove_sandbox};
 use crate::daemon::{
     docker_error, docker_kind, is_not_found, is_not_modified, tolerate_not_modified,
 };
 use crate::exec::DockerExec;
 use crate::forward::DockerForwards;
 use crate::fs::DockerFs;
-use crate::inspect::status_from_inspect;
+use crate::inspect::{configured_env, status_from_inspect};
 use crate::one_shot::{self, DockerOneShot};
 use crate::pty::DockerPty;
 use crate::{RUNTIME_DIRECTORY, SIDECAR_NETWORK_LABEL, sidecars};
@@ -32,8 +31,7 @@ pub struct DockerSandbox {
     pub(crate) id:            SandboxId,
     pub(crate) name:          Option<String>,
     pub(crate) capabilities:  Capabilities,
-    pub(crate) docker:        Docker,
-    pub(crate) working_dir:   String,
+    pub(crate) container:     ContainerRef,
     pub(crate) labels:        BTreeMap<String, String>,
     pub(crate) exec:          Arc<DockerExec>,
     pub(crate) fs:            DockerFs,
@@ -49,6 +47,14 @@ pub struct DockerSandbox {
     pub(crate) events:        EventEmitter,
 }
 
+impl DockerSandbox {
+    /// Inspects the sandbox's container; a missing one is
+    /// [`Error::NotFound`].
+    async fn inspect(&self) -> Result<ContainerInspectResponse> {
+        self.container.inspect().await
+    }
+}
+
 #[async_trait]
 impl Sandbox for DockerSandbox {
     fn id(&self) -> &SandboxId {
@@ -61,11 +67,7 @@ impl Sandbox for DockerSandbox {
 
     #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.id), err)]
     async fn describe(&self) -> Result<SandboxStatus> {
-        match self
-            .docker
-            .inspect_container(self.id.as_str(), None::<InspectContainerOptions>)
-            .await
-        {
+        match self.inspect().await {
             Ok(inspect) => {
                 let mut status = status_from_inspect(self.id.clone(), &inspect);
                 if status.labels.is_empty() {
@@ -73,18 +75,18 @@ impl Sandbox for DockerSandbox {
                 }
                 Ok(status)
             }
-            Err(error) if is_not_found(&error) => {
+            Err(Error::NotFound { .. }) => {
                 let mut status = SandboxStatus::new(self.id.clone(), SandboxState::Deleted);
                 status.name.clone_from(&self.name);
                 status.sandbox_kind = Some(SandboxKind::Container);
                 Ok(status)
             }
-            Err(error) => Err(docker_error("inspecting container", error)),
+            Err(error) => Err(error),
         }
     }
 
     fn working_directory(&self) -> &str {
-        &self.working_dir
+        &self.container.working_dir
     }
 
     fn runtime_directory(&self) -> Option<&str> {
@@ -93,27 +95,7 @@ impl Sandbox for DockerSandbox {
 
     #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.id), err)]
     async fn environment(&self) -> Result<BTreeMap<String, String>> {
-        // The container's effective env is the image's plus what create
-        // set, which the daemon records on `.Config.Env`. `BASH_ENV` is
-        // an internal blank and never part of the reported environment.
-        let inspect = self
-            .docker
-            .inspect_container(self.id.as_str(), None::<InspectContainerOptions>)
-            .await
-            .map_err(|error| docker_error("inspecting container", error))?;
-        let entries = inspect
-            .config
-            .and_then(|config| config.env)
-            .unwrap_or_default();
-        let mut env = BTreeMap::new();
-        for entry in entries {
-            if let Some((key, value)) = entry.split_once('=') {
-                if key != BASH_ENV_VAR {
-                    env.insert(key.to_owned(), value.to_owned());
-                }
-            }
-        }
-        Ok(env)
+        Ok(configured_env(&self.inspect().await?))
     }
 
     #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.id), err)]
@@ -143,11 +125,7 @@ impl Sandbox for DockerSandbox {
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Start,
                 |_| async {
-                    let inspect = self
-                        .docker
-                        .inspect_container(self.id.as_str(), None::<InspectContainerOptions>)
-                        .await
-                        .map_err(|error| docker_error("inspecting container", error))?;
+                    let inspect = self.inspect().await?;
                     if let Some(network) = &self.network {
                         // A crash during create leaves the primary labeled
                         // and stopped, but not connected until every service
@@ -165,11 +143,10 @@ impl Sandbox for DockerSandbox {
                                 "sandbox creation did not finish connecting its services; delete the incomplete sandbox",
                             )));
                         }
-                        sidecars::set_running(&self.docker, network, true).await?;
+                        sidecars::set_running(&self.container.docker, network, true).await?;
                     }
                     if inspect.state.as_ref().and_then(|state| state.paused) == Some(true) {
-                        return self
-                            .docker
+                        return self.container.docker
                             .unpause_container(self.id.as_str())
                             .await
                             .map_err(|error| docker_error("unpausing container", error));
@@ -179,13 +156,12 @@ impl Sandbox for DockerSandbox {
                     // resources before restarting it. Starting an already
                     // running sandbox must preserve its active one-shots.
                     if inspect.state.as_ref().and_then(|state| state.running) != Some(true) {
-                        one_shot::sweep(&self.docker, self.id.as_str()).await?;
+                        one_shot::sweep(&self.container.docker, self.id.as_str()).await?;
                     }
                     // Already-running (304) is success; a vanished container is
                     // not — start's postcondition is a running sandbox, so 404
                     // must surface, unlike stop/delete where gone is the goal.
-                    match self
-                        .docker
+                    match self.container.docker
                         .start_container(self.id.as_str(), None::<StartContainerOptions<String>>)
                         .await
                     {
@@ -218,15 +194,16 @@ impl Sandbox for DockerSandbox {
                     self.forwards.close_all().await;
                     // Whatever a one-shot was doing in the workspace ends
                     // with the sandbox's own processes.
-                    one_shot::sweep(&self.docker, self.id.as_str()).await?;
+                    one_shot::sweep(&self.container.docker, self.id.as_str()).await?;
                     tolerate_not_modified(
-                        self.docker
+                        self.container
+                            .docker
                             .stop_container(self.id.as_str(), Some(StopContainerOptions { t: 1 }))
                             .await,
                         "stopping container",
                     )?;
                     if let Some(network) = &self.network {
-                        sidecars::set_running(&self.docker, network, false).await?;
+                        sidecars::set_running(&self.container.docker, network, false).await?;
                     }
                     Ok(())
                 },
@@ -236,30 +213,18 @@ impl Sandbox for DockerSandbox {
 
     #[tracing::instrument(skip_all, fields(provider_kind = "docker", sandbox_id = %self.id), err)]
     async fn delete(&self) -> Result<()> {
-        let options = RemoveContainerOptions {
-            force: true,
-            v: true,
-            ..Default::default()
-        };
         self.events
             .run(
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Delete,
                 |_| async {
                     self.forwards.close_all().await;
-                    one_shot::sweep(&self.docker, self.id.as_str()).await?;
-                    if let Some(network) = &self.network {
-                        sidecars::sweep(&self.docker, network, Some(self.id.as_str())).await?;
-                    }
-                    match self
-                        .docker
-                        .remove_container(self.id.as_str(), Some(options))
-                        .await
-                    {
-                        Ok(()) => Ok(()),
-                        Err(error) if is_not_found(&error) => Ok(()),
-                        Err(error) => Err(docker_error("removing container", error)),
-                    }
+                    remove_sandbox(
+                        &self.container.docker,
+                        self.id.as_str(),
+                        self.network.as_deref(),
+                    )
+                    .await
                 },
             )
             .await
@@ -272,7 +237,8 @@ impl Sandbox for DockerSandbox {
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Pause,
                 |_| async {
-                    self.docker
+                    self.container
+                        .docker
                         .pause_container(self.id.as_str())
                         .await
                         .map_err(|error| docker_error("pausing container", error))
@@ -288,7 +254,8 @@ impl Sandbox for DockerSandbox {
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Resume,
                 |_| async {
-                    self.docker
+                    self.container
+                        .docker
                         .unpause_container(self.id.as_str())
                         .await
                         .map_err(|error| docker_error("unpausing container", error))

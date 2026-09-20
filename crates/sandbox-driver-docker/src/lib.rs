@@ -50,6 +50,7 @@
 
 mod access;
 mod config;
+mod container;
 mod daemon;
 mod exec;
 mod forward;
