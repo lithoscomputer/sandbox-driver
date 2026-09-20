@@ -15,31 +15,32 @@
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::future;
-use std::pin::pin;
-use std::time::{Duration, Instant};
+use std::pin::Pin;
+use std::result::Result as StdResult;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use bollard::Docker;
 use bollard::container::{
     AttachContainerOptions, Config, CreateContainerOptions, DownloadFromContainerOptions,
-    KillContainerOptions, ListContainersOptions, StartContainerOptions, WaitContainerOptions,
+    KillContainerOptions, ListContainersOptions, LogOutput, StartContainerOptions,
+    WaitContainerOptions,
 };
 use bollard::errors::Error as DockerApiError;
 use bollard::image::BuildImageOptions;
 use bollard::models::{HostConfig, Mount};
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use sandbox_driver::{
     Error, ExecControls, ExecStreamingResult, OneShot, OneShotImage, OneShotSpec, ProviderError,
     Result, Termination, stop_signal,
 };
 use tokio::time;
-use tokio_util::sync::CancellationToken;
 
 use crate::container::{ContainerRef, remove_container_forced};
 use crate::daemon::{docker_error, docker_kind, is_conflict, is_not_found};
-use crate::exec::StreamOutput;
 use crate::fs::tar::reroot;
 use crate::image::{image_present, pull_image};
+use crate::output::{KILL_DRAIN_GRACE, StopMode, StreamOutput, drain_with_stops};
 use crate::{MANAGED_LABEL, non_empty};
 
 /// The label every one-shot container carries, naming the sandbox it
@@ -48,8 +49,6 @@ pub(crate) const ONE_SHOT_LABEL: &str = "sh.sandbox-driver.one-shot";
 /// The one fallback platform: CI images target linux/amd64, so an image
 /// with no manifest for the daemon's architecture is pulled as amd64.
 const FALLBACK_PLATFORM: &str = "linux/amd64";
-/// Grace period for draining output after a kill.
-const KILL_DRAIN_GRACE: Duration = Duration::from_secs(10);
 
 /// The one-shot facet of one Docker sandbox.
 pub(crate) struct DockerOneShot {
@@ -166,11 +165,137 @@ impl DockerOneShot {
         }
     }
 
-    async fn signal(&self, container: &str, signal: &str) {
-        let outcome = self
-            .container
+    /// Readies the image under the operation's own stop controls and
+    /// deadline: an already cancelled run pulls nothing and creates
+    /// nothing.
+    async fn prepare_image_or_stop(
+        &self,
+        spec: &OneShotSpec,
+        controls: &ExecControls,
+        started: Instant,
+    ) -> Result<StdResult<String, Termination>> {
+        let deadline = async {
+            match spec.timeout {
+                Some(timeout) if started.elapsed() < timeout => {
+                    time::sleep(timeout.saturating_sub(started.elapsed())).await;
+                }
+                Some(_) => {}
+                None => future::pending().await,
+            }
+        };
+        Ok(tokio::select! {
+            biased;
+            () = stop_signal(controls.kill.as_ref()) => Err(Termination::Killed),
+            () = stop_signal(controls.term.as_ref()) => Err(Termination::Cancelled),
+            () = deadline => Err(Termination::TimedOut),
+            image = self.prepare_image(&spec.image) => Ok(image?),
+        })
+    }
+
+    /// The one-shot container for `spec`: `image`, the sandbox's
+    /// workspace at its working directory, and the sandbox container's
+    /// network namespace, labeled as this sandbox's.
+    fn container_config(&self, spec: &OneShotSpec, image: String) -> Config<String> {
+        let mut labels = HashMap::new();
+        labels.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
+        labels.insert(ONE_SHOT_LABEL.to_owned(), self.container.id.clone());
+        let host_config = HostConfig {
+            network_mode: Some(format!("container:{}", self.container.id)),
+            mounts: Some(vec![self.workspace.clone()]),
+            init: Some(true),
+            ..Default::default()
+        };
+        let env: Vec<String> = spec
+            .env
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        Config {
+            image: Some(image),
+            entrypoint: spec.entrypoint.clone().map(|entrypoint| vec![entrypoint]),
+            cmd: non_empty(spec.args.clone()),
+            env: non_empty(env),
+            working_dir: Some(
+                spec.working_dir
+                    .clone()
+                    .unwrap_or_else(|| self.container.working_dir.clone()),
+            ),
+            labels: Some(labels),
+            host_config: Some(host_config),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            ..Default::default()
+        }
+    }
+}
+
+/// One-shot output as the daemon streams it.
+type ContainerOutput = Pin<Box<dyn Stream<Item = StdResult<LogOutput, DockerApiError>> + Send>>;
+
+/// A one-shot container from creation to removal. Every failure between
+/// the two removes it, so a run never leaves a container behind.
+struct OneShotContainer {
+    docker: Docker,
+    id:     String,
+}
+
+impl OneShotContainer {
+    async fn create(docker: &Docker, config: Config<String>) -> Result<Self> {
+        let created = docker
+            .create_container(None::<CreateContainerOptions<String>>, config)
+            .await
+            .map_err(|error| docker_error("creating one-shot container", error))?;
+        Ok(Self {
+            docker: docker.clone(),
+            id:     created.id,
+        })
+    }
+
+    /// Attaches to both output streams, then starts the container, so no
+    /// output is missed. A failure at either step removes the container.
+    async fn attach_and_start(&self) -> Result<ContainerOutput> {
+        let attached = match self
             .docker
-            .kill_container(container, Some(KillContainerOptions { signal }))
+            .attach_container(
+                &self.id,
+                Some(AttachContainerOptions::<String> {
+                    stdout: Some(true),
+                    stderr: Some(true),
+                    stream: Some(true),
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            Ok(attached) => attached,
+            Err(error) => {
+                self.remove_now().await;
+                return Err(docker_error("attaching one-shot container", error));
+            }
+        };
+        if let Err(error) = self
+            .docker
+            .start_container(&self.id, None::<StartContainerOptions<String>>)
+            .await
+        {
+            self.remove_now().await;
+            return Err(docker_error("starting one-shot container", error));
+        }
+        Ok(attached.output)
+    }
+
+    /// Asks the container to stop: a term is SIGTERM, a kill SIGKILL.
+    /// Never fails: a container already gone or stopped has nothing to
+    /// do, and any other failure is logged, since the removal at the end
+    /// of the run ends the container regardless.
+    async fn stop(&self, mode: StopMode) -> Result<()> {
+        let signal = match mode {
+            StopMode::Term => "SIGTERM",
+            StopMode::Kill => "SIGKILL",
+        };
+        let outcome = self
+            .docker
+            .kill_container(&self.id, Some(KillContainerOptions { signal }))
             .await;
         match outcome {
             Ok(()) => {}
@@ -184,6 +309,38 @@ impl DockerOneShot {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// The exit code, from the daemon's own wait; a container the drain
+    /// deadline abandoned may still be running, and the removal below
+    /// ends it.
+    async fn exit_code(&self) -> Option<i32> {
+        let mut wait = self.docker.wait_container(
+            &self.id,
+            Some(WaitContainerOptions {
+                condition: "not-running",
+            }),
+        );
+        // Bollard reports a non-zero status as an error variant that
+        // still carries the code; both shapes are the container's exit.
+        match time::timeout(KILL_DRAIN_GRACE, wait.next()).await {
+            Ok(Some(Ok(response))) => i32::try_from(response.status_code).ok(),
+            Ok(Some(Err(DockerApiError::DockerContainerWaitError { code, .. }))) => {
+                i32::try_from(code).ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// Removes the container, running or not; the run is over.
+    async fn remove(self) {
+        self.remove_now().await;
+    }
+
+    async fn remove_now(&self) {
+        let _ =
+            remove_container_forced(&self.docker, &self.id, "removing one-shot container").await;
     }
 }
 
@@ -239,25 +396,7 @@ impl OneShot for DockerOneShot {
     )]
     async fn run(&self, spec: &OneShotSpec, controls: ExecControls) -> Result<ExecStreamingResult> {
         let started = Instant::now();
-        // An already cancelled run does not pull an image or create a
-        // container. Image preparation shares the operation's deadline.
-        let deadline = async {
-            match spec.timeout {
-                Some(timeout) if started.elapsed() < timeout => {
-                    time::sleep(timeout.saturating_sub(started.elapsed())).await;
-                }
-                Some(_) => {}
-                None => future::pending().await,
-            }
-        };
-        let prepared = tokio::select! {
-            biased;
-            () = stop_signal(controls.kill.as_ref()) => Err(Termination::Killed),
-            () = stop_signal(controls.term.as_ref()) => Err(Termination::Cancelled),
-            () = deadline => Err(Termination::TimedOut),
-            image = self.prepare_image(&spec.image) => Ok(image?),
-        };
-        let image = match prepared {
+        let image = match self.prepare_image_or_stop(spec, &controls, started).await? {
             Ok(image) => image,
             Err(termination) => {
                 return Ok(StreamOutput::new(
@@ -267,179 +406,55 @@ impl OneShot for DockerOneShot {
                 .into_result(termination, None, started.elapsed(), false));
             }
         };
-
-        let mut labels = HashMap::new();
-        labels.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
-        labels.insert(ONE_SHOT_LABEL.to_owned(), self.container.id.clone());
-        let host_config = HostConfig {
-            network_mode: Some(format!("container:{}", self.container.id)),
-            mounts: Some(vec![self.workspace.clone()]),
-            init: Some(true),
-            ..Default::default()
-        };
-        let env: Vec<String> = spec
-            .env
-            .iter()
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect();
-        let config = Config {
-            image: Some(image),
-            entrypoint: spec.entrypoint.clone().map(|entrypoint| vec![entrypoint]),
-            cmd: non_empty(spec.args.clone()),
-            env: non_empty(env),
-            working_dir: Some(
-                spec.working_dir
-                    .clone()
-                    .unwrap_or_else(|| self.container.working_dir.clone()),
-            ),
-            labels: Some(labels),
-            host_config: Some(host_config),
-            attach_stdout: Some(true),
-            attach_stderr: Some(true),
-            ..Default::default()
-        };
-        let created = self
-            .container
-            .docker
-            .create_container(None::<CreateContainerOptions<String>>, config)
-            .await
-            .map_err(|error| docker_error("creating one-shot container", error))?;
-        let container = created.id;
-        let remove = |docker: Docker, container: String| async move {
-            let _ =
-                remove_container_forced(&docker, &container, "removing one-shot container").await;
-        };
-
-        let attached = match self
-            .container
-            .docker
-            .attach_container(
-                &container,
-                Some(AttachContainerOptions::<String> {
-                    stdout: Some(true),
-                    stderr: Some(true),
-                    stream: Some(true),
-                    ..Default::default()
-                }),
-            )
-            .await
-        {
-            Ok(attached) => attached,
-            Err(error) => {
-                remove(self.container.docker.clone(), container).await;
-                return Err(docker_error("attaching one-shot container", error));
-            }
-        };
-        let output = attached.output;
-        if let Err(error) = self
-            .container
-            .docker
-            .start_container(&container, None::<StartContainerOptions<String>>)
-            .await
-        {
-            remove(self.container.docker.clone(), container).await;
-            return Err(docker_error("starting one-shot container", error));
-        }
-
+        let container =
+            OneShotContainer::create(&self.container.docker, self.container_config(spec, image))
+                .await?;
+        let output = container.attach_and_start().await?;
         let mut captured =
             StreamOutput::new(spec.output_sanitization, controls.retained_output_limit);
-        let sink_failed = CancellationToken::new();
-        let mut termination = Termination::Exited;
-        let mut term_fired = false;
-        let mut kill_fired = false;
-        let mut drain_deadline: Option<Instant> = None;
-        let mut termed = pin!(stop_signal(controls.term.as_ref()));
-        let mut killed = pin!(stop_signal(controls.kill.as_ref()));
-        let (stream_result, truncated) = {
-            let mut drain = pin!(captured.drain(output, controls.sink.as_ref(), &sink_failed));
-            loop {
-                let timeout = async {
-                    match spec.timeout {
-                        Some(timeout) if !kill_fired => {
-                            time::sleep(timeout.saturating_sub(started.elapsed())).await;
-                        }
-                        _ => future::pending().await,
-                    }
-                };
-                let drain_timeout = async {
-                    match drain_deadline {
-                        Some(deadline) => time::sleep_until(deadline.into()).await,
-                        None => future::pending().await,
-                    }
-                };
-                tokio::select! {
-                    outcome = &mut drain => break (outcome, false),
-                    () = sink_failed.cancelled(), if !kill_fired => {
-                        termination = Termination::Cancelled;
-                        kill_fired = true;
-                        drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                        self.signal(&container, "SIGKILL").await;
-                    }
-                    () = &mut termed, if !term_fired && !kill_fired => {
-                        termination = Termination::Cancelled;
-                        term_fired = true;
-                        self.signal(&container, "SIGTERM").await;
-                    }
-                    () = &mut killed, if !kill_fired => {
-                        termination = Termination::Killed;
-                        kill_fired = true;
-                        drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                        self.signal(&container, "SIGKILL").await;
-                    }
-                    () = timeout => {
-                        termination = Termination::TimedOut;
-                        kill_fired = true;
-                        drain_deadline = Some(Instant::now() + KILL_DRAIN_GRACE);
-                        self.signal(&container, "SIGKILL").await;
-                    }
-                    () = drain_timeout => break (Ok(()), true),
-                }
+        let outcome = match drain_with_stops(
+            &mut captured,
+            output,
+            &controls,
+            spec.timeout,
+            started,
+            |mode| container.stop(mode),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                container.remove().await;
+                return Err(error);
             }
         };
-        if sink_failed.is_cancelled() && !kill_fired {
-            termination = Termination::Cancelled;
-            self.signal(&container, "SIGKILL").await;
-        }
-
-        // The exit code, from the daemon's own wait; a container the drain
-        // deadline abandoned may still be running, and the removal below
-        // ends it.
-        let exit_code = if stream_result.is_ok() {
-            let mut wait = self.container.docker.wait_container(
-                &container,
-                Some(WaitContainerOptions {
-                    condition: "not-running",
-                }),
-            );
-            // Bollard reports a non-zero status as an error variant that
-            // still carries the code; both shapes are the container's exit.
-            match time::timeout(KILL_DRAIN_GRACE, wait.next()).await {
-                Ok(Some(Ok(response))) => i32::try_from(response.status_code).ok(),
-                Ok(Some(Err(DockerApiError::DockerContainerWaitError { code, .. }))) => {
-                    i32::try_from(code).ok()
-                }
-                _ => None,
-            }
+        let exit_code = if outcome.stream.is_ok() {
+            container.exit_code().await
         } else {
             None
         };
-        remove(self.container.docker.clone(), container).await;
-        stream_result.map_err(|error| docker_error("reading one-shot output", error))?;
+        container.remove().await;
+        outcome
+            .stream
+            .map_err(|error| docker_error("reading one-shot output", error))?;
 
         // A container that vanished under the run — the sandbox's stop or
         // delete swept it — ended, but not by exiting: nobody observed how.
-        let termination = if termination == Termination::Exited && exit_code.is_none() {
+        let termination = if outcome.termination == Termination::Exited && exit_code.is_none() {
             Termination::Unknown
         } else {
-            termination
+            outcome.termination
         };
-        Ok(captured.into_result(termination, exit_code, started.elapsed(), truncated))
+        Ok(captured.into_result(termination, exit_code, started.elapsed(), outcome.truncated))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use tokio::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
 
