@@ -12,7 +12,8 @@ use async_trait::async_trait;
 use sandbox_driver::{
     Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputCaptureBuffer,
     OutputSanitizer, OutputSink, OutputStream, Result, SpawnSpec, StderrTail, StdioProcess,
-    StdioProcessHandle, Termination, feed_stdin, run_with_stop_grace, stop_signal,
+    StdioProcessHandle, Termination, feed_stdin, finish_stdin_writer, run_with_stop_grace,
+    stop_signal,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{ChildStderr, ChildStdout, Command};
@@ -430,21 +431,7 @@ impl HostExec {
             .await?
         };
         if let Some(stdin_task) = stdin_task {
-            // The process is gone, so unwritten stdin bytes are unwanted.
-            // Abort instead of joining unbounded: a backgrounded
-            // grandchild that inherited the pipe could otherwise block
-            // the writer forever.
-            stdin_task.abort();
-            match stdin_task.await {
-                Ok(result) => result?,
-                Err(join_error) if join_error.is_cancelled() => {}
-                Err(join_error) => {
-                    return Err(Error::io(
-                        "exec stdin writer task",
-                        io::Error::other(join_error),
-                    ));
-                }
-            }
+            finish_stdin_writer(stdin_task).await?;
         }
         // Pumps that finished cleanly are the only complete output. Every
         // other way out of the race (a stop, the timeout, a failed sink or
@@ -604,26 +591,8 @@ impl HostExec {
         let stderr = child.stderr.take().expect("stderr was piped");
 
         let stderr_tail = StderrTail::default();
-        let tail = stderr_tail.clone();
         // Ends at stderr EOF, i.e. when the process exits.
-        tokio::spawn(async move {
-            let mut reader = stderr;
-            let mut buffer = [0u8; 4096];
-            loop {
-                match reader.read(&mut buffer).await {
-                    Ok(0) => break,
-                    Err(error) => {
-                        tracing::warn!(
-                            provider_kind = "host",
-                            error = ?error,
-                            "stdio stderr reader failed"
-                        );
-                        break;
-                    }
-                    Ok(read) => tail.push(&buffer[..read]),
-                }
-            }
-        });
+        tokio::spawn(stderr_tail.clone().pump(stderr));
 
         Ok(StdioProcess {
             stdin: Box::pin(stdin),

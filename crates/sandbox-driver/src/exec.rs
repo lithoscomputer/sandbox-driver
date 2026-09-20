@@ -9,7 +9,8 @@ use std::{fmt, future, io};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::capabilities::Capability;
@@ -460,6 +461,24 @@ pub async fn feed_stdin<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Ends the task a provider spawned on [`feed_stdin`] once the command
+/// is done. Unwritten stdin bytes are unwanted then, so the task is
+/// aborted rather than joined unbounded: a backgrounded grandchild that
+/// inherited the pipe could otherwise block the writer forever. A task
+/// that had already finished reports its own result; one that was cut
+/// short is fine; one that panicked is an error.
+pub async fn finish_stdin_writer(task: JoinHandle<Result<()>>) -> Result<()> {
+    task.abort();
+    match task.await {
+        Ok(result) => result,
+        Err(join_error) if join_error.is_cancelled() => Ok(()),
+        Err(join_error) => Err(Error::io(
+            "exec stdin writer task",
+            io::Error::other(join_error),
+        )),
+    }
+}
+
 impl fmt::Debug for StdinSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StdinSource").finish_non_exhaustive()
@@ -846,6 +865,24 @@ impl StderrTail {
         }
     }
 
+    /// Reads `stderr` to EOF into the tail. Ends at EOF, which for a
+    /// process's own pipe is when it exits, or at the first read error,
+    /// which is logged: the tail is a diagnostic and never fails a
+    /// process. Providers spawn this beside the process they hand out.
+    pub async fn pump(self, mut stderr: impl AsyncRead + Unpin) {
+        let mut buffer = [0u8; 4096];
+        loop {
+            match stderr.read(&mut buffer).await {
+                Ok(0) => break,
+                Err(error) => {
+                    tracing::warn!(error = ?error, "stdio stderr reader failed");
+                    break;
+                }
+                Ok(read) => self.push(&buffer[..read]),
+            }
+        }
+    }
+
     /// The retained tail decoded lossily, prefixed with an ellipsis when
     /// earlier output was dropped.
     pub fn to_string_lossy(&self) -> String {
@@ -867,6 +904,9 @@ impl Default for StderrTail {
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::duplex;
+    use tokio::task::yield_now;
+
     use super::*;
 
     #[test]
@@ -941,6 +981,44 @@ mod tests {
         assert_eq!(tail.to_string_lossy(), "…23456789");
         tail.push(b"AB");
         assert_eq!(tail.to_string_lossy(), "…456789AB");
+    }
+
+    #[tokio::test]
+    async fn the_stderr_pump_reads_to_eof_into_the_tail() {
+        let tail = StderrTail::new(8);
+        let (mut writer, reader) = duplex(4);
+        let pump = tokio::spawn(tail.clone().pump(reader));
+        writer.write_all(b"0123456789").await.expect("write");
+        drop(writer);
+        pump.await.expect("the pump ends at EOF");
+        assert_eq!(tail.to_string_lossy(), "…23456789");
+    }
+
+    #[tokio::test]
+    async fn finishing_the_stdin_writer_aborts_a_blocked_write_and_keeps_a_result() {
+        // A writer blocked on a full pipe is cut short, not joined.
+        let (writer, _reader) = duplex(1);
+        let blocked = tokio::spawn(feed_stdin(
+            writer,
+            Box::pin(Cursor::new(vec![0u8; 64 * 1024])),
+        ));
+        yield_now().await;
+        finish_stdin_writer(blocked)
+            .await
+            .expect("an aborted writer is not an error");
+
+        // A writer that already finished reports its own outcome.
+        let finished = tokio::spawn(async { Err(Error::io("writing", io::Error::other("boom"))) });
+        while !finished.is_finished() {
+            yield_now().await;
+        }
+        let error = finish_stdin_writer(finished)
+            .await
+            .expect_err("the writer's own error surfaces");
+        assert!(
+            matches!(&error, Error::Io { context, .. } if context == "writing"),
+            "{error}"
+        );
     }
 
     #[test]
