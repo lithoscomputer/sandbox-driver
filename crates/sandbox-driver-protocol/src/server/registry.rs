@@ -73,9 +73,4 @@ impl<T: Clone> Registry<T> {
     pub(super) fn get(&self, id: &str) -> Option<T> {
         self.lock().get(id).cloned()
     }
-
-    /// The entry under `id`, inserting `make()` first when there is none.
-    pub(super) fn get_or_insert_with(&self, id: String, make: impl FnOnce() -> T) -> T {
-        self.lock().entry(id).or_insert_with(make).clone()
-    }
 }
