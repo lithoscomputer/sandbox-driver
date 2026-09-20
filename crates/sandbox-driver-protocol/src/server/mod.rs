@@ -745,6 +745,7 @@ fn initialize(state: &ServerState, params: Value) -> Result<Value, DispatchError
 #[cfg(test)]
 mod tests {
     use serde::Serializer;
+    use serde::ser::Error as _;
 
     use super::*;
 
@@ -752,7 +753,7 @@ mod tests {
 
     impl Serialize for Unencodable {
         fn serialize<S: Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
-            Err(serde::ser::Error::custom(
+            Err(S::Error::custom(
                 "the plugin built a result it cannot encode",
             ))
         }
