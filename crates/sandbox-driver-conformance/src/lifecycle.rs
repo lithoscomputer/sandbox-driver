@@ -7,14 +7,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sandbox_driver::{
-    Action, Error, Event, EventBody, EventContext, EventObserver, ExecSpec, HealthStatus,
-    SandboxFilter, SandboxId, SandboxState, wait_for_state,
+    Action, Capability, Error, Event, EventBody, EventContext, EventObserver, ExecSpec,
+    HealthStatus, Sandbox, SandboxFilter, SandboxId, SandboxState, wait_for_state,
 };
 use tokio::sync::Notify;
 use tokio::time;
 
-use crate::Conformance;
-use crate::check::{CheckOutcome, PASS, cleanup, fail};
+use crate::check::{CheckOutcome, PASS, fail, skip};
+use crate::{Conformance, Provision};
 
 #[derive(Default)]
 struct RecordingEventObserver {
@@ -71,11 +71,8 @@ pub(super) async fn create_describe_delete(ctx: &Conformance) -> CheckOutcome {
     if spec.name.is_none() {
         spec.name = Some(format!("sandbox-driver-conformance-{}", process::id()));
     }
-    let sandbox = ctx
-        .provider
-        .create(&spec, None)
-        .await
-        .map_err(|error| format!("create failed: {error}"))?;
+    let sandbox = ctx.create_from_spec(&spec).await?;
+    ctx.lease(&sandbox);
     let outcome = async {
         let status = sandbox
             .describe()
@@ -127,7 +124,7 @@ pub(super) async fn create_describe_delete(ctx: &Conformance) -> CheckOutcome {
         PASS
     }
     .await;
-    cleanup(&sandbox).await;
+    ctx.cleanup(&sandbox).await;
     outcome?;
 
     let sandbox_id = sandbox.id().clone();
@@ -178,7 +175,7 @@ pub(super) async fn provider_deletes_by_id(ctx: &Conformance) -> CheckOutcome {
             .await
             .map_or(SandboxState::Deleted, |status| status.state);
         if !matches!(state, SandboxState::Deleted | SandboxState::Deleting) {
-            cleanup(&handle).await;
+            ctx.cleanup(&handle).await;
             return fail(format!("sandbox still {state:?} after delete by id"));
         }
     }
@@ -206,15 +203,14 @@ pub(super) async fn attach_unknown_id_is_not_found(ctx: &Conformance) -> CheckOu
 
 pub(super) async fn activate_passes_bash_probe(ctx: &Conformance) -> CheckOutcome {
     let sandbox = ctx.ready().await?;
-    cleanup(&sandbox).await;
+    ctx.cleanup(&sandbox).await;
     PASS
 }
 
 pub(super) async fn working_directory_is_effective(ctx: &Conformance) -> CheckOutcome {
     let spec = ctx.specs.spec();
     let requested = spec.working_directory.clone();
-    let sandbox = ctx.ready_from_spec(&spec).await?;
-    let outcome = async {
+    ctx.with_sandbox(Provision::ReadyFrom(&spec), |sandbox| async move {
         if let Some(requested) = &requested {
             if sandbox.working_directory() != requested {
                 return fail(format!(
@@ -256,15 +252,12 @@ pub(super) async fn working_directory_is_effective(ctx: &Conformance) -> CheckOu
             ));
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 pub(super) async fn runtime_directory_is_private(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.with_ready(|sandbox| async move {
         let Some(runtime_directory) = sandbox.runtime_directory() else {
             return PASS;
         };
@@ -314,25 +307,17 @@ pub(super) async fn runtime_directory_is_private(ctx: &Conformance) -> CheckOutc
             ));
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 pub(super) async fn pause_resume_cycle(ctx: &Conformance) -> CheckOutcome {
-    if !ctx.caps().lifecycle.pause {
-        return Ok(Some("capability lifecycle.pause not declared".to_owned()));
-    }
-    let sandbox = ctx.ready().await?;
-    // The provider's upper bound may be narrowed per sandbox class.
-    if !sandbox.capabilities().lifecycle.pause {
-        cleanup(&sandbox).await;
-        return Ok(Some(
-            "lifecycle.pause masked for this sandbox's class".to_owned(),
-        ));
-    }
-    let outcome = async {
+    ctx.require(Capability::LifecyclePause)?;
+    ctx.with_ready(|sandbox| async move {
+        // The provider's upper bound may be narrowed per sandbox class.
+        if !sandbox.capabilities().lifecycle.pause {
+            return skip("lifecycle.pause masked for this sandbox's class");
+        }
         sandbox
             .pause()
             .await
@@ -361,98 +346,93 @@ pub(super) async fn pause_resume_cycle(ctx: &Conformance) -> CheckOutcome {
             return fail("exec after resume did not succeed");
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 pub(super) async fn fork_preserves_live_process_state(ctx: &Conformance) -> CheckOutcome {
-    if !ctx.caps().lifecycle.fork {
-        return Ok(Some("capability lifecycle.fork not declared".to_owned()));
-    }
-    let sandbox = ctx.ready().await?;
-    if !sandbox.capabilities().lifecycle.fork {
-        cleanup(&sandbox).await;
-        return Ok(Some(
-            "lifecycle.fork masked for this sandbox's class".to_owned(),
-        ));
-    }
+    ctx.require(Capability::LifecycleFork)?;
+    ctx.with_ready(|sandbox| async move {
+        if !sandbox.capabilities().lifecycle.fork {
+            return skip("lifecycle.fork masked for this sandbox's class");
+        }
 
-    let prepare = sandbox
-        .exec()
-        .run(
-            &ExecSpec::bash(
-                "printf preserved > /tmp/sandbox-driver-fork-marker; \
-                 nohup sh -c 'echo $$ > /tmp/sandbox-driver-fork-pid; \
-                 while :; do sleep 1; done' </dev/null >/dev/null 2>&1 & \
-                 for i in 1 2 3 4 5; do test -s /tmp/sandbox-driver-fork-pid && break; sleep 1; done; \
-                 cat /tmp/sandbox-driver-fork-pid",
-            )
-            .timeout(Duration::from_secs(30)),
-        )
-        .await;
-    let source_pid = match prepare {
-        Ok(result) if result.success() => result.stdout_lossy().trim().to_owned(),
-        Ok(result) => {
-            cleanup(&sandbox).await;
-            return fail(format!(
-                "fork process setup failed: {}",
-                result.stderr_lossy()
-            ));
-        }
-        Err(error) => {
-            cleanup(&sandbox).await;
-            return fail(format!("fork process setup failed: {error}"));
-        }
-    };
-
-    let forked = match sandbox.fork(&sandbox_driver::ForkOptions::default()).await {
-        Ok(forked) => forked,
-        Err(error) => {
-            cleanup(&sandbox).await;
-            return fail(format!("fork failed: {error}"));
-        }
-    };
-    let outcome = async {
-        let status = forked
-            .describe()
-            .await
-            .map_err(|error| format!("describing fork failed: {error}"))?;
-        if status.state != SandboxState::Running {
-            return fail(format!("fork returned in state {:?}", status.state));
-        }
-        let result = forked
+        let prepare = sandbox
             .exec()
             .run(
                 &ExecSpec::bash(
-                    "pid=$(cat /tmp/sandbox-driver-fork-pid); \
-                     kill -0 \"$pid\"; printf '%s ' \"$pid\"; \
-                     cat /tmp/sandbox-driver-fork-marker",
+                    "printf preserved > /tmp/sandbox-driver-fork-marker; \
+                     nohup sh -c 'echo $$ > /tmp/sandbox-driver-fork-pid; \
+                     while :; do sleep 1; done' </dev/null >/dev/null 2>&1 & \
+                     for i in 1 2 3 4 5; do \
+                         test -s /tmp/sandbox-driver-fork-pid && break; sleep 1; \
+                     done; \
+                     cat /tmp/sandbox-driver-fork-pid",
                 )
                 .timeout(Duration::from_secs(30)),
             )
+            .await;
+        let source_pid = match prepare {
+            Ok(result) if result.success() => result.stdout_lossy().trim().to_owned(),
+            Ok(result) => {
+                return fail(format!(
+                    "fork process setup failed: {}",
+                    result.stderr_lossy()
+                ));
+            }
+            Err(error) => return fail(format!("fork process setup failed: {error}")),
+        };
+
+        let forked = sandbox
+            .fork(&sandbox_driver::ForkOptions::default())
             .await
-            .map_err(|error| format!("checking forked process failed: {error}"))?;
-        if !result.success() {
-            return fail(format!(
-                "forked process is not running: {}",
-                result.stderr_lossy()
-            ));
-        }
-        let expected = format!("{source_pid} preserved");
-        if result.stdout_lossy().trim() != expected {
-            return fail(format!(
-                "fork did not preserve PID and filesystem: got {:?}, expected {expected:?}",
-                result.stdout_lossy().trim()
-            ));
-        }
-        PASS
+            .map_err(|error| format!("fork failed: {error}"))?;
+        // The fork is a second billed sandbox; lease it so a budget that
+        // expires below still deletes it.
+        ctx.lease(&forked);
+        let outcome = check_fork(&forked, &source_pid).await;
+        ctx.cleanup(&forked).await;
+        outcome
+    })
+    .await
+}
+
+/// The forked sandbox is running, the source's background process is
+/// alive in it under the same PID, and the source's file is present.
+async fn check_fork(forked: &Arc<dyn Sandbox>, source_pid: &str) -> CheckOutcome {
+    let status = forked
+        .describe()
+        .await
+        .map_err(|error| format!("describing fork failed: {error}"))?;
+    if status.state != SandboxState::Running {
+        return fail(format!("fork returned in state {:?}", status.state));
     }
-    .await;
-    cleanup(&forked).await;
-    cleanup(&sandbox).await;
-    outcome
+    let result = forked
+        .exec()
+        .run(
+            &ExecSpec::bash(
+                "pid=$(cat /tmp/sandbox-driver-fork-pid); \
+                 kill -0 \"$pid\"; printf '%s ' \"$pid\"; \
+                 cat /tmp/sandbox-driver-fork-marker",
+            )
+            .timeout(Duration::from_secs(30)),
+        )
+        .await
+        .map_err(|error| format!("checking forked process failed: {error}"))?;
+    if !result.success() {
+        return fail(format!(
+            "forked process is not running: {}",
+            result.stderr_lossy()
+        ));
+    }
+    let expected = format!("{source_pid} preserved");
+    if result.stdout_lossy().trim() != expected {
+        return fail(format!(
+            "fork did not preserve PID and filesystem: got {:?}, expected {expected:?}",
+            result.stdout_lossy().trim()
+        ));
+    }
+    PASS
 }
 
 pub(super) async fn attach_and_list_by_label(ctx: &Conformance) -> CheckOutcome {
@@ -460,12 +440,7 @@ pub(super) async fn attach_and_list_by_label(ctx: &Conformance) -> CheckOutcome 
     let mut spec = ctx.specs.spec();
     spec.labels
         .insert("sandbox-driver-conformance".to_owned(), marker.clone());
-    let sandbox = ctx
-        .provider
-        .create(&spec, None)
-        .await
-        .map_err(|error| format!("create failed: {error}"))?;
-    let outcome = async {
+    ctx.with_sandbox(Provision::CreatedFrom(&spec), |sandbox| async move {
         let attached = ctx
             .provider
             .attach(sandbox.id(), None)
@@ -487,10 +462,8 @@ pub(super) async fn attach_and_list_by_label(ctx: &Conformance) -> CheckOutcome 
             return fail(format!("label filter returned {} sandboxes", listed.len()));
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 /// `health` must answer — a working provider (this suite just created
@@ -518,10 +491,10 @@ pub(super) async fn create_emits_terminal_events(ctx: &Conformance) -> CheckOutc
         .create(&ctx.specs.spec(), Some(context))
         .await
         .map_err(|error| format!("create failed: {error}"))?;
+    ctx.lease(&sandbox);
     observer.completed(Action::Create).await?;
     let seen = observer.events.lock().expect("events lock").clone();
-    sandbox
-        .delete()
+    ctx.delete(&sandbox)
         .await
         .map_err(|error| format!("delete failed: {error}"))?;
     observer.completed(Action::Delete).await?;

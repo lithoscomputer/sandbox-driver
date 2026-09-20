@@ -14,8 +14,8 @@ use tokio::net::TcpStream;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
-use crate::Conformance;
-use crate::check::{CheckOutcome, PASS, SeenChunks, cleanup, fail};
+use crate::check::{CheckOutcome, PASS, SeenChunks, fail, require_on, skip};
+use crate::{Conformance, Provision};
 
 /// A Bash script that answers one HTTP request on `port` with `body` and
 /// exits: Perl where the image has it (Debian, Ubuntu, macOS), else
@@ -45,13 +45,8 @@ else printf '%s' "$resp" | nc -l 127.0.0.1 {port}; fi"#,
 /// the URL succeeds. Remote (HTTPS) preview URLs are the provider's live
 /// tests' business and are skipped here.
 pub(super) async fn preview_url_reaches_a_listening_port(ctx: &Conformance) -> CheckOutcome {
-    if !ctx.caps().access.preview_urls {
-        return Ok(Some(
-            "capability access.preview_urls not declared".to_owned(),
-        ));
-    }
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.require(Capability::PreviewUrls)?;
+    ctx.with_ready(|sandbox| async move {
         let Some(preview) = sandbox.preview_urls() else {
             return fail("access.preview_urls is declared but the facet is absent");
         };
@@ -64,9 +59,7 @@ pub(super) async fn preview_url_reaches_a_listening_port(ctx: &Conformance) -> C
             .await
             .map_err(|error| format!("probe failed: {error}"))?;
         if !can_listen.success() {
-            return Ok(Some(
-                "the sandbox has neither perl nor nc to listen with".to_owned(),
-            ));
+            return skip("the sandbox has neither perl nor nc to listen with");
         }
         // A port unlikely to collide with another sandbox on a shared
         // machine (the Host provider's sandboxes share this machine's ports).
@@ -104,10 +97,10 @@ pub(super) async fn preview_url_reaches_a_listening_port(ctx: &Conformance) -> C
             kill.cancel();
             let _ = server.await;
             let _ = preview.release_preview_url(port).await;
-            return Ok(Some(format!(
+            return skip(format!(
                 "preview URL {} is not on this machine; reachability is the provider's live test",
                 url.url
-            )));
+            ));
         };
         // The server takes a moment to listen; a forward accepts before the
         // container port does and then closes, so retry until the body arrives.
@@ -144,34 +137,29 @@ pub(super) async fn preview_url_reaches_a_listening_port(ctx: &Conformance) -> C
             ));
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 pub(super) async fn stdio_process_round_trips(ctx: &Conformance) -> CheckOutcome {
     if !ctx.caps().exec.stdio_process {
         // The default must be a clean Unsupported.
-        let sandbox = ctx.create().await?;
-        let outcome = match sandbox.exec().spawn_stdio(&SpawnSpec::new("cat")).await {
-            Err(Error::Unsupported { .. }) => Ok(Some(
-                "capability exec.stdio_process not declared".to_owned(),
-            )),
-            Err(other) => fail(format!("expected Unsupported, got {other}")),
-            Ok(_) => fail("stdio_process undeclared but spawn succeeded"),
-        };
-        cleanup(&sandbox).await;
-        return outcome;
+        return ctx
+            .with_sandbox(Provision::Created, |sandbox| async move {
+                match sandbox.exec().spawn_stdio(&SpawnSpec::new("cat")).await {
+                    Err(Error::Unsupported { .. }) => {
+                        skip("capability exec.stdio_process not declared")
+                    }
+                    Err(other) => fail(format!("expected Unsupported, got {other}")),
+                    Ok(_) => fail("stdio_process undeclared but spawn succeeded"),
+                }
+            })
+            .await;
     }
-    let sandbox = ctx.ready().await?;
-    if !sandbox.capabilities().exec.stdio_process {
-        cleanup(&sandbox).await;
-        return Ok(Some(
-            "exec.stdio_process masked for this sandbox".to_owned(),
-        ));
-    }
-    let outcome = async {
+    ctx.with_ready(|sandbox| async move {
+        if !sandbox.capabilities().exec.stdio_process {
+            return skip("exec.stdio_process masked for this sandbox");
+        }
         let mut process = sandbox
             .exec()
             .spawn_stdio(&SpawnSpec::new("cat"))
@@ -199,18 +187,15 @@ pub(super) async fn stdio_process_round_trips(ctx: &Conformance) -> CheckOutcome
         process.handle.terminate().await;
         let _ = process.handle.wait().await;
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 pub(super) async fn pty_is_bidirectional(ctx: &Conformance) -> CheckOutcome {
     if ctx.caps().pty.is_none() {
-        return Ok(Some("pty not declared".to_owned()));
+        return skip("pty not declared");
     }
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.with_ready(|sandbox| async move {
         let Some(pty) = sandbox.pty() else {
             return fail("pty declared but facet is absent");
         };
@@ -266,29 +251,21 @@ pub(super) async fn pty_is_bidirectional(ctx: &Conformance) -> CheckOutcome {
             .await
             .map_err(|error| format!("close failed: {error}"))?;
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 pub(super) async fn logs_follow_streams_and_cancels(ctx: &Conformance) -> CheckOutcome {
     if ctx.caps().logs.is_none() {
-        return Ok(Some("logs not declared".to_owned()));
+        return skip("logs not declared");
     }
     let Some(spec) = ctx.specs.entrypoint_logs_spec() else {
         return fail("logs declared but no entrypoint-log spec was configured");
     };
-    let sandbox = ctx
-        .provider
-        .create(&spec, None)
-        .await
-        .map_err(|error| format!("create log-producing sandbox failed: {error}"))?;
-    if sandbox.capabilities().logs.is_none() {
-        cleanup(&sandbox).await;
-        return Ok(Some("logs not declared for this sandbox".to_owned()));
-    }
-    let outcome = async {
+    ctx.with_sandbox(Provision::CreatedFrom(&spec), |sandbox| async move {
+        if sandbox.capabilities().logs.is_none() {
+            return skip("logs not declared for this sandbox");
+        }
         let Some(logs) = sandbox.logs() else {
             return fail("logs declared but facet is absent");
         };
@@ -339,10 +316,8 @@ pub(super) async fn logs_follow_streams_and_cancels(ctx: &Conformance) -> CheckO
             return fail("entrypoint log sink received an empty chunk");
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 /// A service that listens on a port is awaited by that port and shows up
@@ -350,11 +325,8 @@ pub(super) async fn logs_follow_streams_and_cancels(ctx: &Conformance) -> CheckO
 /// listener is whatever the image offers, python3 or nc; without either
 /// the check is skipped.
 pub(super) async fn services_wait_for_ports_and_list_them(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
-        if !sandbox.capabilities().supports(Capability::Services) {
-            return Ok(Some("capability services not declared".to_owned()));
-        }
+    ctx.with_ready(|sandbox| async move {
+        require_on(sandbox.capabilities(), Capability::Services)?;
         let Some(services) = sandbox.services() else {
             return fail("services are declared but the facet is absent");
         };
@@ -375,7 +347,7 @@ pub(super) async fn services_wait_for_ports_and_list_them(ctx: &Conformance) -> 
         let command = match probe.stdout_lossy().trim() {
             "python3" => format!("exec python3 -m http.server {port} --bind 127.0.0.1"),
             "nc" => format!("while true; do nc -l 127.0.0.1 {port} < /dev/null; done"),
-            _ => return Ok(Some("no listener program in the image".to_owned())),
+            _ => return skip("no listener program in the image"),
         };
         let id = services
             .spawn(&ServiceSpec::new(command))
@@ -418,20 +390,15 @@ pub(super) async fn services_wait_for_ports_and_list_them(ctx: &Conformance) -> 
         .await;
         let _ = services.stop(&id).await;
         result
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 /// Background services: spawn outlives its exec, reports status, serves
 /// logs, and stops idempotently through the provider-selected implementation.
 pub(super) async fn background_services_round_trip(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
-        if !sandbox.capabilities().supports(Capability::Services) {
-            return Ok(Some("capability services not declared".to_owned()));
-        }
+    ctx.with_ready(|sandbox| async move {
+        require_on(sandbox.capabilities(), Capability::Services)?;
         let Some(services) = sandbox.services() else {
             return fail("services are declared but the facet is absent");
         };
@@ -507,10 +474,8 @@ pub(super) async fn background_services_round_trip(ctx: &Conformance) -> CheckOu
             return fail("unknown service id reported running");
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 /// A one-shot container runs in the sandbox's world: it reads a file the
@@ -518,15 +483,14 @@ pub(super) async fn background_services_round_trip(ctx: &Conformance) -> CheckOu
 /// is visible to the sandbox, and a `term` ends a long one.
 pub(super) async fn one_shot_shares_the_sandbox_world(ctx: &Conformance) -> CheckOutcome {
     if ctx.caps().one_shot.is_none() {
-        return Ok(Some("capability one_shot not declared".to_owned()));
+        return skip("capability one_shot not declared");
     }
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.with_ready(|sandbox| async move {
         if sandbox.capabilities().one_shot.is_none() {
             if sandbox.one_shot().is_some() {
                 return fail("one_shot facet is present but not declared for this sandbox");
             }
-            return Ok(Some("one_shot not declared for this sandbox".to_owned()));
+            return skip("one_shot not declared for this sandbox");
         }
         let Some(image) = ctx.specs.one_shot_image() else {
             return fail("one_shot is declared but no one-shot image was configured");
@@ -624,8 +588,6 @@ pub(super) async fn one_shot_shares_the_sandbox_world(ctx: &Conformance) -> Chec
             return fail("the term took over a minute to end the one-shot");
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }

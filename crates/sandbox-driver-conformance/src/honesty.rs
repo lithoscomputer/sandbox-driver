@@ -9,16 +9,15 @@ use sandbox_driver::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::Conformance;
-use crate::check::{CheckOutcome, PASS, cleanup, fail};
+use crate::check::{CheckOutcome, PASS, fail, skip};
+use crate::{Conformance, Provision};
 
 pub(super) async fn unsupported_actions_say_so(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.create().await?;
-    // The per-sandbox set is authoritative: a provider may narrow its
-    // upper bound by sandbox class (Daytona masks VM-only verbs on
-    // container sandboxes), and honesty is judged against the handle.
-    let caps = sandbox.capabilities().clone();
-    let outcome = async {
+    ctx.with_sandbox(Provision::Created, |sandbox| async move {
+        // The per-sandbox set is authoritative: a provider may narrow its
+        // upper bound by sandbox class (Daytona masks VM-only verbs on
+        // container sandboxes), and honesty is judged against the handle.
+        let caps = sandbox.capabilities().clone();
         let mut wrong: Vec<String> = Vec::new();
         let mut check = |name: &str, declared: bool, result: Result<(), Error>| match result {
             Err(Error::Unsupported { .. }) if declared => {
@@ -101,65 +100,55 @@ pub(super) async fn unsupported_actions_say_so(ctx: &Conformance) -> CheckOutcom
         } else {
             fail(wrong.join("; "))
         }
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 pub(super) async fn snapshot_modes_are_honest(ctx: &Conformance) -> CheckOutcome {
-    if !ctx.caps().lifecycle.snapshot_sandbox {
-        return Ok(Some(
-            "capability lifecycle.snapshot_sandbox not declared".to_owned(),
-        ));
-    }
-    let sandbox = ctx.ready().await?;
-    let snapshot_caps = sandbox.capabilities().snapshots.clone().unwrap_or_default();
-    let modes = [
-        (
-            SnapshotMode::Filesystem,
-            snapshot_caps.filesystem_from_sandbox,
-            Capability::SnapshotsFilesystem,
-        ),
-        (
-            SnapshotMode::LiveProcessState,
-            snapshot_caps.live_process_state_from_sandbox,
-            Capability::SnapshotsLiveProcessState,
-        ),
-    ];
-    let mut checked = false;
-    let mut failure = None;
-    for (mode, declared, capability) in modes {
-        if declared {
-            continue;
-        }
-        checked = true;
-        let mut options = sandbox_driver::SandboxSnapshotOptions::default();
-        options.mode = mode;
-        match sandbox.snapshot(&options).await {
-            Err(Error::Unsupported { capability: actual }) if actual == capability => {}
-            Err(error) => {
-                failure = Some(format!(
-                    "{mode:?}: expected Unsupported({capability}), got {error}"
-                ));
-                break;
+    ctx.require(Capability::LifecycleSnapshotSandbox)?;
+    ctx.with_ready(|sandbox| async move {
+        let snapshot_caps = sandbox.capabilities().snapshots.clone().unwrap_or_default();
+        let modes = [
+            (
+                SnapshotMode::Filesystem,
+                snapshot_caps.filesystem_from_sandbox,
+                Capability::SnapshotsFilesystem,
+            ),
+            (
+                SnapshotMode::LiveProcessState,
+                snapshot_caps.live_process_state_from_sandbox,
+                Capability::SnapshotsLiveProcessState,
+            ),
+        ];
+        let mut checked = false;
+        for (mode, declared, capability) in modes {
+            if declared {
+                continue;
             }
-            Ok(id) => {
-                failure = Some(format!(
-                    "undeclared snapshot mode {mode:?} created snapshot {id}"
-                ));
-                break;
+            checked = true;
+            let mut options = sandbox_driver::SandboxSnapshotOptions::default();
+            options.mode = mode;
+            match sandbox.snapshot(&options).await {
+                Err(Error::Unsupported { capability: actual }) if actual == capability => {}
+                Err(error) => {
+                    return fail(format!(
+                        "{mode:?}: expected Unsupported({capability}), got {error}"
+                    ));
+                }
+                Ok(id) => {
+                    return fail(format!(
+                        "undeclared snapshot mode {mode:?} created snapshot {id}"
+                    ));
+                }
             }
         }
-    }
-    cleanup(&sandbox).await;
-    if let Some(failure) = failure {
-        fail(failure)
-    } else if checked {
-        PASS
-    } else {
-        Ok(Some("all sandbox snapshot modes are declared".to_owned()))
-    }
+        if checked {
+            PASS
+        } else {
+            skip("all sandbox snapshot modes are declared")
+        }
+    })
+    .await
 }
 
 pub(super) async fn services_match_capabilities(ctx: &Conformance) -> CheckOutcome {
@@ -180,6 +169,7 @@ pub(super) async fn services_match_capabilities(ctx: &Conformance) -> CheckOutco
         ));
     }
     let sandbox = ctx.create().await?;
+    ctx.lease(&sandbox);
     let sandbox_caps = sandbox.capabilities();
     if sandbox_caps.access.preview_urls != sandbox.preview_urls().is_some() {
         wrong.push("preview_urls facet presence disagrees with capabilities".to_owned());
@@ -220,7 +210,7 @@ pub(super) async fn services_match_capabilities(ctx: &Conformance) -> CheckOutco
     if sandbox_caps.access.vnc != sandbox.vnc().is_some() {
         wrong.push("vnc facet presence disagrees with capabilities".to_owned());
     }
-    cleanup(&sandbox).await;
+    ctx.cleanup(&sandbox).await;
     if wrong.is_empty() {
         PASS
     } else {
@@ -229,26 +219,20 @@ pub(super) async fn services_match_capabilities(ctx: &Conformance) -> CheckOutco
 }
 
 pub(super) async fn ssh_access_matches_capabilities(ctx: &Conformance) -> CheckOutcome {
-    if !ctx.caps().access.ssh {
-        return Ok(Some("capability access.ssh not declared".to_owned()));
-    }
-    let sandbox = ctx.ready().await?;
-    let caps = sandbox.capabilities().access.clone();
-    if !caps.ssh {
-        let has_facet = sandbox.ssh().is_some();
-        cleanup(&sandbox).await;
-        return if has_facet {
-            fail("SSH facet is present but not declared for this sandbox")
-        } else {
-            Ok(Some("access.ssh not declared for this sandbox".to_owned()))
+    ctx.require(Capability::Ssh)?;
+    ctx.with_ready(|sandbox| async move {
+        let caps = sandbox.capabilities().access.clone();
+        if !caps.ssh {
+            return if sandbox.ssh().is_some() {
+                fail("SSH facet is present but not declared for this sandbox")
+            } else {
+                skip("access.ssh not declared for this sandbox")
+            };
+        }
+        let Some(ssh) = sandbox.ssh() else {
+            return fail("access.ssh is declared but the SSH facet is absent");
         };
-    }
-    let Some(ssh) = sandbox.ssh() else {
-        cleanup(&sandbox).await;
-        return fail("access.ssh is declared but the SSH facet is absent");
-    };
 
-    let outcome = async {
         let access = if caps.ssh_ttl {
             ssh.ssh_access(Some(Duration::from_secs(120)))
                 .await
@@ -292,20 +276,13 @@ pub(super) async fn ssh_access_matches_capabilities(ctx: &Conformance) -> CheckO
                 Ok(()) => fail("undeclared SSH revoke succeeded"),
             }
         }
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 pub(super) async fn shell_command_access_matches_capabilities(ctx: &Conformance) -> CheckOutcome {
-    if !ctx.caps().access.shell_command {
-        return Ok(Some(
-            "capability access.shell_command not declared".to_owned(),
-        ));
-    }
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.require(Capability::ShellCommandAccess)?;
+    ctx.with_ready(|sandbox| async move {
         let Some(access) = sandbox.shell_command() else {
             return fail("access.shell_command is declared but the ShellCommand facet is absent");
         };
@@ -317,10 +294,8 @@ pub(super) async fn shell_command_access_matches_capabilities(ctx: &Conformance)
             return fail("ShellCommand returned an empty command");
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 /// A spec field the capability set disclaims must be rejected with the
@@ -328,12 +303,9 @@ pub(super) async fn shell_command_access_matches_capabilities(ctx: &Conformance)
 pub(super) async fn exec_rejects_undeclared_stdin_and_stop(ctx: &Conformance) -> CheckOutcome {
     let caps = ctx.caps();
     if caps.exec.stdin && caps.exec.stop {
-        return Ok(Some(
-            "exec.stdin and exec.stop are both declared".to_owned(),
-        ));
+        return skip("exec.stdin and exec.stop are both declared");
     }
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
+    ctx.with_ready(|sandbox| async move {
         if !caps.exec.stdin {
             let spec = ExecSpec::new("cat")
                 .stdin(b"dropped?".to_vec())
@@ -369,8 +341,6 @@ pub(super) async fn exec_rejects_undeclared_stdin_and_stop(ctx: &Conformance) ->
             }
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }

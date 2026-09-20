@@ -11,18 +11,15 @@ use sandbox_driver::{
 };
 
 use crate::Conformance;
-use crate::check::{CheckOutcome, PASS, cleanup, fail};
+use crate::check::{CheckOutcome, PASS, fail, require_on};
 
 /// A clone pinned to a tag checks out the tagged commit on the admitted
 /// branch, whatever the provider's clone implementation is. The fixture
 /// advances `main` past the tag and adds a branch that shares the tag's
 /// name, so only a clone that fetches the fully qualified tag ref passes.
 pub(super) async fn git_clone_pins_a_tag(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
-        if !sandbox.capabilities().supports(Capability::Git) {
-            return Ok(Some("capability git not declared".to_owned()));
-        }
+    ctx.with_ready(|sandbox| async move {
+        require_on(sandbox.capabilities(), Capability::Git)?;
         let Some(git) = sandbox.git() else {
             return fail("git is declared but the facet is absent");
         };
@@ -131,10 +128,8 @@ pub(super) async fn git_clone_pins_a_tag(ctx: &Conformance) -> CheckOutcome {
             return fail("a failed tag clone left a checkout at the branch head");
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 /// What `git credential fill` answers for the fixture's origin host when
@@ -165,11 +160,8 @@ async fn credential_fill(exec: &dyn sandbox_driver::Exec, repo: &str) -> Result<
 /// sandbox has one. Rotation replaces the secret in place; removal leaves
 /// nothing for `fill` to answer with.
 pub(super) async fn git_ambient_credentials_apply(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
-        if !sandbox.capabilities().supports(Capability::Git) {
-            return Ok(Some("capability git not declared".to_owned()));
-        }
+    ctx.with_ready(|sandbox| async move {
+        require_on(sandbox.capabilities(), Capability::Git)?;
         let Some(git) = sandbox.git() else {
             return fail("git is declared but the facet is absent");
         };
@@ -288,10 +280,8 @@ pub(super) async fn git_ambient_credentials_apply(ctx: &Conformance) -> CheckOut
             return fail(format!("removal left the store file {store:?} behind"));
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 /// The read and plumbing verbs report typed results that agree with git's
@@ -299,11 +289,8 @@ pub(super) async fn git_ambient_credentials_apply(ctx: &Conformance) -> CheckOut
 /// sizes and contents, configuration, untracked paths, staging, and a
 /// fetch, over a sandbox-local remote.
 pub(super) async fn git_verbs_report_typed_results(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
-        if !sandbox.capabilities().supports(Capability::Git) {
-            return Ok(Some("capability git not declared".to_owned()));
-        }
+    ctx.with_ready(|sandbox| async move {
+        require_on(sandbox.capabilities(), Capability::Git)?;
         let Some(git) = sandbox.git() else {
             return fail("git is declared but the facet is absent");
         };
@@ -543,21 +530,16 @@ pub(super) async fn git_verbs_report_typed_results(ctx: &Conformance) -> CheckOu
             return fail(format!("fetch landed {fetched}, not {head}"));
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
 
 /// Git uses a sandbox-local bare remote so every operation can run without
 /// external credentials or network access. Providers still choose their
 /// native, derived, or hybrid implementation behind the normalized facet.
 pub(super) async fn git_round_trip(ctx: &Conformance) -> CheckOutcome {
-    let sandbox = ctx.ready().await?;
-    let outcome = async {
-        if !sandbox.capabilities().supports(Capability::Git) {
-            return Ok(Some("capability git not declared".to_owned()));
-        }
+    ctx.with_ready(|sandbox| async move {
+        require_on(sandbox.capabilities(), Capability::Git)?;
         let Some(git) = sandbox.git() else {
             return fail("git is declared but the facet is absent");
         };
@@ -814,8 +796,6 @@ pub(super) async fn git_round_trip(ctx: &Conformance) -> CheckOutcome {
             return fail(format!("final status is wrong: {status:?}"));
         }
         PASS
-    }
-    .await;
-    cleanup(&sandbox).await;
-    outcome
+    })
+    .await
 }
