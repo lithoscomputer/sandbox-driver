@@ -2,7 +2,7 @@
 //! real filesystem, doubling as the first conformance exercise of the
 //! exec contract, the bash probe, and the exec-derived facets.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{env, process};
@@ -1081,6 +1081,239 @@ async fn designated_directories_attach_by_a_path_derived_id_from_any_provider() 
     created.delete().await.expect("delete designated");
     managed.delete().await.expect("delete managed");
     let _ = tokio_fs::remove_dir_all(&dir).await;
+}
+
+/// A managed workspace is known only to the registry that created it. A
+/// second provider instance over the same registry directory, as another
+/// process opens it, attaches to the workspace by path and sees the
+/// owner's record: the same id, labels, and ownership, and the owner's
+/// state as it changes. The handle works in the workspace and refuses
+/// every lifecycle change, so the owner stays the registry's only writer.
+#[tokio::test]
+async fn another_process_attaches_read_only_to_a_managed_workspace_by_path() {
+    let root = env::temp_dir().join(format!("host-observe-{}", process::id()));
+    let registry = root.join("registry");
+    let workspace = root.join("work");
+    let owner = HostProvider::with_registry(&registry)
+        .await
+        .expect("registry");
+    let mut spec = host_spec().working_directory(workspace.to_string_lossy());
+    spec.workspace_ownership = Some(WorkspaceOwnership::Managed);
+    spec.labels
+        .insert("petri.run".to_owned(), "run-1".to_owned());
+    let owned = owner
+        .create(&spec, None)
+        .await
+        .expect("managed create makes the directory");
+    owned.fs().write("keep", b"hello").await.expect("write");
+    let id = owned.id().clone();
+
+    let observer = HostProvider::observe_registry(&registry);
+    let observed = observer
+        .attach_directory(&workspace, None)
+        .await
+        .expect("the owner's record names the directory");
+    assert_eq!(observed.id(), &id, "the same sandbox, by the owner's id");
+    assert_eq!(observed.working_directory(), owned.working_directory());
+    let status = observed.describe().await.expect("describe");
+    assert_eq!(status.state, SandboxState::Running);
+    assert_eq!(
+        status.workspace_ownership,
+        Some(WorkspaceOwnership::Managed)
+    );
+    assert_eq!(
+        status.labels.get("petri.run").map(String::as_str),
+        Some("run-1")
+    );
+    assert_eq!(
+        observed.fs().read("keep").await.expect("read"),
+        b"hello",
+        "the workspace's files are the owner's"
+    );
+    let result = observed
+        .exec()
+        .run(&ExecSpec::bash("printf '%s' \"$PWD\""))
+        .await
+        .expect("exec in the observed workspace");
+    assert_eq!(
+        result.stdout_lossy(),
+        owned.working_directory(),
+        "commands run in the workspace"
+    );
+    let listed = observer
+        .list(&SandboxFilter::default())
+        .await
+        .expect("list");
+    assert!(
+        listed.iter().any(|status| status.id == id),
+        "the observed registry is listed: {listed:?}"
+    );
+
+    // The same handle attaches by id, so an ownership scope checks it
+    // exactly as it checks any other provider's sandbox.
+    let observer: Arc<dyn SandboxProvider> = Arc::new(observer);
+    let scoped = OwnedProvider::new(
+        Arc::clone(&observer),
+        Ownership::label("petri.run", "run-1"),
+    );
+    let by_id = scoped
+        .attach(&id, None)
+        .await
+        .expect("the run's label is on the owner's record");
+    assert_eq!(by_id.id(), &id);
+    scoped
+        .check(Arc::clone(&observed))
+        .await
+        .expect("the handle attached by path carries the label");
+    let foreign = OwnedProvider::new(
+        Arc::clone(&observer),
+        Ownership::label("petri.run", "run-2"),
+    );
+    let refused = foreign
+        .check(Arc::clone(&observed))
+        .await
+        .err()
+        .expect("another run's scope refuses the sandbox");
+    assert!(matches!(refused, Error::NotOwned { .. }), "{refused}");
+
+    // Every lifecycle change is the owner's alone.
+    for (name, outcome) in [
+        ("stop", observed.stop().await),
+        ("start", observed.start().await),
+        ("delete", observed.delete().await),
+        ("provider delete", observer.delete(&id, None).await),
+    ] {
+        assert!(
+            matches!(
+                &outcome,
+                Err(Error::ReadOnly { id: refused, .. }) if refused == id.as_str()
+            ),
+            "{name}: {outcome:?}"
+        );
+    }
+    assert_eq!(
+        owned.describe().await.expect("owner describe").state,
+        SandboxState::Running,
+        "the owner's sandbox is untouched"
+    );
+    assert!(workspace.is_dir());
+    let mut entries = tokio_fs::read_dir(&registry)
+        .await
+        .expect("registry entries");
+    let mut names = Vec::new();
+    while let Some(entry) = entries.next_entry().await.expect("entry") {
+        names.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    assert_eq!(
+        names,
+        vec![id.as_str().to_owned()],
+        "the observer wrote nothing into the owner's registry"
+    );
+
+    // The owner's later changes show through the handle, and a stopped
+    // sandbox's retained workspace stays usable: the observer's commands
+    // run in its own process groups.
+    owned.stop().await.expect("owner stop");
+    assert_eq!(
+        observed.describe().await.expect("describe").state,
+        SandboxState::Stopped
+    );
+    let result = observed
+        .exec()
+        .run(&ExecSpec::bash("cat keep"))
+        .await
+        .expect("exec in a stopped sandbox's retained workspace");
+    assert_eq!(result.stdout_lossy(), "hello");
+
+    owned.delete().await.expect("owner delete");
+    assert_eq!(
+        observed.describe().await.expect("describe").state,
+        SandboxState::Deleted
+    );
+    let error = observer
+        .attach(&id, None)
+        .await
+        .err()
+        .expect("a deleted sandbox is not found");
+    assert!(matches!(error, Error::NotFound { .. }), "{error}");
+    drop(owned);
+    drop(owner);
+    tokio_fs::remove_dir_all(&root)
+        .await
+        .expect("registry cleanup");
+}
+
+/// A directory no record names is not a sandbox to attach by path; it is
+/// still designated by its path-derived id, as before. A provider finds
+/// its own managed workspace by path too.
+#[tokio::test]
+async fn a_directory_without_a_record_still_designates_by_id() {
+    let root = env::temp_dir().join(format!("host-unrecorded-{}", process::id()));
+    let dir = root.join("plain");
+    tokio_fs::create_dir_all(&dir).await.expect("scratch dir");
+    // A registry nobody has created yet is an empty one.
+    let observer = HostProvider::observe_registry(root.join("registry"));
+    let error = observer
+        .attach_directory(&dir, None)
+        .await
+        .err()
+        .expect("no record names the directory");
+    assert!(
+        matches!(&error, Error::NotFound { id, .. } if id == &dir.display().to_string()),
+        "{error}"
+    );
+    let error = observer
+        .attach_directory(&root.join("missing"), None)
+        .await
+        .err()
+        .expect("a missing directory is not found");
+    assert!(matches!(error, Error::NotFound { .. }), "{error}");
+
+    let derived = HostProvider::directory_id(&dir)
+        .await
+        .expect("an id for the directory");
+    let designated = observer
+        .attach(&derived, None)
+        .await
+        .expect("the directory is designated as before");
+    let status = designated.describe().await.expect("describe");
+    assert_eq!(
+        status.workspace_ownership,
+        Some(WorkspaceOwnership::Designated)
+    );
+    assert!(status.labels.is_empty());
+    let recorded = observer
+        .attach_directory(&dir, None)
+        .await
+        .expect("the adopted directory is now recorded by the observer itself");
+    assert_eq!(recorded.id(), &derived);
+    designated
+        .stop()
+        .await
+        .expect("the observer owns its adoption");
+    designated
+        .delete()
+        .await
+        .expect("delete releases the handle");
+    assert!(dir.is_dir(), "a designated directory is never removed");
+
+    let provider = HostProvider::new();
+    let managed = provider.create(&host_spec(), None).await.expect("create");
+    let found = provider
+        .attach_directory(Path::new(managed.working_directory()), None)
+        .await
+        .expect("a provider finds its own managed workspace by path");
+    assert_eq!(found.id(), managed.id());
+    managed.delete().await.expect("delete");
+    let error = provider
+        .attach_directory(Path::new(managed.working_directory()), None)
+        .await
+        .err()
+        .expect("a deleted workspace is not found");
+    assert!(matches!(error, Error::NotFound { .. }), "{error}");
+    tokio_fs::remove_dir_all(&root)
+        .await
+        .expect("scratch cleanup");
 }
 
 /// A lifecycle change that cannot be persisted leaves nothing half moved:

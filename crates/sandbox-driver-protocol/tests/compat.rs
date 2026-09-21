@@ -492,6 +492,19 @@ fn every_error_kind_decodes_from_its_era_detail() {
         if id == "snap-1")
     );
 
+    let read_only = wire_error(
+        "read_only",
+        false,
+        &[],
+        &serde_json::json!({
+            "resource": "sandbox", "id": "sb-2", "action": "stop", "future_field": 1
+        }),
+    );
+    assert!(
+        matches!(read_only, Error::ReadOnly { resource: ResourceKind::Sandbox, id, action: Action::Stop }
+        if id == "sb-2")
+    );
+
     let invalid_spec = wire_error(
         "invalid_spec",
         false,

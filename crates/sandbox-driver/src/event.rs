@@ -82,6 +82,7 @@ impl From<&Error> for ErrorReport {
         let kind = match error {
             Error::NotFound { .. } => "not_found",
             Error::NotOwned { .. } => "not_owned",
+            Error::ReadOnly { .. } => "read_only",
             Error::Unsupported { .. } => "unsupported",
             Error::InvalidState { .. } => "invalid_state",
             Error::InvalidSpec { .. } => "invalid_spec",

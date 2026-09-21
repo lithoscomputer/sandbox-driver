@@ -41,6 +41,13 @@
 //! id.
 //! Temporary providers end owned process groups when their last owner drops.
 //! Caller-owned registries retain groups for explicit stop or recovery.
+//!
+//! A managed workspace is known only to the registry that created it. A
+//! second process reaches it through [`HostProvider::observe_registry`]: a
+//! read-only view of that registry whose handles carry the owner's record
+//! (id, labels, ownership, state) and work in the workspace, while every
+//! lifecycle change stays the owner's. [`HostProvider::attach_directory`]
+//! finds a recorded sandbox by its workspace path.
 
 mod access;
 mod exec;
@@ -48,19 +55,19 @@ mod fence;
 mod fs;
 mod registry;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime};
-use std::{env, io};
+use std::{env, io, iter};
 
 use async_trait::async_trait;
 use sandbox_driver::{
     Action, Capabilities, Error, EventContext, EventEmitter, EventSubject, Exec, ExecSpec,
     Filesystem, HealthStatus, Isolation, LifecycleTimers, PlatformInfo, PreviewUrls, Progress,
-    ProgressCode, ProviderHealth, ProviderKind, Resources, Result, Sandbox, SandboxFilter,
-    SandboxId, SandboxProvider, SandboxSource, SandboxSpec, SandboxState, SandboxStatus,
-    WorkspaceOwnership,
+    ProgressCode, ProviderHealth, ProviderKind, ResourceKind, Resources, Result, Sandbox,
+    SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec, SandboxState,
+    SandboxStatus, WorkspaceOwnership,
 };
 use tokio::fs as tokio_fs;
 use tokio::sync::Mutex;
@@ -80,11 +87,15 @@ pub(crate) fn host_kind() -> ProviderKind {
 }
 
 /// A directory-backed provider. Use [`Self::with_registry`] to preserve
-/// sandbox identity across provider or plugin restarts.
+/// sandbox identity across provider or plugin restarts, and
+/// [`Self::observe_registry`] to reach another process's sandboxes.
 pub struct HostProvider {
     kind:            ProviderKind,
     capabilities:    Capabilities,
     root:            PathBuf,
+    /// A registry another process owns, read and never written; see
+    /// [`Self::observe_registry`].
+    observed:        Option<PathBuf>,
     cleanup_on_drop: bool,
     registry:        Arc<HandleRegistry>,
 }
@@ -118,45 +129,145 @@ impl HostProvider {
         Ok(Self::at(root, false))
     }
 
+    /// A temporary provider that also reads the registry another process
+    /// owns at `root`, without writing to it: the owner stays its only
+    /// writer. A sandbox recorded there attaches by id or by directory
+    /// ([`Self::attach_directory`]) as a read-only handle: it describes
+    /// the sandbox from the owner's current record, runs commands in the
+    /// workspace, and reads and writes its files, while `start`, `stop`,
+    /// and `delete` are refused with [`Error::ReadOnly`]. Its commands
+    /// run in this provider's own process groups, which end when the
+    /// handle drops; the owner's fence does not cover them, and the
+    /// owner's lifecycle state does not gate them, so a stopped sandbox's
+    /// retained workspace stays usable. `list` reports the observed
+    /// sandboxes beside this provider's own. A missing `root` is an empty
+    /// registry. Sandboxes this provider creates live in its own
+    /// temporary registry, as with [`Self::new`].
+    pub fn observe_registry(root: impl Into<PathBuf>) -> Self {
+        let mut provider = Self::new();
+        provider.observed = Some(root.into());
+        provider
+    }
+
     fn at(root: PathBuf, cleanup_on_drop: bool) -> Self {
         Self {
             kind: host_kind(),
             capabilities: host_capabilities(),
             root,
+            observed: None,
             cleanup_on_drop,
             registry: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
+    /// The registries this provider reads: its own, then the observed one.
+    fn registry_roots(&self) -> impl Iterator<Item = &Path> {
+        iter::once(self.root.as_path()).chain(self.observed.as_deref())
+    }
+
     async fn load(&self, id: &SandboxId) -> Result<Arc<HostSandbox>> {
         let mut registry = self.registry.lock().await;
         if let Some(sandbox) = registry.get(id) {
-            return Ok(sandbox.clone());
+            let sandbox = sandbox.clone();
+            // An owned handle leaves the cache when it is deleted; an
+            // observed one learns of its owner's delete here.
+            if sandbox.observed.is_some() && sandbox.status().await?.state == SandboxState::Deleted
+            {
+                registry.remove(id);
+                return Err(registry::missing(id));
+            }
+            return Ok(sandbox);
         }
-        let record = registry::read(&self.root, id).await?;
+        let (record, observed) = self.read_record(id).await?;
         if record.state == SandboxState::Deleted {
             return Err(registry::missing(id));
         }
         self.cache_handle(
             &mut registry,
             record,
+            observed,
             EventEmitter::new(self.kind.clone(), None),
         )
     }
 
+    /// The record for `id` from this provider's own registry, or else
+    /// from the observed one, returned with that registry's root so the
+    /// handle knows it is read-only.
+    async fn read_record(&self, id: &SandboxId) -> Result<(Record, Option<PathBuf>)> {
+        match registry::read(&self.root, id).await {
+            Ok(record) => return Ok((record, None)),
+            Err(Error::NotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        let Some(observed) = &self.observed else {
+            return Err(registry::missing(id));
+        };
+        let record = registry::read(observed, id).await?;
+        Ok((record, Some(observed.clone())))
+    }
+
+    /// The id of the live sandbox recorded for the canonical `workspace`,
+    /// in this provider's own registry first, then the observed one.
+    async fn recorded_at(&self, workspace: &Path) -> Result<Option<SandboxId>> {
+        for root in self.registry_roots() {
+            let found = registry::records(root).await?.into_iter().find(|record| {
+                record.state != SandboxState::Deleted && record.workspace == workspace
+            });
+            if let Some(record) = found {
+                return Ok(Some(record.id));
+            }
+        }
+        Ok(None)
+    }
+
     /// Builds the shared handle for `record` and caches it in `handles`,
     /// the locked handle registry. Every handle a provider hands out is
-    /// built here, from the provider's own root, so attached handles for
-    /// one sandbox share one live state.
+    /// built here, with its process groups under the provider's own root,
+    /// so attached handles for one sandbox share one live state. A record
+    /// read from an `observed` registry yields a read-only handle.
     fn cache_handle(
         &self,
         handles: &mut HashMap<SandboxId, Arc<HostSandbox>>,
         record: Record,
+        observed: Option<PathBuf>,
         events: EventEmitter,
     ) -> Result<Arc<HostSandbox>> {
-        let sandbox = Arc::new(HostSandbox::new(self, record, events)?);
+        let sandbox = Arc::new(HostSandbox::new(self, record, observed, events)?);
         handles.insert(sandbox.record.id.clone(), sandbox.clone());
         Ok(sandbox)
+    }
+
+    /// Attaches to the sandbox whose workspace is the directory at `path`,
+    /// as this provider's registry or the observed one records it: a
+    /// managed workspace comes back with its id, labels, ownership, and
+    /// state, and one the observed registry records as a read-only
+    /// handle. A directory no live record names is `NotFound`, with the
+    /// path as the id; a designated directory without a record attaches by
+    /// its path-derived id instead (see [`Self::directory_id`]).
+    #[tracing::instrument(skip_all, fields(provider_kind = %self.kind, path = %path.display()), err)]
+    pub async fn attach_directory(
+        &self,
+        path: &Path,
+        events: Option<EventContext>,
+    ) -> Result<Arc<dyn Sandbox>> {
+        let emitter = EventEmitter::new(self.kind.clone(), events);
+        let handle_emitter = emitter.clone();
+        emitter
+            .run(
+                EventSubject::sandbox(None),
+                Action::Attach,
+                |_| async move {
+                    let Ok(workspace) = canonical_directory(path).await else {
+                        return Err(missing_directory(path));
+                    };
+                    let Some(id) = self.recorded_at(&workspace).await? else {
+                        return Err(missing_directory(path));
+                    };
+                    let sandbox = self.load(&id).await?;
+                    Ok(Arc::new(sandbox.with_emitter(handle_emitter)) as Arc<dyn Sandbox>)
+                },
+            )
+            .await
     }
 
     /// A designated directory named by a path-derived id, with no record in
@@ -192,8 +303,17 @@ impl HostProvider {
         self.cache_handle(
             &mut registry,
             record,
+            None,
             EventEmitter::new(self.kind.clone(), None),
         )
+    }
+}
+
+/// No live record names the directory at `path`.
+fn missing_directory(path: &Path) -> Error {
+    Error::NotFound {
+        resource: ResourceKind::Sandbox,
+        id:       path.display().to_string(),
     }
 }
 
@@ -502,7 +622,7 @@ impl SandboxProvider for HostProvider {
                 };
                 registry::write(&root, &record).await?;
                 let mut handles = self.registry.lock().await;
-                let sandbox = self.cache_handle(&mut handles, record, handle_emitter)?;
+                let sandbox = self.cache_handle(&mut handles, record, None, handle_emitter)?;
                 Ok(sandbox as Arc<dyn Sandbox>)
             })
             .await
@@ -562,8 +682,19 @@ impl SandboxProvider for HostProvider {
     async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>> {
         // Reading the records is enough to report sandboxes. Building
         // handles here would allocate process groups and cache a tombstone
-        // for every resource the registry has ever held.
-        let records = registry::records(&self.root).await?;
+        // for every resource the registry has ever held. An observed
+        // registry's records follow this provider's own; a directory both
+        // designate is reported once.
+        let mut records = registry::records(&self.root).await?;
+        if let Some(observed) = &self.observed {
+            let own: HashSet<SandboxId> = records.iter().map(|record| record.id.clone()).collect();
+            records.extend(
+                registry::records(observed)
+                    .await?
+                    .into_iter()
+                    .filter(|record| !own.contains(&record.id)),
+            );
+        }
         Ok(records
             .into_iter()
             .filter(|record| {
@@ -585,9 +716,17 @@ impl SandboxProvider for HostProvider {
 /// admission is a projection of `state == Running`. All three change only
 /// through [`Self::transition`], which holds the state lock for the whole
 /// change.
+///
+/// A handle over an `observed` registry owns none of the three: the
+/// record on disk is the owner's, read afresh on every `describe`, no
+/// lifecycle change is admitted, and its process groups (the provider's
+/// own) admit work regardless.
 pub struct HostSandbox {
     registry:          Weak<HandleRegistry>,
     root:              PathBuf,
+    /// The registry another process owns that the record was read from,
+    /// which makes this handle read-only.
+    observed:          Option<PathBuf>,
     groups:            Arc<ProcessGroups>,
     /// Identity and metadata as the registry stored them when this handle
     /// was built. Its `state` is that moment's value and is never updated;
@@ -604,22 +743,32 @@ pub struct HostSandbox {
 }
 
 impl HostSandbox {
-    fn new(provider: &HostProvider, record: Record, events: EventEmitter) -> Result<Self> {
+    fn new(
+        provider: &HostProvider,
+        record: Record,
+        observed: Option<PathBuf>,
+        events: EventEmitter,
+    ) -> Result<Self> {
         let root = provider.root.clone();
+        let read_only = observed.is_some();
         let groups = Arc::new(ProcessGroups::new(
             registry::resource_dir(&root, &record.id)?.join("groups"),
-            record.state == SandboxState::Running,
+            // The owner's state gates the owner's groups; a read-only
+            // handle's groups are its own and admit work in any state.
+            read_only || record.state == SandboxState::Running,
             provider.cleanup_on_drop,
         ));
         let exec = HostExec::with_groups(
             record.workspace.clone(),
             record.env.clone(),
-            record.ownership == WorkspaceOwnership::Managed,
+            // Recreating a vanished managed workspace is the owner's call.
+            !read_only && record.ownership == WorkspaceOwnership::Managed,
             groups.clone(),
         );
         Ok(Self {
             registry: Arc::downgrade(&provider.registry),
             root,
+            observed,
             groups,
             capabilities: provider.capabilities.clone(),
             working_directory: record.workspace.to_string_lossy().into_owned(),
@@ -643,6 +792,7 @@ impl HostSandbox {
         Self {
             registry: self.registry.clone(),
             root: self.root.clone(),
+            observed: self.observed.clone(),
             groups: self.groups.clone(),
             record: self.record.clone(),
             capabilities: self.capabilities.clone(),
@@ -674,7 +824,8 @@ impl HostSandbox {
     ///
     /// A deleted sandbox cannot start again (it is reported missing), while
     /// stopping or deleting it again succeeds and only drops the cached
-    /// handle.
+    /// handle. A read-only handle refuses every change before touching
+    /// any of the three.
     ///
     /// When `work` or the persist fails after admission moved, admission is
     /// moved back to match the unchanged live state, so a sandbox that still
@@ -692,6 +843,13 @@ impl HostSandbox {
                 EventSubject::sandbox(Some(self.record.id.clone())),
                 action,
                 |_| async {
+                    if self.observed.is_some() {
+                        return Err(Error::ReadOnly {
+                            resource: ResourceKind::Sandbox,
+                            id: self.record.id.as_str().to_owned(),
+                            action,
+                        });
+                    }
                     let mut state = self.state.lock().await;
                     if *state == SandboxState::Deleted {
                         if target == SandboxState::Running {
@@ -763,8 +921,15 @@ impl HostSandbox {
         }
     }
 
-    async fn status(&self) -> SandboxStatus {
-        self.record.status(*self.state.lock().await)
+    /// The sandbox as reported: the live state for an owned sandbox, the
+    /// owner's current record for an observed one, so the owner's later
+    /// changes show through the handle.
+    async fn status(&self) -> Result<SandboxStatus> {
+        if let Some(observed) = &self.observed {
+            let record = registry::read(observed, &self.record.id).await?;
+            return Ok(record.status(record.state));
+        }
+        Ok(self.record.status(*self.state.lock().await))
     }
 }
 
@@ -780,7 +945,7 @@ impl Sandbox for HostSandbox {
 
     #[tracing::instrument(skip_all, fields(provider_kind = "host", sandbox_id = %self.record.id), err)]
     async fn describe(&self) -> Result<SandboxStatus> {
-        Ok(self.status().await)
+        self.status().await
     }
 
     fn working_directory(&self) -> &str {

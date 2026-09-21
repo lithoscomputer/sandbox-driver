@@ -145,6 +145,15 @@ struct ResourceDetail {
     id:       String,
 }
 
+/// `read_only`: the resource, its id, and the lifecycle action the
+/// read-only handle refused.
+#[derive(Debug, Serialize, Deserialize)]
+struct ReadOnlyDetail {
+    resource: ResourceKind,
+    id:       String,
+    action:   Action,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct InvalidSpecDetail {
     field:  String,
@@ -382,6 +391,15 @@ fn detail_of(error: &Error) -> Value {
                 id:       id.clone(),
             })
         }
+        Error::ReadOnly {
+            resource,
+            id,
+            action,
+        } => serde_json::to_value(ReadOnlyDetail {
+            resource: *resource,
+            id:       id.clone(),
+            action:   *action,
+        }),
         Error::InvalidSpec { field, reason } => serde_json::to_value(InvalidSpecDetail {
             field:  field.clone(),
             reason: reason.clone(),
@@ -461,6 +479,18 @@ fn typed_error(kind: &str, detail: Value, causes: &[String]) -> Option<Error> {
         "not_owned" => {
             let ResourceDetail { resource, id } = read(detail)?;
             Error::NotOwned { resource, id }
+        }
+        "read_only" => {
+            let ReadOnlyDetail {
+                resource,
+                id,
+                action,
+            } = read(detail)?;
+            Error::ReadOnly {
+                resource,
+                id,
+                action,
+            }
         }
         "invalid_spec" => {
             let InvalidSpecDetail { field, reason } = read(detail)?;
@@ -600,6 +630,18 @@ mod tests {
         assert!(
             matches!(back, Error::NotOwned { resource: ResourceKind::Sandbox, id } if id == "sb-2")
         );
+
+        let error = Error::ReadOnly {
+            resource: ResourceKind::Sandbox,
+            id:       "sb-3".into(),
+            action:   Action::Delete,
+        };
+        let back = WireError::from_error(&error).into_error();
+        assert!(matches!(
+            back,
+            Error::ReadOnly { resource: ResourceKind::Sandbox, id, action: Action::Delete }
+                if id == "sb-3"
+        ));
 
         let error = Error::InvalidState {
             current: SandboxState::Paused,
