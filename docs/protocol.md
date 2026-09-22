@@ -401,7 +401,7 @@ carry `data`:
 ```
 
 `report.kind` is the stable machine-readable classification:
-`not_found`, `not_owned`, `unsupported`, `invalid_state`, `invalid_spec`, `timeout`,
+`not_found`, `not_owned`, `read_only`, `unsupported`, `invalid_state`, `invalid_spec`, `timeout`,
 `auth`, `rate_limited`, `overloaded`, `limit_exceeded`, `exec`, `git`, `provider`, `transport`, `incomplete`, `io`.
 `report.causes` is a bounded rendered source chain. A receiver restores
 these rendered causes as an opaque remote source chain. `detail` carries
@@ -412,6 +412,7 @@ kind-specific fields for faithful reconstruction:
 | `unsupported` | `capability` (dotted path, e.g. `"exec.stdio_process"`) |
 | `not_found` | `resource` (`sandbox`/`snapshot`/`volume`/`plugin`), `id` |
 | `not_owned` | `resource`, `id` — the resource exists but lacks the labels a host-side ownership scope requires |
+| `read_only` | `resource`, `id`, `action` — the handle observes a resource another process owns and refused the lifecycle `action` (an `Action` name such as `stop` or `delete`) |
 | `invalid_spec` | `field`, `reason` |
 | `invalid_state` | `current`, `action` |
 | `timeout` | `operation`, `elapsed` |

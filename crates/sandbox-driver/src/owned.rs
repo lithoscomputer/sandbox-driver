@@ -103,6 +103,13 @@ impl OwnedProvider {
         &self.inner
     }
 
+    /// The ownership check `attach` applies, for a handle obtained another
+    /// way (a Host attach by directory, say): `sandbox` back when it
+    /// carries the ownership labels, [`Error::NotOwned`] when it does not.
+    pub async fn check(&self, sandbox: Arc<dyn Sandbox>) -> Result<Arc<dyn Sandbox>> {
+        self.checked(sandbox).await
+    }
+
     async fn checked(&self, sandbox: Arc<dyn Sandbox>) -> Result<Arc<dyn Sandbox>> {
         let status = sandbox.describe().await?;
         if self.ownership.owns(&status.labels) {

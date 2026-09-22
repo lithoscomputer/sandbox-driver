@@ -56,6 +56,18 @@ pub enum Error {
         id:       String,
     },
 
+    /// The handle observes a sandbox another process owns and may not
+    /// change its lifecycle: it describes the sandbox and works in its
+    /// workspace, while `start`, `stop`, and `delete` are the owner's
+    /// alone. The Host provider hands out such handles from an observed
+    /// registry.
+    #[error("cannot {action:?} {resource:?} {id:?} through a read-only handle")]
+    ReadOnly {
+        resource: ResourceKind,
+        id:       String,
+        action:   Action,
+    },
+
     /// The provider does not support this capability. Machine-readable so
     /// callers can preflight against [`crate::Capabilities`] instead.
     #[error("capability {capability} is not supported by this provider")]
