@@ -5,10 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use daytona_api_client::apis::Error as ApiError;
-use daytona_api_client::models::sandbox::SandboxClass as DaytonaSandboxClass;
-use daytona_api_client::models::snapshot_dto::SandboxClass as DaytonaSnapshotClass;
 use daytona_api_client::models::{
-    SandboxClass as DaytonaCreateSandboxClass, SnapshotState as ApiSnapshotState,
+    SandboxClass as DaytonaSandboxClass, SnapshotState as ApiSnapshotState,
     VolumeState as ApiVolumeState,
 };
 use daytona_sdk::{Client, DaytonaError};
@@ -168,7 +166,7 @@ pub(crate) fn map_state(state: Option<daytona_sdk::SandboxState>) -> SandboxStat
     }
 }
 
-pub(crate) fn sandbox_kind_from_sandbox_class(class: DaytonaSandboxClass) -> SandboxKind {
+pub(crate) fn sandbox_kind_from_class(class: DaytonaSandboxClass) -> SandboxKind {
     match class {
         DaytonaSandboxClass::CONTAINER => SandboxKind::Container,
         DaytonaSandboxClass::LINUX_VM
@@ -178,20 +176,10 @@ pub(crate) fn sandbox_kind_from_sandbox_class(class: DaytonaSandboxClass) -> San
     }
 }
 
-pub(crate) fn sandbox_kind_from_snapshot_class(class: DaytonaSnapshotClass) -> SandboxKind {
-    match class {
-        DaytonaSnapshotClass::CONTAINER => SandboxKind::Container,
-        DaytonaSnapshotClass::LINUX_VM
-        | DaytonaSnapshotClass::ANDROID
-        | DaytonaSnapshotClass::WINDOWS => SandboxKind::VirtualMachine,
-        DaytonaSnapshotClass::UnknownDefaultOpenApi => SandboxKind::Unknown,
-    }
-}
-
-pub(crate) fn daytona_snapshot_class(kind: SandboxKind) -> Result<DaytonaCreateSandboxClass> {
+pub(crate) fn daytona_snapshot_class(kind: SandboxKind) -> Result<DaytonaSandboxClass> {
     match kind {
-        SandboxKind::Container => Ok(DaytonaCreateSandboxClass::CONTAINER),
-        SandboxKind::VirtualMachine => Ok(DaytonaCreateSandboxClass::LINUX_VM),
+        SandboxKind::Container => Ok(DaytonaSandboxClass::CONTAINER),
+        SandboxKind::VirtualMachine => Ok(DaytonaSandboxClass::LINUX_VM),
         _ => Err(Error::invalid_spec("sandbox_kind", "unknown sandbox kind")),
     }
 }

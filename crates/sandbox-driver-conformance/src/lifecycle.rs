@@ -16,6 +16,10 @@ use tokio::time;
 use crate::check::{COMMAND_TIMEOUT, CheckOutcome, PASS, fail, run_ok, skip};
 use crate::{Conformance, Provision};
 
+/// How long a listing may lag behind a create before the check fails.
+const LIST_VISIBILITY_TIMEOUT: Duration = Duration::from_secs(30);
+const LIST_VISIBILITY_POLL: Duration = Duration::from_millis(500);
+
 #[derive(Default)]
 struct RecordingEventObserver {
     events:  Mutex<Vec<Event>>,
@@ -440,15 +444,33 @@ pub(super) async fn attach_and_list_by_label(ctx: &Conformance) -> CheckOutcome 
         filter
             .labels
             .insert("sandbox-driver-conformance".to_owned(), marker.clone());
-        let listed = ctx
-            .provider
-            .list(&filter)
-            .await
-            .map_err(|error| format!("list failed: {error}"))?;
-        if listed.len() != 1 || listed[0].id != *sandbox.id() {
-            return fail(format!("label filter returned {} sandboxes", listed.len()));
+        // Listings may lag behind a create, so poll until the new sandbox
+        // is the filter's only match.
+        let mut listed = Vec::new();
+        let visible = time::timeout(LIST_VISIBILITY_TIMEOUT, async {
+            loop {
+                listed = ctx
+                    .provider
+                    .list(&filter)
+                    .await
+                    .map_err(|error| format!("list failed: {error}"))?;
+                if listed.len() == 1 && listed[0].id == *sandbox.id() {
+                    return Ok::<_, String>(());
+                }
+                time::sleep(LIST_VISIBILITY_POLL).await;
+            }
+        })
+        .await;
+        match visible {
+            Ok(listing) => {
+                listing?;
+                PASS
+            }
+            Err(_) => fail(format!(
+                "label filter returned {} sandboxes after {LIST_VISIBILITY_TIMEOUT:?}",
+                listed.len()
+            )),
         }
-        PASS
     })
     .await
 }

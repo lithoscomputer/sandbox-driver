@@ -240,7 +240,7 @@ pub trait SandboxProvider: Send + Sync {
         -> Result<Arc<dyn Sandbox>, Error>;               // optional; restore a deleted sandbox
     async fn delete(&self, id: &SandboxId, events: Option<EventContext>)
         -> Result<(), Error>;                             // by id, no handle; idempotent; default = attach + delete
-    async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>, Error>;
+    async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>, Error>; // may lag recent creates/deletes; attach by id for current state
 
     /// Reachability + credential check for preflight and diagnostics.
     /// Always callable; an unhealthy provider is an Ok(report), never Err.

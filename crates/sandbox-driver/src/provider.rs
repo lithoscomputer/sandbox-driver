@@ -80,6 +80,11 @@ pub trait SandboxProvider: Send + Sync {
 
     /// Lists sandboxes this provider manages. Providers that cannot
     /// enumerate declare it via capabilities and return an empty list.
+    ///
+    /// A listing may lag behind recent creates and deletes when the backend
+    /// indexes sandboxes asynchronously (Daytona's does). Callers that need a
+    /// sandbox's current existence or state should `attach` it by id; an
+    /// empty listing does not prove that a just-created sandbox is absent.
     async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>>;
 
     /// Checks that the provider's backend is reachable and the

@@ -7,12 +7,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use daytona_api_client::models::SandboxClass as DaytonaSandboxClass;
 use daytona_api_client::models::api_key_list::Permissions;
-use daytona_api_client::models::sandbox::SandboxClass as DaytonaSandboxClass;
 use daytona_sdk::{
     Client, CreateParams, CreateSandboxOptions, DaytonaConfig, DaytonaError, SandboxBaseParams,
-    SetFilePermissionsOptions, SnapshotParams,
+    SandboxListItem, SetFilePermissionsOptions, SnapshotParams,
 };
+use futures_util::TryStreamExt;
 use sandbox_driver::{
     Action, AuthError, Capabilities, Error, EventContext, EventEmitter, EventSubject, HealthStatus,
     Isolation, LogsCaps, NetworkPolicy, ProviderError, ProviderHealth, ProviderKind, PtyCaps,
@@ -28,7 +29,7 @@ use crate::labels::{MANAGED_LABEL, stored_labels};
 use crate::sandbox::{DaytonaSandbox, status_from_sdk};
 use crate::sdk::{
     DaytonaClient, auto_delete_minutes, daytona_error, fetch_error, gigabytes, is_not_found,
-    map_state, minutes, sandbox_kind_from_sandbox_class, sandbox_kind_from_snapshot_class,
+    map_state, minutes, sandbox_kind_from_class,
 };
 use crate::snapshots::DaytonaSnapshots;
 use crate::volumes::DaytonaVolumes;
@@ -337,7 +338,7 @@ impl DaytonaProvider {
         events: EventEmitter,
     ) -> Result<Arc<DaytonaSandbox>> {
         if let Some(requested) = spec.sandbox_kind {
-            let actual = created.sandbox_class.map(sandbox_kind_from_sandbox_class);
+            let actual = created.sandbox_class.map(sandbox_kind_from_class);
             if actual != Some(requested) {
                 return Err(Error::invalid_spec(
                     "sandbox_kind",
@@ -428,7 +429,7 @@ impl DaytonaProvider {
                 id.as_str(),
                 "fetching snapshot kind",
             ))?;
-        let Some(actual) = snapshot.sandbox_class.map(sandbox_kind_from_snapshot_class) else {
+        let Some(actual) = snapshot.sandbox_class.map(sandbox_kind_from_class) else {
             return Err(Error::invalid_spec(
                 "sandbox_kind",
                 "the snapshot does not report a sandbox kind",
@@ -810,7 +811,7 @@ impl SandboxProvider for DaytonaProvider {
     async fn health(&self) -> Result<ProviderHealth> {
         // Reachability and credential acceptance: the cheapest
         // authenticated call.
-        if let Err(error) = self.client.list(None, Some(1), Some(1)).await {
+        if let Err(error) = self.client.list(None, None, Some(1)).await {
             tracing::warn!("daytona provider health check failed");
             let status = match &error {
                 DaytonaError::Api {
@@ -881,28 +882,17 @@ impl SandboxProvider for DaytonaProvider {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         labels.insert(MANAGED_LABEL.to_owned(), "true".to_owned());
-        let mut statuses = Vec::new();
-        let mut page_number: i32 = 1;
-        loop {
-            let page = self
-                .client
-                .list(Some(&labels), Some(page_number), Some(LIST_PAGE_SIZE))
-                .await
-                .map_err(|error| daytona_error("listing sandboxes", error))?;
-            tracing::debug!(
-                page_number,
-                item_count = page.items.len(),
-                "sandbox page received"
-            );
-            for item in &page.items {
-                statuses.push(status_from_sdk(&self.client, item)?);
-            }
-            if page.total_pages <= i64::from(page_number) {
-                break;
-            }
-            page_number += 1;
-        }
-        Ok(statuses)
+        let items: Vec<SandboxListItem> = self
+            .client
+            .list_all(Some(&labels), Some(LIST_PAGE_SIZE))
+            .try_collect()
+            .await
+            .map_err(|error| daytona_error("listing sandboxes", error))?;
+        tracing::debug!(item_count = items.len(), "sandbox listing received");
+        items
+            .iter()
+            .map(|item| status_from_sdk(&self.client, item))
+            .collect()
     }
 
     fn snapshots(&self) -> Option<&dyn SnapshotProvider> {
