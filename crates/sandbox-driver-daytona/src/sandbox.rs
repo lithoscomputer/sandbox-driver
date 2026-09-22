@@ -1,6 +1,6 @@
 //! The Daytona sandbox handle and its lifecycle.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::result::Result as StdResult;
 use std::sync::Arc;
@@ -24,7 +24,7 @@ use crate::nested::NestedDocker;
 use crate::provider::narrowed_capabilities;
 use crate::sdk::{
     DaytonaClient, auto_delete_minutes, dashboard_url, daytona_error, is_not_found,
-    is_state_change_in_progress, map_state, minutes, sandbox_kind_from_sandbox_class, to_u64,
+    is_state_change_in_progress, map_state, minutes, sandbox_kind_from_class, to_u64,
 };
 use crate::snapshots::{create_sandbox_snapshot, generated_snapshot_name};
 use crate::{
@@ -33,26 +33,88 @@ use crate::{
     TRANSITION_POLL,
 };
 
-pub(crate) fn status_from_sdk(
+/// The fields a [`SandboxStatus`] reads, borrowed from either a full sandbox
+/// (`get`) or a listing summary, so both paths share one mapping.
+pub(crate) struct StatusFields<'a> {
+    id:                 &'a str,
+    name:               &'a str,
+    state:              Option<daytona_sdk::SandboxState>,
+    error_reason:       Option<&'a str>,
+    sandbox_class:      Option<daytona_sdk::SandboxClass>,
+    target:             &'a str,
+    labels:             &'a HashMap<String, String>,
+    snapshot:           Option<&'a str>,
+    network_block_all:  bool,
+    network_allow_list: Option<&'a str>,
+    cpu:                f64,
+    memory:             f64,
+    disk:               f64,
+    gpu:                f64,
+}
+
+impl<'a> From<&'a daytona_sdk::Sandbox> for StatusFields<'a> {
+    fn from(sdk: &'a daytona_sdk::Sandbox) -> Self {
+        Self {
+            id:                 &sdk.id,
+            name:               &sdk.name,
+            state:              sdk.state,
+            error_reason:       sdk.error_reason.as_deref(),
+            sandbox_class:      sdk.sandbox_class,
+            target:             &sdk.target,
+            labels:             &sdk.labels,
+            snapshot:           sdk.snapshot.as_deref(),
+            network_block_all:  sdk.network_block_all,
+            network_allow_list: sdk.network_allow_list.as_deref(),
+            cpu:                sdk.cpu,
+            memory:             sdk.memory,
+            disk:               sdk.disk,
+            gpu:                sdk.gpu,
+        }
+    }
+}
+
+impl<'a> From<&'a daytona_sdk::SandboxListItem> for StatusFields<'a> {
+    fn from(item: &'a daytona_sdk::SandboxListItem) -> Self {
+        Self {
+            id:                 &item.id,
+            name:               &item.name,
+            state:              item.state,
+            error_reason:       item.error_reason.as_deref(),
+            sandbox_class:      item.sandbox_class,
+            target:             &item.target,
+            labels:             &item.labels,
+            snapshot:           item.snapshot.as_deref(),
+            network_block_all:  item.network_block_all,
+            network_allow_list: item.network_allow_list.as_deref(),
+            cpu:                item.cpu,
+            memory:             item.memory,
+            disk:               item.disk,
+            gpu:                item.gpu,
+        }
+    }
+}
+
+pub(crate) fn status_from_sdk<'a>(
     client: &daytona_sdk::Client,
-    sdk: &daytona_sdk::Sandbox,
+    sdk: impl Into<StatusFields<'a>>,
 ) -> Result<SandboxStatus> {
-    let id = SandboxId::try_new(&sdk.id)
+    let sdk = sdk.into();
+    let id = SandboxId::try_new(sdk.id)
         .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
     let mut status = SandboxStatus::new(id, map_state(sdk.state));
-    status.name = (!sdk.name.is_empty()).then(|| sdk.name.clone());
+    status.name = (!sdk.name.is_empty()).then(|| sdk.name.to_owned());
     status.provider_state = sdk.state.map(|state| state.to_string()).unwrap_or_default();
-    status.error_reason.clone_from(&sdk.error_reason);
-    status.sandbox_kind = sdk.sandbox_class.map(sandbox_kind_from_sandbox_class);
-    status.region = (!sdk.target.is_empty()).then(|| sdk.target.clone());
+    status.error_reason = sdk.error_reason.map(str::to_owned);
+    status.sandbox_kind = sdk.sandbox_class.map(sandbox_kind_from_class);
+    status.region = (!sdk.target.is_empty()).then(|| sdk.target.to_owned());
     status.labels = sdk
         .labels
         .iter()
         .filter(|(key, _)| !is_internal_label(key))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    status.snapshot.clone_from(&sdk.snapshot);
-    status.network = Some(network_of(sdk));
+    status.snapshot = sdk.snapshot.map(str::to_owned);
+    status.network = Some(network_of(&sdk));
     status.web_url = dashboard_url(client);
     let mut resources = Resources::default();
     resources.cpu_cores = to_u64(sdk.cpu)
@@ -69,13 +131,12 @@ pub(crate) fn status_from_sdk(
 
 /// The network policy a Daytona sandbox runs under, read back from its
 /// settings: blocked, an allow list of CIDRs, or unrestricted.
-fn network_of(sdk: &daytona_sdk::Sandbox) -> NetworkPolicy {
+fn network_of(sdk: &StatusFields<'_>) -> NetworkPolicy {
     if sdk.network_block_all {
         return NetworkPolicy::Block;
     }
     let cidrs: Vec<String> = sdk
         .network_allow_list
-        .as_deref()
         .unwrap_or_default()
         .split(',')
         .map(str::trim)
@@ -820,5 +881,67 @@ impl Sandbox for DaytonaSandbox {
 
     fn vnc(&self) -> Option<&dyn Vnc> {
         self.capabilities.access.vnc.then_some(&self.access)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use daytona_sdk::{DaytonaConfig, SandboxClass, SandboxListItem};
+    use sandbox_driver::SandboxKind;
+
+    use super::*;
+    use crate::labels::MANAGED_LABEL;
+
+    #[tokio::test]
+    async fn list_summaries_map_to_status() {
+        let client = daytona_sdk::Client::new_with_config(DaytonaConfig {
+            api_key: Some("test-key".to_owned()),
+            ..DaytonaConfig::default()
+        })
+        .await
+        .expect("client builds without contacting the API");
+        let item = SandboxListItem {
+            id: "sb-1".to_owned(),
+            name: "demo".to_owned(),
+            state: Some(daytona_sdk::SandboxState::Started),
+            error_reason: None,
+            sandbox_class: Some(SandboxClass::CONTAINER),
+            target: "us".to_owned(),
+            labels: HashMap::from([
+                ("team".to_owned(), "a".to_owned()),
+                (MANAGED_LABEL.to_owned(), "true".to_owned()),
+            ]),
+            snapshot: Some("base".to_owned()),
+            network_allow_list: Some("10.0.0.0/8, 192.168.0.0/16".to_owned()),
+            cpu: 2.0,
+            memory: 4.0,
+            disk: 20.0,
+            ..SandboxListItem::default()
+        };
+
+        let status = status_from_sdk(&client, &item).expect("maps list summary");
+
+        assert_eq!(status.id.as_str(), "sb-1");
+        assert_eq!(status.name.as_deref(), Some("demo"));
+        assert_eq!(status.state, SandboxState::Running);
+        assert_eq!(status.provider_state, "started");
+        assert_eq!(status.sandbox_kind, Some(SandboxKind::Container));
+        assert_eq!(status.region.as_deref(), Some("us"));
+        assert_eq!(
+            status.labels,
+            BTreeMap::from([("team".to_owned(), "a".to_owned())])
+        );
+        assert_eq!(status.snapshot.as_deref(), Some("base"));
+        assert_eq!(
+            status.network,
+            Some(NetworkPolicy::CidrAllowList {
+                cidrs: vec!["10.0.0.0/8".to_owned(), "192.168.0.0/16".to_owned()],
+            })
+        );
+        let resources = status.resources.expect("resources are reported");
+        assert_eq!(resources.cpu_cores, Some(2));
+        assert_eq!(resources.memory_mb, Some(4096));
+        assert_eq!(resources.disk_mb, Some(20480));
+        assert_eq!(resources.gpus, None);
     }
 }

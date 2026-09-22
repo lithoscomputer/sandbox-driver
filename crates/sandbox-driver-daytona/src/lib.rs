@@ -127,9 +127,10 @@ pub(crate) const TRANSITION_POLL: Duration = Duration::from_secs(1);
 pub(crate) const SNAPSHOT_ACTIVATE_BUDGET: Duration = Duration::from_secs(900);
 pub(crate) const SNAPSHOT_ACTIVATE_POLL: Duration = Duration::from_secs(5);
 
-/// Items requested per page when listing sandboxes or snapshots. The
-/// paginated endpoints truncate an unpaged request to their own default
-/// page size, so listings must walk `total_pages` explicitly.
+/// Items requested per page when listing sandboxes or snapshots. Sandbox
+/// listing follows cursors through the SDK; the snapshot endpoint is still
+/// page-numbered and truncates an unpaged request to its default page size,
+/// so snapshot listing walks `total_pages` explicitly.
 pub(crate) const LIST_PAGE_SIZE: i32 = 100;
 
 #[cfg(test)]

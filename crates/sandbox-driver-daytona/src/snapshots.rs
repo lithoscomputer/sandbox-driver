@@ -5,9 +5,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use daytona_api_client::apis::{sandbox_api, snapshots_api};
-use daytona_api_client::models::sandbox::SandboxClass as DaytonaSandboxClass;
 use daytona_api_client::models::{
-    CreateSandboxSnapshot, SandboxClass as DaytonaCreateSandboxClass, SnapshotDto,
+    CreateSandboxSnapshot, SandboxClass as DaytonaSandboxClass,
+    SandboxClass as DaytonaCreateSandboxClass, SnapshotDto,
 };
 use daytona_sdk::{CreateSnapshotParams, DaytonaError, DockerImage, ImageSource};
 use sandbox_driver::{
@@ -21,7 +21,7 @@ use tokio::time;
 use crate::sdk::{
     DaytonaClient, daytona_error, daytona_snapshot_class, fetch_error, generated_error, gigabytes,
     is_generated_not_found, is_not_found, is_snapshot_deactivation_in_progress, map_snapshot_state,
-    map_state, sandbox_kind_from_sandbox_class, sandbox_kind_from_snapshot_class, to_u64,
+    map_state, sandbox_kind_from_class, to_u64,
 };
 use crate::{
     CREATE_TIMEOUT, LIST_PAGE_SIZE, SNAPSHOT_ACTIVATE_BUDGET, SNAPSHOT_ACTIVATE_POLL,
@@ -166,7 +166,7 @@ fn snapshot_status(dto: SnapshotDto) -> Result<SnapshotStatus> {
 
     let mut status = SnapshotStatus::new(id, map_snapshot_state(dto.state));
     status.name = Some(dto.name);
-    status.sandbox_kind = dto.sandbox_class.map(sandbox_kind_from_snapshot_class);
+    status.sandbox_kind = dto.sandbox_class.map(sandbox_kind_from_class);
     status.regions = dto.region_ids.unwrap_or_default();
     status.resources = (resources != Resources::default()).then_some(resources);
     status.error_reason = dto.error_reason;
@@ -232,7 +232,7 @@ impl DaytonaSnapshots {
             .get(id.as_str())
             .await
             .map_err(|error| daytona_error("fetching sandbox for snapshot", error))?;
-        let actual_kind = sdk.sandbox_class.map(sandbox_kind_from_sandbox_class);
+        let actual_kind = sdk.sandbox_class.map(sandbox_kind_from_class);
         if let Some(requested) = spec.sandbox_kind {
             if actual_kind != Some(requested) {
                 return Err(Error::invalid_spec(
@@ -511,7 +511,6 @@ impl SnapshotProvider for DaytonaSnapshots {
 #[cfg(test)]
 mod tests {
     use daytona_api_client::models::SnapshotState as ApiSnapshotState;
-    use daytona_api_client::models::snapshot_dto::SandboxClass as DaytonaSnapshotClass;
 
     use super::*;
 
@@ -534,7 +533,7 @@ mod tests {
             None,
             None,
         );
-        dto.sandbox_class = Some(DaytonaSnapshotClass::LINUX_VM);
+        dto.sandbox_class = Some(DaytonaSandboxClass::LINUX_VM);
         dto.region_ids = Some(vec!["eu".to_owned(), "us".to_owned()]);
 
         let status = snapshot_status(dto).expect("maps snapshot status");
