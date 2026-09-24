@@ -381,7 +381,7 @@ mod tests {
 
     fn mature_credentials() -> GitCredentials {
         GitCredentials::new("x-access-token", "ghs_old")
-            .minted_at(SystemTime::now() - Duration::from_mins(30))
+            .minted_at(SystemTime::now() - Duration::from_secs(30 * 60))
     }
 
     #[test]
