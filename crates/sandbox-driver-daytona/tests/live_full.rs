@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::fmt::Write as _;
+use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, process};
@@ -13,11 +14,13 @@ use std::{env, process};
 use sandbox_driver::{
     Action, Capability, Error, ExecControls, ExecSpec, ExecStreamingResult, Git,
     GitCheckoutOptions, GitCloneOptions, GitCommitOptions, LifecycleTimers, LogSink, LogSource,
-    NetworkPolicy, Resources, SandboxKind, SandboxProvider, SandboxSnapshotOptions, SandboxSource,
-    SandboxSpec, SandboxState, SnapshotId, SnapshotMode, SnapshotSource, SnapshotSpec,
-    SnapshotState, WaitOptions, wait_for_state,
+    NetworkPolicy, OutputSink, OutputStream, Resources, Sandbox, SandboxKind, SandboxProvider,
+    SandboxSnapshotOptions, SandboxSource, SandboxSpec, SandboxState, SnapshotId, SnapshotMode,
+    SnapshotSource, SnapshotSpec, SnapshotState, StdinSource, WaitOptions, wait_for_state,
 };
 use sandbox_driver_daytona::DaytonaProvider;
+use tokio::io::{AsyncWriteExt as _, duplex};
+use tokio::sync::Notify;
 use tokio::time;
 
 mod support;
@@ -1340,4 +1343,152 @@ async fn wait_for_snapshot_state(
         }
         time::sleep(Duration::from_secs(5)).await;
     }
+}
+
+/// Bytes every value of which appears, in an order no simple
+/// reordering or dropped chunk preserves.
+fn patterned_bytes(len: usize) -> Vec<u8> {
+    let mut state: u32 = 0x9e37_79b9;
+    (0..len)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state.to_be_bytes()[0]
+        })
+        .collect()
+}
+
+#[expect(
+    clippy::print_stderr,
+    reason = "the per-turn latency is the test's evidence"
+)]
+/// A line protocol in the shape ACP uses: each request waits for its
+/// reply before the next is written, so the input must stream rather
+/// than arrive at EOF.
+async fn stdin_streams_turn_by_turn(sandbox: &dyn Sandbox) -> Result<(), String> {
+    const TURNS: usize = 12;
+    let stdout = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let replied = Arc::new(Notify::new());
+    let sink: OutputSink = Arc::new({
+        let stdout = Arc::clone(&stdout);
+        let replied = Arc::clone(&replied);
+        move |stream, bytes| {
+            if stream == OutputStream::Stdout {
+                stdout.lock().expect("stdout").extend_from_slice(&bytes);
+                replied.notify_one();
+            }
+            Box::pin(async { Ok(()) })
+        }
+    });
+    let (mut requests, input) = duplex(4096);
+    let controls = ExecControls {
+        stdin: Some(StdinSource::new(input)),
+        sink: Some(sink),
+        ..ExecControls::buffered()
+    };
+    let spec =
+        ExecSpec::bash(r#"while IFS= read -r line; do printf 'ack:%s\n' "$line"; done; echo done"#)
+            .timeout(Duration::from_secs(180));
+    let run = sandbox.exec().run_streaming(&spec, controls);
+    let turns = async {
+        let started = Instant::now();
+        for turn in 0..TURNS {
+            let request = format!("{{\"id\":{turn},\"text\":\"héllo 世界\"}}\n");
+            requests
+                .write_all(request.as_bytes())
+                .await
+                .map_err(|error| format!("write turn {turn}: {error}"))?;
+            let expected = format!("ack:{}", request.trim_end());
+            time::timeout(Duration::from_secs(30), async {
+                while !String::from_utf8_lossy(&stdout.lock().expect("stdout")).contains(&expected)
+                {
+                    replied.notified().await;
+                }
+            })
+            .await
+            .map_err(|_| format!("no reply to turn {turn} before EOF"))?;
+        }
+        eprintln!(
+            "streamed stdin: {TURNS} turns, {:?} per turn",
+            started.elapsed() / u32::try_from(TURNS).expect("turns fit")
+        );
+        drop(requests);
+        Ok::<_, String>(())
+    };
+    let (result, turns) = tokio::join!(run, turns);
+    turns?;
+    let result = result.map_err(|error| format!("turn-by-turn exec: {error}"))?;
+    if !result.result.success() || !result.result.stdout_lossy().ends_with("done\n") {
+        return Err(format!(
+            "EOF did not end the loop cleanly: {:?} {:?}",
+            result.result.termination,
+            result.result.stdout_lossy()
+        ));
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::print_stderr,
+    reason = "the transfer time is the test's evidence"
+)]
+/// Every byte value, a mebibyte of them, arrives in order and ends at EOF.
+async fn stdin_delivers_exact_bytes(sandbox: &dyn Sandbox) -> Result<(), String> {
+    let bytes = patterned_bytes(1 << 20);
+    let expected = "/tmp/sandbox-driver-streamed-stdin-expected";
+    sandbox
+        .fs()
+        .write(expected, &bytes)
+        .await
+        .map_err(|error| format!("write expected bytes: {error}"))?;
+    let controls = ExecControls {
+        stdin: Some(StdinSource::new(Cursor::new(bytes))),
+        ..ExecControls::buffered()
+    };
+    let spec = ExecSpec::new("cmp")
+        .args(["-", expected])
+        .timeout(Duration::from_secs(300));
+    let started = Instant::now();
+    let result = sandbox
+        .exec()
+        .run_streaming(&spec, controls)
+        .await
+        .map_err(|error| format!("exact-bytes exec: {error}"))?;
+    eprintln!("streamed stdin: 1 MiB in {:?}", started.elapsed());
+    if !result.result.success() {
+        return Err(format!(
+            "streamed bytes differ: {:?} {}{}",
+            result.result.exit_code,
+            result.result.stdout_lossy(),
+            result.result.stderr_lossy()
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn streamed_stdin_is_interactive_exact_and_ends_at_eof() {
+    if env::var("DAYTONA_API_KEY").is_err() {
+        return;
+    }
+    init_diagnostics();
+    let provider = DaytonaProvider::connect().await.expect("connect");
+    let spec = SandboxSpec::new(SandboxSource::Snapshot {
+        id: SnapshotId::try_new(TEST_SNAPSHOT).expect("valid snapshot id"),
+    })
+    .name(unique("sd-streamed-stdin"))
+    .ephemeral(true);
+    let sandbox = provider.create(&spec, None).await.expect("create");
+    if !sandbox.capabilities().exec.stdin_stream {
+        sandbox.delete().await.expect("delete");
+        panic!("Daytona sandboxes declare exec.stdin_stream");
+    }
+
+    let outcome = async {
+        stdin_streams_turn_by_turn(sandbox.as_ref()).await?;
+        stdin_delivers_exact_bytes(sandbox.as_ref()).await
+    }
+    .await;
+
+    sandbox.delete().await.expect("delete");
+    outcome.expect("live streamed stdin");
 }

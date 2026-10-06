@@ -8,7 +8,7 @@
 //! wrong for arbitrary binary streams. Stdin bytes that are not valid
 //! UTF-8 close the pipe rather than corrupting the stream, and there is
 //! no way to signal stdin EOF (ACP never needs one; a workload that does
-//! belongs on [`crate::DaytonaExec`]'s one-shot stdin).
+//! belongs on [`crate::DaytonaExec`]'s streamed or one-shot stdin).
 
 use std::str;
 use std::sync::Arc;
