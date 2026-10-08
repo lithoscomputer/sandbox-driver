@@ -7,9 +7,9 @@ use std::{io, mem, process};
 use async_trait::async_trait;
 use daytona_sdk::{DaytonaError, FileSystemService, ProcessService, SessionCommandLogsResult};
 use sandbox_driver::{
-    Capability, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
-    IncompleteOperation, OutputCaptureBuffer, OutputSanitizer, OutputSink, OutputStream, Result,
-    SpawnSpec, StdioProcess, StopLevel, Termination, run_with_stop_grace,
+    Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, IncompleteOperation,
+    OutputCaptureBuffer, OutputSanitizer, OutputSink, OutputStream, Result, SpawnSpec,
+    StdioProcess, StopLevel, Termination, run_with_stop_grace,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use crate::sdk::{DaytonaClient, daytona_error};
 use crate::session::{Session, WaitOutcome, dedup_capture, missing_suffix, wait_for_completion};
 use crate::shell::{exec_line, shell_quote};
+use crate::streamed_stdin::{self, InputPump};
 use crate::{encoded_exec, resolve_path, stdio, toolbox};
 
 #[derive(Deserialize)]
@@ -276,16 +277,17 @@ impl DaytonaTransport {
         spec: &ExecSpec,
         controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
-        if controls.stdin.is_some() {
-            return Err(Error::unsupported(Capability::ExecStdinStream));
-        }
         // Sessions cost three extra API calls, so plain buffered runs —
         // every derived fs/search/git operation — keep the one-shot
-        // endpoint; only a sink or stop token needs the session
-        // transport. Daytona ends a command by deleting its session,
+        // endpoint; only streamed stdin, a sink, or a stop token needs the
+        // session transport. Daytona ends a command by deleting its session,
         // which is one stop level: a term and a kill end the command the
         // same way, and the result reports whichever was asked for.
-        if controls.sink.is_some() || controls.term.is_some() || controls.kill.is_some() {
+        if controls.stdin.is_some()
+            || controls.sink.is_some()
+            || controls.term.is_some()
+            || controls.kill.is_some()
+        {
             return self.run_session(spec, controls).await;
         }
         self.run_buffered(spec, &controls).await
@@ -413,7 +415,7 @@ impl DaytonaTransport {
         controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
         let started = Instant::now();
-        let run = SessionRun::start(self, spec, &controls).await?;
+        let mut run = SessionRun::start(self, spec, &controls).await?;
         let outcome = match run.wait(spec.timeout, controls.stop_requested()).await {
             Ok(outcome) => outcome,
             Err(error) => return Err(run.abort(error).await),
@@ -431,9 +433,9 @@ async fn close_stdin(file: &mut Option<StdinFile>) {
 /// One session-backed command, owned from start to settled.
 ///
 /// Every early exit goes through [`SessionRun::abort`], which ends the
-/// stream task, deletes the session, and removes the stdin file, so a
-/// new return path cannot leak any of them. The awaited paths are the
-/// contract: [`Session::close`] reports whether deletion confirmed the
+/// stream task and the input pump, deletes the session, and removes the
+/// stdin file, so a new return path cannot leak any of them. The awaited paths
+/// are the contract: [`Session::close`] reports whether deletion confirmed the
 /// command's termination, and [`SessionRun::settle`] turns a refused
 /// deletion into [`Error::Incomplete`]. Dropping an unfinished run (the
 /// caller cancelled) is the fallback only: [`StreamTask`], [`Session`],
@@ -443,6 +445,8 @@ struct SessionRun {
     command_id:        String,
     initial_exit_code: Option<i32>,
     stdin_file:        Option<StdinFile>,
+    /// Forwards streamed stdin; idle for fixed or absent stdin.
+    stdin:             InputPump,
     stream:            StreamTask,
     output:            Arc<Mutex<SessionOutput>>,
     /// A failing sink cancels the execution (the core contract); the
@@ -452,7 +456,7 @@ struct SessionRun {
 
 impl SessionRun {
     /// Uploads the stdin file, starts the command in a fresh session, and
-    /// spawns the log stream.
+    /// spawns the log stream and the input pump.
     async fn start(
         transport: &DaytonaTransport,
         spec: &ExecSpec,
@@ -460,15 +464,23 @@ impl SessionRun {
     ) -> Result<Self> {
         let sandbox = toolbox::sandbox(&transport.client, &transport.sandbox_id).await?;
 
-        let mut stdin_file = match &spec.stdin {
-            Some(bytes) => {
+        // A stream wins over fixed bytes (the control-plane contract).
+        let streamed = controls
+            .stdin
+            .is_some()
+            .then(|| controls.stdin_reader(spec))
+            .flatten();
+        let mut stdin_file = match (&streamed, &spec.stdin) {
+            (None, Some(bytes)) => {
                 Some(StdinFile::create(&transport.client, &transport.sandbox_id, bytes).await?)
             }
-            None => None,
+            _ => None,
         };
 
         let mut command = exec_line(&spec.launch_env(), &spec.program, &spec.args);
-        if let Some(file) = &stdin_file {
+        if streamed.is_some() {
+            command = streamed_stdin::decoded_command(&command);
+        } else if let Some(file) = &stdin_file {
             command.push_str(" < ");
             command.push_str(&shell_quote(&file.path));
         }
@@ -488,6 +500,7 @@ impl SessionRun {
             command_id: started.cmd_id,
             initial_exit_code: started.exit_code,
             stdin_file,
+            stdin: InputPump::default(),
             stream: StreamTask::default(),
             output: Arc::new(Mutex::new(SessionOutput::new(
                 spec,
@@ -508,31 +521,43 @@ impl SessionRun {
             &run.command_id,
             Arc::clone(&run.output),
         );
+        if let Some(reader) = streamed {
+            let input_process = match toolbox::process_of(&sandbox).await {
+                Ok(process) => process,
+                Err(error) => return Err(run.abort(error).await),
+            };
+            run.stdin = InputPump::spawn(input_process, run.session.id(), &run.command_id, reader);
+        }
         Ok(run)
     }
 
     /// Polls the command to its end, the deadline, a stop request, or a
-    /// sink failure.
+    /// sink failure. Input that could not be delivered ends the wait with
+    /// its error: the command would otherwise wait for it forever.
     async fn wait(
-        &self,
+        &mut self,
         timeout: Option<Duration>,
         stop_requested: impl Future<Output = StopLevel>,
     ) -> Result<WaitOutcome> {
-        wait_for_completion(
+        let completion = wait_for_completion(
             &self.session,
             &self.command_id,
             self.initial_exit_code,
             timeout,
             stop_requested,
             self.sink_failed.clone(),
-        )
-        .await
+        );
+        tokio::select! {
+            outcome = completion => outcome,
+            error = self.stdin.failed() => Err(error),
+        }
     }
 
     /// Ends everything the run owns and hands back the error that ended
-    /// it: the stream task is aborted and awaited, the session deleted
-    /// (best-effort, bounded), and the stdin file removed.
+    /// it: the stream task and input pump are aborted and awaited, the
+    /// session deleted (best-effort, bounded), and the stdin file removed.
     async fn abort(mut self, error: Error) -> Error {
+        self.stdin.stop().await;
         self.stream.stop().await;
         self.session.close().await;
         close_stdin(&mut self.stdin_file).await;
@@ -544,6 +569,7 @@ impl SessionRun {
     /// deletion settles the run; a refused one is [`Error::Incomplete`]
     /// saying what was and was not confirmed.
     async fn settle(mut self, mut outcome: WaitOutcome) -> Result<Settled> {
+        self.stdin.stop().await;
         // A non-natural end must actively kill the command: deleting
         // the session terminates it and closes the log stream.
         if outcome.termination != Termination::Exited && !self.session.close().await {

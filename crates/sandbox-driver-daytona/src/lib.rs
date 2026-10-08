@@ -78,6 +78,7 @@ mod session;
 mod shell;
 mod snapshots;
 mod stdio;
+mod streamed_stdin;
 mod toolbox;
 mod volumes;
 

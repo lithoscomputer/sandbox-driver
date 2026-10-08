@@ -200,7 +200,6 @@ impl DaytonaSandbox {
             .transpose()?;
         let mut capabilities = narrowed_capabilities(base_capabilities, sdk.sandbox_class);
         capabilities.one_shot = None;
-        capabilities.exec.stdin_stream = false;
         if let Some(nested) = &nested {
             nested.capabilities(&mut capabilities);
         }

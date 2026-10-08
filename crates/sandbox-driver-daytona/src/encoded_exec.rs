@@ -16,8 +16,8 @@ use std::result::Result as StdResult;
 use std::sync::Arc;
 
 use sandbox_driver::{
-    Capability, Error, Exec, ExecControls, ExecSpec, ExecStreamingResult, OutputCaptureBuffer,
-    OutputLoss, OutputSanitization, OutputSanitizer, OutputSink, OutputStream, Result,
+    Exec, ExecControls, ExecSpec, ExecStreamingResult, OutputCaptureBuffer, OutputLoss,
+    OutputSanitization, OutputSanitizer, OutputSink, OutputStream, Result,
 };
 use tokio::sync::Mutex;
 
@@ -343,15 +343,15 @@ pub(super) async fn run(
     spec: &ExecSpec,
     controls: ExecControls,
 ) -> Result<ExecStreamingResult> {
-    if controls.stdin.is_some() {
-        return Err(Error::unsupported(Capability::ExecStdinStream));
-    }
     let output = Arc::new(Mutex::new(FramedOutput::new(
         spec.output_sanitization,
         &controls,
     )));
     let encoded = encoded_spec(spec);
-    let streaming = controls.sink.is_some() || controls.term.is_some() || controls.kill.is_some();
+    let streaming = controls.stdin.is_some()
+        || controls.sink.is_some()
+        || controls.term.is_some()
+        || controls.kill.is_some();
     let result = if streaming {
         let sink: OutputSink = Arc::new({
             let output = Arc::clone(&output);
@@ -362,11 +362,11 @@ pub(super) async fn run(
         });
         transport
             .run_streaming(&encoded, ExecControls {
-                term: controls.term,
-                kill: controls.kill,
-                sink: Some(sink),
+                stdin:                 controls.stdin,
+                term:                  controls.term,
+                kill:                  controls.kill,
+                sink:                  Some(sink),
                 retained_output_limit: Some(0),
-                ..ExecControls::default()
             })
             .await?
     } else {
