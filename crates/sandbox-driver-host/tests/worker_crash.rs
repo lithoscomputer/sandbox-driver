@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sandbox_driver::{
-    ExecControls, ExecSpec, SandboxProvider, SandboxSource, SandboxSpec, Termination,
+    ExecControls, ExecSpec, SandboxFilter, SandboxProvider, SandboxSource, SandboxSpec, Termination,
 };
 use sandbox_driver_host::HostProvider;
 use tokio::process::Command;
@@ -100,7 +100,11 @@ async fn worker_death_prevents_late_shell_and_descendant_writes() {
     let provider = HostProvider::with_registry(root.join("registry"))
         .await
         .expect("recovery registry");
-    for sandbox in provider.list(&Default::default()).await.expect("list") {
+    for sandbox in provider
+        .list(&SandboxFilter::default())
+        .await
+        .expect("list")
+    {
         provider
             .attach(&sandbox.id, None)
             .await
@@ -128,8 +132,10 @@ async fn a_live_owner_allows_completion_and_public_cancellation_stops_writes() {
         let running = Arc::clone(&sandbox);
         let spec = delayed_writes(&root);
         let token = CancellationToken::new();
-        let mut controls = ExecControls::default();
-        controls.term = Some(token.clone());
+        let controls = ExecControls {
+            term: Some(token.clone()),
+            ..ExecControls::default()
+        };
         let pending =
             tokio::spawn(async move { running.exec().run_streaming(&spec, controls).await });
         started(&root).await;
