@@ -102,7 +102,7 @@ async fn wait_for_sentinel_exit(pgid: i32) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_plugin_crash_preserves_identity_and_stop_fences_surviving_work() {
+async fn a_plugin_crash_stops_work_and_preserves_recoverable_identity() {
     let root = registry();
     let (provider, mut child) = connect(&root).await;
     let sandbox = provider
@@ -148,13 +148,12 @@ async fn a_plugin_crash_preserves_identity_and_stop_fences_surviving_work() {
         .kill()
         .await
         .expect("crash plugin and reap its owned child");
-    // A live workload outlives its owner: the sentinel checks its owner only
-    // once its status is written, so two of its one-second polls must pass
-    // without ending this group.
+    // No replacement provider has fenced this generation: the watcher must
+    // end live work itself when its owning plugin dies.
+    wait_for_sentinel_exit(running_pgid).await;
     let crashed_size = fs::metadata(&heartbeat).await.expect("heartbeat").len();
-    time::sleep(Duration::from_millis(2500)).await;
-    let survived_size = fs::metadata(&heartbeat).await.expect("heartbeat").len();
-    let survived = sentinel_exists(running_pgid);
+    time::sleep(Duration::from_millis(350)).await;
+    let final_crashed_size = fs::metadata(&heartbeat).await.expect("heartbeat").len();
     let failed = time::timeout(Duration::from_secs(5), pending)
         .await
         .expect("pending call ends")
@@ -202,9 +201,9 @@ async fn a_plugin_crash_preserves_identity_and_stop_fences_surviving_work() {
     fs::remove_dir_all(&root).await.expect("registry cleanup");
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].id, id);
-    assert!(
-        survived && survived_size > crashed_size,
-        "a running workload must survive its owner so recovery can fence it"
+    assert_eq!(
+        crashed_size, final_crashed_size,
+        "work kept writing after its plugin died"
     );
     assert_eq!(
         stopped_size, final_size,
