@@ -27,6 +27,7 @@
 //! only for stream pumping inside a running `exec` call and the stderr
 //! tail reader of a spawned stdio process; both end when their process
 //! ends. On Linux and macOS, a sentinel pins each process group until stop.
+//! Owner-process death ends active commands and their in-group descendants.
 //! `stop` fences all work before returning; `start` permits a new generation.
 //! [`HostProvider::with_registry`] keeps private records in a caller-owned
 //! directory. After a restart, attach and list read those records. A recovery
@@ -40,7 +41,8 @@
 //! registry. Creating a sandbox on the same directory twice yields the same
 //! id.
 //! Temporary providers end owned process groups when their last owner drops.
-//! Caller-owned registries retain groups for explicit stop or recovery.
+//! Caller-owned registries retain groups for explicit stop or recovery while
+//! the owning process is alive; its death ends those groups as well.
 //!
 //! A managed workspace is known only to the registry that created it. A
 //! second process reaches it through [`HostProvider::observe_registry`]: a

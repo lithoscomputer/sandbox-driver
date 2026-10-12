@@ -1,9 +1,9 @@
 //! A sentinel pins each process-group id until sandbox stop. Recovery writes
 //! fence markers and only observes process death; it never signals saved ids.
 //! The sentinel publishes its record before checking the marker and spawning
-//! work. Its in-group watcher handles a fence even after the plugin dies. Once
-//! the work has exited and its status is written, the idle sentinel also ends
-//! its group when its owning provider process is gone.
+//! work. Its in-group watcher ends active work when the owning provider dies
+//! or a fence appears. After the workload exits, the idle sentinel watches
+//! the same conditions, so descendants cannot outlive the provider either.
 
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -59,6 +59,7 @@ trap '' TERM
 exec >/dev/null 2>&1
 ( while kill -0 "$w" 2>/dev/null; do
     if [ -e "$fence" ]; then kill -KILL -- "-$$" 2>/dev/null || kill -KILL "-$$"; fi
+    kill -0 "$owner" 2>/dev/null || kill -KILL -- "-$$" 2>/dev/null || kill -KILL "-$$"
     /bin/sleep 0.25
   done ) &
 watch=$!
