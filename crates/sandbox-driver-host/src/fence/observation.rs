@@ -6,8 +6,11 @@
     unsafe_code,
     reason = "libproc exposes process observation through a C API"
 )]
+use std::collections::HashSet;
 #[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::{mem, ptr};
 
@@ -22,6 +25,52 @@ use nix::libc;
 /// our KILL, or a hostile workload's — makes the full listing necessary.
 pub(super) fn group_is_live(pgid: i32) -> bool {
     sentinel_is_live(pgid) || has_live_group_members(pgid)
+}
+
+/// Observe a whole drain batch. Linux must enumerate `/proc` only once:
+/// scanning it separately for every dead sentinel can exhaust the drain
+/// deadline even when all of the groups have already exited.
+#[cfg(target_os = "linux")]
+pub(super) fn live_groups(pgids: &[i32]) -> HashSet<i32> {
+    live_groups_in(Path::new("/proc"), pgids)
+}
+
+#[cfg(target_os = "linux")]
+fn live_groups_in(procfs: &Path, pgids: &[i32]) -> HashSet<i32> {
+    let requested: HashSet<_> = pgids.iter().copied().collect();
+    let mut live = HashSet::new();
+    if requested.is_empty() {
+        return live;
+    }
+    let Ok(entries) = fs::read_dir(procfs) else {
+        return live;
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.bytes().all(|b| b.is_ascii_digit()))
+        {
+            continue;
+        }
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        if let Some(group) = live_group_from_stat(&stat).filter(|id| requested.contains(id)) {
+            live.insert(group);
+        }
+    }
+    live
+}
+
+/// libproc already lists members by group rather than scanning all processes.
+#[cfg(target_os = "macos")]
+pub(super) fn live_groups(pgids: &[i32]) -> HashSet<i32> {
+    pgids
+        .iter()
+        .copied()
+        .filter(|id| group_is_live(*id))
+        .collect()
 }
 
 /// One `/proc/<pgid>/stat` read: the sentinel, live and still leading the
@@ -69,17 +118,54 @@ fn entry_is_live_member(entry: &fs::DirEntry, pgid: i32) -> bool {
 /// comm can hold spaces and parentheses, so the split is after the *last* `)`.
 #[cfg(target_os = "linux")]
 fn stat_is_live_in_group(stat: &str, pgid: i32) -> bool {
-    let Some((_, rest)) = stat.rsplit_once(')') else {
-        return false;
-    };
+    live_group_from_stat(stat) == Some(pgid)
+}
+
+#[cfg(target_os = "linux")]
+fn live_group_from_stat(stat: &str) -> Option<i32> {
+    let (_, rest) = stat.rsplit_once(')')?;
     let mut fields = rest.split_whitespace();
-    let Some(state) = fields.next() else {
-        return false;
-    };
-    let Some(group) = fields.nth(1).and_then(|s| s.parse::<i32>().ok()) else {
-        return false;
-    };
-    group == pgid && state != "Z"
+    let state = fields.next()?;
+    let group = fields.nth(1)?.parse::<i32>().ok()?;
+    (state != "Z").then_some(group)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::env;
+
+    use super::{HashSet, fs, live_groups_in};
+    use crate::registry::fresh_id;
+
+    #[test]
+    fn a_batch_observes_descendants_and_ignores_zombies_and_unrelated_groups() {
+        let procfs = env::temp_dir().join(fresh_id());
+        fs::create_dir_all(&procfs).expect("fixture process table");
+        for (pid, stat) in [
+            ("100", "100 (sentinel) Z 1 100 100"),
+            // The group remains live after its sentinel dies. The command
+            // name can contain spaces and parentheses, including a ')'.
+            ("101", "101 (child (with) spaces)) S 100 100 100"),
+            ("200", "200 (sentinel) S 1 200 200"),
+            ("201", "201 (second child) R 200 200 200"),
+            ("300", "300 (zombie only) Z 1 300 300"),
+            ("400", "400 (unrelated) S 1 400 400"),
+            ("500", "500 (truncated) S 1"),
+            ("600", "600 (bad group) S 1 invalid"),
+            ("self", "100 (nonnumeric entry) S 1 700 700"),
+        ] {
+            let directory = procfs.join(pid);
+            fs::create_dir(&directory).expect("fixture process");
+            fs::write(directory.join("stat"), stat).expect("fixture stat");
+        }
+        // A process can disappear between enumeration and reading its stat.
+        fs::create_dir(procfs.join("800")).expect("vanished process");
+        let live = live_groups_in(&procfs, &[100, 100, 200, 300, 500, 600, 700, 800, 900]);
+        let empty = live_groups_in(&procfs, &[]);
+        fs::remove_dir_all(procfs).expect("fixture cleanup");
+        assert_eq!(live, HashSet::from([100, 200]));
+        assert!(empty.is_empty());
+    }
 }
 
 /// libproc's process listing by group, each member checked for zombie state.

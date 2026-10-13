@@ -22,7 +22,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::spawn_blocking;
 use tokio::{fs, time};
 
-use super::observation::group_is_live;
+use super::observation::{group_is_live, live_groups};
 use crate::host_kind;
 
 const POLL: Duration = Duration::from_millis(25);
@@ -154,9 +154,11 @@ async fn kill_owned_groups(groups: &[Arc<PinnedGroup>]) -> io::Result<()> {
             .filter_map(|group| Some((group.pgid, group.signal(Signal::SIGKILL)?)))
             .collect();
         let live = spawn_blocking(move || {
+            let pgids: Vec<_> = signals.iter().map(|(pgid, _)| *pgid).collect();
+            let live_groups = live_groups(&pgids);
             let mut live = false;
             for (pgid, signalled) in signals {
-                if group_is_live(pgid) {
+                if live_groups.contains(&pgid) {
                     // macOS can reject signals to zombie-only groups.
                     // A failed signal matters only if a live member remains.
                     signalled?;
@@ -389,7 +391,8 @@ async fn await_groups_gone(mut pgids: Vec<i32>, deadline: time::Instant) -> Resu
     pgids.dedup();
     loop {
         pgids = spawn_blocking(move || {
-            pgids.retain(|id| group_is_live(*id));
+            let live = live_groups(&pgids);
+            pgids.retain(|id| live.contains(id));
             pgids
         })
         .await
