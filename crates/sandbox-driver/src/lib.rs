@@ -42,6 +42,7 @@ pub use buffer::{BoundedBuffer, DEFAULT_BUFFER_BYTES};
 mod access;
 mod capabilities;
 mod capture;
+pub mod contract;
 mod derived;
 mod drain;
 mod error;

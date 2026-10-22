@@ -1,5 +1,10 @@
 # sandbox-driver plugin protocol, version 2
 
+The additive [shared contract](shared-contract.md) defines next-API data and
+schema bootstrap requirements. It does not change this version's handshake,
+error encoding, operation DTOs, or transport. New adapters require explicit
+version negotiation; new workload specs must not be sent as v2 specs.
+
 This is the normative specification of the wire protocol between a
 **host** (an application using the protocol client, primarily Petri) and a **plugin** (an executable serving one sandbox provider). It
 is written so a plugin can be implemented in any language without reading

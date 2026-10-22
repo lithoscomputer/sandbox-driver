@@ -103,6 +103,21 @@ id_newtype!(
     ServiceId,
     "service id"
 );
+id_newtype!(
+    /// Operator-chosen provider entry name, distinct from a provider kind.
+    ProviderName,
+    "provider name"
+);
+id_newtype!(
+    /// Operator-chosen environment template name; never a sandbox identity.
+    EnvironmentName,
+    "environment name"
+);
+id_newtype!(
+    /// Non-secret provider-issued identity of the resource domain.
+    NamespaceId,
+    "namespace id"
+);
 
 /// Open provider kind: `"host"`, `"docker"`, `"daytona"`, or any plugin name.
 ///
