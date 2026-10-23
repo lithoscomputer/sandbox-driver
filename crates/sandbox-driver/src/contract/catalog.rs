@@ -132,11 +132,12 @@ struct Entry {
 }
 
 struct Catalog {
-    entries:      BTreeMap<ProviderName, Arc<Entry>>,
-    environments: Arc<dyn EnvironmentSource>,
-    secrets:      Arc<dyn SecretResolver>,
-    options:      CatalogOptions,
-    closed:       AtomicBool,
+    entries:         BTreeMap<ProviderName, Arc<Entry>>,
+    environments:    Arc<dyn EnvironmentSource>,
+    secrets:         Arc<dyn SecretResolver>,
+    options:         CatalogOptions,
+    closed:          AtomicBool,
+    shutdown_result: Mutex<Option<Result<(), Error>>>,
 }
 
 /// Immutable provider bindings with fresh environment snapshots per builder.
@@ -187,6 +188,7 @@ impl Sandboxes {
                 secrets,
                 options,
                 closed: AtomicBool::new(false),
+                shutdown_result: Mutex::new(None),
             }),
         })
     }
@@ -373,16 +375,22 @@ impl Sandboxes {
     /// even when one fails. No unused entry is started to shut it down.
     pub async fn shutdown(self) -> Result<(), Error> {
         self.catalog.closed.store(true, Ordering::Release);
+        let mut result = self.catalog.shutdown_result.lock().await;
+        if let Some(result) = result.as_ref() {
+            return result.clone();
+        }
         let mut first_error = None;
         for entry in self.catalog.entries.values() {
-            let mut active = entry.active.lock().await;
-            if let Some(active) = active.take() {
+            let active = entry.active.lock().await;
+            if let Some(active) = active.as_ref() {
                 if let Err(error) = active.runtime.shutdown().await {
                     first_error.get_or_insert(error);
                 }
             }
         }
-        first_error.map_or(Ok(()), Err)
+        let completed = first_error.map_or(Ok(()), Err);
+        *result = Some(completed.clone());
+        completed
     }
 }
 

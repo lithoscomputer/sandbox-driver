@@ -520,3 +520,39 @@ async fn unresolved_environment_diagnostics_do_not_probe_or_disable_other_entrie
         .await
         .expect("good environment works");
 }
+
+#[tokio::test]
+async fn repeated_shutdown_preserves_unconfirmed_cleanup() {
+    let factory = Arc::new(Factory {
+        shutdown_error: Some(Error::FenceLeaked {
+            message: "cleanup unconfirmed".into(),
+        }),
+        ..Factory::default()
+    });
+    let catalog = catalog(&factory);
+    catalog
+        .provider("entry")
+        .expect("entry")
+        .describe()
+        .await
+        .expect("activate");
+    let clone = catalog.clone();
+    assert!(matches!(
+        catalog.shutdown().await,
+        Err(Error::FenceLeaked { .. })
+    ));
+    assert!(matches!(
+        clone.shutdown().await,
+        Err(Error::FenceLeaked { .. })
+    ));
+    assert_eq!(
+        factory
+            .fake
+            .calls()
+            .await
+            .iter()
+            .filter(|call| call.operation == "shutdown")
+            .count(),
+        1
+    );
+}

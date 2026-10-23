@@ -23,34 +23,36 @@ impl SecretResolver for Secrets {
 }
 
 pub(super) struct Factory {
-    pub(super) fake:         FakeProvider,
-    pub(super) schemas:      ProviderSchemas,
-    pub(super) activations:  Mutex<Vec<Activation>>,
-    pub(super) namespace:    Mutex<Option<NamespaceId>>,
-    pub(super) list_results: Mutex<Option<Result<Vec<SandboxSummary>, Error>>>,
-    pub(super) create_error: Option<Error>,
-    pub(super) creates:      AtomicUsize,
-    pub(super) mutations:    AtomicUsize,
-    pub(super) discovery:    AtomicUsize,
-    pub(super) list_delay:   Duration,
-    pub(super) inflight:     Arc<AtomicUsize>,
-    pub(super) peak:         Arc<AtomicUsize>,
+    pub(super) fake:           FakeProvider,
+    pub(super) schemas:        ProviderSchemas,
+    pub(super) activations:    Mutex<Vec<Activation>>,
+    pub(super) namespace:      Mutex<Option<NamespaceId>>,
+    pub(super) list_results:   Mutex<Option<Result<Vec<SandboxSummary>, Error>>>,
+    pub(super) shutdown_error: Option<Error>,
+    pub(super) create_error:   Option<Error>,
+    pub(super) creates:        AtomicUsize,
+    pub(super) mutations:      AtomicUsize,
+    pub(super) discovery:      AtomicUsize,
+    pub(super) list_delay:     Duration,
+    pub(super) inflight:       Arc<AtomicUsize>,
+    pub(super) peak:           Arc<AtomicUsize>,
 }
 impl Default for Factory {
     fn default() -> Self {
         Self {
-            fake:         FakeProvider::new(),
-            schemas:      FakeProvider::schemas(),
-            activations:  Mutex::new(Vec::new()),
-            namespace:    Mutex::new(None),
-            list_results: Mutex::new(None),
-            create_error: None,
-            creates:      AtomicUsize::new(0),
-            mutations:    AtomicUsize::new(0),
-            discovery:    AtomicUsize::new(0),
-            list_delay:   Duration::ZERO,
-            inflight:     Arc::new(AtomicUsize::new(0)),
-            peak:         Arc::new(AtomicUsize::new(0)),
+            fake:           FakeProvider::new(),
+            schemas:        FakeProvider::schemas(),
+            activations:    Mutex::new(Vec::new()),
+            namespace:      Mutex::new(None),
+            list_results:   Mutex::new(None),
+            shutdown_error: None,
+            create_error:   None,
+            creates:        AtomicUsize::new(0),
+            mutations:      AtomicUsize::new(0),
+            discovery:      AtomicUsize::new(0),
+            list_delay:     Duration::ZERO,
+            inflight:       Arc::new(AtomicUsize::new(0)),
+            peak:           Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -119,7 +121,8 @@ impl ProviderRuntime for Runtime {
         self.runtime.list(filter).await
     }
     async fn shutdown(&self) -> Result<(), Error> {
-        self.runtime.shutdown().await
+        self.runtime.shutdown().await?;
+        self.factory.shutdown_error.clone().map_or(Ok(()), Err)
     }
 }
 
