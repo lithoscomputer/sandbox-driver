@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fmt::Write as _;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use daytona_api_client::models::SandboxClass as DaytonaSandboxClass;
@@ -269,7 +269,15 @@ impl DaytonaProvider {
         sdk_id: &str,
         budget: Duration,
     ) -> Result<daytona_sdk::Sandbox> {
-        let started = Instant::now();
+        time::timeout(budget, self.poll_started(sdk_id))
+            .await
+            .map_err(|_| Error::Timeout {
+                operation: "creating sandbox".to_owned(),
+                elapsed:   budget,
+            })?
+    }
+
+    async fn poll_started(&self, sdk_id: &str) -> Result<daytona_sdk::Sandbox> {
         let mut attempt = 0_u64;
         loop {
             attempt += 1;
@@ -291,31 +299,15 @@ impl DaytonaProvider {
                 }
                 _ => {}
             }
-            let elapsed = started.elapsed();
-            if elapsed >= budget {
-                return Err(Error::Timeout {
-                    operation: "creating sandbox".to_owned(),
-                    elapsed,
-                });
-            }
             time::sleep(CREATE_POLL).await;
         }
     }
 
-    /// Best-effort delete of a sandbox left behind by a failed create,
-    /// bounded by [`CLEANUP_TIMEOUT`]. When the delete itself fails, the
-    /// id is surfaced in the returned error so the caller can clean up
-    /// later.
+    /// Confirm deletion after a failed create, within one cleanup budget.
+    /// An accepted DELETE only starts cleanup. Retain the sandbox ID and
+    /// original failure if removal cannot be confirmed.
     async fn cleanup_failed_create(&self, sdk_id: &str, cause: Error) -> Error {
-        match time::timeout(CLEANUP_TIMEOUT, self.client.delete(sdk_id)).await {
-            Ok(Ok(())) => cause,
-            Ok(Err(error)) if is_not_found(&error) => cause,
-            _ => Error::Provider(ProviderError::with_source(
-                self.kind.clone(),
-                format!("failed create left sandbox {sdk_id} behind"),
-                cause,
-            )),
-        }
+        crate::cleanup::failed_create(&self.client, sdk_id, cause, CLEANUP_TIMEOUT).await
     }
 
     async fn handle(
@@ -910,6 +902,62 @@ mod tests {
 
     use super::*;
     use crate::labels::{TARGET_LABEL, WORKING_DIRECTORY_LABEL};
+
+    #[tokio::test]
+    async fn stalled_create_observation_times_out_and_cleans_up_the_known_sandbox() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use crate::fake_daytona::{FakeDaytona, Reply};
+
+        let deleted = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&deleted);
+        let created = serde_json::json!({
+            "id": "sb-1", "organizationId": "org-1", "name": "sb", "user": "daytona",
+            "env": {}, "labels": {}, "public": false, "networkBlockAll": false,
+            "target": "us", "cpu": 1.0, "gpu": 0.0, "memory": 1.0, "disk": 1.0,
+            "state": "creating",
+        })
+        .to_string();
+        let fake = FakeDaytona::start(|_| {
+            Arc::new(move |method, _| match method {
+                "POST" => Reply::Json(201, created.clone()),
+                "DELETE" => {
+                    observed.store(true, Ordering::SeqCst);
+                    Reply::Json(200, "{}".to_owned())
+                }
+                "GET" if observed.load(Ordering::SeqCst) => Reply::Json(404, "{}".to_owned()),
+                "GET" => Reply::Hang,
+                _ => panic!("unexpected method {method}"),
+            })
+        })
+        .await;
+        let client = Arc::try_unwrap(fake.client().await)
+            .ok()
+            .expect("only client owner");
+        let provider = DaytonaProvider::from_client(client, true);
+        let params = CreateParams::Snapshot(SnapshotParams {
+            base:     SandboxBaseParams::default(),
+            snapshot: "base".to_owned(),
+        });
+        let error = time::timeout(
+            Duration::from_secs(3),
+            provider.create_inner(params, Duration::from_millis(100)),
+        )
+        .await
+        .expect("the create wait and cleanup are bounded")
+        .err()
+        .expect("observation times out");
+        assert!(matches!(error, Error::Timeout { .. }), "{error:?}");
+        assert!(deleted.load(Ordering::SeqCst));
+        assert_eq!(fake.deletes(), 1);
+        assert_eq!(
+            fake.requests()
+                .iter()
+                .filter(|request| request.starts_with("POST "))
+                .count(),
+            1
+        );
+    }
 
     #[tokio::test]
     async fn connect_explicit_rejects_missing_credentials_without_consulting_the_environment() {
