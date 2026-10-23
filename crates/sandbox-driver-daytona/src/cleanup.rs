@@ -79,7 +79,7 @@ mod tests {
                 "id": "sb-1", "organizationId": "org-1", "name": "sb", "user": "daytona",
                 "env": {}, "labels": {}, "public": false, "networkBlockAll": false,
                 "target": "us", "cpu": 1.0, "gpu": 0.0, "memory": 1.0, "disk": 1.0,
-                "state": state,
+                "state": state, "toolboxProxyUrl": "http://unused",
             })
             .to_string(),
         )
@@ -126,7 +126,7 @@ mod tests {
             Duration::from_secs(5),
         )
         .await;
-        assert!(matches!(error, Error::InvalidSpec { .. }));
+        assert!(matches!(error, Error::InvalidSpec { .. }), "{error:?}");
         assert_eq!(observations.load(Ordering::SeqCst), 2);
         assert_eq!(fake.deletes(), 1);
     }
@@ -151,7 +151,7 @@ mod tests {
                 Duration::from_secs(1),
             )
             .await;
-            assert!(matches!(error, Error::InvalidSpec { .. }));
+            assert!(matches!(error, Error::InvalidSpec { .. }), "{error:?}");
             assert_eq!(fake.deletes(), 1);
         }
     }

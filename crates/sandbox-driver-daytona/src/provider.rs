@@ -915,7 +915,7 @@ mod tests {
             "id": "sb-1", "organizationId": "org-1", "name": "sb", "user": "daytona",
             "env": {}, "labels": {}, "public": false, "networkBlockAll": false,
             "target": "us", "cpu": 1.0, "gpu": 0.0, "memory": 1.0, "disk": 1.0,
-            "state": "creating",
+            "state": "creating", "toolboxProxyUrl": "http://unused",
         })
         .to_string();
         let fake = FakeDaytona::start(|_| {
