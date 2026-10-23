@@ -15,9 +15,10 @@ registration, or consumer cutover is introduced here.
 | `sandbox_driver::Error` | `contract::Error` | Keep existing error matching and wire error mapping unchanged. New adapters classify using evidence, not message text. |
 | `Capabilities` and background `Services` facet | `contract::Descriptor`, `CapabilitySet`, workload services | No inference from old flags to new guarantees. Workload services are not a new accessor. |
 | `SandboxId`, legacy attach | `contract::SandboxRef` | No inferred namespace for old IDs. Consumers must explicitly migrate saved records or retain old readers. |
-| v2 initialize and operation DTOs | Common serializable declarations | No v2 handshake additions or version bump here. The protocol lane negotiates the next version and adds explicit adapters. |
+| v2 initialize and operation DTOs | Common serializable declarations | No v2 handshake additions or version bump here. The protocol work negotiates the next version and adds explicit adapters. |
 
-The `contract` module is the shared import location for all new lanes. Existing
+The `contract` module is the shared import location for all new provider and
+client work. Existing
 public exports and required trait methods are unchanged. A new provider may
 reuse legacy implementation internals, but must not claim the new semantics
 merely by wrapping the old traits. Unsupported new operations must fail before
@@ -26,12 +27,18 @@ spec is **not** an adapter: older readers ignore fields and can run the wrong
 workload. There is no automatic fallback to v2 after a new-contract mutation.
 
 Request DTOs reject unknown fields/options rather than dropping instructions.
-Descriptors may acquire additional object fields; unknown enum capabilities
+That includes fields the selected mode does not take: an allow-list on a
+non-allow-list network mode, or a digest on development plugin trust, is a
+decoding error. Descriptors may acquire additional object fields; unknown enum capabilities
 fail decoding rather than being interpreted as supported. Unknown status states
 become `Unknown`, never a terminal state. The closed error enum serializes a
 stable snake-case `code` plus structured fields. A future unknown error code is
 a decode/transport failure with unknown outcome, never `NotFound` or success.
-Wire envelopes and negotiation remain the protocol lane's work; this document
+Rejected credentials (`Unauthenticated`), insufficient permission
+(`PermissionDenied`), and quota or rate limits (`ResourceExhausted`, with an
+optional `retry_after_ms`) are refusals with their own codes, distinct from
+`Unavailable`, so applications can tell bad credentials from an outage.
+Wire envelopes and negotiation remain part of the protocol work; this document
 is not a replacement specification for v2.
 
 ## Identity, admission, and catalog
@@ -62,15 +69,16 @@ namespace agreement must not bypass them.
 `ProviderEntry` describes a connection (`plugin`, `config`, secret names, and
 optional executable path/trust/arguments/environment). `Environment` is a
 provider entry plus a spec template. `EnvironmentSource` returns snapshots from
-application-owned storage. Admission saves the resolved spec and provider
+application-owned storage. A storage failure is `Unavailable`; only `Ok(None)`
+means the environment does not exist. Admission saves the resolved spec and provider
 binding; a later start or recovery must not reread an edited environment.
 Applications persist their own admission/lease records. The driver persists
 provider state needed to implement its declared durability.
 
 These are raw configuration DTOs, not a file loader or an admission validator.
-The core lane owns loading, merging, schema validation, and normalized sizes.
-This gate uses integer MiB/whole cores and milliseconds; it does not add a size
-parser. Human-readable values must normalize once, before reaching providers.
+The core API implementation owns loading, merging, schema validation, and
+normalized sizes. These declarations use integer MiB, whole cores, and
+milliseconds; they do not include a size parser. Human-readable values must normalize once, before reaching providers.
 
 `ProviderSchemas.config_schema` validates **only `ProviderEntry.config`**.
 `spec_schema` validates **only `SandboxSpec.provider_config`**, in addition to
@@ -102,11 +110,11 @@ and credential to be available. It checks local structural configuration;
 unresolved environment-to-entry references are recorded as per-entry diagnostics
 and rejected when selected, not a reason to disable unrelated entries.
 Missing or unusable entries are reported on use or explicit
-per-entry inspection; unrelated entries remain usable. This deliberately
-replaces the older draft's incompatible promises of complete plugin schema
-validation at construction and zero startup work.
+per-entry inspection; unrelated entries remain usable. The catalog therefore
+does not validate every plugin's schema at construction, and it is not
+startup-free: it does the local structural checks above.
 
-The plugin/SDK lane implements this sequence:
+The plugin loader and SDK implement this sequence:
 
 1. **Explicit metadata discovery** (also used on first activation): resolve the
    selected executable and verify its configured checksum or trust record.
@@ -135,7 +143,7 @@ The plugin/SDK lane implements this sequence:
    invent one. Explicit `describe` may activate the selected runtime.
 
 Checksums, installation, probe time/size limits, schema engine, initialize DTOs,
-and supervision are implementations for the core and plugin lanes. The agreed
+and supervision are left to the core API and plugin loader implementations. The agreed
 sequence does not require a new transport. Keep JSON control over stdio and a
 separate authenticated per-operation socket connection for output, input, and
 file contents. Preserve reserved control capacity for stop/cancel/health and
@@ -150,7 +158,10 @@ fallback.
 `"host_directory"` (directory and ownership are separate spec fields).
 The source is required. It is not a provider's VM runner or nested-Docker helper.
 `SandboxSpec::validate` checks portable invariants; capability/schema/backend
-validation is additionally required before admission.
+validation is additionally required before admission. Portable checks include
+environment variables: keys must be non-empty and contain no `=` or NUL, and
+values contain no NUL, because either would change the variable the workload
+receives.
 
 All sandbox exec, effective environment, working-directory and file operations
 address **that workload and its workspace**. No caller-selectable outer-runner
@@ -170,7 +181,9 @@ optional registry credential name, and optional readiness command. Ports are
 reachable **from the workload**, not public host port mappings. Readiness
 requires finite nonzero per-attempt timeout, interval, attempt count, and total
 deadline; zero exit passes. The total deadline bounds waits and attempts even
-when the attempt budget would take longer. Without a check the driver only
+when the attempt budget would take longer. A per-attempt timeout longer than
+the deadline, or an interval at least as long as the deadline when a second
+attempt is allowed, is rejected because the check could never use its budget. Without a check the driver only
 confirms service start; it makes no application-readiness claim.
 `Status.services` reports current workload-reachable host/port mappings, which
 can change on start. Unavailable status must not present stale addresses as
@@ -182,7 +195,9 @@ DNS, extra hosts, and shared-memory MiB. `None` is unspecified, while
 which requests are supported, separately from `services` and one-shot
 `containers`. Unsupported requests return `Unsupported` naming the field,
 including unsupported explicit false values. Providers cannot silently drop
-resource, network, timer, service, or container requests. Host rejects service
+resource, network, timer, service, or container requests. Descriptor `timers`
+lists each enforced timer (`auto_stop`, `auto_archive`, `auto_delete`, `ttl`)
+separately; a request for an unlisted timer is `Unsupported`. Host rejects service
 and container workloads.
 
 ## Lifecycle, fences, and uncertainty
@@ -244,7 +259,7 @@ report `Unavailable`. Never report `NotFound` merely because a local registry
 is empty. An expired handle is `Stale`; reattach after owner death is not promised.
 
 The plugin must attempt bounded owner cleanup on stdin EOF/shutdown, but process
-loss alone is not proof children died. Host's implementation lane must demonstrate
+loss alone is not proof children died. The Host implementation must demonstrate
 confirmed fencing or honest failure. Separate server/worker processes cannot
 independently attach to the same Host workload under this ownership model.
 Applications needing live UI access must route operations to the actual owner;
@@ -266,21 +281,24 @@ that selects that entry.
 
 ## Handoff and verification
 
-- **Core API lane:** consume `contract` types; implement catalog/schema admission,
+- **Core API:** consume `contract` types; implement catalog/schema admission,
   environment overrides, immutable bindings, namespace-checked refs, façade,
   fake and validation. Do not synthesize refs for legacy records.
-- **Plugin/Host lane:** implement metadata discovery and configured lazy launch,
-  next-version negotiation/adapters, same control/data transport, stale handles,
-  owner fencing and separate Host distribution. Keep v2 usable until migration.
-- **Docker lane:** translate portable workload/services/container options and
+- **Plugin loader and Host:** implement metadata discovery and configured lazy
+  launch, next-version negotiation/adapters, same control/data transport, stale
+  handles, owner fencing and separate Host distribution. Keep v2 usable until
+  migration.
+- **Docker:** translate portable workload/services/container options and
   report real namespace/capabilities; prove readiness and cross-instance fence.
-- **Daytona lane:** own runner/snapshot/nested-container recipes and route every
+- **Daytona:** own runner/snapshot/nested-container recipes and route every
   operation to the workload; prove service addressing, readiness and cleanup.
+  Translate timers carefully: here zero disables a timer, while Daytona's
+  `auto_delete_interval` of zero means delete on stop.
 
 The focused tests in `crates/sandbox-driver/tests/shared_contract.rs` cover
 persisted identity independent of environments, namespace refusal, configuration
 and workload decoding, readiness bounds, error uncertainty, schema separation,
 status tolerance and redaction. The existing core/provider/protocol suites must
 continue to pass. These declaration tests are not provider conformance evidence:
-the subsequent integration gate must exercise actual Host plugin, Docker and
-Daytona behavior before any consumer cutover or legacy removal.
+integration tests must exercise actual Host plugin, Docker and Daytona
+behavior before any consumer cutover or legacy removal.

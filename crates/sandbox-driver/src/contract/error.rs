@@ -61,6 +61,22 @@ pub enum Error {
         #[serde(default)]
         outcome: MutationOutcome,
     },
+    /// The backend rejected the configured credentials, for example because
+    /// they are invalid or expired. This request was not admitted.
+    #[error("credentials rejected: {message}")]
+    Unauthenticated { message: String },
+    /// The credentials are valid but do not permit this operation. This
+    /// request was not admitted.
+    #[error("permission denied: {message}")]
+    PermissionDenied { message: String },
+    /// A quota or rate limit refused this request before admission.
+    /// `retry_after_ms` is the backend's hint when it gives one.
+    #[error("resource exhausted: {message}")]
+    ResourceExhausted {
+        message:        String,
+        #[serde(default)]
+        retry_after_ms: Option<u64>,
+    },
     /// This request was not admitted; another owner's work may still be live.
     #[error("sandbox busy: {message}")]
     Busy { message: String },

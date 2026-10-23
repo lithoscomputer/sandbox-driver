@@ -5,18 +5,31 @@ use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::Error;
+use super::{Error, NetworkMode};
 use crate::{SnapshotId, WorkspaceOwnership};
 
 /// The caller's workload, never a helper image or outer runner.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Source {
     Image(String),
+    /// Dockerfile content.
     Dockerfile(String),
     Snapshot(SnapshotId),
     /// No image. Workspace path/ownership are carried by the spec.
     HostDirectory,
+}
+
+// Dockerfile content can embed build secrets; `Debug` redacts it.
+impl fmt::Debug for Source {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Image(reference) => f.debug_tuple("Image").field(reference).finish(),
+            Self::Dockerfile(_) => f.debug_tuple("Dockerfile").field(&"<redacted>").finish(),
+            Self::Snapshot(id) => f.debug_tuple("Snapshot").field(id).finish(),
+            Self::HostDirectory => f.write_str("HostDirectory"),
+        }
+    }
 }
 
 /// Normalized resource requests. Memory/disk are MiB; CPU is whole cores.
@@ -30,8 +43,10 @@ pub struct Resources {
     pub gpus:      Option<u32>,
 }
 
+/// Egress policy. Decoding rejects an allow-list on a mode that does not take
+/// one, so a misplaced restriction is never silently dropped.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "mode", rename_all = "snake_case", try_from = "RawNetworkPolicy")]
 pub enum NetworkPolicy {
     #[default]
     ProviderDefault,
@@ -43,6 +58,37 @@ pub enum NetworkPolicy {
     DomainAllowList {
         domains: Vec<String>,
     },
+}
+
+// Serde's `deny_unknown_fields` does not reach unit variants of an internally
+// tagged enum, so decoding goes through this flat form instead.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNetworkPolicy {
+    mode:    NetworkMode,
+    cidrs:   Option<Vec<String>>,
+    domains: Option<Vec<String>>,
+}
+
+impl TryFrom<RawNetworkPolicy> for NetworkPolicy {
+    type Error = &'static str;
+
+    fn try_from(raw: RawNetworkPolicy) -> Result<Self, Self::Error> {
+        match (raw.mode, raw.cidrs, raw.domains) {
+            (_, Some(_), Some(_)) => Err("network policy cannot set both cidrs and domains"),
+            (NetworkMode::CidrAllowList, Some(cidrs), None) => Ok(Self::CidrAllowList { cidrs }),
+            (NetworkMode::DomainAllowList, None, Some(domains)) => {
+                Ok(Self::DomainAllowList { domains })
+            }
+            (NetworkMode::CidrAllowList, None, None) => Err("cidr_allow_list requires cidrs"),
+            (NetworkMode::DomainAllowList, None, None) => Err("domain_allow_list requires domains"),
+            (_, Some(_), None) => Err("cidrs requires mode cidr_allow_list"),
+            (_, None, Some(_)) => Err("domains requires mode domain_allow_list"),
+            (NetworkMode::ProviderDefault, None, None) => Ok(Self::ProviderDefault),
+            (NetworkMode::AllowAll, None, None) => Ok(Self::AllowAll),
+            (NetworkMode::Block, None, None) => Ok(Self::Block),
+        }
+    }
 }
 
 /// Backend timers, in milliseconds. None inherits a provider default; zero
@@ -118,6 +164,13 @@ impl SandboxSpec {
             }
             _ => {}
         }
+        if self.name.as_deref() == Some("") {
+            return Err(Error::invalid_spec("name", "must not be empty"));
+        }
+        if self.user.as_deref() == Some("") {
+            return Err(Error::invalid_spec("user", "must not be empty"));
+        }
+        validate_env("env", &self.env)?;
         if self.working_directory.as_deref() == Some("") {
             return Err(Error::invalid_spec(
                 "working_directory",
@@ -147,6 +200,9 @@ impl SandboxSpec {
             }
             _ => {}
         }
+        if let Some(container) = &self.container {
+            container.validate()?;
+        }
         for (name, service) in &self.services {
             if name.is_empty()
                 || !name
@@ -172,14 +228,57 @@ impl SandboxSpec {
     }
 }
 
+/// Environment keys become `KEY=VALUE` pairs, so `=` and NUL would change or
+/// truncate the variable that reaches the workload.
+fn validate_env(path: &str, env: &BTreeMap<String, String>) -> Result<(), Error> {
+    for (key, value) in env {
+        if key.is_empty() || key.contains(['=', '\0']) {
+            return Err(Error::invalid_spec(
+                path,
+                "keys must be non-empty and must not contain '=' or NUL",
+            ));
+        }
+        if value.contains('\0') {
+            return Err(Error::invalid_spec(path, "values must not contain NUL"));
+        }
+    }
+    Ok(())
+}
+
+// `env` and `provider_config` can carry credentials, so `Debug` shows env keys
+// only. Destructuring makes every new field choose a representation here.
 impl fmt::Debug for SandboxSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            source,
+            name,
+            resources,
+            network,
+            timers,
+            labels,
+            env,
+            working_directory,
+            workspace_ownership,
+            user,
+            services,
+            container,
+            provider_config: _,
+        } = self;
         f.debug_struct("SandboxSpec")
-            .field("source", &"<redacted>")
-            .field("env", &"<redacted>")
-            .field("services", &self.services)
+            .field("source", source)
+            .field("name", name)
+            .field("resources", resources)
+            .field("network", network)
+            .field("timers", timers)
+            .field("labels", labels)
+            .field("env_keys", &env.keys().collect::<Vec<_>>())
+            .field("working_directory", working_directory)
+            .field("workspace_ownership", workspace_ownership)
+            .field("user", user)
+            .field("services", services)
+            .field("container", container)
             .field("provider_config", &"<redacted>")
-            .finish_non_exhaustive()
+            .finish()
     }
 }
 
@@ -218,6 +317,7 @@ impl ServiceSpec {
         if self.credential.as_deref() == Some("") {
             return Err(Error::invalid_spec("credential", "must not be empty"));
         }
+        validate_env("env", &self.env)?;
         if let Some(ready) = &self.ready {
             ready.validate()?;
         }
@@ -227,20 +327,29 @@ impl ServiceSpec {
 
 impl fmt::Debug for ServiceSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            image,
+            env,
+            ports,
+            credential,
+            ready,
+        } = self;
         f.debug_struct("ServiceSpec")
-            .field("image", &self.image)
-            .field("env", &"<redacted>")
-            .field("ports", &self.ports)
-            .field("credential", &self.credential)
-            .field("ready", &self.ready)
+            .field("image", image)
+            .field("env_keys", &env.keys().collect::<Vec<_>>())
+            .field("ports", ports)
+            .field("credential", credential)
+            .field("ready", ready)
             .finish()
     }
 }
 
 /// Finite readiness budget. `timeout_ms` caps each attempt, `deadline_ms` caps
 /// all attempts and waits, and `retries` is the maximum number of attempts.
-/// A zero exit code passes; timeout/nonzero fails that attempt. No shell is
-/// implied. Absence of a check requires only that the service has started.
+/// Each attempt must fit within the deadline, and so must the interval when a
+/// second attempt is allowed. A zero exit code passes; timeout/nonzero fails
+/// that attempt. No shell is implied. Absence of a check requires only that the
+/// service has started.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReadinessCheck {
@@ -265,18 +374,37 @@ impl ReadinessCheck {
                 "arguments must not contain NUL",
             ));
         }
+        if self.timeout_ms > self.deadline_ms {
+            return Err(Error::invalid_spec(
+                "ready.timeout_ms",
+                "must not exceed deadline_ms",
+            ));
+        }
+        if self.retries.get() > 1 && self.interval_ms >= self.deadline_ms {
+            return Err(Error::invalid_spec(
+                "ready.interval_ms",
+                "must be shorter than deadline_ms when retries allows a second attempt",
+            ));
+        }
         Ok(())
     }
 }
 
 impl fmt::Debug for ReadinessCheck {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            command: _,
+            interval_ms,
+            timeout_ms,
+            deadline_ms,
+            retries,
+        } = self;
         f.debug_struct("ReadinessCheck")
             .field("command", &"<redacted>")
-            .field("interval_ms", &self.interval_ms)
-            .field("timeout_ms", &self.timeout_ms)
-            .field("deadline_ms", &self.deadline_ms)
-            .field("retries", &self.retries)
+            .field("interval_ms", interval_ms)
+            .field("timeout_ms", timeout_ms)
+            .field("deadline_ms", deadline_ms)
+            .field("retries", retries)
             .finish()
     }
 }
@@ -294,4 +422,29 @@ pub struct ContainerSpec {
     pub dns:               Vec<String>,
     pub extra_hosts:       BTreeMap<String, String>,
     pub shm_size_mb:       Option<NonZeroU64>,
+}
+
+impl ContainerSpec {
+    fn validate(&self) -> Result<(), Error> {
+        for (path, entries) in [
+            ("container.capabilities_add", &self.capabilities_add),
+            ("container.capabilities_drop", &self.capabilities_drop),
+            ("container.dns", &self.dns),
+        ] {
+            if entries.iter().any(|entry| entry.trim().is_empty()) {
+                return Err(Error::invalid_spec(path, "entries must not be empty"));
+            }
+        }
+        if self
+            .extra_hosts
+            .iter()
+            .any(|(host, address)| host.trim().is_empty() || address.trim().is_empty())
+        {
+            return Err(Error::invalid_spec(
+                "container.extra_hosts",
+                "hosts and addresses must not be empty",
+            ));
+        }
+        Ok(())
+    }
 }

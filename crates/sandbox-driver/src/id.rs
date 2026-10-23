@@ -184,6 +184,51 @@ impl From<ProviderKind> for String {
     }
 }
 
+/// SHA-256 digest as 64 hexadecimal digits, stored lowercase.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Sha256Digest(String);
+
+impl Sha256Digest {
+    /// Validates a hexadecimal digest in either case and lowercases it.
+    pub fn try_new(value: impl Into<String>) -> Result<Self, InvalidIdError> {
+        let value = value.into();
+        if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(InvalidIdError::new(
+                "sha256 digest",
+                &value,
+                "must be exactly 64 hexadecimal digits",
+            ));
+        }
+        Ok(Self(value.to_ascii_lowercase()))
+    }
+
+    /// The lowercase digest as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Sha256Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for Sha256Digest {
+    type Error = InvalidIdError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_new(value)
+    }
+}
+
+impl From<Sha256Digest> for String {
+    fn from(value: Sha256Digest) -> Self {
+        value.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

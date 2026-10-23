@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU16;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -119,8 +120,8 @@ pub enum PortSupport {
     #[default]
     None,
     Any,
-    /// Workload port numbers. Zero is invalid at descriptor validation.
-    Selected(Vec<u16>),
+    /// Workload port numbers.
+    Selected(BTreeSet<NonZeroU16>),
 }
 
 /// Optional features are absent unless explicitly advertised. Services are a
@@ -135,7 +136,9 @@ pub struct CapabilitySet {
     pub containers:       bool,
     /// Supported workload container options, independent of service support.
     pub container_fields: Vec<ContainerField>,
-    pub timers:           bool,
+    /// Timers the provider enforces. A request for any other timer is
+    /// `Unsupported`, never silently ignored.
+    pub timers:           Vec<TimerCapability>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -165,4 +168,13 @@ pub enum ContainerField {
     Dns,
     ExtraHosts,
     ShmSizeMb,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimerCapability {
+    AutoStop,
+    AutoArchive,
+    AutoDelete,
+    Ttl,
 }

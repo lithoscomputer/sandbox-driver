@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 
 use sandbox_driver::contract::{
     AccessScope, CapabilitySet, Descriptor, Durability, Environment, Error, MutationOutcome,
-    NamespaceId, ProviderEntry, ProviderSchemas, SandboxRef, SandboxSpec, SandboxState, Source,
-    Status,
+    NamespaceId, NetworkPolicy, PluginTrust, PortSupport, ProviderEntry, ProviderSchemas,
+    SandboxRef, SandboxSpec, SandboxState, Source, Status, TimerCapability,
 };
 use serde_json::{Value, json};
 
@@ -136,6 +136,61 @@ fn request_typos_and_unsupported_target_selectors_are_not_dropped() {
 }
 
 #[test]
+fn network_allow_lists_are_never_dropped_by_a_mode_that_ignores_them() {
+    for network in [
+        json!({"mode": "provider_default", "cidrs": ["10.0.0.0/8"]}),
+        json!({"mode": "allow_all", "cidrs": ["10.0.0.0/8"]}),
+        json!({"mode": "block", "domains": ["example.com"]}),
+        json!({"mode": "cidr_allow_list", "domains": ["example.com"]}),
+        json!({"mode": "cidr_allow_list", "cidrs": ["10.0.0.0/8"], "domains": ["example.com"]}),
+        json!({"mode": "block", "egress": "none"}),
+    ] {
+        assert!(
+            serde_json::from_value::<NetworkPolicy>(network.clone()).is_err(),
+            "{network}"
+        );
+    }
+    let policy: NetworkPolicy =
+        serde_json::from_value(json!({"mode": "cidr_allow_list", "cidrs": ["10.0.0.0/8"]}))
+            .expect("allow-list decodes");
+    assert_eq!(policy, NetworkPolicy::CidrAllowList {
+        cidrs: vec!["10.0.0.0/8".into()],
+    });
+    let round_trip = serde_json::to_value(&policy).expect("serializes");
+    assert_eq!(
+        serde_json::from_value::<NetworkPolicy>(round_trip).expect("restores"),
+        policy
+    );
+    assert_eq!(
+        serde_json::to_value(NetworkPolicy::Block).expect("serializes"),
+        json!({"mode": "block"})
+    );
+}
+
+#[test]
+fn plugin_trust_never_skips_a_pinned_digest() {
+    let digest = "AB".repeat(32);
+    for trust in [
+        json!({"mode": "development", "digest": digest}),
+        json!({"mode": "sha256"}),
+        json!({"mode": "sha256", "digest": "abc"}),
+        json!({"mode": "sha256", "digest": "g".repeat(64)}),
+    ] {
+        assert!(
+            serde_json::from_value::<PluginTrust>(trust.clone()).is_err(),
+            "{trust}"
+        );
+    }
+    let trust: PluginTrust =
+        serde_json::from_value(json!({"mode": "sha256", "digest": digest})).expect("pinned");
+    assert!(matches!(&trust, PluginTrust::Sha256 { digest } if digest.as_str() == "ab".repeat(32)));
+    assert_eq!(
+        serde_json::from_value::<PluginTrust>(json!({"mode": "development"})).expect("development"),
+        PluginTrust::Development
+    );
+}
+
+#[test]
 fn readiness_requires_finite_nonzero_budgets_and_a_valid_executable() {
     for field in ["interval_ms", "timeout_ms", "deadline_ms", "retries"] {
         let mut value = workload();
@@ -163,6 +218,33 @@ fn readiness_requires_finite_nonzero_budgets_and_a_valid_executable() {
             if path == "services.postgres.ready.command")
         );
     }
+    for (budget, field) in [
+        (
+            json!({"timeout_ms": 5000, "deadline_ms": 1000}),
+            "timeout_ms",
+        ),
+        (
+            json!({"interval_ms": 60000, "deadline_ms": 60000, "retries": 2}),
+            "interval_ms",
+        ),
+    ] {
+        let mut value = workload();
+        for (key, budget) in budget.as_object().expect("object") {
+            value["services"]["postgres"]["ready"][key] = budget.clone();
+        }
+        let spec: SandboxSpec = serde_json::from_value(value).expect("raw DTO decodes");
+        assert!(
+            matches!(spec.validate(), Err(Error::InvalidSpec { path, .. })
+            if path == format!("services.postgres.ready.{field}")),
+            "{field}"
+        );
+    }
+    // A single attempt never waits, so its interval is irrelevant.
+    let mut value = workload();
+    value["services"]["postgres"]["ready"]["interval_ms"] = json!(60000);
+    value["services"]["postgres"]["ready"]["retries"] = json!(1);
+    let spec: SandboxSpec = serde_json::from_value(value).expect("raw DTO decodes");
+    spec.validate().expect("single attempt fits the deadline");
 }
 
 #[test]
@@ -174,6 +256,17 @@ fn portable_validation_rejects_unsafe_or_empty_requests() {
         json!({"source": {"image": "ubuntu:24.04"}, "workspace_ownership": "managed"}),
         json!({"source": {"image": "ubuntu:24.04"}, "services": {"bad name": {"image": "redis"}}}),
         json!({"source": {"image": "ubuntu:24.04"}, "services": {"DB": {"image": "redis"}, "db": {"image": "redis"}}}),
+        json!({"source": {"image": "ubuntu:24.04"}, "name": ""}),
+        json!({"source": {"image": "ubuntu:24.04"}, "user": ""}),
+        json!({"source": {"image": "ubuntu:24.04"}, "env": {"": "value"}}),
+        json!({"source": {"image": "ubuntu:24.04"}, "env": {"A=B": "value"}}),
+        json!({"source": {"image": "ubuntu:24.04"}, "env": {"A\u{0}": "value"}}),
+        json!({"source": {"image": "ubuntu:24.04"}, "env": {"A": "val\u{0}ue"}}),
+        json!({"source": {"image": "ubuntu:24.04"}, "services": {"db": {"image": "redis", "env": {"A=B": "v"}}}}),
+        json!({"source": {"image": "ubuntu:24.04"}, "container": {"capabilities_add": [""]}}),
+        json!({"source": {"image": "ubuntu:24.04"}, "container": {"capabilities_drop": [" "]}}),
+        json!({"source": {"image": "ubuntu:24.04"}, "container": {"dns": [""]}}),
+        json!({"source": {"image": "ubuntu:24.04"}, "container": {"extra_hosts": {"db": ""}}}),
     ] {
         let spec: SandboxSpec = serde_json::from_value(value).expect("raw DTO");
         assert!(matches!(spec.validate(), Err(Error::InvalidSpec { .. })));
@@ -210,6 +303,25 @@ fn uncertain_errors_default_to_unknown_not_not_started_or_absence() {
         ..
     }));
     assert!(serde_json::from_value::<Error>(json!({"code": "new_failure"})).is_err());
+}
+
+#[test]
+fn credential_and_quota_refusals_are_distinct_from_outages() {
+    for code in ["unauthenticated", "permission_denied", "resource_exhausted"] {
+        let error: Error = serde_json::from_value(json!({"code": code, "message": "refused"}))
+            .expect("known refusal");
+        assert!(!matches!(error, Error::Unavailable { .. }), "{code}");
+        let encoded = serde_json::to_value(&error).expect("error serializes");
+        assert_eq!(encoded["code"], code);
+    }
+    let limited: Error = serde_json::from_value(json!({
+        "code": "resource_exhausted", "message": "rate limited", "retry_after_ms": 1500
+    }))
+    .expect("rate limit");
+    assert!(matches!(limited, Error::ResourceExhausted {
+        retry_after_ms: Some(1500),
+        ..
+    }));
 }
 
 #[test]
@@ -251,6 +363,10 @@ fn connection_and_spec_schemas_are_separate_and_metadata_needs_no_namespace() {
     assert!(!caps.services);
     assert!(!caps.containers);
     assert!(caps.container_fields.is_empty());
+    assert!(caps.timers.is_empty());
+    let caps: CapabilitySet =
+        serde_json::from_value(json!({"timers": ["auto_stop"]})).expect("timer capabilities");
+    assert_eq!(caps.timers, [TimerCapability::AutoStop]);
 }
 
 #[test]
@@ -272,9 +388,21 @@ fn descriptor_requires_runtime_identity_and_does_not_infer_shared_access_from_du
     let mut empty = value.clone();
     empty["namespace"]["id"] = json!("");
     assert!(serde_json::from_value::<Descriptor>(empty).is_err());
-    let mut unknown = value;
+    let mut unknown = value.clone();
     unknown["capabilities"]["container_fields"] = json!(["future_option"]);
     assert!(serde_json::from_value::<Descriptor>(unknown).is_err());
+    let mut zero_port = value.clone();
+    zero_port["ports"] = json!({"exposable": "selected", "ports": [8080, 0]});
+    assert!(serde_json::from_value::<Descriptor>(zero_port).is_err());
+    let mut selected = value;
+    selected["ports"] = json!({"exposable": "selected", "ports": [8080, 3000, 8080]});
+    let descriptor: Descriptor = serde_json::from_value(selected).expect("selected ports");
+    let PortSupport::Selected(ports) = descriptor.ports else {
+        panic!("expected selected ports");
+    };
+    assert_eq!(ports.iter().map(|port| port.get()).collect::<Vec<_>>(), [
+        3000, 8080
+    ]);
 }
 
 #[test]
@@ -317,7 +445,10 @@ fn debug_output_redacts_launch_and_workload_secrets() {
     for secret in ["config-secret", "launch-secret", "arg-secret"] {
         assert!(!debug.contains(secret));
     }
+    assert!(debug.contains("TOKEN"), "env keys stay visible: {debug}");
     let mut value = workload();
+    value["name"] = json!("build-42");
+    value["source"] = json!({"dockerfile": "FROM ubuntu\nARG dockerfile-secret"});
     value["services"]["postgres"]["ready"]["command"] = json!(["check", "command-secret"]);
     let spec: SandboxSpec = serde_json::from_value(value).expect("spec");
     let debug = format!("{spec:?}");
@@ -326,8 +457,19 @@ fn debug_output_redacts_launch_and_workload_secrets() {
         "service-secret",
         "opaque-secret",
         "command-secret",
+        "dockerfile-secret",
     ] {
-        assert!(!debug.contains(secret));
+        assert!(!debug.contains(secret), "{secret} leaked: {debug}");
+    }
+    for visible in [
+        "build-42",
+        "TOKEN",
+        "PASSWORD",
+        "postgres:16",
+        "memory_mb",
+        "Block",
+    ] {
+        assert!(debug.contains(visible), "{visible} hidden: {debug}");
     }
 }
 
@@ -341,9 +483,13 @@ fn legacy_spec_and_error_construction_remain_available() {
     old.validate().expect("legacy spec still validates");
     let error = sandbox_driver::Error::invalid_spec("source", "legacy error");
     assert!(matches!(error, sandbox_driver::Error::InvalidSpec { field, .. } if field == "source"));
-    // The two source encodings cannot accidentally interchange as Rust DTOs.
-    assert!(
-        serde_json::from_value::<SandboxSpec>(serde_json::to_value(old).expect("serialize"))
-            .is_err()
-    );
+    // Image sources are encoded differently, so neither DTO accepts the
+    // other's. Each fixture holds only a source, isolating the encoding.
+    let legacy_source = json!({"source": serde_json::to_value(&old).expect("serialize")["source"]});
+    let error = serde_json::from_value::<SandboxSpec>(legacy_source)
+        .expect_err("legacy image source is rejected");
+    assert!(!error.to_string().contains("unknown field"), "{error}");
+    let contract_source = json!({"source": {"image": "ubuntu:24.04"}});
+    serde_json::from_value::<SandboxSpec>(contract_source.clone()).expect("contract source");
+    assert!(serde_json::from_value::<sandbox_driver::SandboxSpec>(contract_source).is_err());
 }

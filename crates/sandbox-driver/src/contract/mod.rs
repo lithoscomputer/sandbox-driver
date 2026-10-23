@@ -16,7 +16,7 @@ pub use config::{Environment, EnvironmentSource, PluginTrust, ProviderEntry};
 pub use descriptor::{
     AccessScope, CapabilitySet, ContainerField, Descriptor, Durability, EndpointCapability,
     JsonSchema, LifecycleCapability, Locality, Namespace, NamespaceScope, NetworkMode, PortSupport,
-    ProviderSchemas, ResourceCapability, SourceKind,
+    ProviderSchemas, ResourceCapability, SourceKind, TimerCapability,
 };
 pub use error::{Error, MutationOutcome, RemainingResource};
 pub use identity::SandboxRef;
@@ -26,4 +26,4 @@ pub use workload::{
     Timers,
 };
 
-pub use crate::id::{EnvironmentName, NamespaceId, ProviderName};
+pub use crate::id::{EnvironmentName, NamespaceId, ProviderName, Sha256Digest};
