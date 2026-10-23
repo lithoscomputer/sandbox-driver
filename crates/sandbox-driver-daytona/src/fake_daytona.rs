@@ -125,6 +125,14 @@ impl FakeDaytona {
     }
 
     pub(crate) async fn transport(&self) -> DaytonaTransport {
+        DaytonaTransport::new(
+            self.client().await,
+            "sb-1".to_owned(),
+            "/workspace".to_owned(),
+        )
+    }
+
+    pub(crate) async fn client(&self) -> Arc<Client> {
         let client = Client::new_with_config(DaytonaConfig {
             api_key: Some("test-key".to_owned()),
             api_url: Some(format!("http://{}", self.address)),
@@ -132,7 +140,7 @@ impl FakeDaytona {
         })
         .await
         .expect("client");
-        DaytonaTransport::new(Arc::new(client), "sb-1".to_owned(), "/workspace".to_owned())
+        Arc::new(client)
     }
 
     pub(crate) fn requests(&self) -> Vec<String> {

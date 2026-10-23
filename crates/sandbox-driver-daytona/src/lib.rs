@@ -37,6 +37,17 @@
 //! Daytona API and official SDK do not expose a working resize route, so
 //! this provider does not declare it.
 //!
+//! # Failed creation
+//!
+//! Once Daytona returns a sandbox ID, startup observation is bounded. A
+//! failure during startup or provisioning attempts one delete and waits,
+//! within a cleanup deadline, for removal to be confirmed. An accepted delete
+//! or a `destroying` status alone does not confirm cleanup. Unconfirmed cleanup
+//! returns a legacy [`sandbox_driver::ProviderError`] with code
+//! `cleanup_unconfirmed`, the known sandbox ID in `detail.remaining`, and the
+//! cleanup diagnostic in `detail.cleanup`; the original creation failure stays
+//! in its source chain. This is not permission to replay the create.
+//!
 //! # Lifecycle timers
 //!
 //! Unset timers inherit Daytona's server defaults — notably auto-stop
@@ -61,6 +72,7 @@
 //! worker's environment cannot substitute for them.
 
 mod access;
+mod cleanup;
 mod encoded_exec;
 mod exec;
 #[cfg(test)]
