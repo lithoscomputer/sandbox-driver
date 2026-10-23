@@ -556,3 +556,23 @@ async fn repeated_shutdown_preserves_unconfirmed_cleanup() {
         1
     );
 }
+
+#[tokio::test]
+async fn explicit_plugin_trust_never_falls_back_to_a_same_kind_builtin() {
+    let factory = Arc::new(Factory::default());
+    let mut configured = entry();
+    configured.trust = Some(PluginTrust::Development);
+    let catalog = Sandboxes::try_new(
+        [(name("entry"), configured)],
+        environments(),
+        &registry(&factory),
+        Arc::new(Secrets::default()),
+        options(),
+    )
+    .expect("cold catalog");
+    assert!(matches!(
+        catalog.provider("entry").expect("entry").describe().await,
+        Err(Error::Unavailable { .. })
+    ));
+    assert_eq!(factory.discovery.load(Ordering::SeqCst), 0);
+}

@@ -54,7 +54,7 @@ impl Registry {
         Ok(self)
     }
     fn factory(&self, entry: &ProviderEntry) -> Option<Arc<dyn ProviderFactory>> {
-        if entry.path.is_some() {
+        if entry.path.is_some() || entry.trust.is_some() {
             self.plugins.clone()
         } else {
             self.builtins
