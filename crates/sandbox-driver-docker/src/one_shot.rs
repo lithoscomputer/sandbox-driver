@@ -41,7 +41,7 @@ use crate::daemon::{docker_error, docker_kind, is_conflict, is_not_found};
 use crate::fs::tar::reroot;
 use crate::image::{image_present, pull_image};
 use crate::output::{KILL_DRAIN_GRACE, StreamOutput, drain_with_stops};
-use crate::{MANAGED_LABEL, non_empty};
+use crate::{MANAGED_LABEL, fence, non_empty};
 
 /// The label every one-shot container carries, naming the sandbox it
 /// belongs to (the sandbox container's id).
@@ -410,7 +410,7 @@ impl OneShot for DockerOneShot {
             }
         };
         let (container, output) =
-            crate::fence::run(&self.container.docker, &self.container.id, "admit", async {
+            fence::run(&self.container.docker, &self.container.id, "admit", async {
                 let inspect = self.container.inspect().await?;
                 if inspect.state.as_ref().and_then(|state| state.running) != Some(true) {
                     return Err(Error::invalid_spec(

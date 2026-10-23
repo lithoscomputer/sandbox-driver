@@ -17,6 +17,7 @@ use bollard::Docker;
 use bollard::container::{Config, CreateContainerOptions, ListContainersOptions};
 use bollard::errors::Error as DockerApiError;
 use bollard::models::ContainerCreateResponse;
+use futures_util::future::BoxFuture;
 use sandbox_driver::{Error, ProviderError, Result, TransportError};
 use serde_json::Value;
 use tokio::time::error::Elapsed;
@@ -25,6 +26,8 @@ use tokio::time::{Instant, sleep, timeout};
 use crate::MANAGED_LABEL;
 use crate::container::{inspect_container, remove_container_forced};
 use crate::daemon::{docker_error, docker_kind, is_conflict};
+use crate::one_shot::ONE_SHOT_LABEL;
+use crate::sidecars::NETWORK_LABEL;
 
 pub(crate) const FENCE_NAME_LABEL: &str = "sh.sandbox-driver.fence-name";
 pub(crate) const FENCE_LABEL: &str = "sh.sandbox-driver.fence";
@@ -35,22 +38,26 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 /// Serializes admissions and lifecycle changes, not the lifetime of a command.
 /// Once admission completes, stopping the primary and sweeping its labeled
 /// siblings ends the admitted work. The marker is excluded from inventory.
-pub(crate) async fn run<T>(
-    docker: &Docker,
-    id: &str,
+pub(crate) fn run<'a, T: Send + 'a>(
+    docker: &'a Docker,
+    id: &'a str,
     operation: &'static str,
-    work: impl Future<Output = Result<T>>,
-) -> Result<T> {
-    let marker = match timeout(OPERATION_TIMEOUT, acquire(docker, id, operation)).await {
-        Ok(result) => result?,
-        Err(_) => return Err(acquisition_timeout(id)),
-    };
-    let Some(marker) = marker else {
-        return timeout(OPERATION_TIMEOUT, work)
-            .await
-            .map_err(|_| acquisition_timeout(id))?;
-    };
-    finish(docker, &marker, operation, work).await
+    work: impl Future<Output = Result<T>> + Send + 'a,
+) -> BoxFuture<'a, Result<T>> {
+    // Box this orchestration boundary: combining daemon inspection, claim
+    // allocation, and the operation would otherwise inflate every caller.
+    Box::pin(async move {
+        let marker = match timeout(OPERATION_TIMEOUT, acquire(docker, id, operation)).await {
+            Ok(result) => result?,
+            Err(_) => return Err(acquisition_timeout(id)),
+        };
+        let Some(marker) = marker else {
+            return timeout(OPERATION_TIMEOUT, work)
+                .await
+                .map_err(|_| acquisition_timeout(id))?;
+        };
+        finish(docker, &marker, operation, work).await
+    })
 }
 
 async fn finish<T>(
@@ -163,28 +170,32 @@ pub(crate) fn creation_name() -> String {
     )
 }
 
-pub(crate) async fn create<T>(
-    docker: &Docker,
-    image: &str,
-    name: &str,
-    work: impl Future<Output = Result<T>>,
-) -> Result<T> {
-    let marker = match create_marker(docker, image, name, name, "create").await {
-        Ok(Ok(created)) if created.id.is_empty() => {
-            return Err(retained(name, "daemon omitted the fence ID", None));
-        }
-        Ok(Ok(created)) => created.id,
-        Ok(Err(error)) => {
-            let error = docker_error("acquiring creation fence", error);
-            return Err(if uncertain(&error) {
-                retained(name, "creation fence outcome is unknown", Some(error))
-            } else {
-                error
-            });
-        }
-        Err(_) => return Err(retained(name, "creation fence timed out", None)),
-    };
-    finish(docker, &marker, "create", work).await
+pub(crate) fn create<'a, T: Send + 'a>(
+    docker: &'a Docker,
+    image: &'a str,
+    name: &'a str,
+    work: impl Future<Output = Result<T>> + Send + 'a,
+) -> BoxFuture<'a, Result<T>> {
+    // Box this orchestration boundary: combining daemon inspection, claim
+    // allocation, and the operation would otherwise inflate every caller.
+    Box::pin(async move {
+        let marker = match create_marker(docker, image, name, name, "create").await {
+            Ok(Ok(created)) if created.id.is_empty() => {
+                return Err(retained(name, "daemon omitted the fence ID", None));
+            }
+            Ok(Ok(created)) => created.id,
+            Ok(Err(error)) => {
+                let error = docker_error("acquiring creation fence", error);
+                return Err(if uncertain(&error) {
+                    retained(name, "creation fence outcome is unknown", Some(error))
+                } else {
+                    error
+                });
+            }
+            Err(_) => return Err(retained(name, "creation fence timed out", None)),
+        };
+        finish(docker, &marker, "create", work).await
+    })
 }
 
 async fn create_marker(
@@ -208,6 +219,11 @@ async fn create_marker(
                     (FENCE_LABEL.to_owned(), id.to_owned()),
                     (MANAGED_LABEL.to_owned(), "false".to_owned()),
                     (OPERATION_LABEL.to_owned(), operation.to_owned()),
+                    // Image labels are merged by Docker. A claim must never
+                    // inherit a sibling-discovery label and be swept while
+                    // its critical section is still running.
+                    (ONE_SHOT_LABEL.to_owned(), String::new()),
+                    (NETWORK_LABEL.to_owned(), String::new()),
                 ])),
                 ..Default::default()
             },

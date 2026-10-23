@@ -25,10 +25,10 @@ use crate::forward::DockerForwards;
 use crate::fs::DockerFs;
 use crate::image::{image_present, pull_image};
 use crate::inspect::{ContainerFacts, is_managed, sidecar_network_of, status_from_inspect};
-use crate::one_shot::DockerOneShot;
+use crate::one_shot::{self, DockerOneShot};
 use crate::pty::DockerPty;
 use crate::sandbox::DockerSandbox;
-use crate::{MANAGED_LABEL, docker_capabilities};
+use crate::{MANAGED_LABEL, docker_capabilities, fence};
 
 /// The Docker provider, sharing one configured daemon connection.
 pub struct DockerProvider {
@@ -184,12 +184,12 @@ impl SandboxProvider for DockerProvider {
                         &reporter,
                     )
                     .await?;
-                    let fence_name = crate::fence::creation_name();
-                    plan.config.labels.get_or_insert_default().insert(
-                        crate::fence::FENCE_NAME_LABEL.to_owned(),
-                        fence_name.clone(),
-                    );
-                    crate::fence::create(&self.docker, &plan.image, &fence_name, async {
+                    let fence_name = fence::creation_name();
+                    plan.config
+                        .labels
+                        .get_or_insert_default()
+                        .insert(fence::FENCE_NAME_LABEL.to_owned(), fence_name.clone());
+                    fence::create(&self.docker, &plan.image, &fence_name, async {
                         let created = CreatedContainer::create(&self.docker, &plan).await?;
                         let event_id = match SandboxId::try_new(created.id.clone()) {
                             Ok(id) => id,
@@ -267,8 +267,8 @@ impl SandboxProvider for DockerProvider {
                     let inspect = match self.inspect(id.as_str()).await {
                         Ok(inspect) => inspect,
                         Err(Error::NotFound { .. }) => {
-                            crate::fence::ensure_absent(&self.docker, id.as_str()).await?;
-                            return crate::one_shot::sweep(&self.docker, id.as_str()).await;
+                            fence::ensure_absent(&self.docker, id.as_str()).await?;
+                            return one_shot::sweep(&self.docker, id.as_str()).await;
                         }
                         Err(error) => return Err(error),
                     };
@@ -279,7 +279,7 @@ impl SandboxProvider for DockerProvider {
                     }
                     let network = sidecar_network_of(&inspect);
                     let container_id = inspect.id.clone().unwrap_or_else(|| id.as_str().to_owned());
-                    crate::fence::run(&self.docker, &container_id, "delete", async {
+                    fence::run(&self.docker, &container_id, "delete", async {
                         remove_sandbox(&self.docker, &container_id, network.as_deref()).await
                     })
                     .await

@@ -16,7 +16,7 @@ use sandbox_driver::{Error, ProviderError, ResourceKind, Result};
 use tokio::io::AsyncWrite;
 
 use crate::daemon::{docker_error, docker_kind, is_not_found};
-use crate::{one_shot, sidecars};
+use crate::{fence, one_shot, sidecars};
 
 /// A started exec instance with its attached streams.
 pub(crate) struct AttachedExec {
@@ -76,7 +76,7 @@ impl ContainerRef {
         options: CreateExecOptions<String>,
         what: &str,
     ) -> Result<AttachedExec> {
-        crate::fence::run(&self.docker, &self.id, "admit", async {
+        fence::run(&self.docker, &self.id, "admit", async {
             let exec = self
                 .docker
                 .create_exec(&self.id, options)

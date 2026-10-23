@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bollard::Docker;
+use sandbox_driver::contract::Error as ContractError;
 use sandbox_driver::{
     Error, SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec,
 };
@@ -474,10 +475,10 @@ async fn interrupted_service_creation_remains_discoverable_for_cleanup() {
         panic!("expected incomplete cleanup");
     };
     assert_eq!(failure.code.as_deref(), Some("incomplete_cleanup"));
-    let projection: sandbox_driver::contract::Error =
+    let projection: ContractError =
         serde_json::from_value(failure.detail.expect("structured cleanup")).expect("shared error");
     assert!(
-        matches!(projection, sandbox_driver::contract::Error::IncompleteCleanup { remaining, .. }
+        matches!(projection, ContractError::IncompleteCleanup { remaining, .. }
         if remaining.iter().any(|resource| resource.id == "main")
         && remaining.iter().any(|resource| resource.id == "example-net"))
     );

@@ -11,7 +11,7 @@ use sandbox_driver::{
 };
 
 use crate::one_shot::ONE_SHOT_LABEL;
-use crate::{DEFAULT_WORKING_DIRECTORY, MANAGED_LABEL, SIDECAR_NETWORK_LABEL};
+use crate::{DEFAULT_WORKING_DIRECTORY, MANAGED_LABEL, SIDECAR_NETWORK_LABEL, fence};
 
 /// What a sandbox handle needs to know about its container, read from
 /// one inspect. `create` and `attach` build handles from the same facts,
@@ -204,7 +204,7 @@ pub(crate) fn is_internal_label(key: &str) -> bool {
     key == MANAGED_LABEL
         || key == ONE_SHOT_LABEL
         || key == SIDECAR_NETWORK_LABEL
-        || key == crate::fence::FENCE_NAME_LABEL
+        || key == fence::FENCE_NAME_LABEL
 }
 
 /// Whether a container's network mode names a managed sidecar network

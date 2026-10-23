@@ -24,7 +24,7 @@ use crate::fs::DockerFs;
 use crate::inspect::{configured_env, status_from_inspect};
 use crate::one_shot::{self, DockerOneShot};
 use crate::pty::DockerPty;
-use crate::{RUNTIME_DIRECTORY, SIDECAR_NETWORK_LABEL, sidecars};
+use crate::{RUNTIME_DIRECTORY, SIDECAR_NETWORK_LABEL, fence, sidecars};
 
 /// A container-backed sandbox.
 pub struct DockerSandbox {
@@ -124,7 +124,7 @@ impl Sandbox for DockerSandbox {
             .run(
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Start,
-                |_| crate::fence::run(&self.container.docker, self.id.as_str(), "start", async {
+                |_| fence::run(&self.container.docker, self.id.as_str(), "start", async {
                     let inspect = self.inspect().await?;
                     if let Some(network) = &self.network {
                         // A crash during create leaves the primary labeled
@@ -191,7 +191,7 @@ impl Sandbox for DockerSandbox {
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Stop,
                 |_| {
-                    crate::fence::run(&self.container.docker, self.id.as_str(), "stop", async {
+                    fence::run(&self.container.docker, self.id.as_str(), "stop", async {
                         self.forwards.close_all().await;
                         // Whatever a one-shot was doing in the workspace ends
                         // with the sandbox's own processes.
@@ -224,7 +224,7 @@ impl Sandbox for DockerSandbox {
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Delete,
                 |_| {
-                    crate::fence::run(&self.container.docker, self.id.as_str(), "delete", async {
+                    fence::run(&self.container.docker, self.id.as_str(), "delete", async {
                         self.forwards.close_all().await;
                         remove_sandbox(
                             &self.container.docker,
@@ -245,7 +245,7 @@ impl Sandbox for DockerSandbox {
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Pause,
                 |_| {
-                    crate::fence::run(&self.container.docker, self.id.as_str(), "pause", async {
+                    fence::run(&self.container.docker, self.id.as_str(), "pause", async {
                         self.container
                             .docker
                             .pause_container(self.id.as_str())
@@ -264,7 +264,7 @@ impl Sandbox for DockerSandbox {
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Resume,
                 |_| {
-                    crate::fence::run(&self.container.docker, self.id.as_str(), "resume", async {
+                    fence::run(&self.container.docker, self.id.as_str(), "resume", async {
                         self.container
                             .docker
                             .unpause_container(self.id.as_str())

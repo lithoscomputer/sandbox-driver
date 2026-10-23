@@ -2,6 +2,7 @@
 //! `cargo test -p sandbox-driver-docker --test fence -- --ignored`.
 
 use std::collections::HashMap;
+use std::process;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,7 +53,7 @@ async fn stop_fences_other_clients_exec_and_one_shots_and_blocks_start_during_dr
     let mut spec = SandboxSpec::new(SandboxSource::Image {
         reference: IMAGE.to_owned(),
     })
-    .name(format!("fence-services-{}", std::process::id()));
+    .name(format!("fence-services-{}", process::id()));
     spec.provider_config = serde_json::json!({"sidecars": [{
         "name": "service", "image": IMAGE, "entrypoint": ["sleep", "600"]
     }]});
@@ -182,7 +183,7 @@ async fn a_visible_but_unready_creation_cannot_be_started_or_stopped_by_another_
     let provider = DockerProvider::connect().await.expect("Docker is required");
     let other = DockerProvider::connect().await.expect("second provider");
     let docker = Docker::connect_with_local_defaults().expect("Docker client");
-    let name = format!("fence-creation-{}", std::process::id());
+    let name = format!("fence-creation-{}", process::id());
     let mut spec = SandboxSpec::new(SandboxSource::Image {
         reference: IMAGE.to_owned(),
     })
