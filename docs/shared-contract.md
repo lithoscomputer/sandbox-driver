@@ -1,7 +1,9 @@
 # Shared sandbox contract
 
-This is the implementation handoff for `sandbox_driver::contract`. It defines
-common data and required behavior for the next API. It does **not** claim the
+This is the implementation handoff for `sandbox_driver::contract`. The API
+itself, as a consumer or plugin author reads it, is [docs/next-api.md](next-api.md);
+this document states the required behavior behind those shapes and the
+migration rules. It defines common data and required behavior for the next API. It does **not** claim the
 existing providers implement that behavior yet. The current crate-root traits,
 errors, specs, provider libraries, executables, and [protocol v2](protocol.md)
 remain supported during migration. No new transport, façade, fake, provider
