@@ -14,7 +14,7 @@ use sandbox_driver::{
 };
 
 use crate::access::DockerShellCommand;
-use crate::container::{ContainerRef, remove_sandbox};
+use crate::container::{ContainerRef, confirm_stopped, remove_sandbox};
 use crate::daemon::{
     docker_error, docker_kind, is_not_found, is_not_modified, tolerate_not_modified,
 };
@@ -124,7 +124,7 @@ impl Sandbox for DockerSandbox {
             .run(
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Start,
-                |_| async {
+                |_| crate::fence::run(&self.container.docker, self.id.as_str(), "start", async {
                     let inspect = self.inspect().await?;
                     if let Some(network) = &self.network {
                         // A crash during create leaves the primary labeled
@@ -173,7 +173,7 @@ impl Sandbox for DockerSandbox {
                         }),
                         Err(error) => Err(docker_error("starting container", error)),
                     }
-                },
+                }),
             )
             .await
     }
@@ -190,22 +190,28 @@ impl Sandbox for DockerSandbox {
             .run(
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Stop,
-                |_| async {
-                    self.forwards.close_all().await;
-                    // Whatever a one-shot was doing in the workspace ends
-                    // with the sandbox's own processes.
-                    one_shot::sweep(&self.container.docker, self.id.as_str()).await?;
-                    tolerate_not_modified(
-                        self.container
-                            .docker
-                            .stop_container(self.id.as_str(), Some(StopContainerOptions { t: 1 }))
-                            .await,
-                        "stopping container",
-                    )?;
-                    if let Some(network) = &self.network {
-                        sidecars::set_running(&self.container.docker, network, false).await?;
-                    }
-                    Ok(())
+                |_| {
+                    crate::fence::run(&self.container.docker, self.id.as_str(), "stop", async {
+                        self.forwards.close_all().await;
+                        // Whatever a one-shot was doing in the workspace ends
+                        // with the sandbox's own processes.
+                        one_shot::sweep(&self.container.docker, self.id.as_str()).await?;
+                        tolerate_not_modified(
+                            self.container
+                                .docker
+                                .stop_container(
+                                    self.id.as_str(),
+                                    Some(StopContainerOptions { t: 1 }),
+                                )
+                                .await,
+                            "stopping container",
+                        )?;
+                        confirm_stopped(&self.container.docker, self.id.as_str()).await?;
+                        if let Some(network) = &self.network {
+                            sidecars::set_running(&self.container.docker, network, false).await?;
+                        }
+                        Ok(())
+                    })
                 },
             )
             .await
@@ -217,14 +223,16 @@ impl Sandbox for DockerSandbox {
             .run(
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Delete,
-                |_| async {
-                    self.forwards.close_all().await;
-                    remove_sandbox(
-                        &self.container.docker,
-                        self.id.as_str(),
-                        self.network.as_deref(),
-                    )
-                    .await
+                |_| {
+                    crate::fence::run(&self.container.docker, self.id.as_str(), "delete", async {
+                        self.forwards.close_all().await;
+                        remove_sandbox(
+                            &self.container.docker,
+                            self.id.as_str(),
+                            self.network.as_deref(),
+                        )
+                        .await
+                    })
                 },
             )
             .await
@@ -236,12 +244,14 @@ impl Sandbox for DockerSandbox {
             .run(
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Pause,
-                |_| async {
-                    self.container
-                        .docker
-                        .pause_container(self.id.as_str())
-                        .await
-                        .map_err(|error| docker_error("pausing container", error))
+                |_| {
+                    crate::fence::run(&self.container.docker, self.id.as_str(), "pause", async {
+                        self.container
+                            .docker
+                            .pause_container(self.id.as_str())
+                            .await
+                            .map_err(|error| docker_error("pausing container", error))
+                    })
                 },
             )
             .await
@@ -253,12 +263,14 @@ impl Sandbox for DockerSandbox {
             .run(
                 EventSubject::sandbox(Some(self.id.clone())),
                 Action::Resume,
-                |_| async {
-                    self.container
-                        .docker
-                        .unpause_container(self.id.as_str())
-                        .await
-                        .map_err(|error| docker_error("unpausing container", error))
+                |_| {
+                    crate::fence::run(&self.container.docker, self.id.as_str(), "resume", async {
+                        self.container
+                            .docker
+                            .unpause_container(self.id.as_str())
+                            .await
+                            .map_err(|error| docker_error("unpausing container", error))
+                    })
                 },
             )
             .await

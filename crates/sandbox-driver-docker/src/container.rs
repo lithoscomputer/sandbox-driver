@@ -12,10 +12,10 @@ use bollard::errors::Error as DockerApiError;
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::models::{ContainerInspectResponse, ExecInspectResponse};
 use futures_util::Stream;
-use sandbox_driver::{Error, ResourceKind, Result};
+use sandbox_driver::{Error, ProviderError, ResourceKind, Result};
 use tokio::io::AsyncWrite;
 
-use crate::daemon::{docker_error, is_not_found};
+use crate::daemon::{docker_error, docker_kind, is_not_found};
 use crate::{one_shot, sidecars};
 
 /// A started exec instance with its attached streams.
@@ -76,29 +76,32 @@ impl ContainerRef {
         options: CreateExecOptions<String>,
         what: &str,
     ) -> Result<AttachedExec> {
-        let exec = self
-            .docker
-            .create_exec(&self.id, options)
-            .await
-            .map_err(|error| docker_error(&format!("creating {what}"), error))?;
-        let start = self
-            .docker
-            .start_exec(&exec.id, None::<StartExecOptions>)
-            .await
-            .map_err(|error| docker_error(&format!("starting {what}"), error))?;
-        let StartExecResults::Attached { output, input } = start else {
-            return Err(docker_error(
-                &format!("starting {what}"),
-                DockerApiError::IOError {
-                    err: io::Error::other("exec started detached"),
-                },
-            ));
-        };
-        Ok(AttachedExec {
-            id: exec.id,
-            output,
-            input,
+        crate::fence::run(&self.docker, &self.id, "admit", async {
+            let exec = self
+                .docker
+                .create_exec(&self.id, options)
+                .await
+                .map_err(|error| docker_error(&format!("creating {what}"), error))?;
+            let start = self
+                .docker
+                .start_exec(&exec.id, None::<StartExecOptions>)
+                .await
+                .map_err(|error| docker_error(&format!("starting {what}"), error))?;
+            let StartExecResults::Attached { output, input } = start else {
+                return Err(docker_error(
+                    &format!("starting {what}"),
+                    DockerApiError::IOError {
+                        err: io::Error::other("exec started detached"),
+                    },
+                ));
+            };
+            Ok(AttachedExec {
+                id: exec.id,
+                output,
+                input,
+            })
         })
+        .await
     }
 
     /// The exit code of an exec, once it has one.
@@ -156,6 +159,30 @@ pub(crate) async fn remove_container_forced(
         Err(error) if is_not_found(&error) => Ok(()),
         Err(error) => Err(docker_error(context, error)),
     }
+}
+
+/// A stop response is not enough when the subsequent state still permits
+/// execution. Missing state is also unconfirmed, never a successful fence.
+pub(crate) async fn confirm_stopped(docker: &Docker, id: &str) -> Result<()> {
+    let inspect = match inspect_container(docker, id).await {
+        Ok(inspect) => inspect,
+        Err(Error::NotFound { .. }) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if inspect
+        .state
+        .as_ref()
+        .is_some_and(|state| state.running == Some(false) && state.paused != Some(true))
+    {
+        return Ok(());
+    }
+    let mut error = ProviderError::new(
+        docker_kind(),
+        "container termination could not be confirmed",
+    );
+    error.code = Some("fence_leaked".to_owned());
+    error.detail = Some(serde_json::json!({"container": id}));
+    Err(Error::Provider(error))
 }
 
 /// Removes a sandbox's container and everything that depends on it.

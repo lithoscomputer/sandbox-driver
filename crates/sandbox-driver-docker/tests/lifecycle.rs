@@ -33,6 +33,24 @@ impl Daemon {
     }
 
     async fn with_bytes(reply: impl Fn(&str) -> (u16, Vec<u8>) + Send + 'static) -> Self {
+        Self::serve(reply, true).await
+    }
+
+    async fn raw(reply: impl Fn(&str) -> (u16, Value) + Send + 'static) -> Self {
+        Self::serve(
+            move |request| {
+                let (status, body) = reply(request);
+                (status, body.to_string().into_bytes())
+            },
+            false,
+        )
+        .await
+    }
+
+    async fn serve(
+        reply: impl Fn(&str) -> (u16, Vec<u8>) + Send + 'static,
+        automatic_fences: bool,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test operation succeeds");
@@ -78,7 +96,23 @@ impl Daemon {
                 let request = String::from_utf8(bytes).expect("HTTP request is text");
                 recorded.lock().unwrap().push(request.clone());
                 let request = request.lines().next().expect("request line");
-                let (status, body) = reply(request);
+                let (status, body) = if automatic_fences
+                    && request.contains("/containers/create?name=sandbox-driver-fence-")
+                {
+                    (
+                        201,
+                        json!({"Id": "fence", "Warnings": []})
+                            .to_string()
+                            .into_bytes(),
+                    )
+                } else if automatic_fences
+                    && request.starts_with("DELETE ")
+                    && request.contains("/containers/fence?")
+                {
+                    (204, Vec::new())
+                } else {
+                    reply(request)
+                };
                 let body = if status == 204 || status == 304 {
                     Vec::new()
                 } else {
@@ -112,7 +146,7 @@ impl Daemon {
 
 fn inspect(running: bool) -> Value {
     json!({
-        "Id": "main",
+        "Id": "main", "Image": "sha256:test",
         "Config": {"Labels": {"sh.sandbox-driver.managed": "true"}, "WorkingDir": "/workspace"},
         "HostConfig": {"NetworkMode": "example-net"},
         "State": {"Running": running, "Paused": false}
@@ -192,7 +226,14 @@ async fn missing_dependents_are_successful_cleanup() {
         .await
         .unwrap();
     let requests = daemon.finish().await;
-    assert!(requests.last().unwrap().contains("/containers/main?"));
+    assert!(
+        requests
+            .iter()
+            .rev()
+            .nth(1)
+            .unwrap()
+            .contains("/containers/main?")
+    );
 }
 
 #[tokio::test]
@@ -253,7 +294,14 @@ async fn delete_retries_a_network_failure_after_disconnecting_the_sandbox() {
             .count(),
         1
     );
-    assert!(requests.last().unwrap().contains("/containers/main?"));
+    assert!(
+        requests
+            .iter()
+            .rev()
+            .nth(1)
+            .unwrap()
+            .contains("/containers/main?")
+    );
 }
 
 /// A handle whose container vanished reports `NotFound` from every verb
@@ -352,7 +400,14 @@ async fn start_is_idempotent_and_waits_for_service_health() {
             .count(),
         3
     );
-    assert!(requests.last().unwrap().contains("/containers/main/start"));
+    assert!(
+        requests
+            .iter()
+            .rev()
+            .nth(1)
+            .unwrap()
+            .contains("/containers/main/start")
+    );
 }
 
 #[tokio::test]
@@ -365,7 +420,10 @@ async fn interrupted_service_creation_remains_discoverable_for_cleanup() {
         } else if request.contains("/containers/create?name=example-net-db") {
             (500, json!({"message": "original service create failure"}))
         } else if request.contains("/containers/create?") {
-            (201, json!({"Id": "main", "Warnings": []}))
+            (
+                201,
+                json!({"Id": "main", "Image": "sha256:test", "Warnings": []}),
+            )
         } else if request.contains("/networks/create") {
             (201, json!({"Id": "network", "Warning": ""}))
         } else if request.contains("/containers/json?") && request.contains("network%3D") {
@@ -384,7 +442,7 @@ async fn interrupted_service_creation_remains_discoverable_for_cleanup() {
             (
                 200,
                 json!({
-                    "Id": "main", "Config": {"Labels": {
+                    "Id": "main", "Image": "sha256:test", "Config": {"Labels": {
                         "sh.sandbox-driver.managed": "true",
                         "sh.sandbox-driver.sidecar-network": "example-net",
                         "petri.workspace": "test/work"
@@ -412,7 +470,17 @@ async fn interrupted_service_creation_remains_discoverable_for_cleanup() {
         .await
         .err()
         .expect("create fails");
-    assert!(error.to_string().contains("creating sidecar"), "{error}");
+    let Error::Provider(failure) = error else {
+        panic!("expected incomplete cleanup");
+    };
+    assert_eq!(failure.code.as_deref(), Some("incomplete_cleanup"));
+    let projection: sandbox_driver::contract::Error =
+        serde_json::from_value(failure.detail.expect("structured cleanup")).expect("shared error");
+    assert!(
+        matches!(projection, sandbox_driver::contract::Error::IncompleteCleanup { remaining, .. }
+        if remaining.iter().any(|resource| resource.id == "main")
+        && remaining.iter().any(|resource| resource.id == "example-net"))
+    );
     let mut filter = SandboxFilter::default();
     filter
         .labels
@@ -464,8 +532,157 @@ async fn interrupted_service_creation_remains_discoverable_for_cleanup() {
     );
     assert!(
         requests
-            .last()
-            .expect("last cleanup")
+            .iter()
+            .rev()
+            .nth(1)
+            .expect("last resource cleanup before fence release")
             .contains("/containers/main?")
+    );
+}
+
+#[tokio::test]
+async fn a_failed_fence_release_is_not_a_successful_stop() {
+    let stopped = AtomicBool::new(false);
+    let daemon = Daemon::raw(move |request| {
+        if request.contains("/containers/main/stop") {
+            stopped.store(true, Ordering::SeqCst);
+        }
+        if request.contains("/containers/main/json") {
+            return (200, inspect(!stopped.load(Ordering::SeqCst)));
+        }
+        if request.contains("/containers/service/json") {
+            return (200, inspect(false));
+        }
+        if request.contains("/containers/create?name=sandbox-driver-fence-") {
+            (201, json!({"Id": "fence", "Warnings": []}))
+        } else if request.starts_with("DELETE ") && request.contains("/containers/fence?") {
+            (500, json!({"message": "release not confirmed"}))
+        } else {
+            cleanup_reply(request)
+        }
+    })
+    .await;
+    let sandbox = daemon
+        .provider
+        .attach(&SandboxId::try_new("main").unwrap(), None)
+        .await
+        .unwrap();
+    let error = sandbox
+        .stop()
+        .await
+        .expect_err("unconfirmed release must fail");
+    let Error::Provider(error) = error else {
+        panic!("provider error");
+    };
+    assert_eq!(error.code.as_deref(), Some("transport"));
+    assert_eq!(error.detail.unwrap()["fence_container"], "fence");
+    let requests = daemon.finish().await;
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("/containers/main/stop"))
+    );
+}
+
+#[tokio::test]
+async fn unknown_exec_admission_retains_the_fence_without_replaying() {
+    let daemon = Daemon::new(|request| {
+        if request.contains("/containers/main/exec") {
+            (201, json!("not a create-exec response"))
+        } else {
+            cleanup_reply(request)
+        }
+    })
+    .await;
+    let sandbox = daemon
+        .provider
+        .attach(&SandboxId::try_new("main").unwrap(), None)
+        .await
+        .unwrap();
+    let error = sandbox
+        .exec()
+        .run(&sandbox_driver::ExecSpec::new("true"))
+        .await
+        .expect_err("unknown exec ID");
+    let Error::Provider(error) = error else {
+        panic!("provider error");
+    };
+    assert_eq!(error.code.as_deref(), Some("transport"));
+    let requests = daemon.finish().await;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.contains("/containers/main/exec"))
+            .count(),
+        1
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.starts_with("DELETE "))
+    );
+}
+
+#[tokio::test]
+async fn absent_primary_does_not_hide_retained_ownership() {
+    let daemon = Daemon::new(|request| {
+        if request.contains("/containers/main/json") {
+            (404, json!({"message": "primary removed"}))
+        } else if request.contains("/containers/json?") && request.contains("fence") {
+            (200, json!([{"Id": "retained-fence"}]))
+        } else {
+            panic!("unexpected request: {request}");
+        }
+    })
+    .await;
+    let error = daemon
+        .provider
+        .delete(&SandboxId::try_new("main").unwrap(), None)
+        .await
+        .expect_err("ownership remains");
+    assert!(matches!(error, Error::Provider(error) if error.code.as_deref() == Some("busy")));
+    daemon.finish().await;
+}
+
+#[tokio::test]
+async fn a_stop_acknowledgement_with_live_processes_is_a_leaked_fence() {
+    let daemon = Daemon::new(cleanup_reply).await;
+    let sandbox = daemon
+        .provider
+        .attach(&SandboxId::try_new("main").unwrap(), None)
+        .await
+        .unwrap();
+    let error = sandbox
+        .stop()
+        .await
+        .expect_err("daemon still reports running");
+    assert!(
+        matches!(error, Error::Provider(error) if error.code.as_deref() == Some("fence_leaked"))
+    );
+    let requests = daemon.finish().await;
+    assert!(!requests.iter().any(|request| request.starts_with("DELETE ") && request.contains("/containers/fence?")));
+}
+
+#[tokio::test]
+async fn an_unidentifiable_one_shot_prevents_confirmed_stop() {
+    let daemon = Daemon::new(|request| {
+        if request.contains("one-shot") {
+            (200, json!([{"State": "running"}]))
+        } else {
+            cleanup_reply(request)
+        }
+    })
+    .await;
+    let sandbox = daemon
+        .provider
+        .attach(&SandboxId::try_new("main").unwrap(), None)
+        .await
+        .unwrap();
+    assert!(sandbox.stop().await.is_err());
+    let requests = daemon.finish().await;
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.contains("/containers/main/stop"))
     );
 }

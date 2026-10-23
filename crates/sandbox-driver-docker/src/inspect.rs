@@ -201,7 +201,10 @@ pub(crate) fn workspace_of(inspect: &ContainerInspectResponse, working_dir: &str
 
 /// Labels the provider writes for itself, never reported as the caller's.
 pub(crate) fn is_internal_label(key: &str) -> bool {
-    key == MANAGED_LABEL || key == ONE_SHOT_LABEL || key == SIDECAR_NETWORK_LABEL
+    key == MANAGED_LABEL
+        || key == ONE_SHOT_LABEL
+        || key == SIDECAR_NETWORK_LABEL
+        || key == crate::fence::FENCE_NAME_LABEL
 }
 
 /// Whether a container's network mode names a managed sidecar network

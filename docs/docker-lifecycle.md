@@ -1,0 +1,79 @@
+# Docker lifecycle coordination
+
+The Docker provider serializes resource creation, command admission, one-shot
+admission, and lifecycle mutations through a daemon-scoped claim. Independent
+provider instances that connect to the same daemon use the same claim. Existing
+library calls and protocol v2 use this implementation; it does not declare that
+the Docker provider implements the entire next API.
+
+The claim is an unstarted container with a unique Docker name. It carries
+`sh.sandbox-driver.fence` and `sh.sandbox-driver.fence-operation` labels and is
+excluded from sandbox inventory. Creation acquires a claim before exposing the
+primary container. The primary's `sh.sandbox-driver.fence-name` label records
+that claim name for subsequent clients. Older sandboxes without this label use
+the canonical container ID to identify their claim.
+
+An admitted exec releases its claim after Docker starts the attached execution;
+the command itself can then run concurrently with other commands. One-shots
+release admission after their container has started and carry the sandbox ID
+for later discovery. Image preparation precedes one-shot admission. A prepared
+one-shot must still acquire the claim and observe a running sandbox before it
+can start.
+
+Stop holds the claim while removing one-shots, stopping the primary container,
+and stopping its services. It inspects the primary and services to confirm they
+are no longer running; missing or still-running state returns `fence_leaked`
+and retains the claim. Start, exec, one-shot admission, pause, resume, and
+delete cannot overtake that drain. A competing lifecycle claim is refused as a
+legacy `ProviderError` with code `busy`. Short concurrent execution admissions
+can wait up to five seconds for one another. Describe and inventory remain
+available while a claim is held.
+
+## Failure and reconciliation
+
+A completed daemon refusal releases the claim so the application can decide
+whether to retry. A transport failure, deadline, or dropped caller retains it:
+the provider cannot establish that the remote mutation finished. There is no
+lease expiry, automatic takeover, or mutation replay. The error uses code
+`transport`, with `outcome: unknown` and the known claim container ID or name in
+`detail` (or the sandbox ID if acquisition did not reveal the claim). A cancelled future cannot return an error, so the labels provide the
+reconciliation record.
+
+The claim must not be removed merely because its creator disconnected or a
+period of time passed. An operator or application recovery procedure must first
+establish that the original request can no longer change the sandbox and that
+any required termination or cleanup is complete. Different clients, including
+older provider versions and direct Docker commands, must not bypass this
+coordination while managed work is active. The mechanism coordinates cooperating
+provider clients; it is not an authorization boundary against Docker admins.
+
+Claim acquisition and release each have a 60-second bound. Execution admission,
+stop, pause, resume, and delete have a 60-second operation bound; create and start
+have a six-minute bound to allow the existing service readiness budget. A
+failure to confirm claim release is an error even if the workload mutation
+completed.
+
+A failed create attempts dependent cleanup before removing the primary, with a
+30-second cleanup budget. Unconfirmed cleanup uses `incomplete_cleanup` and
+serializes the shared contract's `IncompleteCleanup` error in `detail`, including
+resource identifiers whose removal remains unconfirmed. A cleanup transport
+failure also retains the claim and includes it in the remaining resources.
+Creation failures whose cleanup succeeds preserve their original error.
+
+## Verification and migration scope
+
+The real-daemon fence tests are explicit integration tests:
+
+```sh
+cargo test --locked -p sandbox-driver-docker --test fence -- --ignored
+```
+
+They exercise independent provider clients, stop versus exec/one-shots/services,
+start during draining, cancelled ownership, and attachment during creation.
+The lifecycle failure-injection tests cover release failure, uncertain admission,
+retained ownership after primary removal, and incomplete creation cleanup.
+
+Portable workload translation, namespace and descriptor reporting, next-API
+provider integration, and the new cross-provider conformance harness are separate
+migration work. Passing the legacy suite or these focused tests is not evidence
+that Docker passes that full contract.
