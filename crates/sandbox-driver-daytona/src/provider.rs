@@ -28,8 +28,8 @@ use tokio::time;
 use crate::labels::{MANAGED_LABEL, stored_labels};
 use crate::sandbox::{DaytonaSandbox, status_from_sdk};
 use crate::sdk::{
-    DaytonaClient, auto_delete_minutes, daytona_error, fetch_error, gigabytes, is_not_found,
-    map_state, minutes, sandbox_kind_from_class,
+    DaytonaClient, auto_delete_minutes, daytona_error, fetch_error, gigabytes, map_state, minutes,
+    sandbox_kind_from_class,
 };
 use crate::snapshots::DaytonaSnapshots;
 use crate::volumes::DaytonaVolumes;
