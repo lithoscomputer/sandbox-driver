@@ -160,7 +160,7 @@ pub async fn file_sha256(path: &Path) -> Result<String> {
         .await
         .map_err(|error| Error::io(format!("reading {}", path.display()), error))?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0; 64 * 1024];
+    let mut buffer = vec![0; 64 * 1024];
     loop {
         let count = file
             .read(&mut buffer)

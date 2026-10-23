@@ -20,7 +20,7 @@ use sandbox_driver::contract::{
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
-use tokio::time;
+use tokio::{task, time};
 
 use crate::discovery::{PluginConfig, file_sha256, resolve_plugin_binary};
 
@@ -129,7 +129,7 @@ impl SchemaDiscovery {
             None => config,
         };
         let prefix = prefix.to_owned();
-        let path = tokio::task::spawn_blocking(move || {
+        let path = task::spawn_blocking(move || {
             resolve_plugin_binary(&prefix, &config).and_then(|path| {
                 path.canonicalize()
                     .map_err(|error| sandbox_driver::Error::io("resolving plugin", error))
@@ -154,24 +154,23 @@ impl SchemaDiscovery {
             .expect("metadata cache lock")
             .get(&digest)
             .cloned();
-        let schemas = match cached {
-            Some(schemas) => schemas,
-            None => {
-                let schemas = Arc::new(probe(&path, &self.limits).await?);
-                if self::digest(&path).await? != digest {
-                    return Err(invalid_config(
-                        name,
-                        "sha256",
-                        "plugin executable changed during discovery",
-                    ));
-                }
-                let mut cache = self.cache.lock().expect("metadata cache lock");
-                if cache.len() >= self.limits.cached_binaries {
-                    cache.pop_first();
-                }
-                cache.insert(digest.clone(), Arc::clone(&schemas));
-                schemas
+        let schemas = if let Some(schemas) = cached {
+            schemas
+        } else {
+            let schemas = Arc::new(probe(&path, &self.limits).await?);
+            if self::digest(&path).await? != digest {
+                return Err(invalid_config(
+                    name,
+                    "sha256",
+                    "plugin executable changed during discovery",
+                ));
             }
+            let mut cache = self.cache.lock().expect("metadata cache lock");
+            if cache.len() >= self.limits.cached_binaries {
+                cache.pop_first();
+            }
+            cache.insert(digest.clone(), Arc::clone(&schemas));
+            schemas
         };
         if schemas.kind != entry.plugin {
             return Err(invalid_config(
@@ -290,7 +289,7 @@ async fn probe(path: &Path, limits: &DiscoveryLimits) -> Result<ProviderSchemas,
 
 async fn read_bounded(mut reader: impl AsyncRead + Unpin, max: usize) -> Result<Vec<u8>, Error> {
     let mut bytes = Vec::new();
-    let mut buffer = [0; 8192];
+    let mut buffer = vec![0; 8192];
     loop {
         let count = reader
             .read(&mut buffer)

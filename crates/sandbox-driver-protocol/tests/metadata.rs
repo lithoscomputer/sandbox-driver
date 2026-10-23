@@ -1,17 +1,19 @@
 //! Exercises discovery through real executable boundaries, without a backend.
 #![cfg(unix)]
 
-use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
+use std::{env, fs};
 
 use sandbox_driver::contract::{
-    Descriptor, Error, MutationOutcome, ProviderEntry, ProviderName, ProviderSchemas,
+    Descriptor, Error, MutationOutcome, PluginTrust, ProviderEntry, ProviderName, ProviderSchemas,
 };
 use sandbox_driver_protocol::file_sha256;
 use sandbox_driver_protocol::metadata::{DiscoveryLimits, SchemaDiscovery, write_schema};
 use serde_json::json;
+use tokio::process::Command;
 use tokio::time;
 
 struct Fixture {
@@ -21,7 +23,7 @@ struct Fixture {
 
 impl Fixture {
     fn new(body: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("schema-probe-{}", rand::random::<u64>()));
+        let root = env::temp_dir().join(format!("schema-probe-{}", rand::random::<u64>()));
         fs::create_dir(&root).expect("fixture directory");
         let binary = root.join("plugin");
         let fixture = Self { root, binary };
@@ -115,7 +117,7 @@ async fn every_cache_hit_enforces_trust_and_changed_bytes_invalidate_metadata() 
         Err(Error::InvalidConfig { .. })
     ));
     let pin = file_sha256(&fixture.binary).await.expect("checksum");
-    entry.trust = Some(sandbox_driver::contract::PluginTrust::Sha256 {
+    entry.trust = Some(PluginTrust::Sha256 {
         digest: pin.try_into().expect("digest"),
     });
     assert!(
@@ -205,7 +207,7 @@ async fn invalid_failed_and_oversize_probes_are_never_cached_or_echoed() {
     }
 }
 
-async fn wait_for_file(path: &std::path::Path) {
+async fn wait_for_file(path: &Path) {
     time::timeout(Duration::from_secs(3), async {
         while !path.exists() {
             time::sleep(Duration::from_millis(5)).await;
@@ -216,9 +218,9 @@ async fn wait_for_file(path: &std::path::Path) {
 }
 async fn assert_dead(pid: u32) {
     time::timeout(Duration::from_secs(3), async {
-        while tokio::process::Command::new("/bin/kill")
+        while Command::new("/bin/kill")
             .args(["-0", &pid.to_string()])
-            .stderr(std::process::Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .await
             .expect("check process")
