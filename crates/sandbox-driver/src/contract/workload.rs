@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{Error, NetworkMode};
+use crate::id::validate_label;
+use crate::redact::EnvKeys;
 use crate::{SnapshotId, WorkspaceOwnership};
 
 /// The caller's workload, never a helper image or outer runner.
@@ -91,6 +93,22 @@ impl TryFrom<RawNetworkPolicy> for NetworkPolicy {
     }
 }
 
+impl NetworkPolicy {
+    /// Rejects an empty allow-list: providers treat it as no restriction, the
+    /// opposite of what an emptied-out filter intends.
+    pub fn validate(&self) -> Result<(), Error> {
+        match self {
+            Self::CidrAllowList { cidrs } if cidrs.is_empty() => {
+                Err(Error::invalid_spec("network.cidrs", "must not be empty"))
+            }
+            Self::DomainAllowList { domains } if domains.is_empty() => {
+                Err(Error::invalid_spec("network.domains", "must not be empty"))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Backend timers, in milliseconds. None inherits a provider default; zero
 /// explicitly disables the timer. Application run-end policy is not a timer.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -164,19 +182,16 @@ impl SandboxSpec {
             }
             _ => {}
         }
-        if self.name.as_deref() == Some("") {
-            return Err(Error::invalid_spec("name", "must not be empty"));
-        }
-        if self.user.as_deref() == Some("") {
-            return Err(Error::invalid_spec("user", "must not be empty"));
+        for (path, value) in [
+            ("name", &self.name),
+            ("user", &self.user),
+            ("working_directory", &self.working_directory),
+        ] {
+            if value.as_deref() == Some("") {
+                return Err(Error::invalid_spec(path, "must not be empty"));
+            }
         }
         validate_env("env", &self.env)?;
-        if self.working_directory.as_deref() == Some("") {
-            return Err(Error::invalid_spec(
-                "working_directory",
-                "must not be empty",
-            ));
-        }
         if self.workspace_ownership.is_some() && self.source != Source::HostDirectory {
             return Err(Error::invalid_spec(
                 "workspace_ownership",
@@ -191,38 +206,15 @@ impl SandboxSpec {
                 "designated workspace requires a path",
             ));
         }
-        match &self.network {
-            NetworkPolicy::CidrAllowList { cidrs } if cidrs.is_empty() => {
-                return Err(Error::invalid_spec("network.cidrs", "must not be empty"));
-            }
-            NetworkPolicy::DomainAllowList { domains } if domains.is_empty() => {
-                return Err(Error::invalid_spec("network.domains", "must not be empty"));
-            }
-            _ => {}
-        }
+        self.network.validate()?;
         if let Some(container) = &self.container {
-            container.validate()?;
+            container.validate("container")?;
         }
         for (name, service) in &self.services {
-            if name.is_empty()
-                || !name
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-                || name.starts_with('-')
-                || name.ends_with('-')
-                || name.len() > 63
-            {
-                return Err(Error::invalid_spec(
-                    "services",
-                    "service names must be lowercase DNS labels of at most 63 bytes",
-                ));
-            }
-            service.validate().map_err(|error| match error {
-                Error::InvalidSpec { path, message } => {
-                    Error::invalid_spec(format!("services.{name}.{path}"), message)
-                }
-                other => other,
-            })?;
+            // DNS label: service names become network aliases.
+            validate_label("service name", name, 63)
+                .map_err(|error| Error::invalid_spec("services", error.to_string()))?;
+            service.validate(&format!("services.{name}"))?;
         }
         Ok(())
     }
@@ -271,7 +263,7 @@ impl fmt::Debug for SandboxSpec {
             .field("network", network)
             .field("timers", timers)
             .field("labels", labels)
-            .field("env_keys", &env.keys().collect::<Vec<_>>())
+            .field("env_keys", &EnvKeys(env))
             .field("working_directory", working_directory)
             .field("workspace_ownership", workspace_ownership)
             .field("user", user)
@@ -310,16 +302,23 @@ impl ServiceSpec {
         }
     }
 
-    fn validate(&self) -> Result<(), Error> {
+    /// `path` locates this service in the enclosing spec's error paths.
+    fn validate(&self, path: &str) -> Result<(), Error> {
         if self.image.trim().is_empty() {
-            return Err(Error::invalid_spec("image", "must not be empty"));
+            return Err(Error::invalid_spec(
+                format!("{path}.image"),
+                "must not be empty",
+            ));
         }
         if self.credential.as_deref() == Some("") {
-            return Err(Error::invalid_spec("credential", "must not be empty"));
+            return Err(Error::invalid_spec(
+                format!("{path}.credential"),
+                "must not be empty",
+            ));
         }
-        validate_env("env", &self.env)?;
+        validate_env(&format!("{path}.env"), &self.env)?;
         if let Some(ready) = &self.ready {
-            ready.validate()?;
+            ready.validate(&format!("{path}.ready"))?;
         }
         Ok(())
     }
@@ -336,7 +335,7 @@ impl fmt::Debug for ServiceSpec {
         } = self;
         f.debug_struct("ServiceSpec")
             .field("image", image)
-            .field("env_keys", &env.keys().collect::<Vec<_>>())
+            .field("env_keys", &EnvKeys(env))
             .field("ports", ports)
             .field("credential", credential)
             .field("ready", ready)
@@ -361,28 +360,29 @@ pub struct ReadinessCheck {
 }
 
 impl ReadinessCheck {
-    fn validate(&self) -> Result<(), Error> {
+    /// `path` locates this check in the enclosing spec's error paths.
+    fn validate(&self, path: &str) -> Result<(), Error> {
         if self.command.first().is_none_or(String::is_empty) {
             return Err(Error::invalid_spec(
-                "ready.command",
+                format!("{path}.command"),
                 "requires a non-empty executable",
             ));
         }
         if self.command.iter().any(|arg| arg.contains('\0')) {
             return Err(Error::invalid_spec(
-                "ready.command",
+                format!("{path}.command"),
                 "arguments must not contain NUL",
             ));
         }
         if self.timeout_ms > self.deadline_ms {
             return Err(Error::invalid_spec(
-                "ready.timeout_ms",
+                format!("{path}.timeout_ms"),
                 "must not exceed deadline_ms",
             ));
         }
         if self.retries.get() > 1 && self.interval_ms >= self.deadline_ms {
             return Err(Error::invalid_spec(
-                "ready.interval_ms",
+                format!("{path}.interval_ms"),
                 "must be shorter than deadline_ms when retries allows a second attempt",
             ));
         }
@@ -425,14 +425,18 @@ pub struct ContainerSpec {
 }
 
 impl ContainerSpec {
-    fn validate(&self) -> Result<(), Error> {
-        for (path, entries) in [
-            ("container.capabilities_add", &self.capabilities_add),
-            ("container.capabilities_drop", &self.capabilities_drop),
-            ("container.dns", &self.dns),
+    /// `path` locates these options in the enclosing spec's error paths.
+    fn validate(&self, path: &str) -> Result<(), Error> {
+        for (field, entries) in [
+            ("capabilities_add", &self.capabilities_add),
+            ("capabilities_drop", &self.capabilities_drop),
+            ("dns", &self.dns),
         ] {
             if entries.iter().any(|entry| entry.trim().is_empty()) {
-                return Err(Error::invalid_spec(path, "entries must not be empty"));
+                return Err(Error::invalid_spec(
+                    format!("{path}.{field}"),
+                    "entries must not be empty",
+                ));
             }
         }
         if self
@@ -441,7 +445,7 @@ impl ContainerSpec {
             .any(|(host, address)| host.trim().is_empty() || address.trim().is_empty())
         {
             return Err(Error::invalid_spec(
-                "container.extra_hosts",
+                format!("{path}.extra_hosts"),
                 "hosts and addresses must not be empty",
             ));
         }

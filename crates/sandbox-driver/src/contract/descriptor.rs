@@ -37,10 +37,10 @@ pub struct Descriptor {
     pub isolation:    Isolation,
     pub durability:   Durability,
     pub access:       AccessScope,
-    pub sources:      Vec<SourceKind>,
+    pub sources:      BTreeSet<SourceKind>,
     pub locality:     Locality,
-    pub resources:    Vec<ResourceCapability>,
-    pub network:      Vec<NetworkMode>,
+    pub resources:    BTreeSet<ResourceCapability>,
+    pub network:      BTreeSet<NetworkMode>,
     pub ports:        PortSupport,
     pub capabilities: CapabilitySet,
 }
@@ -77,7 +77,7 @@ pub enum AccessScope {
     Shared,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
     HostDirectory,
@@ -95,7 +95,7 @@ pub struct Locality {
     pub mounts_host_paths: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceCapability {
     Cpu,
@@ -104,7 +104,7 @@ pub enum ResourceCapability {
     Gpus,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkMode {
     ProviderDefault,
@@ -126,22 +126,23 @@ pub enum PortSupport {
 
 /// Optional features are absent unless explicitly advertised. Services are a
 /// spec capability, not the legacy background-process Services facet.
+/// Advertised features are sets: order and repetition carry no meaning.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CapabilitySet {
-    pub lifecycle:        Vec<LifecycleCapability>,
-    pub endpoints:        Vec<EndpointCapability>,
+    pub lifecycle:        BTreeSet<LifecycleCapability>,
+    pub endpoints:        BTreeSet<EndpointCapability>,
     pub services:         bool,
     /// One-shot containers in the workload's workspace/network.
     pub containers:       bool,
     /// Supported workload container options, independent of service support.
-    pub container_fields: Vec<ContainerField>,
+    pub container_fields: BTreeSet<ContainerField>,
     /// Timers the provider enforces. A request for any other timer is
     /// `Unsupported`, never silently ignored.
-    pub timers:           Vec<TimerCapability>,
+    pub timers:           BTreeSet<TimerCapability>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleCapability {
     Pause,
@@ -150,7 +151,7 @@ pub enum LifecycleCapability {
     Recover,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EndpointCapability {
     Ssh,
@@ -158,7 +159,7 @@ pub enum EndpointCapability {
     Vnc,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContainerField {
     Init,
@@ -170,7 +171,7 @@ pub enum ContainerField {
     ShmSizeMb,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TimerCapability {
     AutoStop,

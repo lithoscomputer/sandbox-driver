@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use super::{EnvironmentName, Error, ProviderName, SandboxSpec, Sha256Digest};
 use crate::ProviderKind;
+use crate::redact::EnvKeys;
 
 /// Operator-owned connection data, with no backend or environment template.
 /// This is an unvalidated DTO. Catalog admission, trust verification, secret
@@ -54,7 +55,7 @@ impl fmt::Debug for ProviderEntry {
             .field("path", path)
             .field("trust", trust)
             .field("args", &"<redacted>")
-            .field("env_keys", &env.keys().collect::<Vec<_>>())
+            .field("env_keys", &EnvKeys(env))
             .field("inherit_env", inherit_env)
             .finish()
     }

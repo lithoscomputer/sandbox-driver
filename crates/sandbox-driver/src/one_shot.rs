@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::exec::{ExecControls, ExecStreamingResult};
+use crate::redact::EnvKeys;
 use crate::sanitize::OutputSanitization;
 
 /// Ephemeral containers run beside a sandbox, in its world.
@@ -145,7 +146,7 @@ impl fmt::Debug for OneShotSpec {
             .field("image", &self.image)
             .field("entrypoint", &self.entrypoint)
             .field("args", &"<redacted>")
-            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .field("env_keys", &EnvKeys(&self.env))
             .field("working_dir", &self.working_dir)
             .field("timeout", &self.timeout)
             .field("output_sanitization", &self.output_sanitization)

@@ -9,6 +9,7 @@ use crate::derived::DerivedServices;
 use crate::error::Result;
 use crate::exec::Exec;
 use crate::id::ServiceId;
+use crate::redact::EnvKeys;
 
 /// Long-lived background processes inside a sandbox — an MCP server, a
 /// dev server, anything that must outlive the exec that started it.
@@ -161,7 +162,7 @@ impl fmt::Debug for ServiceSpec {
         f.debug_struct("ServiceSpec")
             .field("command", &"<redacted>")
             .field("working_dir", &self.working_dir)
-            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .field("env_keys", &EnvKeys(&self.env))
             .finish()
     }
 }

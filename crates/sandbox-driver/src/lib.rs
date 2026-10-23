@@ -59,6 +59,7 @@ mod owned;
 mod probe;
 mod provider;
 mod pty;
+mod redact;
 mod sandbox;
 mod sanitize;
 mod search;

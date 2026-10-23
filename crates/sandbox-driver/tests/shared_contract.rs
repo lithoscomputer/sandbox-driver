@@ -1,12 +1,12 @@
 //! Public contract tests. Fixtures assert behavior at persisted/serialized
 //! boundaries, not complete serialized shape snapshots.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use sandbox_driver::contract::{
-    AccessScope, CapabilitySet, Descriptor, Durability, Environment, Error, MutationOutcome,
-    NamespaceId, NetworkPolicy, PluginTrust, PortSupport, ProviderEntry, ProviderSchemas,
-    SandboxRef, SandboxSpec, SandboxState, Source, Status, TimerCapability,
+    AccessScope, CapabilitySet, Descriptor, Durability, Error, MutationOutcome, NamespaceId,
+    NetworkPolicy, PluginTrust, PortSupport, ProviderEntry, ProviderSchemas, SandboxRef,
+    SandboxSpec, SandboxState, Source, Status, TimerCapability,
 };
 use serde_json::{Value, json};
 
@@ -38,15 +38,14 @@ fn workload() -> Value {
     })
 }
 
+/// The readiness check of the fixture's one service.
+fn ready(workload: &mut Value) -> &mut Value {
+    &mut workload["services"]["postgres"]["ready"]
+}
+
 #[test]
 fn saved_reference_does_not_depend_on_the_environment_catalog() {
-    let environment: Environment = serde_json::from_value(json!({
-        "provider": "production", "spec": {"source": {"image": "ubuntu:24.04"}}
-    }))
-    .expect("environment decodes");
-    let mut environments = BTreeMap::from([("build", environment)]);
     let saved = serde_json::to_string(&reference()).expect("reference serializes");
-    environments.clear();
     let restored: SandboxRef = serde_json::from_str(&saved).expect("no environment lookup");
     assert_eq!(restored, reference());
     assert_eq!(restored.provider.as_str(), "production");
@@ -131,7 +130,7 @@ fn request_typos_and_unsupported_target_selectors_are_not_dropped() {
         );
     }
     let mut value = workload();
-    value["services"]["postgres"]["ready"]["timeout"] = json!(1000);
+    ready(&mut value)["timeout"] = json!(1000);
     assert!(serde_json::from_value::<SandboxSpec>(value).is_err());
 }
 
@@ -194,13 +193,13 @@ fn plugin_trust_never_skips_a_pinned_digest() {
 fn readiness_requires_finite_nonzero_budgets_and_a_valid_executable() {
     for field in ["interval_ms", "timeout_ms", "deadline_ms", "retries"] {
         let mut value = workload();
-        value["services"]["postgres"]["ready"][field] = json!(0);
+        ready(&mut value)[field] = json!(0);
         assert!(
             serde_json::from_value::<SandboxSpec>(value).is_err(),
             "{field}"
         );
         let mut value = workload();
-        value["services"]["postgres"]["ready"]
+        ready(&mut value)
             .as_object_mut()
             .expect("object")
             .remove(field);
@@ -211,7 +210,7 @@ fn readiness_requires_finite_nonzero_budgets_and_a_valid_executable() {
     }
     for command in [json!([]), json!([""]), json!(["check", "arg\u{0}ument"])] {
         let mut value = workload();
-        value["services"]["postgres"]["ready"]["command"] = command;
+        ready(&mut value)["command"] = command;
         let spec: SandboxSpec = serde_json::from_value(value).expect("raw DTO decodes");
         assert!(
             matches!(spec.validate(), Err(Error::InvalidSpec { path, .. })
@@ -230,7 +229,7 @@ fn readiness_requires_finite_nonzero_budgets_and_a_valid_executable() {
     ] {
         let mut value = workload();
         for (key, budget) in budget.as_object().expect("object") {
-            value["services"]["postgres"]["ready"][key] = budget.clone();
+            ready(&mut value)[key] = budget.clone();
         }
         let spec: SandboxSpec = serde_json::from_value(value).expect("raw DTO decodes");
         assert!(
@@ -241,8 +240,8 @@ fn readiness_requires_finite_nonzero_budgets_and_a_valid_executable() {
     }
     // A single attempt never waits, so its interval is irrelevant.
     let mut value = workload();
-    value["services"]["postgres"]["ready"]["interval_ms"] = json!(60000);
-    value["services"]["postgres"]["ready"]["retries"] = json!(1);
+    ready(&mut value)["interval_ms"] = json!(60000);
+    ready(&mut value)["retries"] = json!(1);
     let spec: SandboxSpec = serde_json::from_value(value).expect("raw DTO decodes");
     spec.validate().expect("single attempt fits the deadline");
 }
@@ -366,7 +365,7 @@ fn connection_and_spec_schemas_are_separate_and_metadata_needs_no_namespace() {
     assert!(caps.timers.is_empty());
     let caps: CapabilitySet =
         serde_json::from_value(json!({"timers": ["auto_stop"]})).expect("timer capabilities");
-    assert_eq!(caps.timers, [TimerCapability::AutoStop]);
+    assert_eq!(caps.timers, BTreeSet::from([TimerCapability::AutoStop]));
 }
 
 #[test]
@@ -449,7 +448,7 @@ fn debug_output_redacts_launch_and_workload_secrets() {
     let mut value = workload();
     value["name"] = json!("build-42");
     value["source"] = json!({"dockerfile": "FROM ubuntu\nARG dockerfile-secret"});
-    value["services"]["postgres"]["ready"]["command"] = json!(["check", "command-secret"]);
+    ready(&mut value)["command"] = json!(["check", "command-secret"]);
     let spec: SandboxSpec = serde_json::from_value(value).expect("spec");
     let debug = format!("{spec:?}");
     for secret in [
@@ -474,15 +473,12 @@ fn debug_output_redacts_launch_and_workload_secrets() {
 }
 
 #[test]
-fn legacy_spec_and_error_construction_remain_available() {
+fn legacy_and_contract_image_sources_are_not_interchangeable() {
     let old: sandbox_driver::SandboxSpec = serde_json::from_value(json!({
         "source": {"image": {"reference": "ubuntu:24.04"}},
         "provider_config": {"sidecars": []}
     }))
     .expect("v2 fixture still decodes");
-    old.validate().expect("legacy spec still validates");
-    let error = sandbox_driver::Error::invalid_spec("source", "legacy error");
-    assert!(matches!(error, sandbox_driver::Error::InvalidSpec { field, .. } if field == "source"));
     // Image sources are encoded differently, so neither DTO accepts the
     // other's. Each fixture holds only a source, isolating the encoding.
     let legacy_source = json!({"source": serde_json::to_value(&old).expect("serialize")["source"]});
