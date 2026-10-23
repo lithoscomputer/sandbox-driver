@@ -35,7 +35,7 @@ use crate::snapshots::DaytonaSnapshots;
 use crate::volumes::DaytonaVolumes;
 use crate::{
     CLEANUP_TIMEOUT, CREATE_POLL, CREATE_TIMEOUT, DOCKERFILE_CREATE_TIMEOUT, LIST_PAGE_SIZE,
-    RUNTIME_DIRECTORY, RUNTIME_DIRECTORY_PARENT, nested, toolbox,
+    RUNTIME_DIRECTORY, RUNTIME_DIRECTORY_PARENT, cleanup, nested, toolbox,
 };
 
 /// The current-key endpoint includes its effective organization, which the
@@ -307,7 +307,7 @@ impl DaytonaProvider {
     /// An accepted DELETE only starts cleanup. Retain the sandbox ID and
     /// original failure if removal cannot be confirmed.
     async fn cleanup_failed_create(&self, sdk_id: &str, cause: Error) -> Error {
-        crate::cleanup::failed_create(&self.client, sdk_id, cause, CLEANUP_TIMEOUT).await
+        cleanup::failed_create(&self.client, sdk_id, cause, CLEANUP_TIMEOUT).await
     }
 
     async fn handle(
@@ -923,7 +923,7 @@ mod tests {
                 "POST" => Reply::Json(201, created.clone()),
                 "DELETE" => {
                     observed.store(true, Ordering::SeqCst);
-                    Reply::Json(200, "{}".to_owned())
+                    Reply::Json(200, created.clone())
                 }
                 "GET" if observed.load(Ordering::SeqCst) => Reply::Json(404, "{}".to_owned()),
                 "GET" => Reply::Hang,
@@ -945,8 +945,7 @@ mod tests {
         )
         .await
         .expect("the create wait and cleanup are bounded")
-        .err()
-        .expect("observation times out");
+        .expect_err("observation times out");
         assert!(matches!(error, Error::Timeout { .. }), "{error:?}");
         assert!(deleted.load(Ordering::SeqCst));
         assert_eq!(fake.deletes(), 1);

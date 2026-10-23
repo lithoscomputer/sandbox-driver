@@ -109,7 +109,7 @@ mod tests {
         let fake = FakeDaytona::start(|_| {
             Arc::new(move |method, _| {
                 if method == "DELETE" {
-                    return Reply::Json(200, "{}".to_owned());
+                    return sandbox("destroying");
                 }
                 if seen.fetch_add(1, Ordering::SeqCst) == 0 {
                     sandbox("destroying")
@@ -137,7 +137,11 @@ mod tests {
             let fake = FakeDaytona::start(|_| {
                 Arc::new(move |method, _| {
                     if method == "DELETE" {
-                        Reply::Json(if missing { 404 } else { 200 }, "{}".to_owned())
+                        if missing {
+                            Reply::Json(404, "{}".to_owned())
+                        } else {
+                            sandbox("destroying")
+                        }
                     } else {
                         sandbox("destroyed")
                     }
@@ -165,8 +169,6 @@ mod tests {
                         || (method == "GET" && hang == "observe")
                     {
                         Reply::Hang
-                    } else if method == "DELETE" {
-                        Reply::Json(200, "{}".to_owned())
                     } else {
                         sandbox("destroying")
                     }
@@ -194,14 +196,11 @@ mod tests {
         for fail_delete in [false, true] {
             let fake = FakeDaytona::start(|_| {
                 Arc::new(move |method, _| {
-                    Reply::Json(
-                        if method == "DELETE" && !fail_delete {
-                            200
-                        } else {
-                            500
-                        },
-                        "{}".to_owned(),
-                    )
+                    if method == "DELETE" && !fail_delete {
+                        sandbox("destroying")
+                    } else {
+                        Reply::Json(500, "{}".to_owned())
+                    }
                 })
             })
             .await;
