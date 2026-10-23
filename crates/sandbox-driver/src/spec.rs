@@ -5,6 +5,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::SnapshotId;
+use crate::redact::EnvKeys;
 
 /// Provisioning form of a sandbox.
 ///
@@ -229,7 +230,7 @@ impl fmt::Debug for SandboxSpec {
             .field("source", &self.source)
             .field("resources", &self.resources)
             .field("sandbox_kind", &self.sandbox_kind)
-            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .field("env_keys", &EnvKeys(&self.env))
             .field("labels", &self.labels)
             .field("user", &self.user)
             .field("working_directory", &self.working_directory)

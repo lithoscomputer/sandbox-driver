@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::capabilities::Capability;
 use crate::error::{Error, Result};
+use crate::redact::EnvKeys;
 use crate::sanitize::OutputSanitization;
 
 /// The interpreter [`ExecSpec::bash`] names, resolved through `PATH`
@@ -277,7 +278,7 @@ impl fmt::Debug for ExecSpec {
             .field("timeout", &self.timeout)
             .field("stop_grace", &self.stop_grace)
             .field("working_dir", &self.working_dir)
-            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .field("env_keys", &EnvKeys(&self.env))
             .field("stdin_bytes", &self.stdin.as_ref().map(Vec::len))
             .field("output_sanitization", &self.output_sanitization)
             .finish()
@@ -714,7 +715,7 @@ impl fmt::Debug for SpawnSpec {
             .field("program", &self.program)
             .field("args", &"<redacted>")
             .field("working_dir", &self.working_dir)
-            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .field("env_keys", &EnvKeys(&self.env))
             .finish()
     }
 }

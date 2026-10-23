@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -8,54 +9,108 @@ use serde::{Deserialize, Serialize};
 pub struct InvalidIdError {
     kind:   &'static str,
     value:  String,
-    reason: &'static str,
+    reason: Cow<'static, str>,
 }
 
 impl InvalidIdError {
-    fn new(kind: &'static str, value: &str, reason: &'static str) -> Self {
+    fn new(kind: &'static str, value: &str, reason: impl Into<Cow<'static, str>>) -> Self {
         Self {
             kind,
             value: value.to_owned(),
-            reason,
+            reason: reason.into(),
         }
     }
 }
 
 const MAX_ID_LEN: usize = 256;
 
-fn validate_id(kind: &'static str, value: &str) -> Result<(), InvalidIdError> {
+/// Accepts any non-empty identifier without whitespace or control characters.
+fn validate_id(kind: &'static str, value: String) -> Result<String, InvalidIdError> {
     if value.is_empty() {
-        return Err(InvalidIdError::new(kind, value, "must not be empty"));
+        return Err(InvalidIdError::new(kind, &value, "must not be empty"));
     }
     if value.len() > MAX_ID_LEN {
-        return Err(InvalidIdError::new(kind, value, "exceeds 256 bytes"));
+        return Err(InvalidIdError::new(kind, &value, "exceeds 256 bytes"));
     }
     if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return Err(InvalidIdError::new(
             kind,
-            value,
+            &value,
             "must not contain whitespace or control characters",
+        ));
+    }
+    Ok(value)
+}
+
+/// Checks a lowercase label: ASCII letters, digits, and interior hyphens, at
+/// most `max_len` bytes.
+pub(crate) fn validate_label(
+    kind: &'static str,
+    value: &str,
+    max_len: usize,
+) -> Result<(), InvalidIdError> {
+    if value.is_empty() {
+        return Err(InvalidIdError::new(kind, value, "must not be empty"));
+    }
+    if value.len() > max_len {
+        return Err(InvalidIdError::new(
+            kind,
+            value,
+            format!("exceeds {max_len} bytes"),
+        ));
+    }
+    let valid = value
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if !valid || value.starts_with('-') || value.ends_with('-') {
+        return Err(InvalidIdError::new(
+            kind,
+            value,
+            "must be lowercase ASCII letters, digits, and interior hyphens",
         ));
     }
     Ok(())
 }
 
+fn validate_kind(kind: &'static str, value: String) -> Result<String, InvalidIdError> {
+    validate_label(kind, &value, 64)?;
+    Ok(value)
+}
+
+/// Accepts a hexadecimal digest in either case and stores it lowercase.
+fn validate_sha256(kind: &'static str, value: String) -> Result<String, InvalidIdError> {
+    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(InvalidIdError::new(
+            kind,
+            &value,
+            "must be exactly 64 hexadecimal digits",
+        ));
+    }
+    let mut value = value;
+    value.make_ascii_lowercase();
+    Ok(value)
+}
+
+/// Defines a validated string newtype. The optional third argument names a
+/// `fn(&'static str, String) -> Result<String, InvalidIdError>` that checks
+/// and normalizes the stored value; the default accepts any plain identifier.
 macro_rules! id_newtype {
     ($(#[$doc:meta])* $name:ident, $kind:literal) => {
+        id_newtype!($(#[$doc])* $name, $kind, validate_id);
+    };
+    ($(#[$doc:meta])* $name:ident, $kind:literal, $validate:path) => {
         $(#[$doc])*
-        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-        #[serde(try_from = "String", into = "String")]
+        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize)]
+        #[serde(try_from = "String")]
         pub struct $name(String);
 
         impl $name {
-            /// Validates and wraps a provider-issued identifier.
+            /// Validates and wraps the value.
             pub fn try_new(value: impl Into<String>) -> Result<Self, InvalidIdError> {
-                let value = value.into();
-                validate_id($kind, &value)?;
-                Ok(Self(value))
+                Ok(Self($validate($kind, value.into())?))
             }
 
-            /// The identifier as a string slice.
+            /// The value as a string slice.
             pub fn as_str(&self) -> &str {
                 &self.0
             }
@@ -64,6 +119,12 @@ macro_rules! id_newtype {
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str(&self.0)
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(&self.0)
             }
         }
 
@@ -103,71 +164,37 @@ id_newtype!(
     ServiceId,
     "service id"
 );
-
-/// Open provider kind: `"host"`, `"docker"`, `"daytona"`, or any plugin name.
-///
-/// Deliberately not an enum — new providers must not require changes here.
-/// Kinds are lowercase ASCII letters, digits, and hyphens.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct ProviderKind(String);
-
-impl ProviderKind {
-    /// Validates and wraps a provider kind name.
-    pub fn try_new(value: impl Into<String>) -> Result<Self, InvalidIdError> {
-        let value = value.into();
-        if value.is_empty() {
-            return Err(InvalidIdError::new(
-                "provider kind",
-                &value,
-                "must not be empty",
-            ));
-        }
-        if value.len() > 64 {
-            return Err(InvalidIdError::new(
-                "provider kind",
-                &value,
-                "exceeds 64 bytes",
-            ));
-        }
-        let valid = value
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-        if !valid || value.starts_with('-') || value.ends_with('-') {
-            return Err(InvalidIdError::new(
-                "provider kind",
-                &value,
-                "must be lowercase ASCII letters, digits, and interior hyphens",
-            ));
-        }
-        Ok(Self(value))
-    }
-
-    /// The kind as a string slice.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ProviderKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl TryFrom<String> for ProviderKind {
-    type Error = InvalidIdError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::try_new(value)
-    }
-}
-
-impl From<ProviderKind> for String {
-    fn from(value: ProviderKind) -> Self {
-        value.0
-    }
-}
+id_newtype!(
+    /// Operator-chosen provider entry name, distinct from a provider kind.
+    ProviderName,
+    "provider name"
+);
+id_newtype!(
+    /// Operator-chosen environment template name; never a sandbox identity.
+    EnvironmentName,
+    "environment name"
+);
+id_newtype!(
+    /// Non-secret provider-issued identity of the resource domain.
+    NamespaceId,
+    "namespace id"
+);
+id_newtype!(
+    /// Open provider kind: `"host"`, `"docker"`, `"daytona"`, or any plugin name.
+    ///
+    /// Deliberately not an enum — new providers must not require changes here.
+    /// Kinds are lowercase ASCII letters, digits, and hyphens.
+    ProviderKind,
+    "provider kind",
+    validate_kind
+);
+id_newtype!(
+    /// SHA-256 digest as 64 hexadecimal digits, accepted in either case and
+    /// stored lowercase.
+    Sha256Digest,
+    "sha256 digest",
+    validate_sha256
+);
 
 #[cfg(test)]
 mod tests {

@@ -1,5 +1,10 @@
 # sandbox-driver: Rust Interface Design
 
+The next API is specified in [docs/next-api.md](next-api.md), with its
+implementation handoff in the [shared contract](shared-contract.md). The
+design below describes the current compatible API. Host's target distribution is a separately installed plugin;
+existing in-process paths remain until consumer migration.
+
 Sandbox providers for managing sandboxes, snapshots, and volumes. Initial providers: **Daytona**, **Docker**, **Host** (local). Petri and fabro are the primary consumers. The Rust traits are the contract: provider implementations, the protocol client, and tests all speak them. The original Fabro `Sandbox` trait informed the operation set and the migration map below.
 
 Two supported ways to reach a provider, one trait family:
