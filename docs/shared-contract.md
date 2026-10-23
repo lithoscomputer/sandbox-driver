@@ -314,3 +314,35 @@ status tolerance and redaction. The existing core/provider/protocol suites must
 continue to pass. These declaration tests are not provider conformance evidence:
 integration tests must exercise actual Host plugin, Docker and Daytona
 behavior before any consumer cutover or legacy removal.
+
+### Provider interface implementation
+
+The additive provider boundary is exported from `sandbox_driver::contract`:
+
+- `ProviderFactory::discover(&PluginLocation)` receives only kind, path and
+  trust. The plugin adapter owns verification, bounded credential-free probing,
+  and caching by verified digest. Built-in factories return metadata directly.
+- `ProviderFactory::activate(Activation)` receives the selected entry name,
+  frozen connection/launch configuration, discovered schemas, resolved launch
+  environment and separate redacted `SecretValues`. It returns an
+  `Arc<dyn ProviderRuntime>`. Built-ins do not read ambient configuration.
+- `ProviderRuntime` supplies `describe`, `health`, `create(WorkloadAdmission)`,
+  `attach(&SandboxId)`, `list(&LabelFilter)`, `destroy(&SandboxId)` and `shutdown`.
+  The catalog checks namespace before routing attach/destroy. A runtime must
+  also prevent reconnect races from moving an admitted call to another
+  namespace, and invalidate old sandbox handles on generation changes.
+- `Sandbox` supplies reference/workload environment/workspace, status, start,
+  stop, exec, files and ports. Optional lifecycle, endpoints and containers
+  return `None` unless supported. All errors use `contract::Error`.
+- `ExecSpec`/`ExecControls`/`ExecOutcome` are distinct from the legacy exec API.
+  Controls carry one owned stdin reader, an awaited output sink, term/kill
+  tokens and a latest-value terminal resize receiver. `Files` transfers owned
+  byte streams, allowing adapters to keep bulk bytes off control connections.
+- `SandboxSpec::validate_for` and `Environment::validate` check portable
+  invariants and descriptor capabilities. They do not replace JSON Schema or
+  backend-specific validation. `WorkloadAdmission` separates credential values
+  from the persistable spec; providers must retain the admission for restart.
+
+These are implementation interfaces, not proof of provider conformance. The
+façade, schema engine, fake and new conformance scenarios are separate changes.
+Existing crate-root traits and protocol v2 are unchanged.

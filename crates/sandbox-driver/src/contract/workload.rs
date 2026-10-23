@@ -247,7 +247,7 @@ impl SandboxSpec {
 
 /// Environment keys become `KEY=VALUE` pairs, so `=` and NUL would change or
 /// truncate the variable that reaches the workload.
-fn validate_env(path: &str, env: &BTreeMap<String, String>) -> Result<(), Error> {
+pub(super) fn validate_env(path: &str, env: &BTreeMap<String, String>) -> Result<(), Error> {
     for (key, value) in env {
         if key.is_empty() || key.contains(['=', '\0']) {
             return Err(Error::invalid_spec(
