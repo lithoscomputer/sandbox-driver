@@ -32,7 +32,7 @@ use bollard::models::{HostConfig, Mount};
 use futures_util::{Stream, StreamExt};
 use sandbox_driver::{
     Error, ExecControls, ExecStreamingResult, OneShot, OneShotImage, OneShotSpec, ProviderError,
-    Result, StopLevel, Termination, stop_signal,
+    Result, StopLevel, Termination, TransportError, stop_signal,
 };
 use tokio::time;
 
@@ -41,7 +41,7 @@ use crate::daemon::{docker_error, docker_kind, is_conflict, is_not_found};
 use crate::fs::tar::reroot;
 use crate::image::{image_present, pull_image};
 use crate::output::{KILL_DRAIN_GRACE, StreamOutput, drain_with_stops};
-use crate::{MANAGED_LABEL, non_empty};
+use crate::{MANAGED_LABEL, fence, non_empty};
 
 /// The label every one-shot container carries, naming the sandbox it
 /// belongs to (the sandbox container's id).
@@ -380,9 +380,12 @@ pub(crate) async fn sweep(docker: &Docker, sandbox_id: &str) -> Result<()> {
         .await
         .map_err(|error| docker_error("listing one-shot containers", error))?;
     for container in containers {
-        if let Some(id) = container.id {
-            remove_container_forced(docker, &id, "removing one-shot container").await?;
-        }
+        let id = container.id.ok_or_else(|| {
+            Error::Transport(TransportError::new(
+                "daemon listed a one-shot without an ID",
+            ))
+        })?;
+        remove_container_forced(docker, &id, "removing one-shot container").await?;
     }
     Ok(())
 }
@@ -406,10 +409,24 @@ impl OneShot for DockerOneShot {
                 .into_result(termination, None, started.elapsed(), false));
             }
         };
-        let container =
-            OneShotContainer::create(&self.container.docker, self.container_config(spec, image))
+        let (container, output) =
+            fence::run(&self.container.docker, &self.container.id, "admit", async {
+                let inspect = self.container.inspect().await?;
+                if inspect.state.as_ref().and_then(|state| state.running) != Some(true) {
+                    return Err(Error::invalid_spec(
+                        "sandbox",
+                        "one-shot requires a running sandbox",
+                    ));
+                }
+                let container = OneShotContainer::create(
+                    &self.container.docker,
+                    self.container_config(spec, image),
+                )
                 .await?;
-        let output = container.attach_and_start().await?;
+                let output = container.attach_and_start().await?;
+                Ok((container, output))
+            })
+            .await?;
         let mut captured =
             StreamOutput::new(spec.output_sanitization, controls.retained_output_limit);
         let outcome = match drain_with_stops(

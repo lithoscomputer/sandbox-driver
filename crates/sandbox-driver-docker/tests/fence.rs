@@ -1,0 +1,224 @@
+//! Real daemon tests of the cross-client fence. Run explicitly with
+//! `cargo test -p sandbox-driver-docker --test fence -- --ignored`.
+
+use std::collections::HashMap;
+use std::process;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bollard::Docker;
+use bollard::container::{ListContainersOptions, RemoveContainerOptions};
+use sandbox_driver::{
+    Error, ExecControls, ExecSpec, OneShotSpec, SandboxProvider, SandboxSource, SandboxSpec,
+};
+use sandbox_driver_docker::DockerProvider;
+use tokio::time::{sleep, timeout};
+
+const IMAGE: &str = "ghcr.io/fabro-sh/dhi-alpine-base:3.23-dev-2026-06-17";
+
+fn assert_busy<T>(result: sandbox_driver::Result<T>) {
+    assert!(matches!(result, Err(Error::Provider(error)) if error.code.as_deref() == Some("busy")));
+}
+
+async fn labeled(docker: &Docker, label: &str, id: &str) -> Vec<String> {
+    docker
+        .list_containers(Some(ListContainersOptions {
+            all: true,
+            filters: HashMap::from([("label".to_owned(), vec![format!("{label}={id}")])]),
+            ..Default::default()
+        }))
+        .await
+        .expect("list test resources")
+        .into_iter()
+        .filter_map(|c| c.id)
+        .collect()
+}
+
+async fn wait_for_label(docker: &Docker, label: &str, id: &str) {
+    timeout(Duration::from_secs(10), async {
+        while labeled(docker, label, id).await.is_empty() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("operation reached admission");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a live Docker daemon"]
+async fn stop_fences_other_clients_exec_and_one_shots_and_blocks_start_during_drain() {
+    let provider = DockerProvider::connect().await.expect("Docker is required");
+    let other = DockerProvider::connect().await.expect("second provider");
+    let docker = Docker::connect_with_local_defaults().expect("Docker client");
+    let mut spec = SandboxSpec::new(SandboxSource::Image {
+        reference: IMAGE.to_owned(),
+    })
+    .name(format!("fence-services-{}", process::id()));
+    spec.provider_config = serde_json::json!({"sidecars": [{
+        "name": "service", "image": IMAGE, "entrypoint": ["sleep", "600"]
+    }]});
+    let sandbox = provider.create(&spec, None).await.expect("create");
+    let peer = other
+        .attach(sandbox.id(), None)
+        .await
+        .expect("independent attach");
+    let exec_owner = Arc::clone(&sandbox);
+    let command = tokio::spawn(async move {
+        exec_owner.exec().run(&ExecSpec::new("sh").args([
+            "-c", "echo ready > exec-ready; while :; do echo old >> exec-ticks; sleep 0.1; done",
+        ]).timeout(Duration::from_secs(30))).await
+    });
+    let one_shot_owner = Arc::clone(&sandbox);
+    let one_shot = tokio::spawn(async move {
+        one_shot_owner
+            .one_shot()
+            .expect("one-shot")
+            .run(
+                &OneShotSpec::registry(IMAGE)
+                    .args([
+                        "sh",
+                        "-c",
+                        "while :; do echo old >> one-shot-ticks; sleep 0.1; done",
+                    ])
+                    .timeout(Duration::from_secs(30)),
+                ExecControls::buffered(),
+            )
+            .await
+    });
+    let result = async {
+        wait_for_label(&docker, "sh.sandbox-driver.one-shot", sandbox.id().as_str()).await;
+        // Ensure the ordinary exec is admitted before stop; otherwise its
+        // refusal would not prove the stop killed already-running execution.
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let ready = sandbox.exec().run(&ExecSpec::new("test").args(["-f", "exec-ready"])).await;
+                if ready.is_ok_and(|result| result.success()) { break; }
+                sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("exec began");
+        let stopper = Arc::clone(&peer);
+        let stopping = tokio::spawn(async move { stopper.stop().await });
+        wait_for_label(&docker, "sh.sandbox-driver.fence", sandbox.id().as_str()).await;
+        assert_busy(sandbox.start().await);
+        assert_busy(sandbox.exec().run(&ExecSpec::new("true")).await);
+        stopping.await.expect("stop task")?;
+        assert!(labeled(&docker, "sh.sandbox-driver.one-shot", sandbox.id().as_str()).await.is_empty());
+        let _ = timeout(Duration::from_secs(10), command).await.expect("old exec ended").expect("exec task");
+        let _ = timeout(Duration::from_secs(10), one_shot).await.expect("old one-shot ended").expect("one-shot task");
+        let network = format!("{}-net", spec.name.as_deref().expect("named sandbox"));
+        for service in labeled(&docker, "sh.sandbox-driver.network", &network).await {
+            let inspect = docker.inspect_container(&service, None).await.expect("service inspect");
+            assert_eq!(inspect.state.and_then(|state| state.running), Some(false));
+        }
+        peer.start().await?;
+        let unchanged = peer.exec().run(&ExecSpec::new("sh").args([
+            "-c", "before=$(wc -l < exec-ticks); sleep 1; test \"$before\" = \"$(wc -l < exec-ticks)\"",
+        ])).await?;
+        assert!(unchanged.success(), "old generation continued after restart");
+        Ok::<_, Error>(())
+    }.await;
+    sandbox.delete().await.expect("cleanup sandbox");
+    result.expect("fence behavior");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a live Docker daemon"]
+async fn cancelled_drain_retains_ownership_and_never_replays_or_takes_over() {
+    let provider = DockerProvider::connect().await.expect("Docker is required");
+    let other = DockerProvider::connect().await.expect("second provider");
+    let docker = Docker::connect_with_local_defaults().expect("Docker client");
+    let sandbox = provider
+        .create(
+            &SandboxSpec::new(SandboxSource::Image {
+                reference: IMAGE.to_owned(),
+            }),
+            None,
+        )
+        .await
+        .expect("create");
+    let peer = other
+        .attach(sandbox.id(), None)
+        .await
+        .expect("independent attach");
+    let stopper = Arc::clone(&sandbox);
+    let stopping = tokio::spawn(async move { stopper.stop().await });
+    wait_for_label(&docker, "sh.sandbox-driver.fence", sandbox.id().as_str()).await;
+    stopping.abort();
+    let _ = stopping.await;
+    assert_busy(peer.start().await);
+    assert_busy(peer.stop().await);
+    // Test-only operator reconciliation: removal confirms the primary can no
+    // longer execute. The cancelled request only stops resources; it cannot
+    // recreate them. Do not infer safety from an elapsed lease timeout.
+    docker
+        .remove_container(
+            sandbox.id().as_str(),
+            Some(RemoveContainerOptions {
+                force: true,
+                v: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("remove test primary");
+    for marker in labeled(&docker, "sh.sandbox-driver.fence", sandbox.id().as_str()).await {
+        docker
+            .remove_container(
+                &marker,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("remove test marker");
+    }
+    sandbox.delete().await.expect("cleanup");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a live Docker daemon"]
+async fn a_visible_but_unready_creation_cannot_be_started_or_stopped_by_another_client() {
+    let provider = DockerProvider::connect().await.expect("Docker is required");
+    let other = DockerProvider::connect().await.expect("second provider");
+    let docker = Docker::connect_with_local_defaults().expect("Docker client");
+    let name = format!("fence-creation-{}", process::id());
+    let mut spec = SandboxSpec::new(SandboxSource::Image {
+        reference: IMAGE.to_owned(),
+    })
+    .name(&name);
+    spec.provider_config = serde_json::json!({"sidecars": [{
+        "name": "service", "image": IMAGE,
+        "entrypoint": ["sh", "-c", "sleep 3; touch /ready; exec sleep 600"],
+        "health": {"cmd": "test -e /ready", "interval_ms": 100, "retries": 100}
+    }]});
+    let creating = tokio::spawn(async move { provider.create(&spec, None).await });
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if docker.inspect_container(&name, None).await.is_ok() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("primary became visible");
+    let peer = other
+        .attach(
+            &sandbox_driver::SandboxId::try_new(name).expect("name"),
+            None,
+        )
+        .await
+        .expect("attach incomplete allocation");
+    assert_busy(peer.start().await);
+    assert_busy(peer.stop().await);
+    assert_busy(peer.exec().run(&ExecSpec::new("true")).await);
+    let sandbox = creating
+        .await
+        .expect("create task")
+        .expect("ready creation");
+    let exec = sandbox.exec().run(&ExecSpec::new("true")).await;
+    sandbox.delete().await.expect("cleanup");
+    assert!(exec.expect("exec after create").success());
+}

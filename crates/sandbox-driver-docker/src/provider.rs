@@ -25,12 +25,12 @@ use crate::forward::DockerForwards;
 use crate::fs::DockerFs;
 use crate::image::{image_present, pull_image};
 use crate::inspect::{ContainerFacts, is_managed, sidecar_network_of, status_from_inspect};
-use crate::one_shot::DockerOneShot;
+use crate::one_shot::{self, DockerOneShot};
 use crate::pty::DockerPty;
 use crate::sandbox::DockerSandbox;
-use crate::{MANAGED_LABEL, docker_capabilities};
+use crate::{MANAGED_LABEL, docker_capabilities, fence};
 
-/// The Docker provider. One per process, sharing one daemon connection.
+/// The Docker provider, sharing one configured daemon connection.
 pub struct DockerProvider {
     kind:         ProviderKind,
     capabilities: Capabilities,
@@ -168,7 +168,7 @@ impl SandboxProvider for DockerProvider {
     ) -> Result<Arc<dyn Sandbox>> {
         // Boxed: the plan carries the whole container request, and a future
         // that held it inline would be large.
-        let plan = Box::new(ContainerPlan::plan(spec)?);
+        let mut plan = Box::new(ContainerPlan::plan(spec)?);
         let emitter = EventEmitter::new(self.kind.clone(), events);
         let handle_emitter = emitter.clone();
         emitter
@@ -184,27 +184,35 @@ impl SandboxProvider for DockerProvider {
                         &reporter,
                     )
                     .await?;
-                    let created = CreatedContainer::create(&self.docker, &plan).await?;
-                    let event_id = match SandboxId::try_new(created.id.clone()) {
-                        Ok(id) => id,
-                        Err(error) => {
-                            let error = Error::invalid_spec("sandbox_id", error.to_string());
+                    let fence_name = fence::creation_name();
+                    plan.config
+                        .labels
+                        .get_or_insert_default()
+                        .insert(fence::FENCE_NAME_LABEL.to_owned(), fence_name.clone());
+                    fence::create(&self.docker, &plan.image, &fence_name, async {
+                        let created = CreatedContainer::create(&self.docker, &plan).await?;
+                        let event_id = match SandboxId::try_new(created.id.clone()) {
+                            Ok(id) => id,
+                            Err(error) => {
+                                let error = Error::invalid_spec("sandbox_id", error.to_string());
+                                return Err(created.abandon(error).await);
+                            }
+                        };
+                        reporter.set_subject(EventSubject::sandbox(Some(event_id)));
+                        if let Err(error) = created.connect_sidecars(&plan.sidecars).await {
                             return Err(created.abandon(error).await);
                         }
-                    };
-                    reporter.set_subject(EventSubject::sandbox(Some(event_id)));
-                    if let Err(error) = created.connect_sidecars(&plan.sidecars).await {
-                        return Err(created.abandon(error).await);
-                    }
-                    if let Err(error) = created.start().await {
-                        return Err(created.abandon(error).await);
-                    }
-                    let started = match created.verify_running(&self.kind).await {
-                        Ok(started) => started,
-                        Err(error) => return Err(created.abandon(error).await),
-                    };
-                    let facts = ContainerFacts::from_inspect(&started, &created.id);
-                    Ok(self.handle(facts, handle_emitter) as Arc<dyn Sandbox>)
+                        if let Err(error) = created.start().await {
+                            return Err(created.abandon(error).await);
+                        }
+                        let started = match created.verify_running(&self.kind).await {
+                            Ok(started) => started,
+                            Err(error) => return Err(created.abandon(error).await),
+                        };
+                        let facts = ContainerFacts::from_inspect(&started, &created.id);
+                        Ok(self.handle(facts, handle_emitter) as Arc<dyn Sandbox>)
+                    })
+                    .await
                 },
             )
             .await
@@ -258,7 +266,10 @@ impl SandboxProvider for DockerProvider {
                     // same way as a running one.
                     let inspect = match self.inspect(id.as_str()).await {
                         Ok(inspect) => inspect,
-                        Err(Error::NotFound { .. }) => return Ok(()),
+                        Err(Error::NotFound { .. }) => {
+                            fence::ensure_absent(&self.docker, id.as_str()).await?;
+                            return one_shot::sweep(&self.docker, id.as_str()).await;
+                        }
                         Err(error) => return Err(error),
                     };
                     // A container this provider did not create is unknown to
@@ -268,7 +279,10 @@ impl SandboxProvider for DockerProvider {
                     }
                     let network = sidecar_network_of(&inspect);
                     let container_id = inspect.id.clone().unwrap_or_else(|| id.as_str().to_owned());
-                    remove_sandbox(&self.docker, &container_id, network.as_deref()).await
+                    fence::run(&self.docker, &container_id, "delete", async {
+                        remove_sandbox(&self.docker, &container_id, network.as_deref()).await
+                    })
+                    .await
                 },
             )
             .await
