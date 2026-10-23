@@ -233,9 +233,9 @@ async fn assert_dead(pid: u32) {
 
 #[tokio::test]
 async fn timeout_and_caller_cancellation_kill_the_metadata_child() {
-    let fixture = Fixture::new("echo $$ > pid; exec /bin/sleep 30");
+    let fixture = Fixture::new(&format!("{}\necho $$ > pid; exec /bin/sleep 30", emit()));
     let cache = SchemaDiscovery::try_new(DiscoveryLimits {
-        timeout: Duration::from_millis(200),
+        timeout: Duration::from_secs(1),
         ..DiscoveryLimits::default()
     })
     .expect("limits");
@@ -279,9 +279,10 @@ async fn admission_and_cache_storage_are_bounded() {
     let entry = fixture.entry();
     let name = name();
     let mut pending = Box::pin(cache.discover("unused", &name, &entry));
+    let pid_path = fixture.root.join("pid");
     tokio::select! {
         result = &mut pending => panic!("probe returned early: {result:?}"),
-        () = wait_for_file(&fixture.root.join("pid")) => {}
+        () = wait_for_file(&pid_path) => {}
     }
     assert!(matches!(
         cache.discover("unused", &name, &entry).await,
