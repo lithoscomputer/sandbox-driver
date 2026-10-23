@@ -6,16 +6,23 @@
 //! Serialization here defines common data, not a negotiated wire protocol.
 
 mod admission;
+mod catalog;
 mod config;
 mod descriptor;
 mod error;
 mod execution;
+mod fake;
 mod identity;
 mod runtime;
+mod schema;
 mod status;
 mod units;
 mod workload;
 
+pub use catalog::{
+    CatalogDiagnostic, CatalogOptions, Found, ProviderFailure, ProviderHandle, Registry,
+    SandboxBuilder, Sandboxes, StaticEnvironments,
+};
 pub use config::{Environment, EnvironmentSource, PluginTrust, ProviderEntry};
 pub use descriptor::{
     AccessScope, CapabilitySet, ContainerField, Descriptor, Durability, EndpointCapability,
@@ -26,6 +33,7 @@ pub use error::{Error, MutationOutcome, RemainingResource};
 pub use execution::{
     ExecControls, ExecOutcome, ExecSpec, OutputSink, OutputStream, TerminalSize, Termination,
 };
+pub use fake::{FakeCall, FakeExec, FakeProvider};
 pub use identity::SandboxRef;
 pub use runtime::{
     Activation, ByteStream, Containers, Endpoints, Expose, Exposure, FileEntry, FileRange, Files,

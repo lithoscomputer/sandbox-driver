@@ -6,8 +6,9 @@ this document states the required behavior behind those shapes and the
 migration rules. It defines common data and required behavior for the next API. It does **not** claim the
 existing providers implement that behavior yet. The current crate-root traits,
 errors, specs, provider libraries, executables, and [protocol v2](protocol.md)
-remain supported during migration. No new transport, façade, fake, provider
-registration, or consumer cutover is introduced here.
+remain supported during migration. The additive façade, registration boundary, scripted fake and common conformance
+checks now consume these declarations. No new transport or consumer cutover is
+introduced by core.
 
 ## Compatibility boundary
 
@@ -343,6 +344,7 @@ The additive provider boundary is exported from `sandbox_driver::contract`:
   backend-specific validation. `WorkloadAdmission` separates credential values
   from the persistable spec; providers must retain the admission for restart.
 
-These are implementation interfaces, not proof of provider conformance. The
-façade, schema engine, fake and new conformance scenarios are separate changes.
+These are implementation interfaces, not proof of provider conformance. The façade, schema engine, scripted fake and common conformance scenarios are
+implemented in the core catalog follow-up; real provider/transport conformance
+remains an integration gate.
 Existing crate-root traits and protocol v2 are unchanged.
