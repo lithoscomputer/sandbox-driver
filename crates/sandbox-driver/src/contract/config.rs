@@ -12,26 +12,89 @@ use crate::redact::EnvKeys;
 /// Operator-owned connection data, with no backend or environment template.
 /// This is an unvalidated DTO. Catalog admission, trust verification, secret
 /// resolution, and schema validation are separate steps (see shared contract).
+///
+/// On the wire, `trust` is the flat `sha256 = "…"` or `dev = true` an
+/// operator writes; decoding rejects both together.
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(into = "RawProviderEntry", try_from = "RawProviderEntry")]
 pub struct ProviderEntry {
     pub plugin:      ProviderKind,
-    #[serde(default)]
     pub config:      BTreeMap<String, Value>,
-    #[serde(default)]
     pub secrets:     Vec<String>,
-    #[serde(default)]
     pub path:        Option<String>,
-    #[serde(default)]
     pub trust:       Option<PluginTrust>,
-    #[serde(default)]
     pub args:        Vec<String>,
-    #[serde(default)]
     pub env:         BTreeMap<String, String>,
     /// None uses PATH/HOME/TMPDIR/USER; Some([]) inherits nothing.
     /// An explicit list replaces defaults. `env` wins over inherited values.
-    #[serde(default)]
     pub inherit_env: Option<Vec<String>>,
+}
+
+/// The entry as written: trust is two flat keys rather than a tagged object.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProviderEntry {
+    plugin:      ProviderKind,
+    #[serde(default)]
+    config:      BTreeMap<String, Value>,
+    #[serde(default)]
+    secrets:     Vec<String>,
+    #[serde(default)]
+    path:        Option<String>,
+    #[serde(default)]
+    sha256:      Option<Sha256Digest>,
+    #[serde(default)]
+    dev:         bool,
+    #[serde(default)]
+    args:        Vec<String>,
+    #[serde(default)]
+    env:         BTreeMap<String, String>,
+    #[serde(default)]
+    inherit_env: Option<Vec<String>>,
+}
+
+impl TryFrom<RawProviderEntry> for ProviderEntry {
+    type Error = &'static str;
+
+    fn try_from(raw: RawProviderEntry) -> Result<Self, Self::Error> {
+        let trust = match (raw.sha256, raw.dev) {
+            (Some(_), true) => return Err("dev trust does not take a sha256 pin"),
+            (Some(digest), false) => Some(PluginTrust::Sha256 { digest }),
+            (None, true) => Some(PluginTrust::Development),
+            (None, false) => None,
+        };
+        Ok(Self {
+            plugin: raw.plugin,
+            config: raw.config,
+            secrets: raw.secrets,
+            path: raw.path,
+            trust,
+            args: raw.args,
+            env: raw.env,
+            inherit_env: raw.inherit_env,
+        })
+    }
+}
+
+impl From<ProviderEntry> for RawProviderEntry {
+    fn from(entry: ProviderEntry) -> Self {
+        let (sha256, dev) = match entry.trust {
+            Some(PluginTrust::Sha256 { digest }) => (Some(digest), false),
+            Some(PluginTrust::Development) => (None, true),
+            None => (None, false),
+        };
+        Self {
+            plugin: entry.plugin,
+            config: entry.config,
+            secrets: entry.secrets,
+            path: entry.path,
+            sha256,
+            dev,
+            args: entry.args,
+            env: entry.env,
+            inherit_env: entry.inherit_env,
+        }
+    }
 }
 
 // Config, arguments, and launch environment can carry credentials, so `Debug`
@@ -62,46 +125,14 @@ impl fmt::Debug for ProviderEntry {
 }
 
 /// Installation/trust policy only; the metadata probe must obey it too.
-/// Decoding rejects a digest on development trust, so a pinned checksum is
-/// never silently skipped.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case", try_from = "RawPluginTrust")]
+/// Entry decoding rejects a pin together with development trust, so a pinned
+/// checksum is never silently skipped.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PluginTrust {
     /// Checked before executing the binary.
     Sha256 { digest: Sha256Digest },
     /// Explicit development opt-in; never inferred from a missing checksum.
     Development,
-}
-
-// Serde's `deny_unknown_fields` does not reach unit variants of an internally
-// tagged enum, so decoding goes through this flat form instead.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawPluginTrust {
-    mode:   TrustMode,
-    digest: Option<Sha256Digest>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum TrustMode {
-    Sha256,
-    Development,
-}
-
-impl TryFrom<RawPluginTrust> for PluginTrust {
-    type Error = &'static str;
-
-    fn try_from(raw: RawPluginTrust) -> Result<Self, Self::Error> {
-        match (raw.mode, raw.digest) {
-            (TrustMode::Sha256, Some(digest)) => Ok(Self::Sha256 { digest }),
-            (TrustMode::Sha256, None) => Err("sha256 trust requires digest"),
-            (TrustMode::Development, None) => Ok(Self::Development),
-            (TrustMode::Development, Some(_)) => {
-                Err("development trust does not take a digest; use mode sha256")
-            }
-        }
-    }
 }
 
 /// Mutable named template. A running sandbox keeps its admitted spec, not a

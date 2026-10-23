@@ -10,6 +10,7 @@ mod descriptor;
 mod error;
 mod identity;
 mod status;
+mod units;
 mod workload;
 
 pub use config::{Environment, EnvironmentSource, PluginTrust, ProviderEntry};
@@ -21,6 +22,7 @@ pub use descriptor::{
 pub use error::{Error, MutationOutcome, RemainingResource};
 pub use identity::SandboxRef;
 pub use status::{SandboxState, ServiceAddress, Status};
+pub use units::{ParseUnitError, parse_duration_ms, parse_size_mib};
 pub use workload::{
     ContainerSpec, NetworkPolicy, ReadinessCheck, Resources, SandboxSpec, ServiceSpec, Source,
     Timers,

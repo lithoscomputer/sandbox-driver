@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 use sandbox_driver::contract::{
     AccessScope, CapabilitySet, Descriptor, Durability, Error, MutationOutcome, NamespaceId,
-    NetworkPolicy, PluginTrust, PortSupport, ProviderEntry, ProviderSchemas, SandboxRef,
+    NetworkPolicy, PluginTrust, PortSupport, ProviderEntry, ProviderSchemas, Resources, SandboxRef,
     SandboxSpec, SandboxState, Source, Status, TimerCapability,
 };
 use serde_json::{Value, json};
@@ -118,7 +118,7 @@ fn absent_container_options_differ_from_an_explicit_false_request() {
 fn request_typos_and_unsupported_target_selectors_are_not_dropped() {
     for path in [
         "/container/priviledged",
-        "/resources/memory",
+        "/resources/memory_gb",
         "/execution_target",
     ] {
         let mut value = workload();
@@ -137,11 +137,12 @@ fn request_typos_and_unsupported_target_selectors_are_not_dropped() {
 #[test]
 fn network_allow_lists_are_never_dropped_by_a_mode_that_ignores_them() {
     for network in [
-        json!({"mode": "provider_default", "cidrs": ["10.0.0.0/8"]}),
-        json!({"mode": "allow_all", "cidrs": ["10.0.0.0/8"]}),
-        json!({"mode": "block", "domains": ["example.com"]}),
-        json!({"mode": "cidr_allow_list", "domains": ["example.com"]}),
-        json!({"mode": "cidr_allow_list", "cidrs": ["10.0.0.0/8"], "domains": ["example.com"]}),
+        json!({"mode": "provider_default", "allow": ["10.0.0.0/8"]}),
+        json!({"mode": "allow_all", "allow": ["10.0.0.0/8"]}),
+        json!({"mode": "block", "allow": ["example.com"]}),
+        json!({"mode": "cidr_allow_list"}),
+        json!({"mode": "domain_allow_list"}),
+        json!({"mode": "cidr_allow_list", "cidrs": ["10.0.0.0/8"]}),
         json!({"mode": "block", "egress": "none"}),
     ] {
         assert!(
@@ -149,44 +150,108 @@ fn network_allow_lists_are_never_dropped_by_a_mode_that_ignores_them() {
             "{network}"
         );
     }
-    let policy: NetworkPolicy =
-        serde_json::from_value(json!({"mode": "cidr_allow_list", "cidrs": ["10.0.0.0/8"]}))
-            .expect("allow-list decodes");
-    assert_eq!(policy, NetworkPolicy::CidrAllowList {
-        cidrs: vec!["10.0.0.0/8".into()],
-    });
-    let round_trip = serde_json::to_value(&policy).expect("serializes");
-    assert_eq!(
-        serde_json::from_value::<NetworkPolicy>(round_trip).expect("restores"),
-        policy
-    );
+    for (value, policy) in [
+        (
+            json!({"mode": "cidr_allow_list", "allow": ["10.0.0.0/8"]}),
+            NetworkPolicy::CidrAllowList {
+                cidrs: vec!["10.0.0.0/8".into()],
+            },
+        ),
+        (
+            json!({"mode": "domain_allow_list", "allow": ["example.com"]}),
+            NetworkPolicy::DomainAllowList {
+                domains: vec!["example.com".into()],
+            },
+        ),
+    ] {
+        let decoded: NetworkPolicy = serde_json::from_value(value).expect("allow-list decodes");
+        assert_eq!(decoded, policy);
+        let round_trip = serde_json::to_value(&policy).expect("serializes");
+        assert_eq!(round_trip["allow"][0], policy_entry(&policy));
+        assert_eq!(
+            serde_json::from_value::<NetworkPolicy>(round_trip).expect("restores"),
+            policy
+        );
+    }
     assert_eq!(
         serde_json::to_value(NetworkPolicy::Block).expect("serializes"),
         json!({"mode": "block"})
     );
 }
 
+/// The first allow-list entry of a policy, for round-trip checks.
+fn policy_entry(policy: &NetworkPolicy) -> &str {
+    match policy {
+        NetworkPolicy::CidrAllowList { cidrs: allow }
+        | NetworkPolicy::DomainAllowList { domains: allow } => &allow[0],
+        _ => unreachable!("only allow-list policies are checked"),
+    }
+}
+
 #[test]
 fn plugin_trust_never_skips_a_pinned_digest() {
     let digest = "AB".repeat(32);
-    for trust in [
-        json!({"mode": "development", "digest": digest}),
-        json!({"mode": "sha256"}),
-        json!({"mode": "sha256", "digest": "abc"}),
-        json!({"mode": "sha256", "digest": "g".repeat(64)}),
+    for entry in [
+        json!({"plugin": "lima", "dev": true, "sha256": digest}),
+        json!({"plugin": "lima", "sha256": "abc"}),
+        json!({"plugin": "lima", "sha256": "g".repeat(64)}),
+        json!({"plugin": "lima", "trust": {"mode": "development"}}),
     ] {
         assert!(
-            serde_json::from_value::<PluginTrust>(trust.clone()).is_err(),
-            "{trust}"
+            serde_json::from_value::<ProviderEntry>(entry.clone()).is_err(),
+            "{entry}"
         );
     }
-    let trust: PluginTrust =
-        serde_json::from_value(json!({"mode": "sha256", "digest": digest})).expect("pinned");
-    assert!(matches!(&trust, PluginTrust::Sha256 { digest } if digest.as_str() == "ab".repeat(32)));
-    assert_eq!(
-        serde_json::from_value::<PluginTrust>(json!({"mode": "development"})).expect("development"),
-        PluginTrust::Development
+    let pinned: ProviderEntry =
+        serde_json::from_value(json!({"plugin": "lima", "sha256": digest})).expect("pinned");
+    assert!(
+        matches!(&pinned.trust, Some(PluginTrust::Sha256 { digest }) if digest.as_str() == "ab".repeat(32))
     );
+    let encoded = serde_json::to_value(&pinned).expect("entry serializes");
+    assert_eq!(encoded["sha256"], "ab".repeat(32));
+    assert_eq!(encoded["dev"], false);
+    let development: ProviderEntry =
+        serde_json::from_value(json!({"plugin": "lima", "dev": true})).expect("development");
+    assert_eq!(development.trust, Some(PluginTrust::Development));
+    let unpinned: ProviderEntry =
+        serde_json::from_value(json!({"plugin": "host"})).expect("built-in");
+    assert_eq!(unpinned.trust, None);
+}
+
+#[test]
+fn templates_spell_sizes_and_durations_once_and_providers_see_integers() {
+    let spec: SandboxSpec = serde_json::from_value(json!({
+        "source": {"image": "ubuntu:24.04"},
+        "resources": {"cpu": 2, "memory": "4GB", "disk": "20GiB"},
+        "timers": {"auto_stop": "60m", "ttl": "0s"}
+    }))
+    .expect("template spelling decodes");
+    assert_eq!(spec.resources.cpu_cores.expect("cpu").get(), 2);
+    assert_eq!(spec.resources.memory_mb.expect("memory").get(), 4096);
+    assert_eq!(spec.resources.disk_mb.expect("disk").get(), 20480);
+    assert_eq!(spec.timers.auto_stop_ms, Some(3_600_000));
+    assert_eq!(spec.timers.ttl_ms, Some(0));
+    let encoded = serde_json::to_value(&spec).expect("serializes");
+    assert_eq!(encoded["resources"]["memory_mb"], 4096);
+    assert_eq!(encoded["timers"]["auto_stop_ms"], 3_600_000);
+    assert!(encoded["resources"].get("memory").is_none());
+    let normalized: SandboxSpec = serde_json::from_value(encoded).expect("integer form decodes");
+    assert_eq!(normalized.resources, spec.resources);
+    assert_eq!(normalized.timers, spec.timers);
+    for value in [
+        json!({"source": {"image": "u"}, "resources": {"memory": "4"}}),
+        json!({"source": {"image": "u"}, "resources": {"memory": "1.5GB"}}),
+        json!({"source": {"image": "u"}, "resources": {"memory": "512KB"}}),
+        json!({"source": {"image": "u"}, "resources": {"memory": "0GB"}}),
+        json!({"source": {"image": "u"}, "resources": {"memory": "4GB", "memory_mb": 4096}}),
+        json!({"source": {"image": "u"}, "timers": {"auto_stop": "60"}}),
+        json!({"source": {"image": "u"}, "timers": {"auto_stop": -1}}),
+    ] {
+        assert!(
+            serde_json::from_value::<SandboxSpec>(value.clone()).is_err(),
+            "{value}"
+        );
+    }
 }
 
 #[test]
@@ -250,7 +315,7 @@ fn readiness_requires_finite_nonzero_budgets_and_a_valid_executable() {
 fn portable_validation_rejects_unsafe_or_empty_requests() {
     for value in [
         json!({"source": {"image": ""}}),
-        json!({"source": {"image": "ubuntu:24.04"}, "network": {"mode": "cidr_allow_list", "cidrs": []}}),
+        json!({"source": {"image": "ubuntu:24.04"}, "network": {"mode": "cidr_allow_list", "allow": []}}),
         json!({"source": "host_directory", "workspace_ownership": "designated"}),
         json!({"source": {"image": "ubuntu:24.04"}, "workspace_ownership": "managed"}),
         json!({"source": {"image": "ubuntu:24.04"}, "services": {"bad name": {"image": "redis"}}}),
@@ -431,6 +496,20 @@ fn status_unknown_state_is_not_deleted_and_service_addresses_are_workload_relati
     assert_eq!(status.state, SandboxState::Unknown);
     assert_eq!(status.services["postgres"].ports[&5432], 15432);
     assert_eq!(status.services["postgres"].host, "postgres");
+    assert_eq!(status.resources, Resources::default());
+    assert!(status.image.is_none() && status.web_url.is_none());
+    let reported: Status = serde_json::from_value(json!({
+        "reference": reference(), "state": "unavailable",
+        "image": "ubuntu:24.04", "resources": {"memory_mb": 8192},
+        "network": {"mode": "block"}, "web_url": "https://console.example/sb-123"
+    }))
+    .expect("reported facts decode");
+    assert_eq!(reported.state, SandboxState::Unavailable);
+    assert_eq!(
+        reported.resources.memory_mb.expect("rounded up").get(),
+        8192
+    );
+    assert_eq!(reported.network, Some(NetworkPolicy::Block));
 }
 
 #[test]

@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de};
 use serde_json::Value;
 
+use super::units::{Mib, Millis};
 use super::{Error, NetworkMode};
 use crate::id::validate_label;
 use crate::redact::EnvKeys;
@@ -34,19 +35,40 @@ impl fmt::Debug for Source {
     }
 }
 
-/// Normalized resource requests. Memory/disk are MiB; CPU is whole cores.
-/// Human-readable size parsing belongs to the future catalog, not providers.
+/// Resource requests in whole cores and MiB. Decoding also accepts the
+/// template spelling, `cpu = 2` and `memory = "4GB"`, through the one size
+/// grammar; the value is normalized once and always serializes as MiB, so
+/// providers never see the text.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Resources {
+    #[serde(alias = "cpu")]
     pub cpu_cores: Option<NonZeroU32>,
+    #[serde(alias = "memory", deserialize_with = "size_mib")]
     pub memory_mb: Option<NonZeroU64>,
+    #[serde(alias = "disk", deserialize_with = "size_mib")]
     pub disk_mb:   Option<NonZeroU64>,
     pub gpus:      Option<u32>,
 }
 
-/// Egress policy. Decoding rejects an allow-list on a mode that does not take
-/// one, so a misplaced restriction is never silently dropped.
+fn size_mib<'de, D: de::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<NonZeroU64>, D::Error> {
+    Option::<Mib>::deserialize(deserializer)?
+        .map(|Mib(value)| {
+            NonZeroU64::new(value).ok_or_else(|| de::Error::custom("must not be zero"))
+        })
+        .transpose()
+}
+
+fn duration_ms<'de, D: de::Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    Ok(Option::<Millis>::deserialize(deserializer)?.map(|Millis(value)| value))
+}
+
+/// Egress policy. The allow-list modes carry their entries under one `allow`
+/// key; the mode says how to read them. Decoding rejects an allow-list on a
+/// mode that does not take one, so a misplaced restriction is never silently
+/// dropped.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", try_from = "RawNetworkPolicy")]
 pub enum NetworkPolicy {
@@ -55,9 +77,11 @@ pub enum NetworkPolicy {
     AllowAll,
     Block,
     CidrAllowList {
+        #[serde(rename = "allow")]
         cidrs: Vec<String>,
     },
     DomainAllowList {
+        #[serde(rename = "allow")]
         domains: Vec<String>,
     },
 }
@@ -67,28 +91,24 @@ pub enum NetworkPolicy {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawNetworkPolicy {
-    mode:    NetworkMode,
-    cidrs:   Option<Vec<String>>,
-    domains: Option<Vec<String>>,
+    mode:  NetworkMode,
+    allow: Option<Vec<String>>,
 }
 
 impl TryFrom<RawNetworkPolicy> for NetworkPolicy {
     type Error = &'static str;
 
     fn try_from(raw: RawNetworkPolicy) -> Result<Self, Self::Error> {
-        match (raw.mode, raw.cidrs, raw.domains) {
-            (_, Some(_), Some(_)) => Err("network policy cannot set both cidrs and domains"),
-            (NetworkMode::CidrAllowList, Some(cidrs), None) => Ok(Self::CidrAllowList { cidrs }),
-            (NetworkMode::DomainAllowList, None, Some(domains)) => {
-                Ok(Self::DomainAllowList { domains })
+        match (raw.mode, raw.allow) {
+            (NetworkMode::CidrAllowList, Some(cidrs)) => Ok(Self::CidrAllowList { cidrs }),
+            (NetworkMode::DomainAllowList, Some(domains)) => Ok(Self::DomainAllowList { domains }),
+            (NetworkMode::CidrAllowList | NetworkMode::DomainAllowList, None) => {
+                Err("an allow-list mode requires allow")
             }
-            (NetworkMode::CidrAllowList, None, None) => Err("cidr_allow_list requires cidrs"),
-            (NetworkMode::DomainAllowList, None, None) => Err("domain_allow_list requires domains"),
-            (_, Some(_), None) => Err("cidrs requires mode cidr_allow_list"),
-            (_, None, Some(_)) => Err("domains requires mode domain_allow_list"),
-            (NetworkMode::ProviderDefault, None, None) => Ok(Self::ProviderDefault),
-            (NetworkMode::AllowAll, None, None) => Ok(Self::AllowAll),
-            (NetworkMode::Block, None, None) => Ok(Self::Block),
+            (_, Some(_)) => Err("allow requires mode cidr_allow_list or domain_allow_list"),
+            (NetworkMode::ProviderDefault, None) => Ok(Self::ProviderDefault),
+            (NetworkMode::AllowAll, None) => Ok(Self::AllowAll),
+            (NetworkMode::Block, None) => Ok(Self::Block),
         }
     }
 }
@@ -98,11 +118,10 @@ impl NetworkPolicy {
     /// opposite of what an emptied-out filter intends.
     pub fn validate(&self) -> Result<(), Error> {
         match self {
-            Self::CidrAllowList { cidrs } if cidrs.is_empty() => {
-                Err(Error::invalid_spec("network.cidrs", "must not be empty"))
-            }
-            Self::DomainAllowList { domains } if domains.is_empty() => {
-                Err(Error::invalid_spec("network.domains", "must not be empty"))
+            Self::CidrAllowList { cidrs: allow } | Self::DomainAllowList { domains: allow }
+                if allow.is_empty() =>
+            {
+                Err(Error::invalid_spec("network.allow", "must not be empty"))
             }
             _ => Ok(()),
         }
@@ -111,12 +130,18 @@ impl NetworkPolicy {
 
 /// Backend timers, in milliseconds. None inherits a provider default; zero
 /// explicitly disables the timer. Application run-end policy is not a timer.
+/// Decoding also accepts the template spelling, `auto_stop = "60m"`, and
+/// always serializes milliseconds.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Timers {
+    #[serde(alias = "auto_stop", deserialize_with = "duration_ms")]
     pub auto_stop_ms:    Option<u64>,
+    #[serde(alias = "auto_archive", deserialize_with = "duration_ms")]
     pub auto_archive_ms: Option<u64>,
+    #[serde(alias = "auto_delete", deserialize_with = "duration_ms")]
     pub auto_delete_ms:  Option<u64>,
+    #[serde(alias = "ttl", deserialize_with = "duration_ms")]
     pub ttl_ms:          Option<u64>,
 }
 

@@ -27,11 +27,13 @@ spec is **not** an adapter: older readers ignore fields and can run the wrong
 workload. There is no automatic fallback to v2 after a new-contract mutation.
 
 Request DTOs reject unknown fields/options rather than dropping instructions.
-That includes fields the selected mode does not take: an allow-list on a
-non-allow-list network mode, or a digest on development plugin trust, is a
+That includes fields the selected mode does not take: an `allow` list on a
+non-allow-list network mode, or a `sha256` pin together with `dev = true`, is a
 decoding error. Descriptors may acquire additional object fields; unknown enum capabilities
 fail decoding rather than being interpreted as supported. Unknown status states
-become `Unknown`, never a terminal state. The closed error enum serializes a
+become `Unknown`, never a terminal state. `unavailable` means unreachable and
+not known to be gone; `lost` is established absence without a confirmed
+destroy, never inferred from failed contact. The closed error enum serializes a
 stable snake-case `code` plus structured fields. A future unknown error code is
 a decode/transport failure with unknown outcome, never `NotFound` or success.
 Rejected credentials (`Unauthenticated`), insufficient permission
@@ -67,7 +69,9 @@ Existing ownership checks and application lease records remain necessary;
 namespace agreement must not bypass them.
 
 `ProviderEntry` describes a connection (`plugin`, `config`, secret names, and
-optional executable path/trust/arguments/environment). `Environment` is a
+for a third-party plugin its `path`, a `sha256` pin or `dev = true`, `args`,
+`env` and `inherit_env`). The two trust keys are flat because operators write
+them by hand; in Rust they decode to `PluginTrust`. `Environment` is a
 provider entry plus a spec template. `EnvironmentSource` returns snapshots from
 application-owned storage. A storage failure is `Unavailable`; only `Ok(None)`
 means the environment does not exist. Admission saves the resolved spec and provider
@@ -76,9 +80,12 @@ Applications persist their own admission/lease records. The driver persists
 provider state needed to implement its declared durability.
 
 These are raw configuration DTOs, not a file loader or an admission validator.
-The core API implementation owns loading, merging, schema validation, and
-normalized sizes. These declarations use integer MiB, whole cores, and
-milliseconds; they do not include a size parser. Human-readable values must normalize once, before reaching providers.
+The core API implementation owns loading, merging, and schema validation.
+Sizes and durations have one grammar, exported as `parse_size_mib` and
+`parse_duration_ms`. A template or override may say `memory = "4GB"` or
+`auto_stop = "60m"`; decoding normalizes it once to whole MiB and
+milliseconds, and the value always serializes in that integer form
+(`memory_mb`, `auto_stop_ms`), so providers never see the text.
 
 `ProviderSchemas.config_schema` validates **only `ProviderEntry.config`**.
 `spec_schema` validates **only `SandboxSpec.provider_config`**, in addition to
@@ -118,7 +125,7 @@ The plugin loader and SDK implement this sequence:
 
 1. **Explicit metadata discovery** (also used on first activation): resolve the
    selected executable and verify its configured checksum or trust record.
-   Missing trust fails closed unless `PluginTrust::Development` is explicit.
+   Missing trust fails closed unless `dev = true` is explicit.
    Run the executable with `--describe-schema` in a bounded, short-lived metadata
    process. It returns one JSON `ProviderSchemas` object on stdout and exits;
    diagnostics go to stderr. No initialize request, data socket, backend access,
@@ -187,7 +194,10 @@ attempt is allowed, is rejected because the check could never use its budget. Wi
 confirms service start; it makes no application-readiness claim.
 `Status.services` reports current workload-reachable host/port mappings, which
 can change on start. Unavailable status must not present stale addresses as
-current observations.
+current observations. `Status` also carries the image and snapshot in use, the
+resources actually allocated after any provider rounding, the effective
+network policy, and a console URL when the provider has one; an absent field
+was not reported, not zero.
 
 Container options explicitly cover init, privilege, capability additions/drops,
 DNS, extra hosts, and shared-memory MiB. `None` is unspecified, while
