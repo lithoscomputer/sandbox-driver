@@ -9,10 +9,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncRead;
 
+use super::workload::{validate_env, validate_name};
 use super::{
     Descriptor, Error, ExecControls, ExecOutcome, ExecSpec, LifecycleCapability, PluginTrust,
-    ProviderEntry, ProviderName, ProviderSchemas, SandboxRef, SandboxSpec, SandboxState, Source,
-    Status,
+    ProviderEntry, ProviderName, ProviderSchemas, SandboxRef, SandboxSpec, SandboxState, Status,
 };
 use crate::redact::EnvKeys;
 use crate::{FileKind, ProviderKind, SandboxId};
@@ -247,24 +247,112 @@ pub trait Endpoints: Send + Sync {
     async fn vnc(&self) -> Result<crate::VncConnection, Error>;
 }
 
-/// Only Image and Dockerfile sources are accepted for one-shot containers.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Where a one-shot container's image comes from. This is never the
+/// workload's own source: a one-shot runs its own image beside the workload.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum OneShotImage {
+    /// A registry reference, pulled when absent.
+    Image(String),
+    /// Built from a context directory in the workload workspace, resolved
+    /// against the sandbox working directory, so the Dockerfile can copy files
+    /// that sit beside it.
+    Build {
+        context:    String,
+        /// Within the context; `None` is the context's own `Dockerfile`.
+        #[serde(default)]
+        dockerfile: Option<String>,
+        /// The tag the build produces, and its cache key.
+        tag:        String,
+        /// Whether an image already carrying `tag` may run without a build.
+        reuse:      bool,
+    },
+}
+
+/// One container run to completion in the workload's world. Unlike exec,
+/// it runs the image's own command: `entrypoint` replaces the image's
+/// entrypoint, and non-empty `args` replace the image's command, so arguments
+/// alone reach the image's entrypoint.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OneShotSpec {
-    pub source: Source,
-    pub exec:   ExecSpec,
+    pub image:             OneShotImage,
+    #[serde(default)]
+    pub entrypoint:        Option<String>,
+    #[serde(default)]
+    pub args:              Vec<String>,
+    #[serde(default)]
+    pub env:               BTreeMap<String, String>,
+    /// `None` is the sandbox working directory, where the workspace is shared.
+    #[serde(default)]
+    pub working_directory: Option<String>,
+    #[serde(default)]
+    pub timeout_ms:        Option<u64>,
 }
 
 impl OneShotSpec {
+    pub fn new(image: OneShotImage) -> Self {
+        Self {
+            image,
+            entrypoint: None,
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            working_directory: None,
+            timeout_ms: None,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), Error> {
-        if !matches!(self.source, Source::Image(_) | Source::Dockerfile(_)) {
+        match &self.image {
+            OneShotImage::Image(reference) => validate_name("image", reference)?,
+            OneShotImage::Build {
+                context,
+                dockerfile,
+                tag,
+                reuse: _,
+            } => {
+                validate_name("image.build.context", context)?;
+                if let Some(dockerfile) = dockerfile {
+                    validate_name("image.build.dockerfile", dockerfile)?;
+                }
+                validate_name("image.build.tag", tag)?;
+            }
+        }
+        if let Some(entrypoint) = &self.entrypoint {
+            validate_name("entrypoint", entrypoint)?;
+        }
+        if self.args.iter().any(|arg| arg.contains('\0')) {
             return Err(Error::invalid_spec(
-                "source",
-                "one-shot requires an image or Dockerfile",
+                "args",
+                "arguments must not contain NUL",
             ));
         }
-        self.source.validate()?;
-        self.exec.validate()
+        if let Some(path) = &self.working_directory {
+            validate_name("working_directory", path)?;
+        }
+        validate_env("env", &self.env)
+    }
+}
+
+// Arguments and env values can carry credentials, as on `ExecSpec`.
+impl fmt::Debug for OneShotSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            image,
+            entrypoint,
+            args: _,
+            env,
+            working_directory,
+            timeout_ms,
+        } = self;
+        f.debug_struct("OneShotSpec")
+            .field("image", image)
+            .field("entrypoint", entrypoint)
+            .field("args", &"<redacted>")
+            .field("env_keys", &EnvKeys(env))
+            .field("working_directory", working_directory)
+            .field("timeout_ms", timeout_ms)
+            .finish()
     }
 }
 

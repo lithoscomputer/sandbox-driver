@@ -44,15 +44,6 @@ impl Source {
             Self::HostDirectory => SourceKind::HostDirectory,
         }
     }
-
-    pub(super) fn validate(&self) -> Result<(), Error> {
-        match self {
-            Self::Image(value) | Self::Dockerfile(value) if value.trim().is_empty() => {
-                Err(Error::invalid_spec("source", "must not be empty"))
-            }
-            _ => Ok(()),
-        }
-    }
 }
 
 /// Resource requests in whole cores and MiB. Decoding also accepts the
@@ -306,7 +297,12 @@ impl SandboxSpec {
     /// schemas, credentials, and backend-specific restrictions still need
     /// validation before admission; a successful check does not start work.
     pub fn validate(&self) -> Result<(), Error> {
-        self.source.validate()?;
+        match &self.source {
+            Source::Image(value) | Source::Dockerfile(value) if value.trim().is_empty() => {
+                return Err(Error::invalid_spec("source", "must not be empty"));
+            }
+            _ => {}
+        }
         for (path, value) in [
             ("name", &self.name),
             ("user", &self.user),
@@ -370,6 +366,15 @@ pub(super) fn validate_argv(path: &str, argv: &[String]) -> Result<(), Error> {
     }
     if argv.iter().any(|arg| arg.contains('\0')) {
         return Err(Error::invalid_spec(path, "arguments must not contain NUL"));
+    }
+    Ok(())
+}
+
+/// Paths, references and entrypoints reach the backend as C strings, so an
+/// empty value names nothing and NUL would truncate it.
+pub(super) fn validate_name(path: &str, value: &str) -> Result<(), Error> {
+    if value.is_empty() || value.contains('\0') {
+        return Err(Error::invalid_spec(path, "must be non-empty and NUL-free"));
     }
     Ok(())
 }

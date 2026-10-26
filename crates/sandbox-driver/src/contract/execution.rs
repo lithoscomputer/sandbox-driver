@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::Error;
 use super::runtime::ByteStream;
-use super::workload::{validate_argv, validate_env};
+use super::workload::{validate_argv, validate_env, validate_name};
 use crate::OutputLoss;
 use crate::redact::EnvKeys;
 
@@ -43,15 +43,8 @@ impl ExecSpec {
 
     pub fn validate(&self) -> Result<(), Error> {
         validate_argv("argv", &self.argv)?;
-        if self
-            .working_directory
-            .as_ref()
-            .is_some_and(|path| path.is_empty() || path.contains('\0'))
-        {
-            return Err(Error::invalid_spec(
-                "working_directory",
-                "must be non-empty and NUL-free",
-            ));
+        if let Some(path) = &self.working_directory {
+            validate_name("working_directory", path)?;
         }
         validate_env("env", &self.env)
     }

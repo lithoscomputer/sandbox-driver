@@ -338,6 +338,11 @@ The additive provider boundary is exported from `sandbox_driver::contract`:
   Controls carry one owned stdin reader, an awaited output sink, term/kill
   tokens and a latest-value terminal resize receiver. `Files` transfers owned
   byte streams, allowing adapters to keep bulk bytes off control connections.
+- `OneShotSpec` takes its own `OneShotImage`, never the workload `Source`: a
+  registry `image`, or a `build` from a context directory in the workload
+  workspace with an optional Dockerfile path, a tag that keys the build cache
+  and a `reuse` flag. Its command is an optional `entrypoint` plus `args`, not
+  exec argv, so arguments alone reach the image's own entrypoint.
 - `SandboxSpec::validate_for` and `Environment::validate` check portable
   invariants and descriptor capabilities. They do not replace JSON Schema or
   backend-specific validation. `WorkloadAdmission` separates credential values

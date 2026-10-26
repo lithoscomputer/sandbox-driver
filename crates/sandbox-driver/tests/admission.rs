@@ -1,4 +1,6 @@
-use sandbox_driver::contract::{Descriptor, Error, ExecSpec, SandboxSpec};
+use sandbox_driver::contract::{
+    Descriptor, Error, ExecSpec, OneShotImage, OneShotSpec, SandboxSpec,
+};
 use serde_json::json;
 
 fn descriptor() -> Descriptor {
@@ -105,4 +107,51 @@ fn exec_refuses_invalid_arguments_and_redacts_inputs() {
     assert!(!debug.contains("env-secret"));
     spec.env.insert("TOKEN".into(), "nul\0value".into());
     assert!(spec.validate().is_err());
+}
+
+#[test]
+fn one_shot_builds_from_a_workspace_context_and_keeps_the_image_entrypoint() {
+    let mut spec: OneShotSpec = serde_json::from_value(json!({
+        "image": {"build": {"context": "_actions/owner/repo", "tag": "owner-repo", "reuse": true}},
+        "args": ["--flag", "argument-secret"],
+        "env": {"TOKEN": "env-secret"}
+    }))
+    .expect("action build");
+    spec.validate().expect("valid build");
+    assert_eq!(spec.entrypoint, None);
+    let debug = format!("{spec:?}");
+    assert!(!debug.contains("argument-secret"));
+    assert!(!debug.contains("env-secret"));
+    spec.args.push("nul\0arg".into());
+    assert!(spec.validate().is_err());
+
+    for image in [
+        OneShotImage::Image(String::new()),
+        OneShotImage::Build {
+            context:    String::new(),
+            dockerfile: None,
+            tag:        "tag".into(),
+            reuse:      false,
+        },
+        OneShotImage::Build {
+            context:    "context".into(),
+            dockerfile: None,
+            tag:        String::new(),
+            reuse:      false,
+        },
+    ] {
+        assert!(OneShotSpec::new(image).validate().is_err());
+    }
+}
+
+#[test]
+fn one_shot_refuses_workload_sources_and_unknown_build_fields() {
+    for image in [
+        json!({"snapshot": "snap-1"}),
+        json!("host_directory"),
+        json!({"dockerfile": "FROM alpine"}),
+        json!({"build": {"context": ".", "tag": "t", "reuse": false, "cache": true}}),
+    ] {
+        assert!(serde_json::from_value::<OneShotSpec>(json!({"image": image})).is_err());
+    }
 }
