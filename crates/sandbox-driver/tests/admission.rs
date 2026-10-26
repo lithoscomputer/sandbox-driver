@@ -9,7 +9,7 @@ fn descriptor() -> Descriptor {
         "namespace":{"id":"test:one", "scope":"process"},
         "isolation":"none", "durability":"process", "access":"owner_process",
         "sources":["image"], "locality":{}, "resources":[],
-        "network":["provider_default"], "ports":{"exposable":"none"}, "capabilities":{}
+        "network":[], "ports":{"exposable":"none"}, "capabilities":{}
     }))
     .expect("descriptor")
 }
@@ -73,6 +73,20 @@ fn unsupported_requests_are_refused_even_when_false_or_zero() {
                 capability: field.into(),
             })
         );
+    }
+}
+
+#[test]
+fn the_provider_default_network_needs_no_advertisement() {
+    let mut descriptor = descriptor();
+    descriptor.network = serde_json::from_value(json!(["allow_all"])).expect("network modes");
+    for spec in [
+        json!({"source":{"image":"test"}}),
+        json!({"source":{"image":"test"}, "network":{"mode":"provider_default"}}),
+        json!({"source":{"image":"test"}, "network":{"mode":"allow_all"}}),
+    ] {
+        let spec: SandboxSpec = serde_json::from_value(spec).expect("spec");
+        spec.validate_for(&descriptor).expect("supported");
     }
 }
 

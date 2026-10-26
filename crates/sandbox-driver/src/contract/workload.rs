@@ -169,14 +169,18 @@ impl TryFrom<RawNetworkPolicy> for NetworkPolicy {
 }
 
 impl NetworkPolicy {
-    pub(super) fn mode(&self) -> NetworkMode {
-        match self {
-            Self::ProviderDefault => NetworkMode::ProviderDefault,
+    /// The capability this policy needs, with its spec path. Every provider
+    /// honours its own default, so the default requests nothing, whether the
+    /// field is omitted or explicit.
+    pub(super) fn requested(&self) -> Option<(NetworkMode, &'static str)> {
+        let mode = match self {
+            Self::ProviderDefault => return None,
             Self::AllowAll => NetworkMode::AllowAll,
             Self::Block => NetworkMode::Block,
             Self::CidrAllowList { .. } => NetworkMode::CidrAllowList,
             Self::DomainAllowList { .. } => NetworkMode::DomainAllowList,
-        }
+        };
+        Some((mode, "network"))
     }
 
     /// Rejects an empty allow-list: providers treat it as no restriction, the

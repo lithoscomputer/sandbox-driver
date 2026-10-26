@@ -19,7 +19,9 @@ impl SandboxSpec {
         for (capability, field) in self.resources.requested() {
             require(descriptor.resources.contains(&capability), field)?;
         }
-        require(descriptor.network.contains(&self.network.mode()), "network")?;
+        if let Some((capability, field)) = self.network.requested() {
+            require(descriptor.network.contains(&capability), field)?;
+        }
         for (capability, field) in self.timers.requested() {
             require(capabilities.timers.contains(&capability), field)?;
         }

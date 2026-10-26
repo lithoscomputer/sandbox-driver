@@ -207,10 +207,11 @@ DNS, extra hosts, and shared-memory MiB. `None` is unspecified, while
 which requests are supported, separately from `services` and one-shot
 `containers`. Unsupported requests return `Unsupported` naming the field,
 including unsupported explicit false values. Providers cannot silently drop
-resource, network, timer, service, or container requests. Descriptor `timers`
-lists each enforced timer (`auto_stop`, `auto_archive`, `auto_delete`, `ttl`)
-separately; a request for an unlisted timer is `Unsupported`. Host rejects service
-and container workloads.
+resource, network, timer, service, or container requests. The provider-default
+network mode, omitted or explicit, is not a request and needs no descriptor
+entry. Descriptor `timers` lists each enforced timer (`auto_stop`,
+`auto_archive`, `auto_delete`, `ttl`) separately; a request for an unlisted timer
+is `Unsupported`. Host rejects service and container workloads.
 
 ## Lifecycle, fences, and uncertainty
 
