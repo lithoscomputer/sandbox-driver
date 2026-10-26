@@ -207,10 +207,11 @@ DNS, extra hosts, and shared-memory MiB. `None` is unspecified, while
 which requests are supported, separately from `services` and one-shot
 `containers`. Unsupported requests return `Unsupported` naming the field,
 including unsupported explicit false values. Providers cannot silently drop
-resource, network, timer, service, or container requests. Descriptor `timers`
-lists each enforced timer (`auto_stop`, `auto_archive`, `auto_delete`, `ttl`)
-separately; a request for an unlisted timer is `Unsupported`. Host rejects service
-and container workloads.
+resource, network, timer, service, or container requests. The provider-default
+network mode, omitted or explicit, is not a request and needs no descriptor
+entry. Descriptor `timers` lists each enforced timer (`auto_stop`,
+`auto_archive`, `auto_delete`, `ttl`) separately; a request for an unlisted timer
+is `Unsupported`. Host rejects service and container workloads.
 
 ## Lifecycle, fences, and uncertainty
 
@@ -314,3 +315,40 @@ status tolerance and redaction. The existing core/provider/protocol suites must
 continue to pass. These declaration tests are not provider conformance evidence:
 integration tests must exercise actual Host plugin, Docker and Daytona
 behavior before any consumer cutover or legacy removal.
+
+### Provider interface implementation
+
+The additive provider boundary is exported from `sandbox_driver::contract`:
+
+- `ProviderFactory::discover(&PluginLocation)` receives only kind, path and
+  trust. The plugin adapter owns verification, bounded credential-free probing,
+  and caching by verified digest. Built-in factories return metadata directly.
+- `ProviderFactory::activate(Activation)` receives the selected entry name,
+  frozen connection/launch configuration, discovered schemas, resolved launch
+  environment and separate redacted `SecretValues`. It returns an
+  `Arc<dyn ProviderRuntime>`. Built-ins do not read ambient configuration.
+- `ProviderRuntime` supplies `describe`, `health`, `create(WorkloadAdmission)`,
+  `attach(&SandboxId)`, `list(&LabelFilter)`, `destroy(&SandboxId)` and `shutdown`.
+  The catalog checks namespace before routing attach/destroy. A runtime must
+  also prevent reconnect races from moving an admitted call to another
+  namespace, and invalidate old sandbox handles on generation changes.
+- `Sandbox` supplies reference/workload environment/workspace, status, start,
+  stop, exec, files and ports. Optional lifecycle, endpoints and containers
+  return `None` unless supported. All errors use `contract::Error`.
+- `ExecSpec`/`ExecControls`/`ExecOutcome` are distinct from the legacy exec API.
+  Controls carry one owned stdin reader, an awaited output sink, term/kill
+  tokens and a latest-value terminal resize receiver. `Files` transfers owned
+  byte streams, allowing adapters to keep bulk bytes off control connections.
+- `OneShotSpec` takes its own `OneShotImage`, never the workload `Source`: a
+  registry `image`, or a `build` from a context directory in the workload
+  workspace with an optional Dockerfile path, a tag that keys the build cache
+  and a `reuse` flag. Its command is an optional `entrypoint` plus `args`, not
+  exec argv, so arguments alone reach the image's own entrypoint.
+- `SandboxSpec::validate_for` and `Environment::validate` check portable
+  invariants and descriptor capabilities. They do not replace JSON Schema or
+  backend-specific validation. `WorkloadAdmission` separates credential values
+  from the persistable spec; providers must retain the admission for restart.
+
+These are implementation interfaces, not proof of provider conformance. The
+façade, schema engine, fake and new conformance scenarios are separate changes.
+Existing crate-root traits and protocol v2 are unchanged.
