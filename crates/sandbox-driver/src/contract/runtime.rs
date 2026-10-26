@@ -14,6 +14,7 @@ use super::{
     ProviderEntry, ProviderName, ProviderSchemas, SandboxRef, SandboxSpec, SandboxState, Source,
     Status,
 };
+use crate::redact::EnvKeys;
 use crate::{FileKind, ProviderKind, SandboxId};
 
 /// Streaming bytes with bounded buffering owned by the provider/adapter.
@@ -69,12 +70,20 @@ pub struct Activation {
 
 impl fmt::Debug for Activation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            name,
+            entry,
+            schemas,
+            environment,
+            secrets,
+        } = self;
         f.debug_struct("Activation")
-            .field("name", &self.name)
-            .field("entry", &self.entry)
-            .field("environment", &"<redacted>")
-            .field("secrets", &self.secrets)
-            .finish_non_exhaustive()
+            .field("name", name)
+            .field("entry", entry)
+            .field("schemas", schemas)
+            .field("environment_keys", &EnvKeys(environment))
+            .field("secrets", secrets)
+            .finish()
     }
 }
 
@@ -248,15 +257,14 @@ pub struct OneShotSpec {
 
 impl OneShotSpec {
     pub fn validate(&self) -> Result<(), Error> {
-        match &self.source {
-            Source::Image(value) | Source::Dockerfile(value) if !value.trim().is_empty() => {
-                self.exec.validate()
-            }
-            _ => Err(Error::invalid_spec(
+        if !matches!(self.source, Source::Image(_) | Source::Dockerfile(_)) {
+            return Err(Error::invalid_spec(
                 "source",
-                "one-shot requires a non-empty image or Dockerfile",
-            )),
+                "one-shot requires an image or Dockerfile",
+            ));
         }
+        self.source.validate()?;
+        self.exec.validate()
     }
 }
 

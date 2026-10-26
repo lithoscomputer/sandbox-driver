@@ -14,6 +14,7 @@ fn descriptor() -> Descriptor {
 
 #[test]
 fn unsupported_requests_are_refused_even_when_false_or_zero() {
+    let descriptor = descriptor();
     for (field, request) in [
         ("container.init", json!({"container":{"init":false}})),
         (
@@ -65,7 +66,7 @@ fn unsupported_requests_are_refused_even_when_false_or_zero() {
             .extend(request.as_object().expect("object").clone());
         let spec: SandboxSpec = serde_json::from_value(value).expect("spec");
         assert_eq!(
-            spec.validate_for(&descriptor()),
+            spec.validate_for(&descriptor),
             Err(Error::Unsupported {
                 capability: field.into(),
             })
