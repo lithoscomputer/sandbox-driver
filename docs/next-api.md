@@ -523,9 +523,8 @@ and scripted streaming execution surface. Use `FakeProvider::script` to define
 command responses and `FakeProvider::sandboxes` to retain access to its call log.
 Unscripted commands fail; no command executes on the host. It advertises no
 optional services, container, endpoint, lifecycle-extension or port capabilities.
-The reusable conformance suite is a separate follow-up. Optional workload and
-provider restart/failure scenarios remain integration gates, not claims made by
-the fake.
+The common conformance checks run against it; optional workload and provider
+restart/failure scenarios remain integration gates, not claims made by the fake.
 
 ## CLI
 
@@ -591,3 +590,10 @@ entry/identity ordering. Equal duplicate refs collapse; conflicting duplicate
 refs or foreign refs invalidate that entry's batch. Different entry aliases
 remain different refs. `unavailable` includes all failed entries and `failures`
 retains the structured reason; neither implies absence or authorizes replay.
+
+The common new-contract suite is
+`sandbox_driver_conformance::contract::Conformance`. It accepts a catalog,
+environment, and two command fixtures, and checks identity/inventory, binary
+file ranges and preservation, streamed output, stop/start fencing and confirmed
+cleanup. It reports its executed checks explicitly. Passing it alone is not
+provider-ready certification for optional workloads, crash recovery or transport.
