@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, btree_map};
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
@@ -7,14 +7,14 @@ use std::time::Duration;
 use std::{env, fmt};
 
 use async_trait::async_trait;
-use futures_util::{StreamExt, stream};
+use futures_util::{StreamExt, future, stream};
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use tokio::{fs, time};
 
 use super::schema::Schemas;
-use super::workload::validate_env;
+use super::workload::{valid_env_key, validate_env, validate_name};
 use super::{
     Activation, Descriptor, Environment, EnvironmentName, EnvironmentSource, Error, Health,
     LabelFilter, MutationOutcome, NetworkPolicy, PluginLocation, ProviderEntry, ProviderFactory,
@@ -106,11 +106,9 @@ impl EnvironmentSource for StaticEnvironments {
         Ok(self.0.keys().cloned().collect())
     }
     async fn get(&self, name: &str) -> Result<Option<Environment>, Error> {
-        Ok(self
-            .0
-            .iter()
-            .find(|(key, _)| key.as_str() == name)
-            .map(|(_, value)| value.clone()))
+        Ok(EnvironmentName::try_new(name)
+            .ok()
+            .and_then(|name| self.0.get(&name).cloned()))
     }
 }
 
@@ -132,12 +130,13 @@ struct Entry {
 }
 
 struct Catalog {
-    entries:         BTreeMap<ProviderName, Arc<Entry>>,
-    environments:    Arc<dyn EnvironmentSource>,
-    secrets:         Arc<dyn SecretResolver>,
-    options:         CatalogOptions,
-    closed:          AtomicBool,
-    shutdown_result: Mutex<Option<Result<(), Error>>>,
+    entries:          BTreeMap<ProviderName, Arc<Entry>>,
+    environments:     Arc<dyn EnvironmentSource>,
+    secrets:          Arc<dyn SecretResolver>,
+    find_concurrency: NonZeroUsize,
+    find_timeout:     Duration,
+    closed:           AtomicBool,
+    shutdown_result:  OnceCell<Result<(), Error>>,
 }
 
 /// Immutable provider bindings with fresh environment snapshots per builder.
@@ -156,16 +155,27 @@ impl Sandboxes {
         secrets: Arc<dyn SecretResolver>,
         options: CatalogOptions,
     ) -> Result<Self, Error> {
+        // The ambient snapshot is only needed to build launch environments.
+        let CatalogOptions {
+            environment: ambient,
+            find_concurrency,
+            find_timeout,
+        } = options;
         let mut entries = BTreeMap::new();
         for (name, config) in providers {
             if entries.contains_key(&name) {
-                return Err(invalid(&name, "provider", "duplicate provider entry"));
+                return Err(Error::invalid_config(
+                    &name,
+                    "provider",
+                    "duplicate provider entry",
+                ));
             }
-            let environment = launch_environment(&config, &options.environment);
+            let environment = launch_environment(&config, &ambient);
             let local_error = validate_entry(&name, &config)
                 .and_then(|()| {
-                    validate_env("env", &environment)
-                        .map_err(|_| invalid(&name, "inherit_env", "invalid inherited environment"))
+                    validate_env("env", &environment).map_err(|_| {
+                        Error::invalid_config(&name, "inherit_env", "invalid inherited environment")
+                    })
                 })
                 .err();
             let factory = registry.factory(&config);
@@ -186,9 +196,10 @@ impl Sandboxes {
                 entries,
                 environments,
                 secrets,
-                options,
+                find_concurrency,
+                find_timeout,
                 closed: AtomicBool::new(false),
-                shutdown_result: Mutex::new(None),
+                shutdown_result: OnceCell::new(),
             }),
         })
     }
@@ -232,15 +243,23 @@ impl Sandboxes {
     pub fn provider(&self, name: &str) -> Result<ProviderHandle, Error> {
         let name = ProviderName::try_new(name)
             .map_err(|_| Error::invalid_spec("provider", "invalid provider entry name"))?;
+        self.handle(&name)
+    }
+    fn handle(&self, name: &ProviderName) -> Result<ProviderHandle, Error> {
         let entry = self
             .catalog
             .entries
-            .get(&name)
-            .ok_or(Error::NoProvider { entry: name })?;
-        Ok(ProviderHandle {
+            .get(name)
+            .ok_or_else(|| Error::NoProvider {
+                entry: name.clone(),
+            })?;
+        Ok(self.bind(entry))
+    }
+    fn bind(&self, entry: &Arc<Entry>) -> ProviderHandle {
+        ProviderHandle {
             catalog: Arc::clone(&self.catalog),
             entry:   Arc::clone(entry),
-        })
+        }
     }
     /// Snapshot local configuration diagnostics without probing any provider.
     /// Mutable environment references are checked against the current source.
@@ -287,7 +306,7 @@ impl Sandboxes {
     /// builder's spec or its provider binding. No provider is started here.
     pub async fn builder(&self, environment: &str) -> Result<SandboxBuilder, Error> {
         let environment = self.environment(environment).await?;
-        let provider = self.provider(environment.provider.as_str())?;
+        let provider = self.handle(&environment.provider)?;
         Ok(SandboxBuilder {
             provider,
             spec: environment.spec,
@@ -295,22 +314,30 @@ impl Sandboxes {
         })
     }
     pub async fn attach(&self, reference: &SandboxRef) -> Result<Box<dyn Sandbox>, Error> {
-        let provider = self.provider(reference.provider.as_str())?;
-        let active = provider.active().await?;
-        let descriptor = provider.checked_descriptor(&active).await?;
-        reference.check_namespace(&descriptor.namespace.id)?;
-        let sandbox = active.runtime.attach(&reference.id).await?;
+        let sandbox = self
+            .route(reference)
+            .await?
+            .runtime
+            .attach(&reference.id)
+            .await?;
         if sandbox.reference() != *reference {
             return Err(transport("attach returned a different sandbox reference"));
         }
         Ok(sandbox)
     }
     pub async fn destroy(&self, reference: &SandboxRef) -> Result<(), Error> {
-        let provider = self.provider(reference.provider.as_str())?;
-        let active = provider.active().await?;
-        let descriptor = provider.checked_descriptor(&active).await?;
+        self.route(reference)
+            .await?
+            .runtime
+            .destroy(&reference.id)
+            .await
+    }
+    /// Uses the reference's saved entry and refuses a changed namespace
+    /// before anything is dispatched.
+    async fn route(&self, reference: &SandboxRef) -> Result<Arc<Active>, Error> {
+        let (active, descriptor) = self.handle(&reference.provider)?.ready().await?;
         reference.check_namespace(&descriptor.namespace.id)?;
-        active.runtime.destroy(&reference.id).await
+        Ok(active)
     }
     /// Every entry is attempted, at most the configured number concurrently.
     /// Per-entry timeout/errors are explicit failures; successful entries
@@ -319,30 +346,28 @@ impl Sandboxes {
     /// separate identities.
     pub async fn find(&self, filter: LabelFilter) -> Result<Found, Error> {
         self.catalog.ensure_open()?;
-        let handles = self
-            .providers()
-            .iter()
-            .map(|name| self.provider(name.as_str()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let results = stream::iter(handles)
-            .map(|handle| {
+        let mut results = stream::iter(self.catalog.entries.values())
+            .map(|entry| {
+                let handle = self.bind(entry);
                 let filter = &filter;
                 async move {
-                    let result =
-                        time::timeout(self.catalog.options.find_timeout, handle.list(filter))
-                            .await
-                            .unwrap_or_else(|_| {
-                                Err(unavailable(
-                                    "inventory deadline elapsed",
-                                    MutationOutcome::NotStarted,
-                                ))
-                            });
+                    let result = time::timeout(self.catalog.find_timeout, handle.list(filter))
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(unavailable(
+                                "inventory deadline elapsed",
+                                MutationOutcome::NotStarted,
+                            ))
+                        });
                     (handle.entry.name.clone(), result)
                 }
             })
-            .buffer_unordered(self.catalog.options.find_concurrency.get())
+            .buffer_unordered(self.catalog.find_concurrency.get())
             .collect::<Vec<_>>()
             .await;
+        // Each entry's matches share its provider and namespace and arrive
+        // sorted by id, so ordering by entry orders every field by identity.
+        results.sort_by(|left, right| left.0.cmp(&right.0));
         let mut found = Found::default();
         for (entry, result) in results {
             match result {
@@ -353,44 +378,28 @@ impl Sandboxes {
                 }
             }
         }
-        found.sandboxes.sort_by(|left, right| {
-            (
-                &left.reference.provider,
-                &left.reference.namespace,
-                &left.reference.id,
-            )
-                .cmp(&(
-                    &right.reference.provider,
-                    &right.reference.namespace,
-                    &right.reference.id,
-                ))
-        });
-        found.unavailable.sort();
-        found
-            .failures
-            .sort_by(|left, right| left.entry.cmp(&right.entry));
         Ok(found)
     }
     /// Closes this catalog and all its clones. All activated entries are tried
     /// even when one fails. No unused entry is started to shut it down.
     pub async fn shutdown(self) -> Result<(), Error> {
         self.catalog.closed.store(true, Ordering::Release);
-        let mut result = self.catalog.shutdown_result.lock().await;
-        if let Some(result) = result.as_ref() {
-            return result.clone();
-        }
-        let mut first_error = None;
-        for entry in self.catalog.entries.values() {
-            let active = entry.active.lock().await;
-            if let Some(active) = active.as_ref() {
-                if let Err(error) = active.runtime.shutdown().await {
-                    first_error.get_or_insert(error);
-                }
-            }
-        }
-        let completed = first_error.map_or(Ok(()), Err);
-        *result = Some(completed.clone());
-        completed
+        self.catalog
+            .shutdown_result
+            .get_or_init(|| async {
+                let results =
+                    future::join_all(self.catalog.entries.values().map(|entry| async move {
+                        match entry.active.lock().await.as_ref() {
+                            Some(active) => active.runtime.shutdown().await,
+                            None => Ok(()),
+                        }
+                    }))
+                    .await;
+                // Every entry was tried; report the first failure by name.
+                results.into_iter().collect()
+            })
+            .await
+            .clone()
     }
 }
 
@@ -437,14 +446,14 @@ impl ProviderHandle {
             })
             .await?;
         if metadata.kind != entry.plugin {
-            return Err(invalid(
+            return Err(Error::invalid_config(
                 &self.entry.name,
                 "plugin",
                 "metadata kind differs from configured plugin",
             ));
         }
         let schemas = Schemas::compile(&self.entry.name, &metadata)?;
-        schemas.config(&self.entry.name, &object(&entry.config))?;
+        schemas.config(&self.entry.name, &entry.config)?;
         for name in &metadata.secrets {
             if !entry.secrets.contains(name) {
                 return Err(Error::MissingSecret {
@@ -463,19 +472,24 @@ impl ProviderHandle {
                 secrets,
             })
             .await?;
-        let descriptor = match runtime.describe().await {
-            Ok(descriptor) if descriptor.schemas == metadata => descriptor,
-            result => {
+        let checked = runtime.describe().await.and_then(|descriptor| {
+            if descriptor.schemas == metadata {
+                Ok(descriptor)
+            } else {
+                Err(Error::invalid_config(
+                    &self.entry.name,
+                    "schemas",
+                    "runtime metadata disagrees with discovery",
+                ))
+            }
+        });
+        let descriptor = match checked {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
                 // Activation admitted no sandbox mutations. Cleanup is awaited;
                 // preserve an honest cleanup failure over the metadata error.
                 runtime.shutdown().await?;
-                return Err(result.err().unwrap_or_else(|| {
-                    invalid(
-                        &self.entry.name,
-                        "schemas",
-                        "runtime metadata disagrees with discovery",
-                    )
-                }));
+                return Err(error);
             }
         };
         let initialized = Arc::new(Active {
@@ -505,7 +519,7 @@ impl ProviderHandle {
                         name:  name.clone(),
                     })?;
             if value.contains('\0') {
-                return Err(invalid(
+                return Err(Error::invalid_config(
                     &self.entry.name,
                     "secrets",
                     "secret value contains NUL",
@@ -515,7 +529,10 @@ impl ProviderHandle {
         }
         Ok(SecretValues::new(values))
     }
-    async fn checked_descriptor(&self, active: &Active) -> Result<Descriptor, Error> {
+    /// Activates the entry and confirms its metadata and namespace still match
+    /// what activation saw. Every operation passes through here first.
+    async fn ready(&self) -> Result<(Arc<Active>, Descriptor), Error> {
+        let active = self.active().await?;
         self.catalog.ensure_open()?;
         let descriptor = active.runtime.describe().await?;
         if descriptor.schemas != active.descriptor.schemas {
@@ -527,28 +544,33 @@ impl ProviderHandle {
                 actual:   descriptor.namespace.id,
             });
         }
-        Ok(descriptor)
+        Ok((active, descriptor))
+    }
+    /// Portable checks run before activation, so an invalid spec starts
+    /// nothing; provider checks follow. Credentials are not resolved here.
+    async fn admit(&self, spec: &SandboxSpec) -> Result<(Arc<Active>, Descriptor), Error> {
+        spec.validate()?;
+        let (active, descriptor) = self.ready().await?;
+        spec.validate_for(&descriptor)?;
+        active.schemas.spec(&spec.provider_config)?;
+        Ok((active, descriptor))
     }
     pub async fn describe(&self) -> Result<Descriptor, Error> {
-        let active = self.active().await?;
-        self.checked_descriptor(&active).await
+        Ok(self.ready().await?.1)
     }
     /// Validates a proposed template/override without admitting a workload or
     /// resolving service credentials. Explicit inspection may activate the
     /// entry.
     pub async fn validate_spec(&self, spec: &SandboxSpec) -> Result<(), Error> {
-        spec.validate()?;
-        let active = self.active().await?;
-        spec.validate_for(&self.checked_descriptor(&active).await?)?;
-        active.schemas.spec(&object(&spec.provider_config))
+        self.admit(spec).await?;
+        Ok(())
     }
 
     pub async fn health(&self) -> Result<Health, Error> {
         self.active().await?.runtime.health().await
     }
     async fn list(&self, filter: &LabelFilter) -> Result<Vec<SandboxSummary>, Error> {
-        let active = self.active().await?;
-        let descriptor = self.checked_descriptor(&active).await?;
+        let (active, descriptor) = self.ready().await?;
         let matches = active.runtime.list(filter).await?;
         let mut unique = BTreeMap::new();
         for summary in matches {
@@ -560,12 +582,16 @@ impl ProviderHandle {
                     "inventory returned a mismatched reference or labels",
                 ));
             }
-            if let Some(previous) = unique.insert(summary.reference.id.clone(), summary.clone()) {
-                if previous != summary {
+            match unique.entry(summary.reference.id.clone()) {
+                btree_map::Entry::Vacant(slot) => {
+                    slot.insert(summary);
+                }
+                btree_map::Entry::Occupied(slot) if *slot.get() != summary => {
                     return Err(transport(
                         "inventory returned conflicting duplicate references",
                     ));
                 }
+                btree_map::Entry::Occupied(_) => {}
             }
         }
         Ok(unique.into_values().collect())
@@ -651,27 +677,27 @@ impl SandboxBuilder {
     }
     #[must_use]
     pub fn memory(mut self, value: &str) -> Self {
-        match parse_size_mib(value).ok().and_then(NonZeroU64::new) {
-            Some(value) => self.spec.resources.memory_mb = Some(value),
-            None => {
-                self.error.get_or_insert_with(|| {
-                    Error::invalid_spec("resources.memory", "requires a positive size with units")
-                });
-            }
+        if let Some(size) = self.size("resources.memory", value) {
+            self.spec.resources.memory_mb = Some(size);
         }
         self
     }
     #[must_use]
     pub fn disk(mut self, value: &str) -> Self {
-        match parse_size_mib(value).ok().and_then(NonZeroU64::new) {
-            Some(value) => self.spec.resources.disk_mb = Some(value),
-            None => {
-                self.error.get_or_insert_with(|| {
-                    Error::invalid_spec("resources.disk", "requires a positive size with units")
-                });
-            }
+        if let Some(size) = self.size("resources.disk", value) {
+            self.spec.resources.disk_mb = Some(size);
         }
         self
+    }
+    /// The first invalid size is kept as a deferred admission error.
+    fn size(&mut self, path: &str, value: &str) -> Option<NonZeroU64> {
+        let size = parse_size_mib(value).ok().and_then(NonZeroU64::new);
+        if size.is_none() {
+            self.error.get_or_insert_with(|| {
+                Error::invalid_spec(path, "requires a positive size with units")
+            });
+        }
+        size
     }
     /// Merges opaque keys; the selected provider's spec_schema validates them.
     #[must_use]
@@ -686,11 +712,7 @@ impl SandboxBuilder {
         if let Some(error) = self.error {
             return Err(error);
         }
-        self.spec.validate()?;
-        let active = self.provider.active().await?;
-        let descriptor = self.provider.checked_descriptor(&active).await?;
-        self.spec.validate_for(&descriptor)?;
-        active.schemas.spec(&object(&self.spec.provider_config))?;
+        let (active, descriptor) = self.provider.admit(&self.spec).await?;
         let credentials = self
             .provider
             .resolve_secrets(
@@ -721,16 +743,6 @@ impl SandboxBuilder {
     }
 }
 
-fn object(value: &BTreeMap<String, Value>) -> Value {
-    Value::Object(value.clone().into_iter().collect())
-}
-fn invalid(entry: &ProviderName, path: &str, message: &str) -> Error {
-    Error::InvalidConfig {
-        entry:   entry.clone(),
-        path:    path.into(),
-        message: message.into(),
-    }
-}
 fn transport(message: &str) -> Error {
     Error::Transport {
         message: message.into(),
@@ -743,22 +755,19 @@ fn unavailable(message: &str, outcome: MutationOutcome) -> Error {
         outcome,
     }
 }
-fn valid_env_name(name: &str) -> bool {
-    !name.is_empty() && !name.contains(['=', '\0'])
-}
 fn validate_entry(name: &ProviderName, entry: &ProviderEntry) -> Result<(), Error> {
     validate_env("env", &entry.env)
-        .map_err(|_| invalid(name, "env", "invalid launch environment"))?;
+        .map_err(|_| Error::invalid_config(name, "env", "invalid launch environment"))?;
     let secrets: HashSet<_> = entry.secrets.iter().collect();
-    if secrets.len() != entry.secrets.len() || secrets.iter().any(|key| !valid_env_name(key)) {
-        return Err(invalid(
+    if secrets.len() != entry.secrets.len() || secrets.iter().any(|key| !valid_env_key(key)) {
+        return Err(Error::invalid_config(
             name,
             "secrets",
             "secret names must be unique valid environment keys",
         ));
     }
     if entry.env.keys().any(|key| secrets.contains(key)) {
-        return Err(invalid(
+        return Err(Error::invalid_config(
             name,
             "env",
             "explicit environment conflicts with a secret name",
@@ -767,17 +776,21 @@ fn validate_entry(name: &ProviderName, entry: &ProviderEntry) -> Result<(), Erro
     if entry
         .inherit_env
         .as_ref()
-        .is_some_and(|names| names.iter().any(|name| !valid_env_name(name)))
+        .is_some_and(|names| names.iter().any(|name| !valid_env_key(name)))
     {
-        return Err(invalid(name, "inherit_env", "invalid environment key"));
+        return Err(Error::invalid_config(
+            name,
+            "inherit_env",
+            "invalid environment key",
+        ));
     }
     if entry.args.iter().any(|arg| arg.contains('\0'))
         || entry
             .path
-            .as_ref()
-            .is_some_and(|path| path.is_empty() || path.contains('\0'))
+            .as_deref()
+            .is_some_and(|path| validate_name("path", path).is_err())
     {
-        return Err(invalid(
+        return Err(Error::invalid_config(
             name,
             "launch",
             "invalid executable path or argument",

@@ -35,8 +35,8 @@ pub(super) struct Factory {
     pub(super) mutations:      AtomicUsize,
     pub(super) discovery:      AtomicUsize,
     pub(super) list_delay:     Duration,
-    pub(super) inflight:       Arc<AtomicUsize>,
-    pub(super) peak:           Arc<AtomicUsize>,
+    pub(super) inflight:       AtomicUsize,
+    pub(super) peak:           AtomicUsize,
 }
 impl Default for Factory {
     fn default() -> Self {
@@ -52,8 +52,8 @@ impl Default for Factory {
             mutations:      AtomicUsize::new(0),
             discovery:      AtomicUsize::new(0),
             list_delay:     Duration::ZERO,
-            inflight:       Arc::new(AtomicUsize::new(0)),
-            peak:           Arc::new(AtomicUsize::new(0)),
+            inflight:       AtomicUsize::new(0),
+            peak:           AtomicUsize::new(0),
         }
     }
 }
@@ -106,14 +106,14 @@ impl ProviderRuntime for Runtime {
         self.runtime.destroy(id).await
     }
     async fn list(&self, filter: &LabelFilter) -> Result<Vec<SandboxSummary>, Error> {
-        struct Guard(Arc<AtomicUsize>);
-        impl Drop for Guard {
+        struct Guard<'a>(&'a AtomicUsize);
+        impl Drop for Guard<'_> {
             fn drop(&mut self) {
                 self.0.fetch_sub(1, Ordering::SeqCst);
             }
         }
         let count = self.factory.inflight.fetch_add(1, Ordering::SeqCst) + 1;
-        let _guard = Guard(Arc::clone(&self.factory.inflight));
+        let _guard = Guard(&self.factory.inflight);
         self.factory.peak.fetch_max(count, Ordering::SeqCst);
         time::sleep(self.factory.list_delay).await;
         if let Some(result) = self.factory.list_results.lock().await.as_ref() {
@@ -160,12 +160,19 @@ pub(super) fn options() -> CatalogOptions {
     }
 }
 pub(super) fn catalog(factory: &Arc<Factory>) -> Sandboxes {
+    catalog_with(factory, [(name("entry"), entry())], options())
+}
+pub(super) fn catalog_with(
+    factory: &Arc<Factory>,
+    providers: impl IntoIterator<Item = (ProviderName, ProviderEntry)>,
+    options: CatalogOptions,
+) -> Sandboxes {
     Sandboxes::try_new(
-        [(name("entry"), entry())],
+        providers,
         environments(),
         &registry(factory),
         Arc::new(Secrets::default()),
-        options(),
+        options,
     )
     .expect("catalog")
 }

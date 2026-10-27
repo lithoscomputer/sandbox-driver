@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::io;
 
@@ -36,34 +37,40 @@ impl Schemas {
         })
     }
 
-    pub(super) fn config(&self, entry: &ProviderName, value: &Value) -> Result<(), Error> {
-        self.config
-            .validate(value)
-            .map_err(|error| Error::InvalidConfig {
-                entry:   entry.clone(),
-                path:    format!("config{}", error.instance_path()),
+    pub(super) fn config(
+        &self,
+        entry: &ProviderName,
+        config: &BTreeMap<String, Value>,
+    ) -> Result<(), Error> {
+        self.config.validate(&object(config)).map_err(|error| {
+            Error::invalid_config(
+                entry,
+                format!("config{}", error.instance_path()),
                 // Engine diagnostics contain instance values, including secrets.
-                message: "does not satisfy provider config_schema".into(),
-            })
+                "does not satisfy provider config_schema",
+            )
+        })
     }
 
-    pub(super) fn spec(&self, value: &Value) -> Result<(), Error> {
+    pub(super) fn spec(&self, provider_config: &BTreeMap<String, Value>) -> Result<(), Error> {
         if let Some(schema) = &self.spec {
-            schema.validate(value).map_err(|error| Error::InvalidSpec {
-                path:    format!("provider_config{}", error.instance_path()),
-                message: "does not satisfy provider spec_schema".into(),
+            schema.validate(&object(provider_config)).map_err(|error| {
+                Error::invalid_spec(
+                    format!("provider_config{}", error.instance_path()),
+                    "does not satisfy provider spec_schema",
+                )
             })?;
         }
         Ok(())
     }
 }
 
+fn object(map: &BTreeMap<String, Value>) -> Value {
+    Value::Object(map.clone().into_iter().collect())
+}
+
 fn compile(entry: &ProviderName, path: &str, schema: &JsonSchema) -> Result<Validator, Error> {
-    let invalid = |message: &str| Error::InvalidConfig {
-        entry:   entry.clone(),
-        path:    path.into(),
-        message: message.into(),
-    };
+    let invalid = |message: &str| Error::invalid_config(entry, path, message);
     let draft = match schema.get("$schema").and_then(Value::as_str) {
         Some("http://json-schema.org/draft-07/schema#") => Draft::Draft7,
         Some("https://json-schema.org/draft/2019-09/schema") => Draft::Draft201909,
@@ -77,6 +84,6 @@ fn compile(entry: &ProviderName, path: &str, schema: &JsonSchema) -> Result<Vali
     jsonschema::options()
         .with_draft(draft)
         .with_retriever(NoExternalReferences)
-        .build(&Value::Object(schema.clone().into_iter().collect()))
+        .build(&object(schema))
         .map_err(|_| invalid("invalid schema or unresolved external reference"))
 }
