@@ -4,7 +4,7 @@ mod support;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -143,14 +143,7 @@ async fn config_and_spec_schemas_are_separate_and_rejections_precede_create() {
     config
         .config
         .insert("endpoint".into(), json!("secret-endpoint"));
-    let catalog = Sandboxes::try_new(
-        [(name("entry"), config)],
-        environments(),
-        &registry(&factory),
-        Arc::new(Secrets::default()),
-        options(),
-    )
-    .expect("catalog");
+    let catalog = catalog_with(&factory, [(name("entry"), config)], options());
     catalog
         .provider("entry")
         .expect("entry")
@@ -249,14 +242,7 @@ async fn secret_env_conflict_is_local_and_empty_inheritance_is_empty() {
     clean.inherit_env = Some(vec![]);
     let mut opts = options();
     opts.environment.insert("PATH".into(), "ambient".into());
-    let catalog = Sandboxes::try_new(
-        [(name("entry"), clean), (name("bad"), bad)],
-        environments(),
-        &registry(&factory),
-        Arc::new(Secrets::default()),
-        opts,
-    )
-    .expect("catalog");
+    let catalog = catalog_with(&factory, [(name("entry"), clean), (name("bad"), bad)], opts);
     assert!(matches!(
         catalog.provider("bad").expect("entry").describe().await,
         Err(Error::InvalidConfig { .. })
@@ -272,25 +258,18 @@ async fn secret_env_conflict_is_local_and_empty_inheritance_is_empty() {
 
 #[tokio::test(start_paused = true)]
 async fn inventory_is_bounded_and_timeouts_leave_other_results_usable() {
-    let peak = Arc::new(AtomicUsize::new(0));
-    let inflight = Arc::new(AtomicUsize::new(0));
     let factory = Arc::new(Factory {
         list_delay: Duration::from_secs(1),
-        peak: peak.clone(),
-        inflight: inflight.clone(),
         ..Factory::default()
     });
     let mut opts = options();
     opts.find_concurrency = NonZeroUsize::new(2).expect("nonzero");
     opts.find_timeout = Duration::from_secs(10);
-    let catalog = Sandboxes::try_new(
+    let catalog = catalog_with(
+        &factory,
         (0..5).map(|n| (name(&format!("entry{n}")), entry())),
-        environments(),
-        &registry(&factory),
-        Arc::new(Secrets::default()),
         opts,
-    )
-    .expect("catalog");
+    );
     assert!(
         catalog
             .find(LabelFilter::default())
@@ -299,13 +278,16 @@ async fn inventory_is_bounded_and_timeouts_leave_other_results_usable() {
             .failures
             .is_empty()
     );
-    assert_eq!(peak.load(Ordering::SeqCst), 2);
-    assert_eq!(inflight.load(Ordering::SeqCst), 0);
+    assert_eq!(factory.peak.load(Ordering::SeqCst), 2);
+    assert_eq!(factory.inflight.load(Ordering::SeqCst), 0);
     let slow = Arc::new(Factory {
         list_delay: Duration::from_secs(60),
         ..Factory::default()
     });
-    let catalog = catalog_for_timeout(&slow);
+    let catalog = catalog_with(&slow, [(name("entry"), entry())], CatalogOptions {
+        find_timeout: Duration::from_secs(1),
+        ..options()
+    });
     let found = catalog
         .find(LabelFilter::default())
         .await
@@ -313,19 +295,6 @@ async fn inventory_is_bounded_and_timeouts_leave_other_results_usable() {
     assert_eq!(found.unavailable, vec![name("entry")]);
     assert!(matches!(found.failures[0].error, Error::Unavailable { .. }));
     assert_eq!(slow.inflight.load(Ordering::SeqCst), 0);
-}
-fn catalog_for_timeout(factory: &Arc<Factory>) -> Sandboxes {
-    Sandboxes::try_new(
-        [(name("entry"), entry())],
-        environments(),
-        &registry(factory),
-        Arc::new(Secrets::default()),
-        CatalogOptions {
-            find_timeout: Duration::from_secs(1),
-            ..options()
-        },
-    )
-    .expect("catalog")
 }
 
 #[tokio::test]
@@ -424,14 +393,11 @@ async fn inventory_preserves_successes_beside_missing_provider() {
     let factory = Arc::new(Factory::default());
     let unavailable: ProviderEntry =
         serde_json::from_value(json!({"plugin":"missing"})).expect("entry");
-    let catalog = Sandboxes::try_new(
+    let catalog = catalog_with(
+        &factory,
         [(name("entry"), entry()), (name("offline"), unavailable)],
-        environments(),
-        &registry(&factory),
-        Arc::new(Secrets::default()),
         options(),
-    )
-    .expect("catalog");
+    );
     let sandbox = catalog
         .builder("test")
         .await
@@ -562,14 +528,7 @@ async fn explicit_plugin_trust_never_falls_back_to_a_same_kind_builtin() {
     let factory = Arc::new(Factory::default());
     let mut configured = entry();
     configured.trust = Some(PluginTrust::Development);
-    let catalog = Sandboxes::try_new(
-        [(name("entry"), configured)],
-        environments(),
-        &registry(&factory),
-        Arc::new(Secrets::default()),
-        options(),
-    )
-    .expect("cold catalog");
+    let catalog = catalog_with(&factory, [(name("entry"), configured)], options());
     assert!(matches!(
         catalog.provider("entry").expect("entry").describe().await,
         Err(Error::Unavailable { .. })
