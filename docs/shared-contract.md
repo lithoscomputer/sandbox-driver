@@ -355,8 +355,9 @@ Existing crate-root traits and protocol v2 are unchanged.
 
 ### Scripted fake provider
 
-`contract::FakeProvider` implements the provider factory/runtime boundary in
-memory. `script` supplies command responses; unscripted commands fail without
+`sandbox_driver_testing::contract::FakeProvider` implements the provider factory/runtime boundary in
+memory. Consumers use `sandbox-driver-testing` as a dev-dependency; the core
+library exports no fake. `script` supplies command responses; unscripted commands fail without
 executing on the host. Clones share workload state and call history. The fake
 supports required lifecycle, identity, files and streaming execution, and
 advertises no optional workload capabilities. Its focused tests exercise

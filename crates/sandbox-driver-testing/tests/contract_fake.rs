@@ -4,10 +4,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sandbox_driver::contract::{
-    Activation, Error, ExecControls, ExecSpec, FakeExec, FakeProvider, MutationOutcome, OutputSink,
-    ProviderFactory, ProviderName, ProviderRuntime, Sandbox, SandboxSpec, SandboxState,
-    SecretValues, Source, WorkloadAdmission,
+    Activation, Error, ExecControls, ExecSpec, MutationOutcome, OutputSink, ProviderFactory,
+    ProviderName, ProviderRuntime, Sandbox, SandboxSpec, SandboxState, SecretValues, Source,
+    WorkloadAdmission,
 };
+use sandbox_driver_testing::contract::{FakeExec, FakeProvider};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio::time;
