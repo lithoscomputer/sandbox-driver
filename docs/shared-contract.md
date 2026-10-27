@@ -6,8 +6,8 @@ this document states the required behavior behind those shapes and the
 migration rules. It defines common data and required behavior for the next API. It does **not** claim the
 existing providers implement that behavior yet. The current crate-root traits,
 errors, specs, provider libraries, executables, and [protocol v2](protocol.md)
-remain supported during migration. No new transport, façade, fake, provider
-registration, or consumer cutover is introduced here.
+remain supported during migration. The scripted fake consumes these declarations; no new transport, façade,
+provider registration, or consumer cutover is introduced here.
 
 ## Compatibility boundary
 
@@ -350,5 +350,16 @@ The additive provider boundary is exported from `sandbox_driver::contract`:
   from the persistable spec; providers must retain the admission for restart.
 
 These are implementation interfaces, not proof of provider conformance. The
-façade, schema engine, fake and new conformance scenarios are separate changes.
+façade, schema engine and new conformance scenarios are separate changes.
 Existing crate-root traits and protocol v2 are unchanged.
+
+### Scripted fake provider
+
+`contract::FakeProvider` implements the provider factory/runtime boundary in
+memory. `script` supplies command responses; unscripted commands fail without
+executing on the host. Clones share workload state and call history. The fake
+supports required lifecycle, identity, files and streaming execution, and
+advertises no optional workload capabilities. Its focused tests exercise
+cancellation, shutdown uncertainty and workload-relative file paths directly
+through the provider interfaces. Catalog helpers and the reusable conformance
+suite are separate follow-ups.

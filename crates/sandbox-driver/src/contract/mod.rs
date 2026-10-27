@@ -10,6 +10,7 @@ mod config;
 mod descriptor;
 mod error;
 mod execution;
+mod fake;
 mod identity;
 mod runtime;
 mod status;
@@ -26,6 +27,7 @@ pub use error::{Error, MutationOutcome, RemainingResource};
 pub use execution::{
     ExecControls, ExecOutcome, ExecSpec, OutputSink, OutputStream, TerminalSize, Termination,
 };
+pub use fake::{FakeCall, FakeExec, FakeProvider};
 pub use identity::SandboxRef;
 pub use runtime::{
     Activation, ByteStream, Containers, Endpoints, Expose, Exposure, FileEntry, FileRange, Files,
