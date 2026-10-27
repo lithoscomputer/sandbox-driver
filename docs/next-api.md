@@ -112,8 +112,6 @@ impl Sandboxes {
         path: &Path, registry: &Registry, credentials: Arc<dyn SecretResolver>,
         options: CatalogOptions,
     ) -> Result<Self, Error>;
-    /// In-memory, for tests.
-    pub fn fake() -> Self;
 
     // Sandboxes
     pub async fn builder(&self, environment: &str) -> Result<SandboxBuilder, Error>;   // NoEnvironment if unknown
@@ -515,10 +513,11 @@ The suite also verifies that exec and files address the requested workload rathe
 ## Testing
 
 ```rust
-let sandboxes = Sandboxes::fake();
+let sandboxes = sandbox_driver_testing::contract::fake();
 ```
 
-The current fake implements the required in-memory lifecycle, identity, files,
+The fake lives in `sandbox-driver-testing`, which consumers add as a
+dev-dependency. It implements the required in-memory lifecycle, identity, files,
 and scripted streaming execution surface. Use `FakeProvider::script` to define
 command responses and `FakeProvider::sandboxes` to retain access to its call log.
 Unscripted commands fail; no command executes on the host. It advertises no

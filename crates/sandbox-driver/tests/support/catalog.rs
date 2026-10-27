@@ -6,6 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use sandbox_driver::SandboxId;
 use sandbox_driver::contract::*;
+use sandbox_driver_testing::contract::FakeProvider;
 use tokio::sync::Mutex;
 use tokio::time;
 

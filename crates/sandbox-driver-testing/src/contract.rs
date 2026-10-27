@@ -10,21 +10,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use sandbox_driver::contract::{
+    AccessScope, Activation, ByteStream, CapabilitySet, CatalogOptions, Descriptor, Durability,
+    Environment, EnvironmentName, Error, ExecControls, ExecOutcome, ExecSpec, Expose, Exposure,
+    FileEntry, FileRange, Files, Health, LabelFilter, Locality, MutationOutcome, Namespace,
+    NamespaceId, NamespaceScope, NetworkMode, OutputStream, PluginLocation, PortSupport, Ports,
+    ProviderEntry, ProviderFactory, ProviderName, ProviderRuntime, ProviderSchemas, Registry,
+    Sandbox, SandboxRef, SandboxSpec, SandboxState, SandboxSummary, Sandboxes, SecretResolver,
+    Source, SourceKind, StaticEnvironments, Status, Termination, WorkloadAdmission,
+};
+use sandbox_driver::{FileKind, Isolation, OutputLoss, ProviderKind, SandboxId};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
-
-use super::{
-    AccessScope, Activation, ByteStream, CapabilitySet, CatalogOptions, Descriptor, Durability,
-    Environment, EnvironmentName, Error, ExecControls, ExecOutcome, ExecSpec, Expose, Exposure,
-    FileEntry, FileRange, Files, Health, LabelFilter, Locality, MutationOutcome, Namespace,
-    NamespaceId, NamespaceScope, NetworkMode, PluginLocation, PortSupport, Ports, ProviderEntry,
-    ProviderFactory, ProviderName, ProviderRuntime, ProviderSchemas, Registry, Sandbox, SandboxRef,
-    SandboxSpec, SandboxState, SandboxSummary, Sandboxes, SecretResolver, Source, SourceKind,
-    StaticEnvironments, Status, Termination, WorkloadAdmission,
-};
-use crate::{FileKind, Isolation, OutputLoss, ProviderKind, SandboxId};
 
 static NEXT_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 
@@ -181,10 +180,9 @@ impl FakeProvider {
         .expect("valid fake catalog")
     }
 }
-impl Sandboxes {
-    pub fn fake() -> Self {
-        FakeProvider::new().sandboxes()
-    }
+/// Creates a catalog with a fresh in-memory fake and the `default` environment.
+pub fn fake() -> Sandboxes {
+    FakeProvider::new().sandboxes()
 }
 
 #[async_trait]
@@ -248,10 +246,10 @@ impl ProviderRuntime for Runtime {
         self.open()?;
         admission.spec.validate_for(&self.fake.descriptor())?;
         if !admission.spec.provider_config.is_empty() {
-            return Err(Error::invalid_spec(
-                "provider_config",
-                "fake accepts no options",
-            ));
+            return Err(Error::InvalidSpec {
+                path:    "provider_config".into(),
+                message: "fake accepts no options".into(),
+            });
         }
         let mut records = self.fake.inner.records.lock().await;
         if let Some(name) = &admission.spec.name {
@@ -354,10 +352,10 @@ impl ProviderRuntime for Runtime {
 impl Handle {
     fn path(&self, path: &str) -> Result<String, Error> {
         if path.is_empty() || path.contains('\0') {
-            return Err(Error::invalid_spec(
-                "path",
-                "requires a non-empty NUL-free workload path",
-            ));
+            return Err(Error::InvalidSpec {
+                path:    "path".into(),
+                message: "requires a non-empty NUL-free workload path".into(),
+            });
         }
         let joined = if path.starts_with('/') {
             path.to_owned()
@@ -508,14 +506,14 @@ impl Sandbox for Handle {
             }
             if let Some(sink) = controls.sink {
                 let stdout = if spec.tty {
-                    super::OutputStream::Terminal
+                    OutputStream::Terminal
                 } else {
-                    super::OutputStream::Stdout
+                    OutputStream::Stdout
                 };
                 let stderr = if spec.tty {
-                    super::OutputStream::Terminal
+                    OutputStream::Terminal
                 } else {
-                    super::OutputStream::Stderr
+                    OutputStream::Stderr
                 };
                 if !response.stdout.is_empty() {
                     sink(stdout, response.stdout).await?;
@@ -540,8 +538,8 @@ impl Sandbox for Handle {
             biased;
             () = self.closed.cancelled() => return Err(Error::Stale {outcome:MutationOutcome::Unknown}),
             () = stop.cancelled() => Termination::Killed,
-            () = crate::stop_signal(controls.kill.as_ref()) => Termination::Killed,
-            () = crate::stop_signal(controls.term.as_ref()) => Termination::Terminated,
+            () = sandbox_driver::stop_signal(controls.kill.as_ref()) => Termination::Killed,
+            () = sandbox_driver::stop_signal(controls.term.as_ref()) => Termination::Terminated,
             () = deadline => Termination::TimedOut,
             result = work => result?,
         };
