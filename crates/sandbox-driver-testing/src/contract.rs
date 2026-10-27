@@ -13,16 +13,18 @@ use async_trait::async_trait;
 use sandbox_driver::contract::{
     AccessScope, Activation, ByteStream, CapabilitySet, Descriptor, Durability, Error,
     ExecControls, ExecOutcome, ExecSpec, Expose, Exposure, FileEntry, FileRange, Files, Health,
-    LabelFilter, Locality, MutationOutcome, Namespace, NamespaceId, NamespaceScope, NetworkMode,
-    OutputStream, PluginLocation, PortSupport, Ports, ProviderFactory, ProviderName,
+    JsonSchema, LabelFilter, Locality, MutationOutcome, Namespace, NamespaceId, NamespaceScope,
+    NetworkMode, OutputStream, PluginLocation, PortSupport, Ports, ProviderFactory, ProviderName,
     ProviderRuntime, ProviderSchemas, Sandbox, SandboxRef, SandboxSpec, SandboxState,
     SandboxSummary, Source, SourceKind, Status, Termination, WorkloadAdmission,
 };
 use sandbox_driver::{FileKind, Isolation, OutputLoss, ProviderKind, SandboxId};
-use tokio::io::AsyncReadExt;
-use tokio::sync::{Mutex, RwLock};
+use tokio::io::{self, AsyncReadExt};
+use tokio::sync::{Mutex, RwLock, RwLockReadGuard};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
+
+use crate::fs;
 
 static NEXT_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 
@@ -49,11 +51,11 @@ pub struct FakeProvider {
     inner: Arc<FakeState>,
 }
 struct FakeState {
-    namespace: NamespaceId,
-    next_id:   AtomicU64,
-    records:   Mutex<BTreeMap<SandboxId, Arc<Record>>>,
-    calls:     Mutex<Vec<FakeCall>>,
-    scripts:   Mutex<BTreeMap<Vec<String>, FakeExec>>,
+    descriptor: Descriptor,
+    next_id:    AtomicU64,
+    records:    Mutex<BTreeMap<SandboxId, Arc<Record>>>,
+    calls:      Mutex<Vec<FakeCall>>,
+    scripts:    Mutex<BTreeMap<Vec<String>, FakeExec>>,
 }
 struct Runtime {
     fake:   FakeProvider,
@@ -85,17 +87,33 @@ impl Default for FakeProvider {
 }
 impl FakeProvider {
     pub fn new() -> Self {
+        let namespace = NamespaceId::try_new(format!(
+            "fake:{}",
+            NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed)
+        ))
+        .expect("generated namespace");
         Self {
             inner: Arc::new(FakeState {
-                namespace: NamespaceId::try_new(format!(
-                    "fake:{}",
-                    NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed)
-                ))
-                .expect("generated namespace"),
-                next_id:   AtomicU64::new(1),
-                records:   Mutex::new(BTreeMap::new()),
-                calls:     Mutex::new(Vec::new()),
-                scripts:   Mutex::new(BTreeMap::new()),
+                descriptor: Descriptor {
+                    schemas:      Self::schemas(),
+                    namespace:    Namespace {
+                        id:    namespace,
+                        scope: NamespaceScope::Process,
+                    },
+                    isolation:    Isolation::None,
+                    durability:   Durability::Process,
+                    access:       AccessScope::Shared,
+                    sources:      [SourceKind::Image].into(),
+                    locality:     Locality::default(),
+                    resources:    BTreeSet::default(),
+                    network:      [NetworkMode::ProviderDefault].into(),
+                    ports:        PortSupport::None,
+                    capabilities: CapabilitySet::default(),
+                },
+                next_id:    AtomicU64::new(1),
+                records:    Mutex::new(BTreeMap::new()),
+                calls:      Mutex::new(Vec::new()),
+                scripts:    Mutex::new(BTreeMap::new()),
             }),
         }
     }
@@ -114,27 +132,22 @@ impl FakeProvider {
         self.inner.calls.lock().await.clone()
     }
     pub fn schemas() -> ProviderSchemas {
-        ProviderSchemas { kind:ProviderKind::try_new("fake").expect("constant kind"), version:"1".into(),
-            config_schema:serde_json::from_value(serde_json::json!({"$schema":"https://json-schema.org/draft/2020-12/schema", "type":"object", "additionalProperties":false})).expect("constant schema"),
-            spec_schema:Some(serde_json::from_value(serde_json::json!({"$schema":"https://json-schema.org/draft/2020-12/schema", "type":"object", "additionalProperties":false})).expect("constant schema")), secrets:Vec::new() }
+        let closed: JsonSchema = serde_json::from_value(serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": false,
+        }))
+        .expect("constant schema");
+        ProviderSchemas {
+            kind:          ProviderKind::try_new("fake").expect("constant kind"),
+            version:       "1".into(),
+            config_schema: closed.clone(),
+            spec_schema:   Some(closed),
+            secrets:       Vec::new(),
+        }
     }
     pub fn descriptor(&self) -> Descriptor {
-        Descriptor {
-            schemas:      Self::schemas(),
-            namespace:    Namespace {
-                id:    self.inner.namespace.clone(),
-                scope: NamespaceScope::Process,
-            },
-            isolation:    Isolation::None,
-            durability:   Durability::Process,
-            access:       AccessScope::Shared,
-            sources:      [SourceKind::Image].into(),
-            locality:     Locality::default(),
-            resources:    BTreeSet::default(),
-            network:      [NetworkMode::ProviderDefault].into(),
-            ports:        PortSupport::None,
-            capabilities: CapabilitySet::default(),
-        }
+        self.inner.descriptor.clone()
     }
     async fn record(&self, operation: &str, id: Option<&SandboxId>) {
         self.inner.calls.lock().await.push(FakeCall {
@@ -160,15 +173,15 @@ impl ProviderFactory for FakeProvider {
     }
 }
 impl Runtime {
-    fn open(&self) -> Result<(), Error> {
-        if self.closed.is_cancelled() {
-            Err(stale())
-        } else {
-            Ok(())
+    fn bind(&self, record: Arc<Record>) -> Handle {
+        Handle {
+            record,
+            fake: self.fake.clone(),
+            closed: self.closed.clone(),
         }
     }
     async fn handle(&self, id: &SandboxId) -> Result<Handle, Error> {
-        self.open()?;
+        ensure_open(&self.closed)?;
         let record = self
             .fake
             .inner
@@ -179,22 +192,18 @@ impl Runtime {
             .filter(|record| record.reference.provider == self.entry)
             .cloned()
             .ok_or_else(|| absent(id))?;
-        Ok(Handle {
-            record,
-            fake: self.fake.clone(),
-            closed: self.closed.clone(),
-        })
+        Ok(self.bind(record))
     }
 }
 #[async_trait]
 impl ProviderRuntime for Runtime {
     async fn describe(&self) -> Result<Descriptor, Error> {
-        self.open()?;
+        ensure_open(&self.closed)?;
         self.fake.record("describe", None).await;
         Ok(self.fake.descriptor())
     }
     async fn health(&self) -> Result<Health, Error> {
-        self.open()?;
+        ensure_open(&self.closed)?;
         self.fake.record("health", None).await;
         Ok(Health {
             healthy: true,
@@ -202,8 +211,8 @@ impl ProviderRuntime for Runtime {
         })
     }
     async fn create(&self, admission: WorkloadAdmission) -> Result<Box<dyn Sandbox>, Error> {
-        self.open()?;
-        admission.spec.validate_for(&self.fake.descriptor())?;
+        ensure_open(&self.closed)?;
+        admission.spec.validate_for(&self.fake.inner.descriptor)?;
         if !admission.spec.provider_config.is_empty() {
             return Err(Error::InvalidSpec {
                 path:    "provider_config".into(),
@@ -236,7 +245,7 @@ impl ProviderRuntime for Runtime {
         let record = Arc::new(Record {
             reference: SandboxRef {
                 provider:  self.entry.clone(),
-                namespace: self.fake.inner.namespace.clone(),
+                namespace: self.fake.inner.descriptor.namespace.id.clone(),
                 id:        id.clone(),
             },
             spec: admission.spec,
@@ -251,11 +260,7 @@ impl ProviderRuntime for Runtime {
         records.insert(id.clone(), Arc::clone(&record));
         drop(records);
         self.fake.record("create", Some(&id)).await;
-        Ok(Box::new(Handle {
-            record,
-            fake: self.fake.clone(),
-            closed: self.closed.clone(),
-        }))
+        Ok(Box::new(self.bind(record)))
     }
     async fn attach(&self, id: &SandboxId) -> Result<Box<dyn Sandbox>, Error> {
         let handle = self.handle(id).await?;
@@ -263,7 +268,7 @@ impl ProviderRuntime for Runtime {
         Ok(Box::new(handle))
     }
     async fn list(&self, filter: &LabelFilter) -> Result<Vec<SandboxSummary>, Error> {
-        self.open()?;
+        ensure_open(&self.closed)?;
         self.fake.record("list", None).await;
         let records: Vec<_> = self
             .fake
@@ -289,13 +294,12 @@ impl ProviderRuntime for Runtime {
         Ok(summaries)
     }
     async fn destroy(&self, id: &SandboxId) -> Result<(), Error> {
-        self.open()?;
         let handle = match self.handle(id).await {
             Ok(handle) => handle,
             Err(Error::NotFound { .. }) => return Ok(()),
             Err(error) => return Err(error),
         };
-        handle.end(true).await?;
+        handle.destroy().await;
         self.fake.inner.records.lock().await.remove(id);
         self.fake.record("destroy", Some(id)).await;
         Ok(())
@@ -316,60 +320,36 @@ impl Handle {
                 message: "requires a non-empty NUL-free workload path".into(),
             });
         }
-        let joined = if path.starts_with('/') {
-            path.to_owned()
-        } else {
-            format!("{}/{}", self.record.directory.display(), path)
-        };
-        let mut parts = Vec::new();
-        for part in joined.split('/') {
-            match part {
-                "" | "." => {}
-                ".." => {
-                    parts.pop();
-                }
-                part => parts.push(part),
-            }
-        }
-        Ok(format!("/{}", parts.join("/")))
+        Ok(fs::resolve(&self.record.directory.to_string_lossy(), path))
     }
-    fn open(&self) -> Result<(), Error> {
-        if self.closed.is_cancelled() {
-            Err(stale())
-        } else {
-            Ok(())
-        }
+    async fn log(&self, operation: &str) {
+        self.fake
+            .record(operation, Some(&self.record.reference.id))
+            .await;
     }
-    async fn end(&self, destroy: bool) -> Result<(), Error> {
-        self.open()?;
+    /// Admits work inside the stop fence. The guard holds stop/destroy off
+    /// until the work ends; the token fires when either begins.
+    async fn admit(&self) -> Result<(RwLockReadGuard<'_, ()>, CancellationToken), Error> {
+        let fence = self.record.fence.read().await;
+        let state = self.record.state.lock().await;
+        if state.state != SandboxState::Running {
+            return Err(busy());
+        }
+        Ok((fence, state.stop.clone()))
+    }
+    async fn destroy(&self) {
         {
             let mut state = self.record.state.lock().await;
             if state.state == SandboxState::Deleted {
-                return if destroy {
-                    Ok(())
-                } else {
-                    Err(absent(&self.record.reference.id))
-                };
+                return;
             }
-            if state.state == SandboxState::Deleting && !destroy {
-                return Err(busy());
-            }
-            state.state = if destroy {
-                SandboxState::Deleting
-            } else {
-                SandboxState::Stopping
-            };
+            state.state = SandboxState::Deleting;
             state.stop.cancel();
         }
         let _fence = self.record.fence.write().await;
         let mut state = self.record.state.lock().await;
-        if destroy {
-            self.record.files.lock().await.clear();
-            state.state = SandboxState::Deleted;
-        } else if state.state == SandboxState::Stopping {
-            state.state = SandboxState::Stopped;
-        }
-        Ok(())
+        self.record.files.lock().await.clear();
+        state.state = SandboxState::Deleted;
     }
 }
 #[async_trait]
@@ -384,10 +364,8 @@ impl Sandbox for Handle {
         &self.record.spec.env
     }
     async fn status(&self) -> Result<Status, Error> {
-        self.open()?;
-        self.fake
-            .record("status", Some(&self.record.reference.id))
-            .await;
+        ensure_open(&self.closed)?;
+        self.log("status").await;
         let state = self.record.state.lock().await.state;
         Ok(Status {
             reference: self.reference(),
@@ -406,7 +384,7 @@ impl Sandbox for Handle {
         })
     }
     async fn start(&self) -> Result<(), Error> {
-        self.open()?;
+        ensure_open(&self.closed)?;
         let _fence = self.record.fence.try_write().map_err(|_| busy())?;
         let mut state = self.record.state.lock().await;
         match state.state {
@@ -417,29 +395,34 @@ impl Sandbox for Handle {
         }
         state.stop = CancellationToken::new();
         state.state = SandboxState::Running;
-        self.fake
-            .record("start", Some(&self.record.reference.id))
-            .await;
+        self.log("start").await;
         Ok(())
     }
     async fn stop(&self) -> Result<(), Error> {
-        self.end(false).await?;
-        self.fake
-            .record("stop", Some(&self.record.reference.id))
-            .await;
+        ensure_open(&self.closed)?;
+        {
+            let mut state = self.record.state.lock().await;
+            match state.state {
+                SandboxState::Deleted => return Err(absent(&self.record.reference.id)),
+                SandboxState::Deleting => return Err(busy()),
+                _ => {}
+            }
+            state.state = SandboxState::Stopping;
+            state.stop.cancel();
+        }
+        let _fence = self.record.fence.write().await;
+        let mut state = self.record.state.lock().await;
+        if state.state == SandboxState::Stopping {
+            state.state = SandboxState::Stopped;
+        }
+        drop(state);
+        self.log("stop").await;
         Ok(())
     }
     async fn exec(&self, spec: ExecSpec, controls: ExecControls) -> Result<ExecOutcome, Error> {
-        self.open()?;
+        ensure_open(&self.closed)?;
         spec.validate()?;
-        let _fence = self.record.fence.read().await;
-        let stop = {
-            let state = self.record.state.lock().await;
-            if state.state != SandboxState::Running {
-                return Err(busy());
-            }
-            state.stop.clone()
-        };
+        let (_fence, stop) = self.admit().await?;
         let response = self
             .fake
             .inner
@@ -451,34 +434,23 @@ impl Sandbox for Handle {
             .ok_or_else(|| Error::Unsupported {
                 capability: "unscripted fake command".into(),
             })?;
-        self.fake
-            .record("exec", Some(&self.record.reference.id))
-            .await;
+        self.log("exec").await;
         let work = async {
             if let Some(mut stdin) = controls.stdin {
-                let mut bytes = [0; 4096];
-                while stdin.read(&mut bytes).await.map_err(|_| Error::Transport {
-                    message: "fake stdin failed".into(),
-                    outcome: MutationOutcome::Unknown,
-                })? != 0
-                {}
+                io::copy(&mut stdin, &mut io::sink())
+                    .await
+                    .map_err(|_| transport("fake stdin failed"))?;
             }
             if let Some(sink) = controls.sink {
-                let stdout = if spec.tty {
-                    OutputStream::Terminal
+                let (stdout, stderr) = if spec.tty {
+                    (OutputStream::Terminal, OutputStream::Terminal)
                 } else {
-                    OutputStream::Stdout
+                    (OutputStream::Stdout, OutputStream::Stderr)
                 };
-                let stderr = if spec.tty {
-                    OutputStream::Terminal
-                } else {
-                    OutputStream::Stderr
-                };
-                if !response.stdout.is_empty() {
-                    sink(stdout, response.stdout).await?;
-                }
-                if !response.stderr.is_empty() {
-                    sink(stderr, response.stderr).await?;
+                for (stream, bytes) in [(stdout, response.stdout), (stderr, response.stderr)] {
+                    if !bytes.is_empty() {
+                        sink(stream, bytes).await?;
+                    }
                 }
             }
             if response.wait_for_stop {
@@ -495,7 +467,9 @@ impl Sandbox for Handle {
         };
         let termination = tokio::select! {
             biased;
-            () = self.closed.cancelled() => return Err(Error::Stale {outcome:MutationOutcome::Unknown}),
+            () = self.closed.cancelled() => {
+                return Err(Error::Stale { outcome: MutationOutcome::Unknown });
+            }
             () = stop.cancelled() => Termination::Killed,
             () = sandbox_driver::stop_signal(controls.kill.as_ref()) => Termination::Killed,
             () = sandbox_driver::stop_signal(controls.term.as_ref()) => Termination::Terminated,
@@ -520,10 +494,8 @@ impl Sandbox for Handle {
 #[async_trait]
 impl Files for Handle {
     async fn get(&self, path: &str, range: Option<FileRange>) -> Result<ByteStream, Error> {
-        self.open()?;
-        self.fake
-            .record("files.get", Some(&self.record.reference.id))
-            .await;
+        ensure_open(&self.closed)?;
+        self.log("files.get").await;
         let files = self.record.files.lock().await;
         let path = self.path(path)?;
         let bytes = files.get(&path).ok_or_else(|| Error::NotFound {
@@ -545,56 +517,44 @@ impl Files for Handle {
         Ok(Box::pin(Cursor::new(bytes[start..end].to_vec())))
     }
     async fn put(&self, path: &str, mut bytes: ByteStream) -> Result<(), Error> {
-        self.open()?;
-        let _fence = self.record.fence.read().await;
-        let stop = {
-            let state = self.record.state.lock().await;
-            if state.state != SandboxState::Running {
-                return Err(busy());
-            }
-            state.stop.clone()
-        };
+        ensure_open(&self.closed)?;
+        let path = self.path(path)?;
+        let (_fence, stop) = self.admit().await?;
         let mut buffer = Vec::new();
         tokio::select! {
             () = self.closed.cancelled() => return Err(stale()),
             () = stop.cancelled() => return Err(busy()),
-            result = bytes.read_to_end(&mut buffer) => {result.map_err(|_| Error::Transport {message:"fake file input failed".into(), outcome:MutationOutcome::Unknown})?;}
+            result = bytes.read_to_end(&mut buffer) => {
+                result.map_err(|_| transport("fake file input failed"))?;
+            }
         }
-        self.record
-            .files
-            .lock()
-            .await
-            .insert(self.path(path)?, buffer);
-        self.fake
-            .record("files.put", Some(&self.record.reference.id))
-            .await;
+        self.record.files.lock().await.insert(path, buffer);
+        self.log("files.put").await;
         Ok(())
     }
     async fn list(&self, path: &str, depth: u32) -> Result<Vec<FileEntry>, Error> {
-        self.open()?;
-        self.fake
-            .record("files.list", Some(&self.record.reference.id))
-            .await;
+        ensure_open(&self.closed)?;
+        self.log("files.list").await;
         let path = self.path(path)?;
         let prefix = format!("{}/", path.trim_end_matches('/'));
         let files = self.record.files.lock().await;
         let mut entries = BTreeMap::new();
-        for (path, bytes) in files.iter() {
-            let Some(tail) = path.strip_prefix(&prefix) else {
-                continue;
-            };
-            let parts: Vec<_> = tail.split('/').collect();
+        let below = files
+            .range(prefix.clone()..)
+            .take_while(|(path, _)| path.starts_with(&prefix));
+        for (path, bytes) in below {
+            let parts: Vec<_> = path[prefix.len()..].split('/').collect();
             for index in 0..parts.len().min((depth as usize).saturating_add(1)) {
                 let entry_path = format!("{}{}", prefix, parts[..=index].join("/"));
-                let is_file = index + 1 == parts.len();
+                let (kind, size) = if index + 1 == parts.len() {
+                    (FileKind::File, bytes.len() as u64)
+                } else {
+                    (FileKind::Directory, 0)
+                };
                 entries.insert(entry_path.clone(), FileEntry {
                     path: entry_path,
-                    kind: if is_file {
-                        FileKind::File
-                    } else {
-                        FileKind::Directory
-                    },
-                    size: if is_file { bytes.len() as u64 } else { 0 },
+                    kind,
+                    size,
                 });
             }
         }
@@ -604,22 +564,25 @@ impl Files for Handle {
 #[async_trait]
 impl Ports for Handle {
     async fn expose(&self, _: NonZeroU16, _: Expose) -> Result<Exposure, Error> {
-        self.open()?;
-        self.fake
-            .record("ports", Some(&self.record.reference.id))
-            .await;
+        ensure_open(&self.closed)?;
+        self.log("ports").await;
         Err(Error::Unsupported {
             capability: "ports".into(),
         })
     }
     async fn release(&self, _: NonZeroU16) -> Result<(), Error> {
-        self.open()?;
-        self.fake
-            .record("ports", Some(&self.record.reference.id))
-            .await;
+        ensure_open(&self.closed)?;
+        self.log("ports").await;
         Err(Error::Unsupported {
             capability: "ports".into(),
         })
+    }
+}
+fn ensure_open(closed: &CancellationToken) -> Result<(), Error> {
+    if closed.is_cancelled() {
+        Err(stale())
+    } else {
+        Ok(())
     }
 }
 fn absent(id: &SandboxId) -> Error {
@@ -636,5 +599,11 @@ fn busy() -> Error {
 fn stale() -> Error {
     Error::Stale {
         outcome: MutationOutcome::NotStarted,
+    }
+}
+fn transport(message: &str) -> Error {
+    Error::Transport {
+        message: message.into(),
+        outcome: MutationOutcome::Unknown,
     }
 }
