@@ -37,8 +37,9 @@ pub use fake::{FakeCall, FakeExec, FakeProvider};
 pub use identity::SandboxRef;
 pub use runtime::{
     Activation, ByteStream, Containers, Endpoints, Expose, Exposure, FileEntry, FileRange, Files,
-    Health, LabelFilter, Lifecycle, OneShotSpec, PluginLocation, Ports, ProviderFactory,
-    ProviderRuntime, Sandbox, SandboxSummary, SecretResolver, SecretValues, WorkloadAdmission,
+    Health, LabelFilter, Lifecycle, OneShotImage, OneShotSpec, PluginLocation, Ports,
+    ProviderFactory, ProviderRuntime, Sandbox, SandboxSummary, SecretResolver, SecretValues,
+    WorkloadAdmission,
 };
 pub use status::{SandboxState, ServiceAddress, Status};
 pub use units::{ParseUnitError, parse_duration_ms, parse_size_mib};

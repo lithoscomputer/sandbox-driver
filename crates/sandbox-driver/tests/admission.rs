@@ -1,4 +1,6 @@
-use sandbox_driver::contract::{Descriptor, Error, ExecSpec, SandboxSpec};
+use sandbox_driver::contract::{
+    Descriptor, Error, ExecSpec, OneShotImage, OneShotSpec, SandboxSpec,
+};
 use serde_json::json;
 
 fn descriptor() -> Descriptor {
@@ -7,13 +9,14 @@ fn descriptor() -> Descriptor {
         "namespace":{"id":"test:one", "scope":"process"},
         "isolation":"none", "durability":"process", "access":"owner_process",
         "sources":["image"], "locality":{}, "resources":[],
-        "network":["provider_default"], "ports":{"exposable":"none"}, "capabilities":{}
+        "network":[], "ports":{"exposable":"none"}, "capabilities":{}
     }))
     .expect("descriptor")
 }
 
 #[test]
 fn unsupported_requests_are_refused_even_when_false_or_zero() {
+    let descriptor = descriptor();
     for (field, request) in [
         ("container.init", json!({"container":{"init":false}})),
         (
@@ -65,11 +68,25 @@ fn unsupported_requests_are_refused_even_when_false_or_zero() {
             .extend(request.as_object().expect("object").clone());
         let spec: SandboxSpec = serde_json::from_value(value).expect("spec");
         assert_eq!(
-            spec.validate_for(&descriptor()),
+            spec.validate_for(&descriptor),
             Err(Error::Unsupported {
                 capability: field.into(),
             })
         );
+    }
+}
+
+#[test]
+fn the_provider_default_network_needs_no_advertisement() {
+    let mut descriptor = descriptor();
+    descriptor.network = serde_json::from_value(json!(["allow_all"])).expect("network modes");
+    for spec in [
+        json!({"source":{"image":"test"}}),
+        json!({"source":{"image":"test"}, "network":{"mode":"provider_default"}}),
+        json!({"source":{"image":"test"}, "network":{"mode":"allow_all"}}),
+    ] {
+        let spec: SandboxSpec = serde_json::from_value(spec).expect("spec");
+        spec.validate_for(&descriptor).expect("supported");
     }
 }
 
@@ -104,4 +121,51 @@ fn exec_refuses_invalid_arguments_and_redacts_inputs() {
     assert!(!debug.contains("env-secret"));
     spec.env.insert("TOKEN".into(), "nul\0value".into());
     assert!(spec.validate().is_err());
+}
+
+#[test]
+fn one_shot_builds_from_a_workspace_context_and_keeps_the_image_entrypoint() {
+    let mut spec: OneShotSpec = serde_json::from_value(json!({
+        "image": {"build": {"context": "_actions/owner/repo", "tag": "owner-repo", "reuse": true}},
+        "args": ["--flag", "argument-secret"],
+        "env": {"TOKEN": "env-secret"}
+    }))
+    .expect("action build");
+    spec.validate().expect("valid build");
+    assert_eq!(spec.entrypoint, None);
+    let debug = format!("{spec:?}");
+    assert!(!debug.contains("argument-secret"));
+    assert!(!debug.contains("env-secret"));
+    spec.args.push("nul\0arg".into());
+    assert!(spec.validate().is_err());
+
+    for image in [
+        OneShotImage::Image(String::new()),
+        OneShotImage::Build {
+            context:    String::new(),
+            dockerfile: None,
+            tag:        "tag".into(),
+            reuse:      false,
+        },
+        OneShotImage::Build {
+            context:    "context".into(),
+            dockerfile: None,
+            tag:        String::new(),
+            reuse:      false,
+        },
+    ] {
+        assert!(OneShotSpec::new(image).validate().is_err());
+    }
+}
+
+#[test]
+fn one_shot_refuses_workload_sources_and_unknown_build_fields() {
+    for image in [
+        json!({"snapshot": "snap-1"}),
+        json!("host_directory"),
+        json!({"dockerfile": "FROM alpine"}),
+        json!({"build": {"context": ".", "tag": "t", "reuse": false, "cache": true}}),
+    ] {
+        assert!(serde_json::from_value::<OneShotSpec>(json!({"image": image})).is_err());
+    }
 }

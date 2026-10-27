@@ -208,10 +208,11 @@ DNS, extra hosts, and shared-memory MiB. `None` is unspecified, while
 which requests are supported, separately from `services` and one-shot
 `containers`. Unsupported requests return `Unsupported` naming the field,
 including unsupported explicit false values. Providers cannot silently drop
-resource, network, timer, service, or container requests. Descriptor `timers`
-lists each enforced timer (`auto_stop`, `auto_archive`, `auto_delete`, `ttl`)
-separately; a request for an unlisted timer is `Unsupported`. Host rejects service
-and container workloads.
+resource, network, timer, service, or container requests. The provider-default
+network mode, omitted or explicit, is not a request and needs no descriptor
+entry. Descriptor `timers` lists each enforced timer (`auto_stop`,
+`auto_archive`, `auto_delete`, `ttl`) separately; a request for an unlisted timer
+is `Unsupported`. Host rejects service and container workloads.
 
 ## Lifecycle, fences, and uncertainty
 
@@ -339,6 +340,11 @@ The additive provider boundary is exported from `sandbox_driver::contract`:
   Controls carry one owned stdin reader, an awaited output sink, term/kill
   tokens and a latest-value terminal resize receiver. `Files` transfers owned
   byte streams, allowing adapters to keep bulk bytes off control connections.
+- `OneShotSpec` takes its own `OneShotImage`, never the workload `Source`: a
+  registry `image`, or a `build` from a context directory in the workload
+  workspace with an optional Dockerfile path, a tag that keys the build cache
+  and a `reuse` flag. Its command is an optional `entrypoint` plus `args`, not
+  exec argv, so arguments alone reach the image's own entrypoint.
 - `SandboxSpec::validate_for` and `Environment::validate` check portable
   invariants and descriptor capabilities. They do not replace JSON Schema or
   backend-specific validation. `WorkloadAdmission` separates credential values

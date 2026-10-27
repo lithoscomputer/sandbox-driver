@@ -11,8 +11,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::Error;
 use super::runtime::ByteStream;
-use super::workload::validate_env;
+use super::workload::{validate_argv, validate_env, validate_name};
 use crate::OutputLoss;
+use crate::redact::EnvKeys;
 
 /// An argv executed in the requested workload, never in its outer runner.
 #[derive(Clone, Serialize, Deserialize)]
@@ -41,23 +42,9 @@ impl ExecSpec {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
-        if self.argv.first().is_none_or(String::is_empty)
-            || self.argv.iter().any(|arg| arg.contains('\0'))
-        {
-            return Err(Error::invalid_spec(
-                "argv",
-                "requires a non-empty executable and NUL-free arguments",
-            ));
-        }
-        if self
-            .working_directory
-            .as_ref()
-            .is_some_and(|path| path.is_empty() || path.contains('\0'))
-        {
-            return Err(Error::invalid_spec(
-                "working_directory",
-                "must be non-empty and NUL-free",
-            ));
+        validate_argv("argv", &self.argv)?;
+        if let Some(path) = &self.working_directory {
+            validate_name("working_directory", path)?;
         }
         validate_env("env", &self.env)
     }
@@ -65,12 +52,20 @@ impl ExecSpec {
 
 impl fmt::Debug for ExecSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            argv: _,
+            env,
+            working_directory,
+            timeout_ms,
+            tty,
+        } = self;
         f.debug_struct("ExecSpec")
             .field("argv", &"<redacted>")
-            .field("env", &"<redacted>")
-            .field("tty", &self.tty)
-            .field("timeout_ms", &self.timeout_ms)
-            .finish_non_exhaustive()
+            .field("env_keys", &EnvKeys(env))
+            .field("working_directory", working_directory)
+            .field("timeout_ms", timeout_ms)
+            .field("tty", tty)
+            .finish()
     }
 }
 
