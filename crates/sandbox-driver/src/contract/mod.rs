@@ -6,6 +6,7 @@
 //! Serialization here defines common data, not a negotiated wire protocol.
 
 mod admission;
+mod catalog;
 mod config;
 mod descriptor;
 mod error;
@@ -13,10 +14,15 @@ mod execution;
 mod fake;
 mod identity;
 mod runtime;
+mod schema;
 mod status;
 mod units;
 mod workload;
 
+pub use catalog::{
+    CatalogDiagnostic, CatalogOptions, Found, ProviderFailure, ProviderHandle, Registry,
+    SandboxBuilder, Sandboxes, StaticEnvironments,
+};
 pub use config::{Environment, EnvironmentSource, PluginTrust, ProviderEntry};
 pub use descriptor::{
     AccessScope, CapabilitySet, ContainerField, Descriptor, Durability, EndpointCapability,
