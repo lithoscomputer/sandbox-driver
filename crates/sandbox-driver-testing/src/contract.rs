@@ -11,12 +11,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sandbox_driver::contract::{
-    AccessScope, Activation, ByteStream, CapabilitySet, Descriptor, Durability, Error,
-    ExecControls, ExecOutcome, ExecSpec, Expose, Exposure, FileEntry, FileRange, Files, Health,
-    JsonSchema, LabelFilter, Locality, MutationOutcome, Namespace, NamespaceId, NamespaceScope,
-    NetworkMode, OutputStream, PluginLocation, PortSupport, Ports, ProviderFactory, ProviderName,
-    ProviderRuntime, ProviderSchemas, Sandbox, SandboxRef, SandboxSpec, SandboxState,
-    SandboxSummary, Source, SourceKind, Status, Termination, WorkloadAdmission,
+    AccessScope, Activation, ByteStream, CapabilitySet, CatalogOptions, Descriptor, Durability,
+    Environment, EnvironmentName, Error, ExecControls, ExecOutcome, ExecSpec, Expose, Exposure,
+    FileEntry, FileRange, Files, Health, JsonSchema, LabelFilter, Locality, MutationOutcome,
+    Namespace, NamespaceId, NamespaceScope, NetworkMode, OutputStream, PluginLocation, PortSupport,
+    Ports, ProviderEntry, ProviderFactory, ProviderName, ProviderRuntime, ProviderSchemas,
+    Registry, Sandbox, SandboxRef, SandboxSpec, SandboxState, SandboxSummary, Sandboxes,
+    SecretResolver, Source, SourceKind, StaticEnvironments, Status, Termination, WorkloadAdmission,
 };
 use sandbox_driver::{FileKind, Isolation, OutputLoss, ProviderKind, SandboxId};
 use tokio::io::{self, AsyncReadExt};
@@ -155,6 +156,46 @@ impl FakeProvider {
             id:        id.cloned(),
         });
     }
+    /// Creates a catalog with `fake` provider and `default` environment. These
+    /// names are test fixtures only; production catalogs have no seeded
+    /// entries.
+    pub fn sandboxes(&self) -> Sandboxes {
+        struct NoSecrets;
+        #[async_trait]
+        impl SecretResolver for NoSecrets {
+            async fn resolve(&self, _: &str) -> Result<Option<String>, Error> {
+                Ok(None)
+            }
+        }
+        let name = ProviderName::try_new("fake").expect("constant name");
+        let entry: ProviderEntry =
+            serde_json::from_value(serde_json::json!({"plugin":"fake"})).expect("constant entry");
+        let environment = Environment {
+            provider: name.clone(),
+            spec:     SandboxSpec::new(Source::Image("fake:workload".into())),
+        };
+        let registry = Registry::new()
+            .builtin(entry.plugin.clone(), Arc::new(self.clone()))
+            .expect("unique fake registration");
+        Sandboxes::try_new(
+            [(name, entry)],
+            Arc::new(StaticEnvironments(BTreeMap::from([(
+                EnvironmentName::try_new("default").expect("constant name"),
+                environment,
+            )]))),
+            &registry,
+            Arc::new(NoSecrets),
+            CatalogOptions {
+                environment: BTreeMap::new(),
+                ..CatalogOptions::default()
+            },
+        )
+        .expect("valid fake catalog")
+    }
+}
+/// Creates a catalog with a fresh in-memory fake and the `default` environment.
+pub fn fake() -> Sandboxes {
+    FakeProvider::new().sandboxes()
 }
 
 #[async_trait]

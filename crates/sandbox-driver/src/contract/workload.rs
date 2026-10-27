@@ -349,7 +349,7 @@ impl SandboxSpec {
 /// truncate the variable that reaches the workload.
 pub(super) fn validate_env(path: &str, env: &BTreeMap<String, String>) -> Result<(), Error> {
     for (key, value) in env {
-        if key.is_empty() || key.contains(['=', '\0']) {
+        if !valid_env_key(key) {
             return Err(Error::invalid_spec(
                 path,
                 "keys must be non-empty and must not contain '=' or NUL",
@@ -360,6 +360,10 @@ pub(super) fn validate_env(path: &str, env: &BTreeMap<String, String>) -> Result
         }
     }
     Ok(())
+}
+
+pub(super) fn valid_env_key(key: &str) -> bool {
+    !key.is_empty() && !key.contains(['=', '\0'])
 }
 
 /// Argv is executed without a shell: the executable must be named, and NUL
