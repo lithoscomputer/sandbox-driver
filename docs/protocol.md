@@ -1097,3 +1097,45 @@ version-1 `fs/read` or `fs/write` shape is a `-32600` here.
 Native search/service passthrough, local `shell_command`, and
 `host/credentials` (per-call secret fetches from the host) remain
 deferred. They are masked or absent per §5.
+
+## 15. Shared-contract metadata discovery
+
+The additive `sandbox_driver_protocol::metadata` module implements the
+credential-free discovery step in [the shared contract](shared-contract.md).
+It does not change the v2 handshake or make a v2 provider implement the new
+contract. Existing `launch_plugin`, `PluginProvider`, and `serve_stdio` remain
+the v2 entry points.
+
+`SchemaDiscovery` starts nothing when constructed. An explicit `discover`
+resolves only the selected entry, checks its checksum (or explicit development
+trust), and runs the executable with exactly `--describe-schema`. The child
+gets null stdin, no runtime arguments, no connection configuration, and no
+configured, inherited, or resolved secret environment. On Unix the probe PATH
+is `/usr/bin:/bin`; no HOME or user PATH is forwarded. On Windows only
+SystemRoot is forwarded. The executable writes one `ProviderSchemas` JSON
+object and exits successfully; diagnostics belong on stderr. SDK authors can
+use `metadata::write_schema` before constructing their provider or loading
+runtime settings, then exit.
+
+Default budgets are five seconds for the whole discovery call, 1 MiB of stdout,
+64 KiB of stderr, four concurrent discoveries, and 64 cached binaries. Both
+pipes are drained concurrently and bounded. Timeout, cancellation, failure,
+or excessive output drops and kills the probe child; Tokio owns reaping.
+Over-capacity calls fail before launch. Probe output is not included in errors.
+
+The cache contains metadata only, keyed by the actual SHA-256 of the executable.
+Every lookup rehashes the selected executable and checks that entry's trust,
+even on a cache hit. Changed bytes require rediscovery; failed probes are not
+cached. Cache eviction permits a later probe. `DiscoveredPlugin` retains the
+canonical executable path, digest, schemas, and whether a pin was verified.
+Runtime integration must call `verify_unchanged` immediately before launch and
+`check_descriptor` after initialization, before sending any sandbox operation.
+The latter compares kind, version, schemas, and required secret names; cached
+metadata never supplies namespace or capability facts. Unlike legacy v2 kind
+aliasing, the configured new-contract plugin kind must match discovery.
+
+Probing executes trusted code, not sandboxed code. Installation directories and
+executables must be protected against concurrent modification. The checksum
+covers the executable bytes, not interpreters, shared libraries, or dependencies.
+No runtime adapter or new protocol negotiation is implied by successful
+metadata discovery; those remain separate migration steps.
