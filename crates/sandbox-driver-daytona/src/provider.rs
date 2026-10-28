@@ -307,7 +307,7 @@ impl DaytonaProvider {
     /// An accepted DELETE only starts cleanup. Retain the sandbox ID and
     /// original failure if removal cannot be confirmed.
     async fn cleanup_failed_create(&self, sdk_id: &str, cause: Error) -> Error {
-        cleanup::failed_create(&self.client, sdk_id, cause, CLEANUP_TIMEOUT).await
+        cleanup::failed_create(&self.client, &self.kind, sdk_id, cause, CLEANUP_TIMEOUT).await
     }
 
     async fn handle(
@@ -907,34 +907,24 @@ mod tests {
     async fn stalled_create_observation_times_out_and_cleans_up_the_known_sandbox() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        use crate::fake_daytona::{FakeDaytona, Reply};
+        use crate::fake_daytona::{FakeDaytona, Reply, sandbox_json};
 
-        let deleted = Arc::new(AtomicBool::new(false));
-        let observed = Arc::clone(&deleted);
-        let created = serde_json::json!({
-            "id": "sb-1", "organizationId": "org-1", "name": "sb", "user": "daytona",
-            "env": {}, "labels": {}, "public": false, "networkBlockAll": false,
-            "target": "us", "cpu": 1.0, "gpu": 0.0, "memory": 1.0, "disk": 1.0,
-            "state": "creating", "toolboxProxyUrl": "http://unused",
-        })
-        .to_string();
+        let deleted = AtomicBool::new(false);
+        let created = sandbox_json("creating");
         let fake = FakeDaytona::start(|_| {
             Arc::new(move |method, _| match method {
                 "POST" => Reply::Json(201, created.clone()),
                 "DELETE" => {
-                    observed.store(true, Ordering::SeqCst);
+                    deleted.store(true, Ordering::SeqCst);
                     Reply::Json(200, created.clone())
                 }
-                "GET" if observed.load(Ordering::SeqCst) => Reply::Json(404, "{}".to_owned()),
+                "GET" if deleted.load(Ordering::SeqCst) => Reply::Json(404, "{}".to_owned()),
                 "GET" => Reply::Hang,
                 _ => panic!("unexpected method {method}"),
             })
         })
         .await;
-        let client = Arc::try_unwrap(fake.client().await)
-            .ok()
-            .expect("only client owner");
-        let provider = DaytonaProvider::from_client(client, true);
+        let provider = DaytonaProvider::from_client(fake.client().await, true);
         let params = CreateParams::Snapshot(SnapshotParams {
             base:     SandboxBaseParams::default(),
             snapshot: "base".to_owned(),
@@ -947,7 +937,6 @@ mod tests {
         .expect("the create wait and cleanup are bounded")
         .expect_err("observation times out");
         assert!(matches!(error, Error::Timeout { .. }), "{error:?}");
-        assert!(deleted.load(Ordering::SeqCst));
         assert_eq!(fake.deletes(), 1);
         assert_eq!(
             fake.requests()

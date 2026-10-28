@@ -44,7 +44,7 @@
 //! within a cleanup deadline, for removal to be confirmed. An accepted delete
 //! or a `destroying` status alone does not confirm cleanup. Unconfirmed cleanup
 //! returns a legacy [`sandbox_driver::ProviderError`] with code
-//! `cleanup_unconfirmed`, the known sandbox ID in `detail.remaining`, and the
+//! `incomplete_cleanup`, the known sandbox ID in `detail.remaining`, and the
 //! cleanup diagnostic in `detail.cleanup`; the original creation failure stays
 //! in its source chain. This is not permission to replay the create.
 //!
