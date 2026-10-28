@@ -4,8 +4,9 @@
 //! surface. Provider-specific workload targeting, optional services/containers,
 //! crash recovery and fault injection remain separate integration gates; a
 //! passing report does not certify those unexecuted scenarios.
+use std::future;
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sandbox_driver::contract::{
@@ -13,8 +14,19 @@ use sandbox_driver::contract::{
     OutputSink, Sandbox, SandboxRef, SandboxState, Sandboxes, Termination,
 };
 use tokio::io::AsyncReadExt;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio::time;
+
+use crate::check::{CheckOutcome, Verdict, fail};
+use crate::{CheckResult, Outcome, Report};
+
+/// Every check's sandbox carries this label; the awkward value proves it
+/// round-trips through inventory unchanged.
+const LABEL_KEY: &str = "conformance";
+const LABEL_VALUE: &str = "quotes='\" unicode=λ newline=\n";
+
+/// Probe output beyond this fails the sink rather than buffering unbounded.
+const PROBE_OUTPUT_LIMIT: usize = 64 * 1024;
 
 /// Provider-specific commands used to exercise execution without assuming a
 /// shell exists. `probe` must emit `probe_output` and exit zero. `long_running`
@@ -34,25 +46,18 @@ pub struct Conformance {
     pub timeout: Duration,
 }
 
-#[derive(Clone, Debug)]
-pub struct Check {
-    pub name:   &'static str,
-    pub result: Result<(), Error>,
+/// What a check does with its freshly created sandbox.
+enum Scenario<'a> {
+    Identity,
+    Files,
+    Exec,
+    /// Stops the sandbox through a handle attached from this catalog.
+    Fence(&'a Sandboxes),
 }
-#[derive(Clone, Debug)]
-pub struct Report {
-    pub checks: Vec<Check>,
-}
-impl Report {
-    pub fn passed(&self) -> bool {
-        self.checks.iter().all(|check| check.result.is_ok())
-    }
-    pub fn assert_pass(&self) {
-        assert!(
-            self.passed(),
-            "new-contract conformance failed: {:#?}",
-            self.checks
-        );
+
+impl From<Error> for Verdict {
+    fn from(error: Error) -> Self {
+        Self::Failed(error.to_string())
     }
 }
 
@@ -75,80 +80,85 @@ impl Conformance {
     }
 
     /// Creates one sandbox per check, then attempts bounded cleanup even after
-    /// a check fails or times out. Unknown create outcomes have no guessed ID;
-    /// providers/applications must reconcile those through inventory.
+    /// a check fails or times out; a cleanup failure fails its check. Unknown
+    /// create outcomes have no guessed ID; providers/applications must
+    /// reconcile those through inventory.
     pub async fn run(&self) -> Report {
-        let mut checks = Vec::new();
-        let mut names = vec![
-            "identity_and_inventory",
-            "binary_files",
-            "streamed_exec",
-            "cross_handle_stop_fence",
+        let mut scenarios = vec![
+            ("identity_and_inventory", Scenario::Identity),
+            ("binary_files", Scenario::Files),
+            ("streamed_exec", Scenario::Exec),
+            ("cross_handle_stop_fence", Scenario::Fence(&self.catalog)),
         ];
-        if self.peer.is_some() {
-            names.push("cross_instance_stop_fence");
+        if let Some(peer) = &self.peer {
+            scenarios.push(("cross_instance_stop_fence", Scenario::Fence(peer)));
         }
-        for name in names {
-            let reference = Mutex::new(None);
+        let mut results = Vec::new();
+        for (name, scenario) in scenarios {
+            let mut reference = None;
             let operation = async {
                 let sandbox = self
                     .catalog
                     .builder(&self.environment)
                     .await?
-                    .label("conformance", "quotes='\" unicode=λ newline=\n")
+                    .label(LABEL_KEY, LABEL_VALUE)
                     .create()
                     .await?;
-                *reference.lock().await = Some(sandbox.reference());
-                match name {
-                    "identity_and_inventory" => self.identity(sandbox.as_ref()).await,
-                    "binary_files" => Self::files(sandbox.as_ref()).await,
-                    "streamed_exec" => self.exec(sandbox.as_ref()).await,
-                    "cross_instance_stop_fence" => {
-                        let peer = self.peer.as_ref().expect("peer check requires peer");
-                        self.fence_with(sandbox.as_ref(), peer).await
-                    }
-                    _ => self.fence_with(sandbox.as_ref(), &self.catalog).await,
+                reference = Some(sandbox.reference());
+                let sandbox = sandbox.as_ref();
+                match scenario {
+                    Scenario::Identity => self.identity(sandbox).await,
+                    Scenario::Files => Self::files(sandbox).await,
+                    Scenario::Exec => self.exec(sandbox).await,
+                    Scenario::Fence(catalog) => self.fence_with(sandbox, catalog).await,
                 }
             };
             let result = time::timeout(self.timeout, operation)
                 .await
-                .unwrap_or_else(|_| {
-                    Err(failed(
-                        "conformance check deadline elapsed; outcome unknown",
-                    ))
-                });
-            checks.push(Check { name, result });
-            if let Some(reference) = reference.lock().await.take() {
-                checks.push(Check {
-                    name:   "cleanup",
-                    result: self.cleanup(&reference).await,
-                });
-            }
+                .unwrap_or_else(|_| fail("conformance check deadline elapsed; outcome unknown"));
+            let cleanup = match reference {
+                Some(reference) => self.cleanup(&reference).await,
+                None => Ok(()),
+            };
+            let outcome = match (result, cleanup) {
+                (Err(Verdict::Failed(reason)), Err(cleanup)) => Outcome::Failed {
+                    reason: format!("{reason}; cleanup: {cleanup}"),
+                },
+                (_, Err(cleanup)) => Outcome::Failed {
+                    reason: format!("cleanup: {cleanup}"),
+                },
+                (Ok(()), Ok(())) => Outcome::Passed,
+                (Err(Verdict::Skipped(reason)), Ok(())) => Outcome::Skipped { reason },
+                (Err(Verdict::Failed(reason)), Ok(())) => Outcome::Failed { reason },
+            };
+            results.push(CheckResult { name, outcome });
         }
-        Report { checks }
+        Report { results }
     }
-    async fn cleanup(&self, reference: &SandboxRef) -> Result<(), Error> {
-        time::timeout(self.timeout, self.catalog.destroy(reference))
-            .await
-            .unwrap_or_else(|_| Err(failed("cleanup deadline elapsed; removal unconfirmed")))?;
+    async fn cleanup(&self, reference: &SandboxRef) -> Result<(), String> {
+        match time::timeout(self.timeout, self.catalog.destroy(reference)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(format!("destroy failed: {error}")),
+            Err(_) => return Err("destroy deadline elapsed; removal unconfirmed".into()),
+        }
         match time::timeout(self.timeout, self.catalog.attach(reference)).await {
             Ok(Err(Error::NotFound { .. })) => Ok(()),
-            _ => Err(failed("destroy did not establish authoritative absence")),
+            Ok(Ok(_)) => Err("sandbox still attachable after destroy".into()),
+            Ok(Err(error)) => Err(format!("absence unconfirmed after destroy: {error}")),
+            Err(_) => Err("absence check deadline elapsed".into()),
         }
     }
-    async fn identity(&self, sandbox: &dyn Sandbox) -> Result<(), Error> {
+    async fn identity(&self, sandbox: &dyn Sandbox) -> CheckOutcome {
+        let reference = sandbox.reference();
         let status = sandbox.status().await?;
         require(
             status.state == SandboxState::Running,
             "create did not reach running",
         )?;
+        require(status.reference == reference, "status changed reference")?;
+        let attached = self.catalog.attach(&reference).await?;
         require(
-            status.reference == sandbox.reference(),
-            "status changed reference",
-        )?;
-        let attached = self.catalog.attach(&sandbox.reference()).await?;
-        require(
-            attached.reference() == sandbox.reference(),
+            attached.reference() == reference,
             "attach changed reference",
         )?;
         require(
@@ -161,54 +171,39 @@ impl Conformance {
         )?;
         let found = self
             .catalog
-            .find(LabelFilter::eq(
-                "conformance",
-                "quotes='\" unicode=λ newline=\n",
-            ))
+            .find(LabelFilter::eq(LABEL_KEY, LABEL_VALUE))
             .await?;
         require(
-            !found.unavailable.contains(&sandbox.reference().provider),
+            !found.unavailable.contains(&reference.provider),
             "own provider failed inventory",
         )?;
         require(
             found
                 .sandboxes
                 .iter()
-                .any(|summary| summary.reference == sandbox.reference()),
+                .any(|summary| summary.reference == reference),
             "label did not round-trip through inventory",
         )
     }
-    async fn files(sandbox: &dyn Sandbox) -> Result<(), Error> {
+    async fn files(sandbox: &dyn Sandbox) -> CheckOutcome {
         let path = "conformance/nested/binary.dat";
         let payload = vec![0, 255, 1, 13, 10, 128, 0];
         sandbox
             .files()
             .put(path, Box::pin(Cursor::new(payload.clone())))
             .await?;
-        let mut bytes = Vec::new();
-        sandbox
-            .files()
-            .get(path, None)
-            .await?
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|_| failed("file transfer failed"))?;
-        require(bytes == payload, "file bytes changed")?;
-        bytes.clear();
-        sandbox
-            .files()
-            .get(
-                path,
-                Some(FileRange {
-                    offset: 1,
-                    length: Some(3),
-                }),
-            )
-            .await?
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|_| failed("range transfer failed"))?;
-        require(bytes == payload[1..4], "file range ignored")?;
+        require(
+            read(sandbox, path, None).await? == payload,
+            "file bytes changed",
+        )?;
+        let range = Some(FileRange {
+            offset: 1,
+            length: Some(3),
+        });
+        require(
+            read(sandbox, path, range).await? == payload[1..4],
+            "file range ignored",
+        )?;
         let entries = sandbox.files().list("conformance/nested", 0).await?;
         require(
             entries.iter().any(|entry| {
@@ -218,29 +213,26 @@ impl Conformance {
         )?;
         sandbox.stop().await?;
         sandbox.start().await?;
-        bytes.clear();
-        sandbox
-            .files()
-            .get(path, None)
-            .await?
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|_| failed("file read after restart failed"))?;
-        require(bytes == payload, "stop/start lost workspace")
+        require(
+            read(sandbox, path, None).await? == payload,
+            "stop/start lost workspace",
+        )
     }
-    async fn exec(&self, sandbox: &dyn Sandbox) -> Result<(), Error> {
+    async fn exec(&self, sandbox: &dyn Sandbox) -> CheckOutcome {
         let output = Arc::new(Mutex::new(Vec::new()));
         let capture = Arc::clone(&output);
         let sink: OutputSink = Arc::new(move |_, bytes| {
-            let capture = Arc::clone(&capture);
-            Box::pin(async move {
-                let mut output = capture.lock().await;
-                if output.len().saturating_add(bytes.len()) > 65536 {
-                    return Err(failed("probe output exceeded 64 KiB"));
-                }
+            let mut output = capture.lock().expect("probe output lock");
+            let result = if output.len().saturating_add(bytes.len()) > PROBE_OUTPUT_LIMIT {
+                Err(Error::Transport {
+                    message: "probe output exceeded 64 KiB".into(),
+                    outcome: MutationOutcome::Unknown,
+                })
+            } else {
                 output.extend(bytes);
                 Ok(())
-            })
+            };
+            Box::pin(future::ready(result))
         });
         let outcome = sandbox
             .exec(self.commands.probe.clone(), ExecControls {
@@ -254,42 +246,43 @@ impl Conformance {
         )?;
         require(!outcome.output_loss.is_lossy(), "probe output was lost")?;
         require(
-            *output.lock().await == self.commands.probe_output,
+            *output.lock().expect("probe output lock") == self.commands.probe_output,
             "probe output differed",
         )
     }
-    async fn fence_with(&self, sandbox: &dyn Sandbox, catalog: &Sandboxes) -> Result<(), Error> {
-        let attached = match catalog.attach(&sandbox.reference()).await {
+    async fn fence_with(&self, sandbox: &dyn Sandbox, catalog: &Sandboxes) -> CheckOutcome {
+        let reference = sandbox.reference();
+        let attached = match catalog.attach(&reference).await {
             Ok(attached) => attached,
-            Err(Error::Busy { .. })
-                if catalog
-                    .provider(sandbox.reference().provider.as_str())?
+            Err(error @ Error::Busy { .. }) => {
+                // An owner-process provider may refuse a second handle
+                // instead of joining the fence.
+                let access = catalog
+                    .provider(reference.provider.as_str())?
                     .describe()
                     .await?
-                    .access
-                    == AccessScope::OwnerProcess =>
-            {
-                return Ok(());
+                    .access;
+                return if access == AccessScope::OwnerProcess {
+                    Ok(())
+                } else {
+                    Err(error.into())
+                };
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         };
         let (ready, mut receiver) = mpsc::channel(1);
         let sink: OutputSink = Arc::new(move |_, _| {
-            let ready = ready.clone();
-            Box::pin(async move {
-                let _ = ready.try_send(());
-                Ok(())
-            })
+            let _ = ready.try_send(());
+            Box::pin(future::ready(Ok(())))
         });
         let exec = sandbox.exec(self.commands.long_running.clone(), ExecControls {
             sink: Some(sink),
             ..ExecControls::default()
         });
         let stop = async {
-            receiver
-                .recv()
-                .await
-                .ok_or_else(|| failed("execution ended without readiness output"))?;
+            if receiver.recv().await.is_none() {
+                return fail("execution ended without readiness output");
+            }
             attached.stop().await?;
             require(
                 attached.status().await?.state == SandboxState::Stopped,
@@ -313,16 +306,21 @@ impl Conformance {
         )
     }
 }
-fn failed(message: &str) -> Error {
-    Error::Transport {
-        message: message.into(),
-        outcome: MutationOutcome::Unknown,
-    }
+async fn read(
+    sandbox: &dyn Sandbox,
+    path: &str,
+    range: Option<FileRange>,
+) -> Result<Vec<u8>, Verdict> {
+    let mut bytes = Vec::new();
+    sandbox
+        .files()
+        .get(path, range)
+        .await?
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| format!("reading {path} failed: {error}"))?;
+    Ok(bytes)
 }
-fn require(condition: bool, message: &str) -> Result<(), Error> {
-    if condition {
-        Ok(())
-    } else {
-        Err(failed(message))
-    }
+fn require(condition: bool, message: &str) -> CheckOutcome {
+    if condition { Ok(()) } else { fail(message) }
 }
