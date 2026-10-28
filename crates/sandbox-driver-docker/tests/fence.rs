@@ -2,9 +2,9 @@
 //! `cargo test -p sandbox-driver-docker --test fence -- --ignored`.
 
 use std::collections::HashMap;
-use std::process;
 use std::sync::Arc;
 use std::time::Duration;
+use std::{iter, process};
 
 use bollard::Docker;
 use bollard::container::{ListContainersOptions, RemoveContainerOptions};
@@ -150,21 +150,11 @@ async fn cancelled_drain_retains_ownership_and_never_replays_or_takes_over() {
     // Test-only operator reconciliation: removal confirms the primary can no
     // longer execute. The cancelled request only stops resources; it cannot
     // recreate them. Do not infer safety from an elapsed lease timeout.
-    docker
-        .remove_container(
-            sandbox.id().as_str(),
-            Some(RemoveContainerOptions {
-                force: true,
-                v: true,
-                ..Default::default()
-            }),
-        )
-        .await
-        .expect("remove test primary");
-    for marker in labeled(&docker, "sh.sandbox-driver.fence", sandbox.id().as_str()).await {
+    let markers = labeled(&docker, "sh.sandbox-driver.fence", sandbox.id().as_str()).await;
+    for container in iter::once(sandbox.id().as_str().to_owned()).chain(markers) {
         docker
             .remove_container(
-                &marker,
+                &container,
                 Some(RemoveContainerOptions {
                     force: true,
                     v: true,
@@ -172,7 +162,7 @@ async fn cancelled_drain_retains_ownership_and_never_replays_or_takes_over() {
                 }),
             )
             .await
-            .expect("remove test marker");
+            .expect("remove test primary and markers");
     }
     sandbox.delete().await.expect("cleanup");
 }

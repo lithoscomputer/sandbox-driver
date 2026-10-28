@@ -7,7 +7,7 @@ use std::time::Duration;
 use bollard::Docker;
 use sandbox_driver::contract::Error as ContractError;
 use sandbox_driver::{
-    Error, SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec,
+    Error, Sandbox, SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec,
 };
 use sandbox_driver_docker::DockerProvider;
 use serde_json::{Value, json};
@@ -26,31 +26,18 @@ struct Daemon {
 
 impl Daemon {
     async fn new(reply: impl Fn(&str) -> (u16, Value) + Send + 'static) -> Self {
-        Self::with_bytes(move |request| {
-            let (status, body) = reply(request);
-            (status, body.to_string().into_bytes())
-        })
-        .await
+        Self::serve(json_bytes(reply), true).await
     }
 
-    async fn with_bytes(reply: impl Fn(&str) -> (u16, Vec<u8>) + Send + 'static) -> Self {
-        Self::serve(reply, true).await
-    }
-
-    async fn raw(reply: impl Fn(&str) -> (u16, Value) + Send + 'static) -> Self {
-        Self::serve(
-            move |request| {
-                let (status, body) = reply(request);
-                (status, body.to_string().into_bytes())
-            },
-            false,
-        )
-        .await
+    /// Fences are still created automatically, but `reply` answers their
+    /// release.
+    async fn with_manual_release(reply: impl Fn(&str) -> (u16, Value) + Send + 'static) -> Self {
+        Self::serve(json_bytes(reply), false).await
     }
 
     async fn serve(
         reply: impl Fn(&str) -> (u16, Vec<u8>) + Send + 'static,
-        automatic_fences: bool,
+        automatic_release: bool,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -97,23 +84,22 @@ impl Daemon {
                 let request = String::from_utf8(bytes).expect("HTTP request is text");
                 recorded.lock().unwrap().push(request.clone());
                 let request = request.lines().next().expect("request line");
-                let (status, body) = if automatic_fences
-                    && request.contains("/containers/create?name=sandbox-driver-fence-")
-                {
-                    (
-                        201,
-                        json!({"Id": "fence", "Warnings": []})
-                            .to_string()
-                            .into_bytes(),
-                    )
-                } else if automatic_fences
-                    && request.starts_with("DELETE ")
-                    && request.contains("/containers/fence?")
-                {
-                    (204, Vec::new())
-                } else {
-                    reply(request)
-                };
+                let (status, body) =
+                    if request.contains("/containers/create?name=sandbox-driver-fence-") {
+                        (
+                            201,
+                            json!({"Id": "fence", "Warnings": []})
+                                .to_string()
+                                .into_bytes(),
+                        )
+                    } else if automatic_release
+                        && request.starts_with("DELETE ")
+                        && request.contains("/containers/fence?")
+                    {
+                        (204, Vec::new())
+                    } else {
+                        reply(request)
+                    };
                 let body = if status == 204 || status == 304 {
                     Vec::new()
                 } else {
@@ -138,10 +124,33 @@ impl Daemon {
         }
     }
 
+    async fn attach_main(&self) -> Arc<dyn Sandbox> {
+        let id = SandboxId::try_new("main").expect("valid sandbox ID");
+        self.provider.attach(&id, None).await.expect("attach main")
+    }
+
     async fn finish(self) -> Vec<String> {
         self.stop.cancel();
         self.task.await.expect("test operation succeeds");
         self.requests.lock().unwrap().clone()
+    }
+}
+
+/// The last daemon request before the automatic fence release.
+fn before_fence_release(requests: &[String]) -> &str {
+    requests
+        .iter()
+        .rev()
+        .nth(1)
+        .expect("a request before the fence release")
+}
+
+fn json_bytes(
+    reply: impl Fn(&str) -> (u16, Value) + Send + 'static,
+) -> impl Fn(&str) -> (u16, Vec<u8>) + Send + 'static {
+    move |request| {
+        let (status, body) = reply(request);
+        (status, body.to_string().into_bytes())
     }
 }
 
@@ -227,14 +236,7 @@ async fn missing_dependents_are_successful_cleanup() {
         .await
         .unwrap();
     let requests = daemon.finish().await;
-    assert!(
-        requests
-            .iter()
-            .rev()
-            .nth(1)
-            .unwrap()
-            .contains("/containers/main?")
-    );
+    assert!(before_fence_release(&requests).contains("/containers/main?"));
 }
 
 #[tokio::test]
@@ -295,14 +297,7 @@ async fn delete_retries_a_network_failure_after_disconnecting_the_sandbox() {
             .count(),
         1
     );
-    assert!(
-        requests
-            .iter()
-            .rev()
-            .nth(1)
-            .unwrap()
-            .contains("/containers/main?")
-    );
+    assert!(before_fence_release(&requests).contains("/containers/main?"));
 }
 
 /// A handle whose container vanished reports `NotFound` from every verb
@@ -323,11 +318,7 @@ async fn a_vanished_container_is_not_found_by_environment_and_start() {
         }
     })
     .await;
-    let sandbox = daemon
-        .provider
-        .attach(&SandboxId::try_new("main").unwrap(), None)
-        .await
-        .unwrap();
+    let sandbox = daemon.attach_main().await;
     gone.store(true, Ordering::SeqCst);
     assert!(matches!(
         sandbox.environment().await,
@@ -347,11 +338,7 @@ async fn stop_reports_failed_one_shot_cleanup() {
         }
     })
     .await;
-    let sandbox = daemon
-        .provider
-        .attach(&SandboxId::try_new("main").unwrap(), None)
-        .await
-        .unwrap();
+    let sandbox = daemon.attach_main().await;
     assert!(sandbox.stop().await.is_err());
     let requests = daemon.finish().await;
     assert!(
@@ -384,11 +371,7 @@ async fn start_is_idempotent_and_waits_for_service_health() {
         }
     })
     .await;
-    let sandbox = daemon
-        .provider
-        .attach(&SandboxId::try_new("main").unwrap(), None)
-        .await
-        .unwrap();
+    let sandbox = daemon.attach_main().await;
     timeout(Duration::from_secs(3), sandbox.start())
         .await
         .unwrap()
@@ -401,14 +384,7 @@ async fn start_is_idempotent_and_waits_for_service_health() {
             .count(),
         3
     );
-    assert!(
-        requests
-            .iter()
-            .rev()
-            .nth(1)
-            .unwrap()
-            .contains("/containers/main/start")
-    );
+    assert!(before_fence_release(&requests).contains("/containers/main/start"));
 }
 
 #[tokio::test]
@@ -531,20 +507,13 @@ async fn interrupted_service_creation_remains_discoverable_for_cleanup() {
             .count(),
         1
     );
-    assert!(
-        requests
-            .iter()
-            .rev()
-            .nth(1)
-            .expect("last resource cleanup before fence release")
-            .contains("/containers/main?")
-    );
+    assert!(before_fence_release(&requests).contains("/containers/main?"));
 }
 
 #[tokio::test]
 async fn a_failed_fence_release_is_not_a_successful_stop() {
     let stopped = AtomicBool::new(false);
-    let daemon = Daemon::raw(move |request| {
+    let daemon = Daemon::with_manual_release(move |request| {
         if request.contains("/containers/main/stop") {
             stopped.store(true, Ordering::SeqCst);
         }
@@ -554,20 +523,14 @@ async fn a_failed_fence_release_is_not_a_successful_stop() {
         if request.contains("/containers/service/json") {
             return (200, inspect(false));
         }
-        if request.contains("/containers/create?name=sandbox-driver-fence-") {
-            (201, json!({"Id": "fence", "Warnings": []}))
-        } else if request.starts_with("DELETE ") && request.contains("/containers/fence?") {
+        if request.starts_with("DELETE ") && request.contains("/containers/fence?") {
             (500, json!({"message": "release not confirmed"}))
         } else {
             cleanup_reply(request)
         }
     })
     .await;
-    let sandbox = daemon
-        .provider
-        .attach(&SandboxId::try_new("main").unwrap(), None)
-        .await
-        .unwrap();
+    let sandbox = daemon.attach_main().await;
     let error = sandbox
         .stop()
         .await
@@ -595,11 +558,7 @@ async fn unknown_exec_admission_retains_the_fence_without_replaying() {
         }
     })
     .await;
-    let sandbox = daemon
-        .provider
-        .attach(&SandboxId::try_new("main").unwrap(), None)
-        .await
-        .unwrap();
+    let sandbox = daemon.attach_main().await;
     let error = sandbox
         .exec()
         .run(&sandbox_driver::ExecSpec::new("true"))
@@ -648,11 +607,7 @@ async fn absent_primary_does_not_hide_retained_ownership() {
 #[tokio::test]
 async fn a_stop_acknowledgement_with_live_processes_is_a_leaked_fence() {
     let daemon = Daemon::new(cleanup_reply).await;
-    let sandbox = daemon
-        .provider
-        .attach(&SandboxId::try_new("main").unwrap(), None)
-        .await
-        .unwrap();
+    let sandbox = daemon.attach_main().await;
     let error = sandbox
         .stop()
         .await
@@ -674,11 +629,7 @@ async fn an_unidentifiable_one_shot_prevents_confirmed_stop() {
         }
     })
     .await;
-    let sandbox = daemon
-        .provider
-        .attach(&SandboxId::try_new("main").unwrap(), None)
-        .await
-        .unwrap();
+    let sandbox = daemon.attach_main().await;
     assert!(sandbox.stop().await.is_err());
     let requests = daemon.finish().await;
     assert!(

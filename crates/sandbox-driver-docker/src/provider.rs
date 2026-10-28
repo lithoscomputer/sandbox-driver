@@ -21,6 +21,7 @@ use crate::container::{ContainerRef, inspect_container, remove_sandbox};
 use crate::create::{ContainerPlan, CreatedContainer};
 use crate::daemon::{docker_error, docker_kind};
 use crate::exec::DockerExec;
+use crate::fence::Operation;
 use crate::forward::DockerForwards;
 use crate::fs::DockerFs;
 use crate::image::{image_present, pull_image};
@@ -184,11 +185,7 @@ impl SandboxProvider for DockerProvider {
                         &reporter,
                     )
                     .await?;
-                    let fence_name = fence::creation_name();
-                    plan.config
-                        .labels
-                        .get_or_insert_default()
-                        .insert(fence::FENCE_NAME_LABEL.to_owned(), fence_name.clone());
+                    let fence_name = fence::reserve_creation(&mut plan.config.labels);
                     fence::create(&self.docker, &plan.image, &fence_name, async {
                         let created = CreatedContainer::create(&self.docker, &plan).await?;
                         let event_id = match SandboxId::try_new(created.id.clone()) {
@@ -267,8 +264,9 @@ impl SandboxProvider for DockerProvider {
                     let inspect = match self.inspect(id.as_str()).await {
                         Ok(inspect) => inspect,
                         Err(Error::NotFound { .. }) => {
-                            fence::ensure_absent(&self.docker, id.as_str()).await?;
-                            return one_shot::sweep(&self.docker, id.as_str()).await;
+                            let sweep = one_shot::sweep(&self.docker, id.as_str());
+                            return fence::run(&self.docker, id.as_str(), Operation::Delete, sweep)
+                                .await;
                         }
                         Err(error) => return Err(error),
                     };
@@ -279,7 +277,7 @@ impl SandboxProvider for DockerProvider {
                     }
                     let network = sidecar_network_of(&inspect);
                     let container_id = inspect.id.clone().unwrap_or_else(|| id.as_str().to_owned());
-                    fence::run(&self.docker, &container_id, "delete", async {
+                    fence::run(&self.docker, &container_id, Operation::Delete, async {
                         remove_sandbox(&self.docker, &container_id, network.as_deref()).await
                     })
                     .await

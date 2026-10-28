@@ -147,25 +147,25 @@ fn network_of(inspect: &ContainerInspectResponse) -> Option<NetworkPolicy> {
 /// Whether an inspected container is one this provider created. Anything
 /// else is not a sandbox, whatever else it is.
 pub(crate) fn is_managed(inspect: &ContainerInspectResponse) -> bool {
+    label_of(inspect, MANAGED_LABEL) == Some("true")
+}
+
+/// One label of an inspected container.
+pub(crate) fn label_of<'a>(inspect: &'a ContainerInspectResponse, key: &str) -> Option<&'a str> {
     inspect
         .config
         .as_ref()
         .and_then(|config| config.labels.as_ref())
-        .and_then(|labels| labels.get(MANAGED_LABEL))
+        .and_then(|labels| labels.get(key))
         .map(String::as_str)
-        == Some("true")
 }
 
 /// The managed sidecar network an inspected container joined, if any: a
 /// user-defined network named after the sandbox. New containers record it
 /// before creating dependencies; older containers used their network mode.
 pub(crate) fn sidecar_network_of(inspect: &ContainerInspectResponse) -> Option<String> {
-    inspect
-        .config
-        .as_ref()
-        .and_then(|config| config.labels.as_ref())
-        .and_then(|labels| labels.get(SIDECAR_NETWORK_LABEL))
-        .cloned()
+    label_of(inspect, SIDECAR_NETWORK_LABEL)
+        .map(str::to_owned)
         .or_else(|| {
             inspect
                 .host_config

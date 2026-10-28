@@ -26,6 +26,7 @@ use tokio::time::{Instant, sleep, timeout};
 use crate::MANAGED_LABEL;
 use crate::container::{inspect_container, remove_container_forced};
 use crate::daemon::{docker_error, docker_kind, is_conflict};
+use crate::inspect::label_of;
 use crate::one_shot::ONE_SHOT_LABEL;
 use crate::sidecars::NETWORK_LABEL;
 
@@ -33,7 +34,48 @@ pub(crate) const FENCE_NAME_LABEL: &str = "sh.sandbox-driver.fence-name";
 pub(crate) const FENCE_LABEL: &str = "sh.sandbox-driver.fence";
 const OPERATION_LABEL: &str = "sh.sandbox-driver.fence-operation";
 const ADMISSION_WAIT: Duration = Duration::from_secs(5);
+const MAX_ADMISSION_POLL: Duration = Duration::from_millis(200);
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
+/// Creation and start wait on image pulls and service readiness.
+const PROVISIONING_TIMEOUT: Duration = Duration::from_secs(360);
+
+/// What a fence owner is doing, recorded on its marker.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Operation {
+    Admit,
+    Create,
+    Start,
+    Stop,
+    Delete,
+    Pause,
+    Resume,
+}
+
+impl Operation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Admit => "admit",
+            Self::Create => "create",
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Delete => "delete",
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+        }
+    }
+
+    fn budget(self) -> Duration {
+        match self {
+            Self::Create | Self::Start => PROVISIONING_TIMEOUT,
+            _ => OPERATION_TIMEOUT,
+        }
+    }
+
+    /// An absent primary cannot admit new work, so only teardown proceeds.
+    fn tolerates_absent(self) -> bool {
+        matches!(self, Self::Stop | Self::Delete)
+    }
+}
 
 /// Serializes admissions and lifecycle changes, not the lifetime of a command.
 /// Once admission completes, stopping the primary and sweeping its labeled
@@ -41,7 +83,7 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) fn run<'a, T: Send + 'a>(
     docker: &'a Docker,
     id: &'a str,
-    operation: &'static str,
+    operation: Operation,
     work: impl Future<Output = Result<T>> + Send + 'a,
 ) -> BoxFuture<'a, Result<T>> {
     // Box this orchestration boundary: combining daemon inspection, claim
@@ -63,17 +105,12 @@ pub(crate) fn run<'a, T: Send + 'a>(
 async fn finish<T>(
     docker: &Docker,
     marker: &str,
-    operation: &str,
+    operation: Operation,
     work: impl Future<Output = Result<T>>,
 ) -> Result<T> {
-    let budget = if matches!(operation, "start" | "create") {
-        Duration::from_secs(360)
-    } else {
-        OPERATION_TIMEOUT
-    };
     // A completed response (including a refusal) releases ownership. A lost
     // response does not prove that the daemon stopped processing the request.
-    let result = match timeout(budget, work).await {
+    let result = match timeout(operation.budget(), work).await {
         Ok(Err(error)) if retain_claim(&error) => return Err(retain_error(marker, error)),
         Ok(result) => result,
         Err(_) => return Err(retained(marker, "operation timed out", None)),
@@ -90,13 +127,13 @@ async fn finish<T>(
     }
 }
 
-async fn acquire(docker: &Docker, id: &str, operation: &str) -> Result<Option<String>> {
+async fn acquire(docker: &Docker, id: &str, operation: Operation) -> Result<Option<String>> {
     // Canonical IDs prevent names and short IDs from producing different locks.
     let inspect = match inspect_container(docker, id).await {
         Ok(inspect) => inspect,
-        Err(Error::NotFound { .. }) if matches!(operation, "delete" | "stop") => {
-            // An absent primary cannot admit new work. An earlier request may
-            // still own its marker, though, so absence alone is insufficient.
+        Err(Error::NotFound { .. }) if operation.tolerates_absent() => {
+            // An earlier request may still own its marker, though, so
+            // absence alone is insufficient.
             ensure_absent(docker, id).await?;
             return Ok(None);
         }
@@ -104,70 +141,56 @@ async fn acquire(docker: &Docker, id: &str, operation: &str) -> Result<Option<St
     };
     let id = inspect
         .id
+        .as_deref()
         .ok_or_else(|| Error::Transport(TransportError::new("daemon omitted the sandbox ID")))?;
     let image = inspect
         .image
+        .as_deref()
         .ok_or_else(|| Error::Transport(TransportError::new("daemon omitted the sandbox image")))?;
-    let name = inspect
-        .config
-        .as_ref()
-        .and_then(|config| config.labels.as_ref())
-        .and_then(|labels| labels.get(FENCE_NAME_LABEL))
-        .cloned()
-        .unwrap_or_else(|| format!("sandbox-driver-fence-{id}"));
+    let name = label_of(&inspect, FENCE_NAME_LABEL)
+        .map_or_else(|| format!("sandbox-driver-fence-{id}"), str::to_owned);
     let deadline = Instant::now() + ADMISSION_WAIT;
+    let mut poll = Duration::from_millis(10);
     loop {
-        let result = create_marker(docker, &image, &name, &id, operation).await;
-        match result {
-            Ok(Ok(created)) if created.id.is_empty() => {
-                return Err(retained(&name, "daemon omitted the fence ID", None));
-            }
-            Ok(Ok(created)) => return Ok(Some(created.id)),
+        match create_marker(docker, image, &name, id, operation).await {
             Ok(Err(error)) if is_conflict(&error) => {
                 let marker = match inspect_container(docker, &name).await {
                     Ok(marker) => marker,
                     Err(Error::NotFound { .. }) => continue,
                     Err(error) => return Err(error),
                 };
-                let owner = marker
-                    .config
-                    .as_ref()
-                    .and_then(|config| config.labels.as_ref())
-                    .and_then(|labels| labels.get(OPERATION_LABEL))
-                    .map(String::as_str);
                 // Short concurrent admissions can queue, preserving concurrent
                 // exec callers. Lifecycle ownership is always a Busy refusal.
-                if owner != Some("admit") || Instant::now() >= deadline {
+                if label_of(&marker, OPERATION_LABEL) != Some(Operation::Admit.label())
+                    || Instant::now() >= deadline
+                {
                     return Err(busy("another operation owns the sandbox fence"));
                 }
-                sleep(Duration::from_millis(10)).await;
+                sleep(poll).await;
+                poll = (poll * 2).min(MAX_ADMISSION_POLL);
             }
-            Ok(Err(error)) => {
-                let error = docker_error("acquiring sandbox fence", error);
-                return Err(if uncertain(&error) {
-                    retained(&name, "fence acquisition outcome is unknown", Some(error))
-                } else {
-                    error
-                });
-            }
-            Err(_) => return Err(retained(&name, "fence acquisition timed out", None)),
+            attempt => return claimed(&name, attempt).map(Some),
         }
     }
 }
 
 /// Allocates the gate before the primary is visible to attach/list. Its name
 /// is stored in the primary's immutable labels, so all later clients use it.
-pub(crate) fn creation_name() -> String {
+pub(crate) fn reserve_creation(labels: &mut Option<HashMap<String, String>>) -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    format!(
+    let name = format!(
         "sandbox-driver-fence-create-{}-{time}-{}",
         process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
-    )
+    );
+    labels
+        .get_or_insert_default()
+        .insert(FENCE_NAME_LABEL.to_owned(), name.clone());
+    name
 }
 
 pub(crate) fn create<'a, T: Send + 'a>(
@@ -176,35 +199,23 @@ pub(crate) fn create<'a, T: Send + 'a>(
     name: &'a str,
     work: impl Future<Output = Result<T>> + Send + 'a,
 ) -> BoxFuture<'a, Result<T>> {
-    // Box this orchestration boundary: combining daemon inspection, claim
-    // allocation, and the operation would otherwise inflate every caller.
+    // Boxed for the same reason as `run`.
     Box::pin(async move {
-        let marker = match create_marker(docker, image, name, name, "create").await {
-            Ok(Ok(created)) if created.id.is_empty() => {
-                return Err(retained(name, "daemon omitted the fence ID", None));
-            }
-            Ok(Ok(created)) => created.id,
-            Ok(Err(error)) => {
-                let error = docker_error("acquiring creation fence", error);
-                return Err(if uncertain(&error) {
-                    retained(name, "creation fence outcome is unknown", Some(error))
-                } else {
-                    error
-                });
-            }
-            Err(_) => return Err(retained(name, "creation fence timed out", None)),
-        };
-        finish(docker, &marker, "create", work).await
+        let attempt = create_marker(docker, image, name, name, Operation::Create).await;
+        let marker = claimed(name, attempt)?;
+        finish(docker, &marker, Operation::Create, work).await
     })
 }
+
+type MarkerAttempt = StdResult<StdResult<ContainerCreateResponse, DockerApiError>, Elapsed>;
 
 async fn create_marker(
     docker: &Docker,
     image: &str,
     name: &str,
     id: &str,
-    operation: &str,
-) -> StdResult<StdResult<ContainerCreateResponse, DockerApiError>, Elapsed> {
+    operation: Operation,
+) -> MarkerAttempt {
     timeout(
         OPERATION_TIMEOUT,
         docker.create_container(
@@ -218,7 +229,7 @@ async fn create_marker(
                 labels: Some(HashMap::from([
                     (FENCE_LABEL.to_owned(), id.to_owned()),
                     (MANAGED_LABEL.to_owned(), "false".to_owned()),
-                    (OPERATION_LABEL.to_owned(), operation.to_owned()),
+                    (OPERATION_LABEL.to_owned(), operation.label().to_owned()),
                     // Image labels are merged by Docker. A claim must never
                     // inherit a sibling-discovery label and be swept while
                     // its critical section is still running.
@@ -232,8 +243,27 @@ async fn create_marker(
     .await
 }
 
+/// The marker a creation attempt produced, unless the daemon refused it.
+fn claimed(name: &str, attempt: MarkerAttempt) -> Result<String> {
+    match attempt {
+        Ok(Ok(created)) if created.id.is_empty() => {
+            Err(retained(name, "daemon omitted the fence ID", None))
+        }
+        Ok(Ok(created)) => Ok(created.id),
+        Ok(Err(error)) => {
+            let error = docker_error("acquiring sandbox fence", error);
+            Err(if uncertain(&error) {
+                retained(name, "fence acquisition outcome is unknown", Some(error))
+            } else {
+                error
+            })
+        }
+        Err(_) => Err(retained(name, "fence acquisition timed out", None)),
+    }
+}
+
 /// An absent primary is not proof that an earlier request released ownership.
-pub(crate) async fn ensure_absent(docker: &Docker, id: &str) -> Result<()> {
+async fn ensure_absent(docker: &Docker, id: &str) -> Result<()> {
     let markers = timeout(
         OPERATION_TIMEOUT,
         docker.list_containers(Some(ListContainersOptions {
@@ -271,7 +301,7 @@ fn uncertain(error: &Error) -> bool {
         }
         cause = current.source();
     }
-    matches!(error, Error::Transport(_))
+    false
 }
 
 fn busy(message: &str) -> Error {
@@ -281,13 +311,13 @@ fn busy(message: &str) -> Error {
 }
 
 fn retain_error(marker: &str, error: Error) -> Error {
-    if let Error::Provider(mut failure) = error {
-        if failure.code.as_deref() == Some("fence_leaked") {
+    match error {
+        Error::Provider(mut failure) if failure.code.as_deref() == Some("fence_leaked") => {
             failure.detail.get_or_insert_with(|| serde_json::json!({}))["fence_container"] =
                 Value::String(marker.to_owned());
-            return Error::Provider(failure);
+            Error::Provider(failure)
         }
-        if failure.code.as_deref() == Some("incomplete_cleanup") {
+        Error::Provider(mut failure) if failure.code.as_deref() == Some("incomplete_cleanup") => {
             if let Some(remaining) = failure
                 .detail
                 .as_mut()
@@ -296,15 +326,10 @@ fn retain_error(marker: &str, error: Error) -> Error {
             {
                 remaining.push(serde_json::json!({"kind": "fence_container", "id": marker}));
             }
-            return Error::Provider(failure);
+            Error::Provider(failure)
         }
-        return retained(
-            marker,
-            "daemon outcome is unknown",
-            Some(Error::Provider(failure)),
-        );
+        error => retained(marker, "daemon outcome is unknown", Some(error)),
     }
-    retained(marker, "daemon outcome is unknown", Some(error))
 }
 
 fn acquisition_timeout(id: &str) -> Error {

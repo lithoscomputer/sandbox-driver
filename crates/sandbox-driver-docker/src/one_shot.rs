@@ -38,10 +38,11 @@ use tokio::time;
 
 use crate::container::{ContainerRef, remove_container_forced};
 use crate::daemon::{docker_error, docker_kind, is_conflict, is_not_found};
+use crate::fence::{self, Operation};
 use crate::fs::tar::reroot;
 use crate::image::{image_present, pull_image};
 use crate::output::{KILL_DRAIN_GRACE, StreamOutput, drain_with_stops};
-use crate::{MANAGED_LABEL, fence, non_empty};
+use crate::{MANAGED_LABEL, non_empty};
 
 /// The label every one-shot container carries, naming the sandbox it
 /// belongs to (the sandbox container's id).
@@ -409,8 +410,11 @@ impl OneShot for DockerOneShot {
                 .into_result(termination, None, started.elapsed(), false));
             }
         };
-        let (container, output) =
-            fence::run(&self.container.docker, &self.container.id, "admit", async {
+        let (container, output) = fence::run(
+            &self.container.docker,
+            &self.container.id,
+            Operation::Admit,
+            async {
                 let inspect = self.container.inspect().await?;
                 if inspect.state.as_ref().and_then(|state| state.running) != Some(true) {
                     return Err(Error::invalid_spec(
@@ -425,8 +429,9 @@ impl OneShot for DockerOneShot {
                 .await?;
                 let output = container.attach_and_start().await?;
                 Ok((container, output))
-            })
-            .await?;
+            },
+        )
+        .await?;
         let mut captured =
             StreamOutput::new(spec.output_sanitization, controls.retained_output_limit);
         let outcome = match drain_with_stops(
