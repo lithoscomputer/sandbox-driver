@@ -6,9 +6,9 @@ this document states the required behavior behind those shapes and the
 migration rules. It defines common data and required behavior for the next API. It does **not** claim the
 existing providers implement that behavior yet. The current crate-root traits,
 errors, specs, provider libraries, executables, and [protocol v2](protocol.md)
-remain supported during migration. The additive façade, registration boundary
-and scripted fake now consume these declarations. No new transport or consumer
-cutover is introduced by core.
+remain supported during migration. The additive façade, registration boundary,
+scripted fake and common conformance checks now consume these declarations.
+No new transport or consumer cutover is introduced by core.
 
 ## Compatibility boundary
 
@@ -351,19 +351,19 @@ The additive provider boundary is exported from `sandbox_driver::contract`:
   from the persistable spec; providers must retain the admission for restart.
 
 These are implementation interfaces, not proof of provider conformance. The
-façade, schema engine and scripted fake are implemented; the reusable
-conformance suite is a separate follow-up. Real provider/transport conformance
-remains an integration gate.
+façade, schema engine, scripted fake and reusable conformance suite are
+implemented. Real provider/transport conformance remains an integration gate.
 Existing crate-root traits and protocol v2 are unchanged.
 
 ### Scripted fake provider
 
-`sandbox_driver_testing::contract::FakeProvider` implements the provider factory/runtime boundary in
-memory. Consumers use `sandbox-driver-testing` as a dev-dependency; the core
-library exports no fake. `script` supplies command responses; unscripted commands fail without
-executing on the host. Clones share workload state and call history. The fake
-supports required lifecycle, identity, files and streaming execution, and
-advertises no optional workload capabilities. Its focused tests exercise
-cancellation, shutdown uncertainty and workload-relative file paths directly
-through the provider interfaces. The testing crate provides `FakeProvider::sandboxes` and `contract::fake` helpers;
-the reusable conformance suite is a separate follow-up.
+`sandbox_driver_testing::contract::FakeProvider` implements the provider
+factory/runtime boundary in memory. Consumers use `sandbox-driver-testing` as
+a dev-dependency; the core library exports no fake. `script` supplies command
+responses; unscripted commands fail without executing on the host. Clones share
+workload state and call history. The fake supports required lifecycle, identity,
+files and streaming execution, and advertises no optional workload capabilities.
+Its focused tests exercise cancellation, shutdown uncertainty and workload-relative
+file paths directly through the provider interfaces. The testing crate provides
+`FakeProvider::sandboxes` and `contract::fake` helpers; the reusable conformance
+suite exercises the fake through those helpers.
