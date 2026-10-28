@@ -7,16 +7,24 @@ use sandbox_driver::{Error, ErrorReport, ProviderError, ProviderKind, Result, Sa
 use tokio::time;
 
 use crate::TRANSITION_POLL;
-use crate::sdk::{DaytonaClient, daytona_error, is_not_found, map_state};
+use crate::sdk::{
+    DaytonaClient, daytona_error, is_not_found, is_state_change_in_progress, map_state,
+};
 
-/// A single delete request, followed by observations of authoritative absence.
-/// No uncertain mutation is replayed. A failed observation cannot prove
-/// cleanup.
+/// A single admitted delete request, followed by observations of authoritative
+/// absence. A delete rejected because a state change is in progress was never
+/// admitted, so it is repeated; no uncertain mutation is replayed. A failed
+/// observation cannot prove cleanup.
 async fn delete_and_confirm(client: &DaytonaClient, id: &str) -> Result<()> {
-    match client.delete(id).await {
-        Ok(()) => {}
-        Err(error) if is_not_found(&error) => return Ok(()),
-        Err(error) => return Err(daytona_error("requesting failed-create cleanup", error)),
+    loop {
+        match client.delete(id).await {
+            Ok(()) => break,
+            Err(error) if is_not_found(&error) => return Ok(()),
+            Err(error) if is_state_change_in_progress(&error) => {
+                time::sleep(TRANSITION_POLL).await;
+            }
+            Err(error) => return Err(daytona_error("requesting failed-create cleanup", error)),
+        }
     }
     loop {
         match client.get(id).await {
@@ -131,6 +139,26 @@ mod tests {
         assert!(matches!(error, Error::InvalidSpec { .. }), "{error:?}");
         assert_eq!(observations.load(Ordering::SeqCst), 2);
         assert_eq!(fake.deletes(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_rejected_during_a_state_change_is_repeated_until_admitted() {
+        let rejections = Arc::new(AtomicUsize::new(0));
+        let rejected = Arc::clone(&rejections);
+        let (error, fake) = clean_up(
+            move |method| match method {
+                "DELETE" if rejected.fetch_add(1, Ordering::SeqCst) == 0 => Reply::Json(
+                    400,
+                    r#"{"message":"Sandbox state change in progress"}"#.to_owned(),
+                ),
+                "DELETE" => sandbox("destroying"),
+                _ => Reply::Json(404, "{}".to_owned()),
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(matches!(error, Error::InvalidSpec { .. }), "{error:?}");
+        assert_eq!(fake.deletes(), 2);
     }
 
     #[tokio::test]

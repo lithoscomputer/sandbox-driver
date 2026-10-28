@@ -40,13 +40,14 @@
 //! # Failed creation
 //!
 //! Once Daytona returns a sandbox ID, startup observation is bounded. A
-//! failure during startup or provisioning attempts one delete and waits,
-//! within a cleanup deadline, for removal to be confirmed. An accepted delete
-//! or a `destroying` status alone does not confirm cleanup. Unconfirmed cleanup
-//! returns a legacy [`sandbox_driver::ProviderError`] with code
-//! `incomplete_cleanup`, the known sandbox ID in `detail.remaining`, and the
-//! cleanup diagnostic in `detail.cleanup`; the original creation failure stays
-//! in its source chain. This is not permission to replay the create.
+//! failure during startup or provisioning deletes the sandbox, repeating the
+//! request only while Daytona rejects it for an in-progress state change, and
+//! waits, within a five-minute cleanup deadline, for removal to be confirmed.
+//! An accepted delete or a `destroying` status alone does not confirm cleanup.
+//! Unconfirmed cleanup returns a legacy [`sandbox_driver::ProviderError`] with
+//! code `incomplete_cleanup`, the known sandbox ID in `detail.remaining`, and
+//! the cleanup diagnostic in `detail.cleanup`; the original creation failure
+//! stays in its source chain. This is not permission to replay the create.
 //!
 //! # Lifecycle timers
 //!
@@ -133,6 +134,10 @@ pub(crate) const CREATE_POLL: Duration = Duration::from_secs(2);
 /// Upper bound on cleanup calls (deletes) so a stalled REST call cannot
 /// block cancellation or failure paths indefinitely.
 pub(crate) const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Budget for confirming that a failed create's sandbox is gone. Live
+/// destroys have taken over two minutes; this stays small beside the
+/// create budgets.
+pub(crate) const FAILED_CREATE_CLEANUP_BUDGET: Duration = Duration::from_secs(300);
 /// Budget for waiting out an in-flight Daytona lifecycle transition
 /// (for example an auto-stop racing a reactivation).
 pub(crate) const TRANSITION_BUDGET: Duration = Duration::from_secs(120);

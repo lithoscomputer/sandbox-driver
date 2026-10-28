@@ -34,8 +34,8 @@ use crate::sdk::{
 use crate::snapshots::DaytonaSnapshots;
 use crate::volumes::DaytonaVolumes;
 use crate::{
-    CLEANUP_TIMEOUT, CREATE_POLL, CREATE_TIMEOUT, DOCKERFILE_CREATE_TIMEOUT, LIST_PAGE_SIZE,
-    RUNTIME_DIRECTORY, RUNTIME_DIRECTORY_PARENT, cleanup, nested, toolbox,
+    CREATE_POLL, CREATE_TIMEOUT, DOCKERFILE_CREATE_TIMEOUT, FAILED_CREATE_CLEANUP_BUDGET,
+    LIST_PAGE_SIZE, RUNTIME_DIRECTORY, RUNTIME_DIRECTORY_PARENT, cleanup, nested, toolbox,
 };
 
 /// The current-key endpoint includes its effective organization, which the
@@ -307,7 +307,14 @@ impl DaytonaProvider {
     /// An accepted DELETE only starts cleanup. Retain the sandbox ID and
     /// original failure if removal cannot be confirmed.
     async fn cleanup_failed_create(&self, sdk_id: &str, cause: Error) -> Error {
-        cleanup::failed_create(&self.client, &self.kind, sdk_id, cause, CLEANUP_TIMEOUT).await
+        cleanup::failed_create(
+            &self.client,
+            &self.kind,
+            sdk_id,
+            cause,
+            FAILED_CREATE_CLEANUP_BUDGET,
+        )
+        .await
     }
 
     async fn handle(
