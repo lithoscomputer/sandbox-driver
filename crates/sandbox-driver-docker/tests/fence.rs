@@ -7,9 +7,12 @@ use std::time::Duration;
 use std::{iter, process};
 
 use bollard::Docker;
-use bollard::container::{ListContainersOptions, RemoveContainerOptions};
+use bollard::container::{
+    Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
+};
 use sandbox_driver::{
     Error, ExecControls, ExecSpec, OneShotSpec, SandboxProvider, SandboxSource, SandboxSpec,
+    Termination,
 };
 use sandbox_driver_docker::DockerProvider;
 use tokio::time::{sleep, timeout};
@@ -211,4 +214,80 @@ async fn a_visible_but_unready_creation_cannot_be_started_or_stopped_by_another_
     let exec = sandbox.exec().run(&ExecSpec::new("true")).await;
     sandbox.delete().await.expect("cleanup");
     assert!(exec.expect("exec after create").success());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a live Docker daemon"]
+async fn a_held_lifecycle_claim_does_not_keep_a_timeout_from_stopping_a_command() {
+    let provider = DockerProvider::connect().await.expect("Docker is required");
+    let docker = Docker::connect_with_local_defaults().expect("Docker client");
+    let spec = SandboxSpec::new(SandboxSource::Image {
+        reference: IMAGE.to_owned(),
+    })
+    .name(format!("fence-control-{}", process::id()));
+    let sandbox = Arc::new(provider.create(&spec, None).await.expect("create"));
+    let runner = Arc::clone(&sandbox);
+    let running = tokio::spawn(async move {
+        runner
+            .exec()
+            .run(
+                &ExecSpec::new("sleep")
+                    .args(["600"])
+                    .timeout(Duration::from_secs(3)),
+            )
+            .await
+    });
+    // Once the command is admitted, stand in for another client's lifecycle
+    // claim, using the marker name recorded on the primary.
+    sleep(Duration::from_secs(1)).await;
+    let id = sandbox.id().as_str();
+    let inspect = docker
+        .inspect_container(id, None)
+        .await
+        .expect("inspect primary");
+    let name = inspect
+        .config
+        .and_then(|config| config.labels)
+        .and_then(|labels| labels.get("sh.sandbox-driver.fence-name").cloned())
+        .expect("primary records its fence name");
+    let marker = docker
+        .create_container(
+            Some(CreateContainerOptions {
+                name:     name.clone(),
+                platform: None,
+            }),
+            Config {
+                image: inspect.image.clone(),
+                entrypoint: Some(vec!["/bin/false".to_owned()]),
+                labels: Some(HashMap::from([
+                    ("sh.sandbox-driver.fence".to_owned(), id.to_owned()),
+                    (
+                        "sh.sandbox-driver.fence-operation".to_owned(),
+                        "start".to_owned(),
+                    ),
+                ])),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("hold the claim");
+    let result = timeout(Duration::from_secs(30), running)
+        .await
+        .expect("timeout ends the command")
+        .expect("exec task");
+    docker
+        .remove_container(
+            &marker.id,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("release the claim");
+    sandbox.delete().await.expect("cleanup");
+    assert_eq!(
+        result.expect("stopped run").termination,
+        Termination::TimedOut
+    );
 }

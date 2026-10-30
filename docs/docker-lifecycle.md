@@ -27,7 +27,9 @@ and retains the claim. Start, exec, one-shot admission, pause, resume, and
 delete cannot overtake that drain. A competing lifecycle claim is refused as a
 legacy `ProviderError` with code `busy`. Short concurrent execution admissions
 can wait up to five seconds for one another. Describe and inventory remain
-available while a claim is held.
+available while a claim is held, and so do the stop-request and PTY cleanup
+execs that end already-admitted commands: they start no new work, so a held
+claim must not keep a command from being stopped.
 
 ## Failure and reconciliation
 

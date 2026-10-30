@@ -70,39 +70,54 @@ impl ContainerRef {
         inspect_container(&self.docker, &self.id).await
     }
 
-    /// Creates an exec from `options` and starts it attached to its
-    /// streams. `what` names the exec in errors: "stdio exec", say.
+    /// Admits new work: creates an exec from `options` under the sandbox
+    /// fence and starts it attached to its streams. `what` names the exec
+    /// in errors: "stdio exec", say.
     pub(crate) async fn start_attached(
         &self,
         options: CreateExecOptions<String>,
         what: &str,
     ) -> Result<AttachedExec> {
-        fence::run(&self.docker, &self.id, Operation::Admit, async {
-            let exec = self
-                .docker
-                .create_exec(&self.id, options)
-                .await
-                .map_err(|error| docker_error(&format!("creating {what}"), error))?;
-            let start = self
-                .docker
-                .start_exec(&exec.id, None::<StartExecOptions>)
-                .await
-                .map_err(|error| docker_error(&format!("starting {what}"), error))?;
-            let StartExecResults::Attached { output, input } = start else {
-                return Err(docker_error(
-                    &format!("starting {what}"),
-                    DockerApiError::IOError {
-                        err: io::Error::other("exec started detached"),
-                    },
-                ));
-            };
-            Ok(AttachedExec {
-                id: exec.id,
-                output,
-                input,
-            })
-        })
+        fence::run(
+            &self.docker,
+            &self.id,
+            Operation::Admit,
+            self.start_control(options, what),
+        )
         .await
+    }
+
+    /// Starts an exec that only signals work already admitted, such as a
+    /// stop request. It bypasses admission: it starts no new work, and a
+    /// held lifecycle claim must not keep a stop from reaching a command.
+    pub(crate) async fn start_control(
+        &self,
+        options: CreateExecOptions<String>,
+        what: &str,
+    ) -> Result<AttachedExec> {
+        let exec = self
+            .docker
+            .create_exec(&self.id, options)
+            .await
+            .map_err(|error| docker_error(&format!("creating {what}"), error))?;
+        let start = self
+            .docker
+            .start_exec(&exec.id, None::<StartExecOptions>)
+            .await
+            .map_err(|error| docker_error(&format!("starting {what}"), error))?;
+        let StartExecResults::Attached { output, input } = start else {
+            return Err(docker_error(
+                &format!("starting {what}"),
+                DockerApiError::IOError {
+                    err: io::Error::other("exec started detached"),
+                },
+            ));
+        };
+        Ok(AttachedExec {
+            id: exec.id,
+            output,
+            input,
+        })
     }
 
     /// The exit code of an exec, once it has one.
