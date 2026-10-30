@@ -45,6 +45,10 @@ depends = ["plugins:build"]
 description = "Run all Rust tests with Nextest"
 run = "cargo nextest run --locked --all-targets --all-features --no-tests=pass"
 
+[tasks."test:doc"]
+description = "Compile and run the core library and README examples"
+run = "cargo test --locked --doc -p sandbox-driver"
+
 [tasks."test:cli"]
 depends = ["plugins:build"]
 description = "Run CLI black-box tests, including available live providers"
@@ -77,7 +81,7 @@ run = ["git diff --check", "git diff --cached --check"]
 
 [tasks.check]
 description = "Run the complete routine verification gate"
-depends = ["fmt:check", "lint", "test", "check:actions", "check:whitespace"]
+depends = ["fmt:check", "lint", "test", "test:doc", "check:actions", "check:whitespace"]
 
 [tasks."check:nightly"]
 description = "Run the extended nightly verification gate"

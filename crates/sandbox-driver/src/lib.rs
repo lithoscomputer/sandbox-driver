@@ -130,3 +130,7 @@ pub use spec::{
 };
 pub use state::{SandboxState, SandboxStatus};
 pub use wait::{WaitOptions, wait_for_stable_state, wait_for_state};
+
+#[cfg(doctest)]
+#[doc = include_str!("../../../README.md")]
+pub struct ReadmeDoctests;
