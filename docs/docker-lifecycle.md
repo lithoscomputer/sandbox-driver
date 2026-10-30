@@ -48,11 +48,10 @@ coordination while managed work is active. The mechanism coordinates cooperating
 provider clients; it is not an authorization boundary against Docker admins.
 
 Each daemon call that acquires, discovers, or releases a claim has a 60-second
-bound. Execution admission,
-stop, pause, resume, and delete have a 60-second operation bound; create and start
-have a six-minute bound to allow the existing service readiness budget. A
-failure to confirm claim release is an error even if the workload mutation
-completed.
+bound. Execution admission, stop, pause, resume, and delete have a 60-second
+operation bound; create and start have a six-minute bound to allow the existing
+service readiness budget. A failure to confirm claim release is an error even if
+the workload mutation completed.
 
 A failed create attempts dependent cleanup before removing the primary, with a
 30-second cleanup budget. Unconfirmed cleanup uses `incomplete_cleanup` and
