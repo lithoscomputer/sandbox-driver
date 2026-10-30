@@ -154,16 +154,18 @@ async fn acquire(docker: &Docker, id: &str, operation: Operation) -> Result<Opti
     loop {
         match create_marker(docker, image, &name, id, operation).await {
             Ok(Err(error)) if is_conflict(&error) => {
-                let marker = match inspect_container(docker, &name).await {
-                    Ok(marker) => marker,
-                    Err(Error::NotFound { .. }) => continue,
-                    Err(error) => return Err(error),
-                };
                 // Short concurrent admissions can queue, preserving concurrent
                 // exec callers. Lifecycle ownership is always a Busy refusal.
-                if label_of(&marker, OPERATION_LABEL) != Some(Operation::Admit.label())
-                    || Instant::now() >= deadline
-                {
+                let queued = match inspect_container(docker, &name).await {
+                    Ok(marker) => {
+                        label_of(&marker, OPERATION_LABEL) == Some(Operation::Admit.label())
+                    }
+                    // Released between the attempt and the inspect: retry, but
+                    // still within the admission wait.
+                    Err(Error::NotFound { .. }) => true,
+                    Err(error) => return Err(error),
+                };
+                if !queued || Instant::now() >= deadline {
                     return Err(busy("another operation owns the sandbox fence"));
                 }
                 sleep(poll).await;
