@@ -650,4 +650,10 @@ async fn an_unidentifiable_one_shot_prevents_confirmed_stop() {
             .iter()
             .any(|request| request.contains("/containers/main/stop"))
     );
+    // A complete listing is not an unknown outcome, so the claim is released.
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.starts_with("DELETE ") && request.contains("/containers/fence?"))
+    );
 }
