@@ -32,7 +32,7 @@ use bollard::models::{HostConfig, Mount};
 use futures_util::{Stream, StreamExt};
 use sandbox_driver::{
     Error, ExecControls, ExecStreamingResult, OneShot, OneShotImage, OneShotSpec, ProviderError,
-    Result, StopLevel, Termination, TransportError, stop_signal,
+    Result, SandboxState, StopLevel, Termination, TransportError, stop_signal,
 };
 use tokio::time;
 
@@ -41,6 +41,7 @@ use crate::daemon::{docker_error, docker_kind, is_conflict, is_not_found};
 use crate::fence::{self, Operation};
 use crate::fs::tar::reroot;
 use crate::image::{image_present, pull_image};
+use crate::inspect::map_state;
 use crate::output::{KILL_DRAIN_GRACE, StreamOutput, drain_with_stops};
 use crate::{MANAGED_LABEL, non_empty};
 
@@ -415,12 +416,14 @@ impl OneShot for DockerOneShot {
             &self.container.id,
             Operation::Admit,
             async {
-                let inspect = self.container.inspect().await?;
-                if inspect.state.as_ref().and_then(|state| state.running) != Some(true) {
-                    return Err(Error::invalid_spec(
-                        "sandbox",
-                        "one-shot requires a running sandbox",
-                    ));
+                // A sandbox state, not a spec field, decides admission. Docker
+                // reports a paused container as running, so classify it.
+                let state = map_state(&self.container.inspect().await?);
+                if state != SandboxState::Running {
+                    return Err(Error::Provider(ProviderError::new(
+                        docker_kind(),
+                        format!("one-shot requires a running sandbox, not {state:?}"),
+                    )));
                 }
                 let container = OneShotContainer::create(
                     &self.container.docker,
