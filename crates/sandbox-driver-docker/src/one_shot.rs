@@ -32,14 +32,16 @@ use bollard::models::{HostConfig, Mount};
 use futures_util::{Stream, StreamExt};
 use sandbox_driver::{
     Error, ExecControls, ExecStreamingResult, OneShot, OneShotImage, OneShotSpec, ProviderError,
-    Result, StopLevel, Termination, stop_signal,
+    Result, SandboxState, StopLevel, Termination, stop_signal,
 };
 use tokio::time;
 
 use crate::container::{ContainerRef, remove_container_forced};
-use crate::daemon::{docker_error, docker_kind, is_conflict, is_not_found};
+use crate::daemon::{docker_error, docker_kind, is_conflict, is_not_found, listed_id};
+use crate::fence::{self, Operation};
 use crate::fs::tar::reroot;
 use crate::image::{image_present, pull_image};
+use crate::inspect::map_state;
 use crate::output::{KILL_DRAIN_GRACE, StreamOutput, drain_with_stops};
 use crate::{MANAGED_LABEL, non_empty};
 
@@ -380,9 +382,8 @@ pub(crate) async fn sweep(docker: &Docker, sandbox_id: &str) -> Result<()> {
         .await
         .map_err(|error| docker_error("listing one-shot containers", error))?;
     for container in containers {
-        if let Some(id) = container.id {
-            remove_container_forced(docker, &id, "removing one-shot container").await?;
-        }
+        let id = listed_id(container.id, "one-shot")?;
+        remove_container_forced(docker, &id, "removing one-shot container").await?;
     }
     Ok(())
 }
@@ -406,10 +407,44 @@ impl OneShot for DockerOneShot {
                 .into_result(termination, None, started.elapsed(), false));
             }
         };
-        let container =
-            OneShotContainer::create(&self.container.docker, self.container_config(spec, image))
+        // Releasing the fence can fail after the one-shot started; remove it
+        // then rather than leave it running with nobody draining its output.
+        let mut created_id = None;
+        let admitted = fence::run(
+            &self.container.docker,
+            &self.container.id,
+            Operation::Admit,
+            async {
+                // A sandbox state, not a spec field, decides admission. Docker
+                // reports a paused container as running, so classify it.
+                let state = map_state(&self.container.inspect().await?);
+                if state != SandboxState::Running {
+                    return Err(Error::Provider(ProviderError::new(
+                        docker_kind(),
+                        format!("one-shot requires a running sandbox, not {state:?}"),
+                    )));
+                }
+                let container = OneShotContainer::create(
+                    &self.container.docker,
+                    self.container_config(spec, image),
+                )
                 .await?;
-        let output = container.attach_and_start().await?;
+                created_id = Some(container.id.clone());
+                let output = container.attach_and_start().await?;
+                Ok((container, output))
+            },
+        )
+        .await;
+        let (container, output) = match admitted {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                if let Some(id) = created_id {
+                    let docker = self.container.docker.clone();
+                    OneShotContainer { docker, id }.remove().await;
+                }
+                return Err(error);
+            }
+        };
         let mut captured =
             StreamOutput::new(spec.output_sanitization, controls.retained_output_limit);
         let outcome = match drain_with_stops(
