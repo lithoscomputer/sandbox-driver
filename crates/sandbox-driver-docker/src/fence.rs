@@ -18,6 +18,7 @@ use bollard::container::{Config, CreateContainerOptions, ListContainersOptions};
 use bollard::errors::Error as DockerApiError;
 use bollard::models::{ContainerCreateResponse, ContainerInspectResponse};
 use futures_util::future::BoxFuture;
+use sandbox_driver::contract::RemainingResource;
 use sandbox_driver::{Error, ProviderError, Result, TransportError};
 use serde_json::Value;
 use tokio::time::error::Elapsed;
@@ -314,24 +315,43 @@ fn busy(message: &str) -> Error {
 }
 
 fn retain_error(marker: &str, error: Error) -> Error {
-    match error {
-        Error::Provider(mut failure) if failure.code.as_deref() == Some("fence_leaked") => {
-            failure.detail.get_or_insert_with(|| serde_json::json!({}))["fence_container"] =
-                Value::String(marker.to_owned());
-            Error::Provider(failure)
-        }
-        Error::Provider(mut failure) if failure.code.as_deref() == Some("incomplete_cleanup") => {
-            if let Some(remaining) = failure
-                .detail
-                .as_mut()
-                .and_then(|detail| detail.get_mut("remaining"))
-                .and_then(Value::as_array_mut)
-            {
-                remaining.push(serde_json::json!({"kind": "fence_container", "id": marker}));
-            }
-            Error::Provider(failure)
-        }
-        error => retained(marker, "daemon outcome is unknown", Some(error)),
+    let Error::Provider(mut failure) = error else {
+        return retained(marker, "daemon outcome is unknown", Some(error));
+    };
+    if record_marker(&mut failure, marker) {
+        return Error::Provider(failure);
+    }
+    retained(
+        marker,
+        "daemon outcome is unknown",
+        Some(Error::Provider(failure)),
+    )
+}
+
+/// Adds the retained marker to a failure that already describes what
+/// remains, reporting whether its detail had a place for it.
+fn record_marker(failure: &mut ProviderError, marker: &str) -> bool {
+    match failure.code.as_deref() {
+        Some("fence_leaked") => failure
+            .detail
+            .get_or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .map(|detail| detail.insert("fence_container".to_owned(), marker.into()))
+            .is_some(),
+        Some("incomplete_cleanup") => failure
+            .detail
+            .as_mut()
+            .and_then(|detail| detail.get_mut("remaining"))
+            .and_then(Value::as_array_mut)
+            .map(|remaining| {
+                let resource = RemainingResource {
+                    kind: "fence_container".to_owned(),
+                    id:   marker.to_owned(),
+                };
+                remaining.push(serde_json::to_value(resource).expect("resource serializes"));
+            })
+            .is_some(),
+        _ => false,
     }
 }
 
