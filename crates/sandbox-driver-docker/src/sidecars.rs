@@ -310,28 +310,35 @@ pub(crate) async fn set_running(docker: &Docker, network: &str, running: bool) -
                     .await,
                 "stopping sidecar",
             )?;
-            confirm_stopped(docker, id).await?;
         }
+    }
+    // Stop every service before confirming any, so one unconfirmed service
+    // does not leave the rest running.
+    if !running {
+        for container in &containers {
+            if let Some(id) = &container.id {
+                confirm_stopped(docker, id).await?;
+            }
+        }
+        return Ok(());
     }
     // Start every service before waiting: a health check may depend on
     // another service on the same network.
-    if running {
-        for container in containers {
-            let id = container.id.ok_or_else(|| {
-                Error::Transport(TransportError::new("daemon listed a sidecar without an ID"))
-            })?;
-            let inspect = docker
-                .inspect_container(&id, None)
-                .await
-                .map_err(|error| docker_error("inspecting sidecar health", error))?;
-            if inspect
-                .state
-                .as_ref()
-                .and_then(|state| state.health.as_ref())
-                .is_some()
-            {
-                await_health(docker, &id).await?;
-            }
+    for container in containers {
+        let id = container.id.ok_or_else(|| {
+            Error::Transport(TransportError::new("daemon listed a sidecar without an ID"))
+        })?;
+        let inspect = docker
+            .inspect_container(&id, None)
+            .await
+            .map_err(|error| docker_error("inspecting sidecar health", error))?;
+        if inspect
+            .state
+            .as_ref()
+            .and_then(|state| state.health.as_ref())
+            .is_some()
+        {
+            await_health(docker, &id).await?;
         }
     }
     Ok(())

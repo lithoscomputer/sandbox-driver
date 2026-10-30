@@ -616,6 +616,12 @@ async fn a_stop_acknowledgement_with_live_processes_is_a_leaked_fence() {
         matches!(error, Error::Provider(error) if error.code.as_deref() == Some("fence_leaked"))
     );
     let requests = daemon.finish().await;
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("/containers/service/stop")),
+        "an unconfirmed primary must not leave its services running"
+    );
     assert!(!requests.iter().any(|request| request.starts_with("DELETE ") && request.contains("/containers/fence?")));
 }
 

@@ -210,11 +210,16 @@ impl Sandbox for DockerSandbox {
                     .await,
                 "stopping container",
             )?;
+            // Stop the services even when the primary cannot be confirmed:
+            // an early return would leave every one of them running.
+            let services = match &self.network {
+                Some(network) => {
+                    sidecars::set_running(&self.container.docker, network, false).await
+                }
+                None => Ok(()),
+            };
             confirm_stopped(&self.container.docker, self.id.as_str()).await?;
-            if let Some(network) = &self.network {
-                sidecars::set_running(&self.container.docker, network, false).await?;
-            }
-            Ok(())
+            services
         })
         .await
     }
