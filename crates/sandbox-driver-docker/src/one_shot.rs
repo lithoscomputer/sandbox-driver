@@ -32,12 +32,12 @@ use bollard::models::{HostConfig, Mount};
 use futures_util::{Stream, StreamExt};
 use sandbox_driver::{
     Error, ExecControls, ExecStreamingResult, OneShot, OneShotImage, OneShotSpec, ProviderError,
-    Result, SandboxState, StopLevel, Termination, TransportError, stop_signal,
+    Result, SandboxState, StopLevel, Termination, stop_signal,
 };
 use tokio::time;
 
 use crate::container::{ContainerRef, remove_container_forced};
-use crate::daemon::{docker_error, docker_kind, is_conflict, is_not_found};
+use crate::daemon::{docker_error, docker_kind, is_conflict, is_not_found, listed_id};
 use crate::fence::{self, Operation};
 use crate::fs::tar::reroot;
 use crate::image::{image_present, pull_image};
@@ -382,11 +382,7 @@ pub(crate) async fn sweep(docker: &Docker, sandbox_id: &str) -> Result<()> {
         .await
         .map_err(|error| docker_error("listing one-shot containers", error))?;
     for container in containers {
-        let id = container.id.ok_or_else(|| {
-            Error::Transport(TransportError::new(
-                "daemon listed a one-shot without an ID",
-            ))
-        })?;
+        let id = listed_id(container.id, "one-shot")?;
         remove_container_forced(docker, &id, "removing one-shot container").await?;
     }
     Ok(())

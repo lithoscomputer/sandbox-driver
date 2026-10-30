@@ -31,13 +31,13 @@ use bollard::container::{
 use bollard::models::{ContainerStateStatusEnum, EndpointSettings, HealthStatusEnum, HostConfig};
 use bollard::network::{CreateNetworkOptions, DisconnectNetworkOptions, InspectNetworkOptions};
 use futures_util::StreamExt;
-use sandbox_driver::{Error, ProviderError, Result, TransportError};
+use sandbox_driver::{Error, ProviderError, Result};
 use tokio::time;
 
 use crate::config::{Sidecar, to_health_config};
 use crate::container::confirm_stopped;
 use crate::daemon::{
-    docker_error, docker_kind, is_not_found, is_not_modified, tolerate_not_modified,
+    docker_error, docker_kind, is_not_found, is_not_modified, listed_id, tolerate_not_modified,
 };
 use crate::image::{image_present, pull_image};
 use crate::{MANAGED_LABEL, non_empty};
@@ -230,9 +230,7 @@ pub(crate) async fn sweep(docker: &Docker, network: &str, sandbox: Option<&str>)
         .await
         .map_err(|error| docker_error("listing sidecars", error))?;
     for container in containers {
-        let id = container.id.ok_or_else(|| {
-            Error::Transport(TransportError::new("daemon listed a sidecar without an ID"))
-        })?;
+        let id = listed_id(container.id, "sidecar")?;
 
         match docker
             .remove_container(
@@ -291,12 +289,10 @@ pub(crate) async fn set_running(docker: &Docker, network: &str, running: bool) -
         .await
         .map_err(|error| docker_error("listing sidecars", error))?;
     for container in &containers {
-        let id = container.id.as_ref().ok_or_else(|| {
-            Error::Transport(TransportError::new("daemon listed a sidecar without an ID"))
-        })?;
+        let id = listed_id(container.id.clone(), "sidecar")?;
         if running {
             match docker
-                .start_container(id, None::<StartContainerOptions<String>>)
+                .start_container(&id, None::<StartContainerOptions<String>>)
                 .await
             {
                 Ok(()) => {}
@@ -306,7 +302,7 @@ pub(crate) async fn set_running(docker: &Docker, network: &str, running: bool) -
         } else {
             tolerate_not_modified(
                 docker
-                    .stop_container(id, Some(StopContainerOptions { t: 1 }))
+                    .stop_container(&id, Some(StopContainerOptions { t: 1 }))
                     .await,
                 "stopping sidecar",
             )?;
@@ -325,9 +321,7 @@ pub(crate) async fn set_running(docker: &Docker, network: &str, running: bool) -
     // Start every service before waiting: a health check may depend on
     // another service on the same network.
     for container in containers {
-        let id = container.id.ok_or_else(|| {
-            Error::Transport(TransportError::new("daemon listed a sidecar without an ID"))
-        })?;
+        let id = listed_id(container.id, "sidecar")?;
         let inspect = docker
             .inspect_container(&id, None)
             .await
