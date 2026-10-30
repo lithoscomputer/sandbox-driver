@@ -9,7 +9,9 @@ the Docker provider implements the entire next API.
 The claim is an unstarted container with a unique Docker name. It carries
 `sh.sandbox-driver.fence` and `sh.sandbox-driver.fence-operation` labels and is
 excluded from sandbox inventory. Creation acquires a claim before exposing the
-primary container. The primary's `sh.sandbox-driver.fence-name` label records
+primary container; its `sh.sandbox-driver.fence` label is the requested sandbox
+name, so deleting that name finds the claim before the primary exists. The
+primary's `sh.sandbox-driver.fence-name` label records
 that claim name for subsequent clients. Older sandboxes without this label use
 the canonical container ID to identify their claim.
 

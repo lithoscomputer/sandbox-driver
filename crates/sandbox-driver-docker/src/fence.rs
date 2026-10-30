@@ -197,15 +197,19 @@ pub(crate) fn reserve_creation(labels: &mut Option<HashMap<String, String>>) -> 
     name
 }
 
+/// Claims creation under `name`. The marker is labeled with `sandbox`, the
+/// name the caller requested, so a delete of that name sees the claim before
+/// the primary exists.
 pub(crate) fn create<'a, T: Send + 'a>(
     docker: &'a Docker,
     image: &'a str,
     name: &'a str,
+    sandbox: &'a str,
     work: impl Future<Output = Result<T>> + Send + 'a,
 ) -> BoxFuture<'a, Result<T>> {
     // Boxed for the same reason as `run`.
     Box::pin(async move {
-        let attempt = create_marker(docker, image, name, name, Operation::Create).await;
+        let attempt = create_marker(docker, image, name, sandbox, Operation::Create).await;
         let marker = claimed(name, attempt)?;
         finish(docker, &marker, Operation::Create, work).await
     })

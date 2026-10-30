@@ -186,7 +186,8 @@ impl SandboxProvider for DockerProvider {
                     )
                     .await?;
                     let fence_name = fence::reserve_creation(&mut plan.config.labels);
-                    fence::create(&self.docker, &plan.image, &fence_name, async {
+                    let owner = spec.name.as_deref().unwrap_or(&fence_name);
+                    fence::create(&self.docker, &plan.image, &fence_name, owner, async {
                         let created = CreatedContainer::create(&self.docker, &plan).await?;
                         let event_id = match SandboxId::try_new(created.id.clone()) {
                             Ok(id) => id,

@@ -291,3 +291,37 @@ async fn a_held_lifecycle_claim_does_not_keep_a_timeout_from_stopping_a_command(
         Termination::TimedOut
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a live Docker daemon"]
+async fn an_in_flight_creation_refuses_a_delete_by_name() {
+    let provider = DockerProvider::connect().await.expect("Docker is required");
+    let other = DockerProvider::connect().await.expect("second provider");
+    let docker = Docker::connect_with_local_defaults().expect("Docker client");
+    let name = format!("fence-creating-{}", process::id());
+    let mut spec = SandboxSpec::new(SandboxSource::Image {
+        reference: IMAGE.to_owned(),
+    })
+    .name(&name);
+    spec.provider_config = serde_json::json!({"sidecars": [{
+        "name": "service", "image": IMAGE,
+        "entrypoint": ["sh", "-c", "sleep 3; touch /ready; exec sleep 600"],
+        "health": {"cmd": "test -e /ready", "interval_ms": 100, "retries": 100}
+    }]});
+    let creating = tokio::spawn(async move { provider.create(&spec, None).await });
+    // Whether or not the primary is visible yet, the claim is found by name.
+    wait_for_label(&docker, "sh.sandbox-driver.fence", &name).await;
+    assert_busy(
+        other
+            .delete(
+                &sandbox_driver::SandboxId::try_new(name).expect("name"),
+                None,
+            )
+            .await,
+    );
+    let sandbox = creating
+        .await
+        .expect("create task")
+        .expect("ready creation");
+    sandbox.delete().await.expect("cleanup");
+}
