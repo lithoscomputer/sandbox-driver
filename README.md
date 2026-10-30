@@ -1,139 +1,230 @@
 # sandbox-driver
 
-Sandbox providers for managing sandboxes, snapshots, and volumes. Every
-provider implements one trait family from `sandbox-driver`, and an
-application reaches it in one of two supported ways:
+Create and operate sandboxes through one Rust API, with providers for local processes, Docker containers, and cloud VMs.
 
-- **In-process.** The application links a bundled provider library
-  (`sandbox-driver-host`, `sandbox-driver-docker`, `sandbox-driver-daytona`)
-  and constructs the provider directly. Fabro embeds the bundled providers
-  this way.
-- **JSON-RPC plugin.** The application launches a provider executable and
-  speaks the protocol in `sandbox-driver-protocol`. Third-party providers,
-  and any bundled provider an operator prefers to run out of process, take
-  this path. Petri uses it for every provider.
+[![CI](https://github.com/lithoscomputer/sandbox-driver/actions/workflows/routine.yml/badge.svg)](https://github.com/lithoscomputer/sandbox-driver/actions/workflows/routine.yml)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
 
-Both paths present the same `SandboxProvider` and `Sandbox` traits, so
-application code is written once. The difference is confined to
-construction and to the wire mask in `docs/protocol.md` §5.
+```rust
+use sandbox_driver::contract::{Error, ExecControls, ExecSpec};
+use sandbox_driver_testing::contract::{FakeExec, FakeProvider};
 
-| Crate | Purpose |
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    // Offline preview: script a result; no command runs on the host.
+    let fake = FakeProvider::new();
+    fake.script(["cargo", "test"], FakeExec::default()).await;
+    let sandboxes = fake.sandboxes();
+    let sandbox = sandboxes.builder("default").await?
+        .label("job", "1842").create().await?;
+    let outcome = sandbox.exec(
+        ExecSpec::argv(["cargo", "test"]), ExecControls::default(),
+    ).await?;
+    sandboxes.destroy(&sandbox.reference()).await?;
+    sandboxes.shutdown().await?;
+    assert_eq!(outcome.exit_code, Some(0));
+    Ok(())
+}
+```
+
+**API preview:** This README introduces the upcoming `Sandboxes` interface.
+The examples run today against the in-memory provider in `sandbox-driver-testing`.
+Real-provider and plugin integration is still in progress.
+See the [target specification](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/next-api.md)
+and the [current provider API](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/design.md).
+
+Part of [Lithos](#part-of-lithos), a family of Rust building blocks for AI tools.
+
+## Why does this exist?
+
+An application needs the same operations whether its workload runs locally,
+in a container, or on a remote machine. Provider SDKs expose different
+configuration, lifecycle, and execution APIs. `sandbox-driver` puts those
+operations behind one interface and checks which capabilities a provider supports.
+
+## Who is it for?
+
+**Use it if** you are building an agent runner, workflow engine, or development
+tool that creates sandboxes, runs commands, and returns to them later.
+
+**Look elsewhere if** you need scheduling, queues, or workflow execution;
+[Petri](https://github.com/lithoscomputer/petri) is the workflow engine in this family.
+Use a provider's own SDK when you need operations outside the shared contract.
+
+## What does it do?
+
+The target interface provides:
+
+- Named environments: select a workload template and override it for one sandbox.
+- Sandbox lifecycle: create, inspect, stop, start, reattach, and destroy.
+- Command execution with streamed input and output, timeouts, and cancellation.
+- File transfers, port exposure, and optional services and one-shot containers.
+- Saved sandbox references and label searches across configured providers.
+- Plugin discovery, checksum verification, and supervision for external providers.
+
+An **environment** is a named workload template on a **provider entry**.
+The entry defines the connection, credentials, and plugin trust settings.
+The environment defines what to run: its source, resources, network, and services.
+
+In the target setup, Docker and [Daytona](https://www.daytona.io/), a cloud sandbox
+service, run as in-process providers. Host and third-party providers run as
+separately installed plugins. Applications use the same `Sandboxes` API for each.
+
+**Out of scope:** Scheduling, queues, leases, and decisions about when to retry
+or delete work belong to the application. Isolation depends on the provider;
+Host runs processes in a directory and provides no isolation boundary.
+
+| Crate | Use it when |
 | --- | --- |
-| `sandbox-driver` | Core traits, types, exec-derived facets, wait/probe helpers |
-| `sandbox-driver-host` | Host executable and internal implementation — directories, no isolation |
-| `sandbox-driver-docker` | Docker executable and internal implementation — containers with a workspace volume, one-shot containers, sidecars, image pulls |
-| `sandbox-driver-docker-config` | The Docker provider's `provider_config` as plain Serde types, for hosts on the wire |
-| `sandbox-driver-daytona` | Daytona executable and internal implementation — cloud VMs, nested Docker, snapshots, volumes |
-| `sandbox-driver-daytona-config` | Typed Daytona and nested Docker configuration for plugin clients |
-| `sandbox-driver-protocol` | JSON-RPC plugin protocol (version 2, with per-operation data channels): serve any provider, adapt any plugin |
-| `sandbox-driver-conformance` | Black-box conformance suite every provider must pass |
-| `sandbox-driver-testing` | Scripted in-memory sandbox and provider doubles for consumers' unit tests |
-| `sandbox-driver-cli` | `lithos-sandbox` command for provider diagnostics and sandbox operations |
+| `sandbox-driver` | Build against the shared API; the preview lives in `contract` |
+| `sandbox-driver-docker` | Embed Docker support or build its provider executable |
+| `sandbox-driver-daytona` | Embed Daytona support or build its provider executable |
+| `sandbox-driver-host` | Build the Host executable; its current embedding API remains during migration |
+| `sandbox-driver-docker-config` | Construct typed Docker options for the current provider API |
+| `sandbox-driver-daytona-config` | Construct typed Daytona options for the current provider API |
+| `sandbox-driver-protocol` | Serve or connect to providers over the current version 2 protocol |
+| `sandbox-driver-conformance` | Check a provider against the shared behavioral contract |
+| `sandbox-driver-testing` | Test callers with an in-memory provider and scripted commands |
+| `sandbox-driver-cli` | Install the `lithos-sandbox` command |
 
-Each provider package is a library with a supported public API for in-process
-embedding, and also builds a plugin executable with the same name as the
-package. The Docker library is reused inside Daytona for nested Docker.
-`lithos-sandbox` reaches every provider through JSON-RPC so it exercises the
-same path a third-party plugin does.
+## How do I use it?
 
-Host and Docker pass conformance locally (Docker needs a daemon), in
-process and served over the plugin wire; the Daytona suite runs live with
-`DAYTONA_API_KEY` set.
+### Install
 
-See `docs/design.md` for the interface design
-and `docs/protocol.md` for the normative plugin wire protocol.
-
-## Nested Docker on Daytona
-
-Daytona can own a nested job container, sidecars, and one-shot action containers.
-Use `DaytonaProviderConfig` from `sandbox-driver-daytona-config`. The runner
-snapshot must include `start-docker`, the Docker CLI, and Python 3. Nested
-operations use Daytona's native process and file APIs. The outer sandbox
-owns the lifecycle of all nested resources.
-See [the design](docs/design.md#nested-docker-on-daytona) for configuration and
-restart behavior.
-
-Docker command construction and binary file transfers have local tests. The hosted integration remains an
-explicit live gate:
+This workspace is not published to crates.io. Add the core library from Git:
 
 ```sh
-# Set DAYTONA_API_KEY and SANDBOX_DRIVER_DAYTONA_DIND_SNAPSHOT first.
-cargo nextest run --locked -p sandbox-driver-daytona --test nested_docker --run-ignored only
+cargo add sandbox-driver --git https://github.com/lithoscomputer/sandbox-driver
+cargo add tokio --features macros,rt-multi-thread,io-util
 ```
 
-## CLI
-
-Build the `lithos-sandbox` command and inspect the available operations:
+The examples also need the testing crate. Add it as a development dependency
+and save each complete program under your application's `examples/` directory:
 
 ```sh
-mise run dev
-export SANDBOX_DRIVER_PLUGIN_DEV=1
-export PATH="$PWD/target/debug:$PATH"
-target/debug/lithos-sandbox --help
+cargo add --dev sandbox-driver-testing --git https://github.com/lithoscomputer/sandbox-driver
+cargo run --example sandbox
 ```
 
-Host plugins can recover across restarts on Linux and macOS. Set
-`SANDBOX_DRIVER_HOST_REGISTRY` in an explicitly configured plugin environment
-to a caller-owned directory. Stop fences sandbox process groups;
-recovery never signals saved process ids. Named workspaces remain designated
-unless `workspace_ownership: Managed` explicitly transfers their creation and
-deletion to the provider. Managed workspaces are deleted only after work stops.
+Use `examples/sandbox.rs` for the first example. It needs no daemon or credentials.
+The library uses the application's Tokio runtime.
 
-The development opt-in above allows local binaries without checksum pins.
-For installed providers, configure checksum pins as described in
-[the CLI guide](docs/cli.md#provider-executables).
+### Use it as a library
 
-Run a command in a temporary Host sandbox:
+Create one `Sandboxes` catalog per process. Production callers supply provider
+entries, an `EnvironmentSource`, a `Registry`, a `SecretResolver`, and
+`CatalogOptions` to `Sandboxes::try_new`. The library ships no default providers
+or environments. The fake's `default` environment is a test fixture.
+
+Provider entries stay fixed for the catalog's lifetime. Environments can come
+from a static list, a configuration file, or an application store.
+Applications register provider adapters explicitly; core does not install them.
+See [catalog configuration](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/next-api.md#configuration)
+for the target setup and remaining integration work.
+
+Save a `SandboxRef` to return to a sandbox. It contains the provider entry,
+namespace, and sandbox ID, so it does not depend on the environment's name.
+This offline example reattaches and reads a file through the shared API:
+
+```rust
+use std::io::Cursor;
+use tokio::io::AsyncReadExt;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let sandboxes = sandbox_driver_testing::contract::fake();
+    let sandbox = sandboxes.builder("default").await?.create().await?;
+    sandbox.files().put("result.txt", Box::pin(Cursor::new(b"passed"))).await?;
+    let reference = sandbox.reference();
+    drop(sandbox);
+
+    let attached = sandboxes.attach(&reference).await?;
+    let mut reader = attached.files().get("result.txt", None).await?;
+    let mut result = String::new();
+    reader.read_to_string(&mut result).await?;
+    sandboxes.destroy(&reference).await?;
+    sandboxes.shutdown().await?;
+    assert_eq!(result, "passed");
+    Ok(())
+}
+```
+
+Use labels to find related work across providers:
+
+```rust
+use sandbox_driver::contract::{Error, LabelFilter};
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let sandboxes = sandbox_driver_testing::contract::fake();
+    let sandbox = sandboxes.builder("default").await?
+        .label("job", "1842").create().await?;
+    let found = sandboxes.find(LabelFilter::eq("job", "1842")).await?;
+    sandboxes.destroy(&sandbox.reference()).await?;
+    sandboxes.shutdown().await?;
+    assert!(found.unavailable.is_empty());
+    assert_eq!(found.sandboxes.len(), 1);
+    Ok(())
+}
+```
+
+`find` returns partial results when a provider cannot be reached. Inspect
+`unavailable` and `failures`; missing results do not prove a sandbox was deleted.
+The fake executes only scripted commands and advertises no optional capabilities.
+
+With real providers, reattachment depends on their declared durability and access
+scope. The target Host plugin promises access only through its owning process.
+A lost connection or dropped execution future does not confirm that work stopped.
+The library does not replay mutations whose outcome is unknown.
+
+More detail: [client API](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/next-api.md#client-api),
+[provider contract](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/shared-contract.md),
+and [diagnostics](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/diagnostics.md).
+
+### Use it from the command line
+
+The current CLI still uses the existing provider API and version 2 protocol:
 
 ```sh
-lithos-sandbox --provider host sandbox run --workspace "$PWD" -- \
-  bash -lc 'cargo test'
+cargo install --git https://github.com/lithoscomputer/sandbox-driver --locked sandbox-driver-cli
+lithos-sandbox --help
+lithos-sandbox provider list
 ```
 
-Use Docker for persistent sandbox operations:
+Sandbox operations also need an installed provider executable and its checksum
+configuration. Docker needs a reachable daemon; Daytona needs API credentials.
+See the [current CLI guide](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/cli.md).
+The [planned CLI](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/next-api.md#cli)
+will use the environment catalog; those commands are not available yet.
 
-```sh
-id=$(lithos-sandbox --provider docker --output id sandbox create \
-  --image ubuntu:24.04)
-lithos-sandbox --provider docker sandbox exec "$id" -- uname -a
-lithos-sandbox --provider docker sandbox delete "$id"
-```
+## Status and compatibility
 
-See [docs/cli.md](docs/cli.md) for provider profiles, plugin configuration,
-creation specifications, output formats, and exit behavior.
+- **Maturity:** Pre-1.0; the public API is changing during the migration.
+- **Implemented preview:** The catalog, schema validation, scripted fake, and common conformance suite are available under `contract` modules.
+- **Cutover gate:** The shared API, plugin loader, and Docker, Daytona, and Host providers must pass conformance together before real-provider adoption.
+- **MSRV:** Rust 1.85, as declared in the workspace manifest.
+- **CI platforms:** macOS arm64, Linux x86_64, and Linux arm64.
+- **Public formats:** Serialized configuration and sandbox references; plugin protocol version 2 today, version 3 in the target specification.
 
-## Diagnostics
+Current provider integration tests are separate from the new-contract gate.
+Host and Docker have in-process and plugin checks; Docker needs a daemon.
+Daytona's live checks require `DAYTONA_API_KEY`.
+See [development and verification](https://github.com/lithoscomputer/sandbox-driver/blob/main/DEVELOPING.md).
 
-The library crates emit `tracing` spans and events. Applications choose
-the subscriber and output destination. Operation fields include provider
-kinds, resource IDs, states, attempts, counts, and durations. They do not
-include commands, environment values, tokens, URLs, file paths, request
-bodies, or command output.
+## Part of Lithos
 
-The plugin executables configure a stderr subscriber. They use `RUST_LOG`
-when set and default to `info`. Protocol messages remain on stdout.
+| Crate | Role |
+| --- | --- |
+| [lithos-llm](https://github.com/lithoscomputer/lithos-llm) | Model access: one client and catalog across LLM providers |
+| [pebble](https://github.com/lithoscomputer/pebble) | Agent loop, plus a coding agent and CLI built on it |
+| **[sandbox-driver](https://github.com/lithoscomputer/sandbox-driver)** | **Sandboxes (host, Docker, cloud VMs) behind one interface** |
+| [petri](https://github.com/lithoscomputer/petri) | Workflow engine that runs CI and agent workflows on the crates above |
 
-## Setup
+## Contributing
 
-Install the locked tools and prepare the repository:
+Development setup, tests, and conventions are in
+[DEVELOPING.md](https://github.com/lithoscomputer/sandbox-driver/blob/main/DEVELOPING.md).
 
-```sh
-mise trust
-mise install --locked --jobs=1
-mise run setup
-```
+## License
 
-Use the repository tasks for development and verification:
-
-```sh
-mise run dev
-mise run test
-mise run check
-```
-
-See [DEVELOPING.md](DEVELOPING.md) for the complete development workflow.
-
-Routine and nightly checks run on macOS arm64, Linux x86_64, and Linux arm64.
-A pushed `v*` tag builds one archive per plugin executable for the same three
-platforms, with a checksum of each archive and of each executable, and
-creates a draft GitHub release.
+Licensed under the [MIT License](https://github.com/lithoscomputer/sandbox-driver/blob/main/LICENSE).

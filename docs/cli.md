@@ -4,6 +4,10 @@ The `sandbox-driver-cli` crate builds the `lithos-sandbox` executable. The CLI
 uses JSON-RPC for every provider, including Host, Docker, and Daytona. It
 does not link provider implementations or add resources to the core contract.
 
+This guide describes the current CLI and version 2 protocol. The
+[planned CLI](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/next-api.md#cli)
+uses the upcoming environment catalog and is not available yet.
+
 ## Provider executables
 
 Build the CLI and all provider executables with `mise run dev`. Each provider
@@ -35,6 +39,23 @@ All other ambient variables are removed. Plugin diagnostics default to
 The default Host profile uses a temporary in-memory registry. To configure a
 durable registry or a different environment, use an explicit plugin profile.
 The current CLI still limits Host sandbox operations to `sandbox run`.
+
+### Current Host recovery and workspace ownership
+
+The current Host plugin can recover across restarts on Linux and macOS when
+`SANDBOX_DRIVER_HOST_REGISTRY` names a caller-owned directory in an explicit
+plugin profile's environment. Stop fences sandbox process groups; recovery
+never signals saved process IDs. The CLI still exposes Host sandbox operations
+only through `sandbox run`.
+
+A named workspace remains caller-owned unless `workspace_ownership: Managed`
+explicitly transfers its creation and deletion to the provider. Managed
+workspaces are deleted only after work stops. See the
+[current Host design](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/design.md#durable-host-recovery).
+
+This recovery model is part of the existing API. The
+[target Host contract](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/shared-contract.md#host-ownership-and-retained-workspaces)
+instead promises process durability and access through its owning process.
 
 ## Command structure
 

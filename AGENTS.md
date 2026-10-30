@@ -57,3 +57,16 @@ style-guide defaults.
 ## Working documents
 
 Save plans under `.ai/plans/` and reviews under `.ai/reviews/`.
+
+## README.md
+
+Keep README.md focused on what the library is, who it serves, installation,
+short examples, scope, compatibility, and the Lithos family. Put API reference
+in rustdoc, longer guides in `docs/`, and contributor tasks in `DEVELOPING.md`.
+Use absolute GitHub URLs for repository links.
+
+The README previews `docs/next-api.md`; keep implemented and planned behavior
+explicit until real providers pass the shared-contract conformance gate.
+Its Rust examples are doctests. Run `mise run test:doc` after changing them;
+`mise run check` also runs them. Keep examples complete, without hidden lines
+or ignored code blocks.
