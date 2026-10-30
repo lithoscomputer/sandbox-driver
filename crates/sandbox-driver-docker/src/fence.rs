@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bollard::Docker;
 use bollard::container::{Config, CreateContainerOptions, ListContainersOptions};
 use bollard::errors::Error as DockerApiError;
-use bollard::models::ContainerCreateResponse;
+use bollard::models::{ContainerCreateResponse, ContainerInspectResponse};
 use futures_util::future::BoxFuture;
 use sandbox_driver::{Error, ProviderError, Result, TransportError};
 use serde_json::Value;
@@ -89,14 +89,15 @@ pub(crate) fn run<'a, T: Send + 'a>(
     // Box this orchestration boundary: combining daemon inspection, claim
     // allocation, and the operation would otherwise inflate every caller.
     Box::pin(async move {
-        let marker = match timeout(OPERATION_TIMEOUT, acquire(docker, id, operation)).await {
-            Ok(result) => result?,
-            Err(_) => return Err(acquisition_timeout(id)),
-        };
-        let Some(marker) = marker else {
-            return timeout(OPERATION_TIMEOUT, work)
-                .await
-                .map_err(|_| acquisition_timeout(id))?;
+        // Each daemon call in `acquire` carries its own bound, so a slow
+        // marker creation still reports the marker it may have left.
+        let Some(marker) = acquire(docker, id, operation).await? else {
+            return timeout(operation.budget(), work).await.map_err(|_| {
+                unconfirmed(
+                    id,
+                    "operation on an absent sandbox timed out; outcome is unknown",
+                )
+            })?;
         };
         finish(docker, &marker, operation, work).await
     })
@@ -129,7 +130,7 @@ async fn finish<T>(
 
 async fn acquire(docker: &Docker, id: &str, operation: Operation) -> Result<Option<String>> {
     // Canonical IDs prevent names and short IDs from producing different locks.
-    let inspect = match inspect_container(docker, id).await {
+    let inspect = match discover(docker, id, id).await {
         Ok(inspect) => inspect,
         Err(Error::NotFound { .. }) if operation.tolerates_absent() => {
             // An earlier request may still own its marker, though, so
@@ -156,7 +157,7 @@ async fn acquire(docker: &Docker, id: &str, operation: Operation) -> Result<Opti
             Ok(Err(error)) if is_conflict(&error) => {
                 // Short concurrent admissions can queue, preserving concurrent
                 // exec callers. Lifecycle ownership is always a Busy refusal.
-                let queued = match inspect_container(docker, &name).await {
+                let queued = match discover(docker, id, &name).await {
                     Ok(marker) => {
                         label_of(&marker, OPERATION_LABEL) == Some(Operation::Admit.label())
                     }
@@ -334,11 +335,22 @@ fn retain_error(marker: &str, error: Error) -> Error {
     }
 }
 
+/// Inspects `container` while acquiring the fence for sandbox `id`.
+async fn discover(docker: &Docker, id: &str, container: &str) -> Result<ContainerInspectResponse> {
+    timeout(OPERATION_TIMEOUT, inspect_container(docker, container))
+        .await
+        .map_err(|_| acquisition_timeout(id))?
+}
+
 fn acquisition_timeout(id: &str) -> Error {
-    let mut error = ProviderError::new(
-        docker_kind(),
+    unconfirmed(
+        id,
         "fence acquisition or discovery timed out; ownership requires reconciliation",
-    );
+    )
+}
+
+fn unconfirmed(id: &str, message: &str) -> Error {
+    let mut error = ProviderError::new(docker_kind(), message);
     error.code = Some("transport".to_owned());
     error.detail = Some(serde_json::json!({"sandbox_id": id, "outcome": "unknown"}));
     Error::Provider(error)
