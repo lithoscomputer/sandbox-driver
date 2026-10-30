@@ -120,8 +120,9 @@ async fn stop_fences_other_clients_exec_and_one_shots_and_blocks_start_during_dr
         assert!(unchanged.success(), "old generation continued after restart");
         Ok::<_, Error>(())
     }.await;
-    sandbox.delete().await.expect("cleanup sandbox");
+    let cleanup = sandbox.delete().await;
     result.expect("fence behavior");
+    cleanup.expect("cleanup sandbox");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -212,8 +213,9 @@ async fn a_visible_but_unready_creation_cannot_be_started_or_stopped_by_another_
         .expect("create task")
         .expect("ready creation");
     let exec = sandbox.exec().run(&ExecSpec::new("true")).await;
-    sandbox.delete().await.expect("cleanup");
+    let cleanup = sandbox.delete().await;
     assert!(exec.expect("exec after create").success());
+    cleanup.expect("cleanup");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -285,11 +287,12 @@ async fn a_held_lifecycle_claim_does_not_keep_a_timeout_from_stopping_a_command(
         )
         .await
         .expect("release the claim");
-    sandbox.delete().await.expect("cleanup");
+    let cleanup = sandbox.delete().await;
     assert_eq!(
         result.expect("stopped run").termination,
         Termination::TimedOut
     );
+    cleanup.expect("cleanup");
 }
 
 #[tokio::test(flavor = "multi_thread")]
