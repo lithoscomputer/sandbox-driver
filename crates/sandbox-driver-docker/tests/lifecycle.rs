@@ -447,12 +447,19 @@ async fn interrupted_service_creation_remains_discoverable_for_cleanup() {
         .await
         .err()
         .expect("create fails");
+    assert!(error.to_string().contains("creating sidecar"), "{error}");
     let Error::Provider(failure) = error else {
         panic!("expected incomplete cleanup");
     };
     assert_eq!(failure.code.as_deref(), Some("incomplete_cleanup"));
-    let projection: ContractError =
-        serde_json::from_value(failure.detail.expect("structured cleanup")).expect("shared error");
+    let detail = failure.detail.expect("structured cleanup");
+    assert!(
+        detail["cause"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("creating sidecar")),
+        "{detail}"
+    );
+    let projection: ContractError = serde_json::from_value(detail).expect("shared error");
     assert!(
         matches!(projection, ContractError::IncompleteCleanup { remaining, .. }
         if remaining.iter().any(|resource| resource.id == "main")

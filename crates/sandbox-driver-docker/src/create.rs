@@ -12,8 +12,8 @@ use bollard::models::{
 use bollard::network::{ConnectNetworkOptions, DisconnectNetworkOptions};
 use sandbox_driver::contract::{Error as ContractError, RemainingResource};
 use sandbox_driver::{
-    BASH_ENV_VAR, Error, LifecycleTimers, NetworkPolicy, ProviderError, ProviderKind, Result,
-    SandboxKind, SandboxSource, SandboxSpec, SandboxState, TransportError,
+    BASH_ENV_VAR, Error, ErrorReport, LifecycleTimers, NetworkPolicy, ProviderError, ProviderKind,
+    Result, SandboxKind, SandboxSource, SandboxSpec, SandboxState, TransportError,
 };
 use serde::Deserialize;
 use tokio::time;
@@ -413,11 +413,16 @@ impl CreatedContainer {
             message: "failed-create cleanup could not be confirmed".to_owned(),
             remaining,
         };
-        let mut failure =
-            ProviderError::with_source(docker_kind(), projection.to_string(), cleanup_error);
+        let message = format!("{projection} after create failed: {error}");
+        // The cleanup failure stays the source because it decides whether
+        // the creation claim is retained; the creation failure travels in
+        // the message and `detail.cause`.
+        let mut failure = ProviderError::with_source(docker_kind(), message, cleanup_error);
         failure.code = Some("incomplete_cleanup".to_owned());
-        failure.detail =
-            Some(serde_json::to_value(projection).expect("cleanup projection serializes"));
+        let mut detail = serde_json::to_value(projection).expect("cleanup projection serializes");
+        detail["cause"] =
+            serde_json::to_value(ErrorReport::from(&error)).expect("error report serializes");
+        failure.detail = Some(detail);
         Error::Provider(failure)
     }
 }
