@@ -407,7 +407,10 @@ impl OneShot for DockerOneShot {
                 .into_result(termination, None, started.elapsed(), false));
             }
         };
-        let (container, output) = fence::run(
+        // Releasing the fence can fail after the one-shot started; remove it
+        // then rather than leave it running with nobody draining its output.
+        let mut created_id = None;
+        let admitted = fence::run(
             &self.container.docker,
             &self.container.id,
             Operation::Admit,
@@ -426,11 +429,22 @@ impl OneShot for DockerOneShot {
                     self.container_config(spec, image),
                 )
                 .await?;
+                created_id = Some(container.id.clone());
                 let output = container.attach_and_start().await?;
                 Ok((container, output))
             },
         )
-        .await?;
+        .await;
+        let (container, output) = match admitted {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                if let Some(id) = created_id {
+                    let docker = self.container.docker.clone();
+                    OneShotContainer { docker, id }.remove().await;
+                }
+                return Err(error);
+            }
+        };
         let mut captured =
             StreamOutput::new(spec.output_sanitization, controls.retained_output_limit);
         let outcome = match drain_with_stops(
