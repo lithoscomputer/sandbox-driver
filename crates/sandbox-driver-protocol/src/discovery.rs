@@ -30,6 +30,7 @@ use std::{env, fs};
 use sandbox_driver::{Error, ProviderKind, ResourceKind, Result};
 use sha2::{Digest, Sha256};
 use tokio::fs as tokio_fs;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::client::PluginProvider;
@@ -155,11 +156,21 @@ fn is_executable_file(path: &Path) -> bool {
 
 /// The SHA-256 of a file, as lowercase hex. Useful for generating pins.
 pub async fn file_sha256(path: &Path) -> Result<String> {
-    let bytes = tokio_fs::read(path)
+    let mut file = tokio_fs::File::open(path)
         .await
         .map_err(|error| Error::io(format!("reading {}", path.display()), error))?;
     let mut hasher = Sha256::new();
-    hasher.update(&bytes);
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .await
+            .map_err(|error| Error::io(format!("reading {}", path.display()), error))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(64);
     for byte in digest {

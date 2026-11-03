@@ -33,6 +33,7 @@ mod control;
 mod diagnostics;
 pub mod discovery;
 mod limits;
+pub mod metadata;
 mod server;
 mod supervisor;
 mod wire;
