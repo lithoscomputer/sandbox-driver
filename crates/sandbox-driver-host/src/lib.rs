@@ -52,6 +52,7 @@
 //! finds a recorded sandbox by its workspace path.
 
 mod access;
+pub mod contract;
 mod exec;
 mod fence;
 mod fs;

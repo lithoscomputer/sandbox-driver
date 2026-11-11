@@ -253,7 +253,7 @@ provider = "lima"
 source = { image = "ubuntu-lts" }
 ```
 
-Per provider entry: `plugin`, `config` (whatever that provider's `config_schema` accepts, validated on first selected-entry activation so a typo fails with the field named; the library never reads its contents), `secrets`, and for a third-party plugin `path`, `sha256` or `dev`, `args`, `env`, `inherit_env`. A `sha256` pin together with `dev = true` is a decoding error, so a pin is never silently skipped.
+Per provider entry: `plugin`, `config` (whatever that provider's `config_schema` accepts, validated on first selected-entry activation so a typo fails with the field named; the library never reads its contents), `secrets`, and for a third-party plugin `path`, `sha256` or `dev`, `args`, `env`, `inherit_env`. A `sha256` pin together with `dev = true` is a decoding error, so a pin is never silently skipped. The kinds `host`, `docker` and `daytona` are reserved for the built-in providers: an entry naming one of them with `path`, `sha256` or `dev` is a configuration error, so a third-party plugin picks another kind, such as `acme-daytona`.
 
 Credentials and conveniences take different paths:
 
@@ -288,7 +288,7 @@ Docker and Daytona are built in. Host is a plugin: installed separately on the m
 
 Each of these facts comes from the provider's descriptor at runtime; the table summarizes them.
 
-`host` runs commands as child processes in a directory the client designates, on the machine where the Host plugin is installed. One live plugin instance owns its sandboxes, their process groups and their lifecycle; a second instance cannot take them over from a path or a ref, and reattaching after the owner dies is not promised. Its sandboxes last as long as that instance. Use `docker` for local sandboxes that must outlive the caller.
+`host` runs commands as child processes in a directory the client designates, on the machine of the process that activated it. One live Host instance owns its sandboxes, their process groups and their lifecycle; a second instance cannot take them over from a path or a ref, and reattaching after the owner dies is not promised. Its sandboxes last as long as that instance. Use `docker` for local sandboxes that must outlive the caller.
 
 ## Using a third-party plugin
 
@@ -569,7 +569,12 @@ Prior art: Jupyter kernelspecs and `jupyter_client`, Kubernetes CRI and RuntimeC
 `contract::Sandboxes` requires an explicit `Registry`, `SecretResolver` and
 `CatalogOptions`; no real provider is registered by core. `Registry::builtin`
 registers an adapter, and `Registry::plugins` supplies the ordinary plugin
-loader. Host cannot be registered as a built-in. Metadata discovery receives
+loader. Host, Docker and Daytona are built-ins, and their reserved kinds never
+reach the plugin loader, even when the application did not register that
+built-in. `sandbox_driver_host::contract::HostFactory` is Host's built-in: an
+`owner_process`, `process`-durable provider where only the instance that
+created a sandbox can operate it; another live instance gets `busy`, and one
+whose owner is gone gets `unavailable`, never `not_found`. Metadata discovery receives
 only `PluginLocation`, never runtime configuration or secrets.
 
 `builder`, `environment` and `environments` are async because their source may
