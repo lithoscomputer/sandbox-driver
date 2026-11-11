@@ -15,7 +15,7 @@ use crate::sdk::{
 /// absence. A delete rejected because a state change is in progress was never
 /// admitted, so it is repeated; no uncertain mutation is replayed. A failed
 /// observation cannot prove cleanup.
-async fn delete_and_confirm(client: &DaytonaClient, id: &str) -> Result<()> {
+pub(crate) async fn delete_and_confirm(client: &DaytonaClient, id: &str) -> Result<()> {
     loop {
         match client.delete(id).await {
             Ok(()) => break,

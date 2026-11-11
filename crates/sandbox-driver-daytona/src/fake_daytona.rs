@@ -143,6 +143,10 @@ impl FakeDaytona {
         )
     }
 
+    pub(crate) fn url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
     pub(crate) async fn client(&self) -> Client {
         Client::new_with_config(DaytonaConfig {
             api_key: Some("test-key".to_owned()),

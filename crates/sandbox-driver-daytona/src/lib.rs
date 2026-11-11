@@ -74,6 +74,7 @@
 
 mod access;
 mod cleanup;
+pub mod contract;
 mod encoded_exec;
 mod exec;
 #[cfg(test)]

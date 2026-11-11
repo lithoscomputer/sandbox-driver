@@ -1,8 +1,9 @@
 //! The Daytona provider: connect, create, attach, undelete, health, list.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fmt::Write as _;
+use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use daytona_sdk::{
     SandboxListItem, SetFilePermissionsOptions, SnapshotParams,
 };
 use futures_util::TryStreamExt;
+use futures_util::future::BoxFuture;
 use sandbox_driver::{
     Action, AuthError, Capabilities, Error, EventContext, EventEmitter, EventSubject, HealthStatus,
     Isolation, LogsCaps, NetworkPolicy, ProviderError, ProviderHealth, ProviderKind, PtyCaps,
@@ -43,11 +45,11 @@ use crate::{
 /// neither the credential nor its masked value belongs in provider identity.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CurrentApiKey {
-    name:            String,
-    permissions:     Vec<Permissions>,
+pub(crate) struct CurrentApiKey {
+    name: String,
+    permissions: Vec<Permissions>,
     #[serde(default)]
-    organization_id: Option<String>,
+    pub(crate) organization_id: Option<String>,
 }
 
 /// Scopes every sandbox-driver Daytona operation may need, paired with
@@ -116,6 +118,11 @@ fn cached_snapshot_name(
     }
     name
 }
+
+/// Provisioning that replaces nested-Docker setup in
+/// [`DaytonaProvider::create_with`].
+pub(crate) type Provision =
+    Box<dyn FnOnce(Arc<DaytonaSandbox>) -> BoxFuture<'static, Result<()>> + Send>;
 
 /// The Daytona provider.
 pub struct DaytonaProvider {
@@ -227,6 +234,29 @@ impl DaytonaProvider {
         }
     }
 
+    /// Whether the credential is an API key, whose organization the control
+    /// plane chooses, rather than a JWT with an explicit organization.
+    pub(crate) fn uses_api_key(&self) -> bool {
+        self.uses_api_key
+    }
+
+    /// Asks the control plane to describe the configured credential: its
+    /// name, scopes, and the organization it selects. The error is the
+    /// transport failure's message.
+    pub(crate) async fn current_api_key(&self) -> StdResult<reqwest::Response, String> {
+        let config = self.client.api_configuration();
+        let mut request = config
+            .client
+            .get(format!("{}/api-keys/current", config.base_path));
+        if let Some(token) = &config.bearer_access_token {
+            request = request.bearer_auth(token);
+        }
+        if let Some(organization) = self.client.organization_id() {
+            request = request.header("X-Daytona-Organization-ID", organization);
+        }
+        request.send().await.map_err(|error| error.to_string())
+    }
+
     fn jwt_health_identity(&self) -> Option<String> {
         // An API key ignores the organization header. Only JWT authentication
         // can use that header as its effective resource namespace.
@@ -334,6 +364,7 @@ impl DaytonaProvider {
         created: daytona_sdk::Sandbox,
         spec: &SandboxSpec,
         nested_docker: Option<&NestedDockerConfig>,
+        provision: Option<Provision>,
         events: EventEmitter,
     ) -> Result<Arc<DaytonaSandbox>> {
         if let Some(requested) = spec.sandbox_kind {
@@ -347,7 +378,9 @@ impl DaytonaProvider {
         }
         initialize_directories(&created, spec.working_directory.as_deref()).await?;
         let handle = self.handle(created, events).await?;
-        if let (Some(config), Some(nested)) = (nested_docker, handle.nested.as_ref()) {
+        if let Some(provision) = provision {
+            provision(Arc::clone(&handle)).await?;
+        } else if let (Some(config), Some(nested)) = (nested_docker, handle.nested.as_ref()) {
             nested.create(config, &spec.env).await?;
         }
         Ok(handle)
@@ -441,6 +474,92 @@ impl DaytonaProvider {
             ));
         }
         Ok(())
+    }
+
+    /// The legacy `create`, with two hooks for the shared-contract runtime:
+    /// `extra_labels` joins the internal metadata Daytona stores, and
+    /// `provision`, when given, replaces nested-Docker provisioning. A
+    /// failure in either path deletes the sandbox and confirms removal.
+    pub(crate) async fn create_with(
+        &self,
+        spec: &SandboxSpec,
+        events: Option<EventContext>,
+        extra_labels: &BTreeMap<String, String>,
+        provision: Option<Provision>,
+    ) -> Result<Arc<DaytonaSandbox>> {
+        spec.validate()?;
+        validate_supported_creation_fields(spec)?;
+        let mut base = base_params(spec)?;
+        if let Some(labels) = &mut base.labels {
+            labels.extend(extra_labels.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        let nested_docker = provider_config(&spec.provider_config)?.docker;
+        let params = match &spec.source {
+            SandboxSource::Image { .. } | SandboxSource::Dockerfile { .. } => {
+                if spec.sandbox_kind == Some(SandboxKind::VirtualMachine) {
+                    return Err(Error::invalid_spec(
+                        "sandbox_kind",
+                        "Daytona virtual machines must be created from a virtual-machine snapshot",
+                    ));
+                }
+                // An image or Dockerfile is built once into a snapshot named
+                // by its inputs, and every later create with the same inputs
+                // reuses it; the resources size the snapshot.
+                let snapshot = self.cached_snapshot(spec, events.clone()).await?;
+                CreateParams::Snapshot(SnapshotParams {
+                    base,
+                    snapshot: snapshot.as_str().to_owned(),
+                })
+            }
+            SandboxSource::Snapshot { id } => {
+                self.ensure_snapshot_kind(id, spec.sandbox_kind).await?;
+                CreateParams::Snapshot(SnapshotParams {
+                    base,
+                    snapshot: id.as_str().to_owned(),
+                })
+            }
+            SandboxSource::HostDirectory => {
+                return Err(Error::invalid_spec(
+                    "source",
+                    "the daytona provider needs an image, dockerfile, or snapshot source",
+                ));
+            }
+            _ => return Err(Error::invalid_spec("source", "unsupported sandbox source")),
+        };
+
+        let budget = if matches!(spec.source, SandboxSource::Dockerfile { .. }) {
+            DOCKERFILE_CREATE_TIMEOUT
+        } else {
+            CREATE_TIMEOUT
+        };
+        let emitter = EventEmitter::new(self.kind.clone(), events);
+        let handle_emitter = emitter.clone();
+        emitter
+            .run(
+                EventSubject::pending_sandbox(spec.name.clone()),
+                Action::Create,
+                |reporter| async move {
+                    let created = self.create_inner(params, budget).await?;
+                    let event_id = SandboxId::try_new(created.id.clone())
+                        .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
+                    reporter.set_subject(EventSubject::sandbox(Some(event_id)));
+                    let sdk_id = created.id.clone();
+                    match self
+                        .finish_create(
+                            created,
+                            spec,
+                            nested_docker.as_ref(),
+                            provision,
+                            handle_emitter,
+                        )
+                        .await
+                    {
+                        Ok(handle) => Ok(handle),
+                        Err(error) => Err(self.cleanup_failed_create(&sdk_id, error).await),
+                    }
+                },
+            )
+            .await
     }
 }
 
@@ -682,70 +801,10 @@ impl SandboxProvider for DaytonaProvider {
         spec: &SandboxSpec,
         events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
-        spec.validate()?;
-        validate_supported_creation_fields(spec)?;
-        let base = base_params(spec)?;
-        let nested_docker = provider_config(&spec.provider_config)?.docker;
-        let params = match &spec.source {
-            SandboxSource::Image { .. } | SandboxSource::Dockerfile { .. } => {
-                if spec.sandbox_kind == Some(SandboxKind::VirtualMachine) {
-                    return Err(Error::invalid_spec(
-                        "sandbox_kind",
-                        "Daytona virtual machines must be created from a virtual-machine snapshot",
-                    ));
-                }
-                // An image or Dockerfile is built once into a snapshot named
-                // by its inputs, and every later create with the same inputs
-                // reuses it; the resources size the snapshot.
-                let snapshot = self.cached_snapshot(spec, events.clone()).await?;
-                CreateParams::Snapshot(SnapshotParams {
-                    base,
-                    snapshot: snapshot.as_str().to_owned(),
-                })
-            }
-            SandboxSource::Snapshot { id } => {
-                self.ensure_snapshot_kind(id, spec.sandbox_kind).await?;
-                CreateParams::Snapshot(SnapshotParams {
-                    base,
-                    snapshot: id.as_str().to_owned(),
-                })
-            }
-            SandboxSource::HostDirectory => {
-                return Err(Error::invalid_spec(
-                    "source",
-                    "the daytona provider needs an image, dockerfile, or snapshot source",
-                ));
-            }
-            _ => return Err(Error::invalid_spec("source", "unsupported sandbox source")),
-        };
-
-        let budget = if matches!(spec.source, SandboxSource::Dockerfile { .. }) {
-            DOCKERFILE_CREATE_TIMEOUT
-        } else {
-            CREATE_TIMEOUT
-        };
-        let emitter = EventEmitter::new(self.kind.clone(), events);
-        let handle_emitter = emitter.clone();
-        emitter
-            .run(
-                EventSubject::pending_sandbox(spec.name.clone()),
-                Action::Create,
-                |reporter| async move {
-                    let created = self.create_inner(params, budget).await?;
-                    let event_id = SandboxId::try_new(created.id.clone())
-                        .map_err(|error| Error::invalid_spec("sandbox_id", error.to_string()))?;
-                    reporter.set_subject(EventSubject::sandbox(Some(event_id)));
-                    let sdk_id = created.id.clone();
-                    match self
-                        .finish_create(created, spec, nested_docker.as_ref(), handle_emitter)
-                        .await
-                    {
-                        Ok(handle) => Ok(handle as Arc<dyn Sandbox>),
-                        Err(error) => Err(self.cleanup_failed_create(&sdk_id, error).await),
-                    }
-                },
-            )
-            .await
+        let handle = self
+            .create_with(spec, events, &BTreeMap::new(), None)
+            .await?;
+        Ok(handle as Arc<dyn Sandbox>)
     }
 
     #[tracing::instrument(
@@ -830,18 +889,8 @@ impl SandboxProvider for DaytonaProvider {
         // Scope enumeration works only for API-key credentials; a JWT
         // credential proved itself above and skips it, as does a control
         // plane without key introspection.
-        let config = self.client.api_configuration();
-        let mut request = config
-            .client
-            .get(format!("{}/api-keys/current", config.base_path));
-        if let Some(token) = &config.bearer_access_token {
-            request = request.bearer_auth(token);
-        }
-        if let Some(organization) = self.client.organization_id() {
-            request = request.header("X-Daytona-Organization-ID", organization);
-        }
         let key = async {
-            let response = request.send().await.ok()?.error_for_status().ok()?;
+            let response = self.current_api_key().await.ok()?.error_for_status().ok()?;
             response.json::<CurrentApiKey>().await.ok()
         }
         .await;

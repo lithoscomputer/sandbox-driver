@@ -223,6 +223,20 @@ impl DaytonaSandbox {
 }
 
 impl DaytonaSandbox {
+    pub(crate) fn client(&self) -> &DaytonaClient {
+        &self.client
+    }
+
+    pub(crate) fn sdk_id(&self) -> &str {
+        &self.sdk_id
+    }
+
+    /// Preview access through the runner, whatever the exec target: a
+    /// nested workload on the runner's network serves on the runner's ports.
+    pub(crate) fn access(&self) -> &DaytonaAccess {
+        &self.access
+    }
+
     fn container(&self) -> Option<&NestedDocker> {
         self.nested
             .as_ref()
