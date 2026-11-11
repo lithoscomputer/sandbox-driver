@@ -30,6 +30,7 @@ use std::{env, fs};
 use sandbox_driver::{Error, ProviderKind, ResourceKind, Result};
 use sha2::{Digest, Sha256};
 use tokio::fs as tokio_fs;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::client::PluginProvider;
@@ -138,28 +139,36 @@ fn resolve_on_search_path(name: &str, search: &OsStr) -> Option<PathBuf> {
 }
 
 fn is_executable_file(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
+    fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && is_executable(&metadata))
+}
+
+/// Whether any execute permission bit is set. Always true off Unix.
+pub(crate) fn is_executable(metadata: &fs::Metadata) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         metadata.permissions().mode() & 0o111 != 0
     }
     #[cfg(not(unix))]
-    true
+    {
+        let _ = metadata;
+        true
+    }
 }
 
 /// The SHA-256 of a file, as lowercase hex. Useful for generating pins.
 pub async fn file_sha256(path: &Path) -> Result<String> {
-    let bytes = tokio_fs::read(path)
-        .await
-        .map_err(|error| Error::io(format!("reading {}", path.display()), error))?;
+    let io_error = |error| Error::io(format!("reading {}", path.display()), error);
+    let mut file = tokio_fs::File::open(path).await.map_err(io_error)?;
     let mut hasher = Sha256::new();
-    hasher.update(&bytes);
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).await.map_err(io_error)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(64);
     for byte in digest {
