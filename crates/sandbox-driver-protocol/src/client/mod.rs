@@ -32,9 +32,10 @@ use tracing::field;
 
 use self::exec::ExecProgress;
 use crate::channel::{Channel, ChannelListener, ChannelReceiver};
-use crate::wire::Message;
+use crate::wire::{Message, WireError};
 use crate::{TransportLimits, control, limits, methods as m};
 
+pub(crate) mod contract;
 mod exec;
 mod fs;
 mod provider;
@@ -82,12 +83,26 @@ struct Client {
     cleanup: Mutex<JoinSet<()>>,
     failed_cleanup: Mutex<Vec<(Arc<OwnedSemaphorePermit>, TransportError)>>,
     closed_error: Mutex<Option<TransportError>>,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, Failure>>>>,
     event_contexts: Mutex<HashMap<String, EventContext>>,
     /// Contexts for in-flight resource operations, keyed by a wire-only
     /// route id so events can arrive before a resource id exists.
     event_routes: Mutex<HashMap<String, EventContext>>,
     tasks: OnceLock<[AbortOnDropHandle<()>; 3]>,
+}
+
+/// Why a request produced no result: the plugin's own error reply, or a local
+/// failure (admission, encoding, a closed transport). Each protocol version
+/// decodes remote errors into its own error type.
+pub(crate) enum Failure {
+    Remote(WireError),
+    Local(Error),
+}
+
+impl From<Error> for Failure {
+    fn from(error: Error) -> Self {
+        Self::Local(error)
+    }
 }
 
 struct DeliveredEvent {
@@ -97,7 +112,7 @@ struct DeliveredEvent {
 }
 
 struct PendingCall<'a> {
-    pending: &'a Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>,
+    pending: &'a Mutex<HashMap<u64, oneshot::Sender<Result<Value, Failure>>>>,
     id:      u64,
 }
 
@@ -272,7 +287,7 @@ impl Client {
             pending.drain().collect()
         };
         for (_, sender) in pending {
-            let _ = sender.send(Err(Error::Transport(error.clone())));
+            let _ = sender.send(Err(Failure::Local(Error::Transport(error.clone()))));
         }
         self.event_contexts
             .lock()
@@ -296,15 +311,16 @@ impl Client {
     /// proves the plugin opened the channel: a response that arrives
     /// first waits a bounded grace for it, so a result never lands ahead
     /// of the bytes it describes.
-    async fn call_with_channel<R, T, Fut>(
+    async fn call_with_channel<R, T, E, Fut>(
         &self,
         method: &str,
-        call: impl Future<Output = Result<R>>,
+        call: impl Future<Output = Result<R, E>>,
         receiver: ChannelReceiver,
         pump: impl FnOnce(Channel) -> Fut,
-    ) -> Result<(R, T)>
+    ) -> Result<(R, T), E>
     where
-        Fut: Future<Output = Result<T>>,
+        Fut: Future<Output = Result<T, E>>,
+        E: From<Error>,
     {
         let accepted = AtomicBool::new(false);
         let pump = async {
@@ -327,8 +343,8 @@ impl Client {
                 // its final data frames still await scheduling on this side.
                 if responded.load(Ordering::SeqCst) {
                     time::timeout(self.limits.hard_cancel_drain_timeout, operation).await
-                        .unwrap_or_else(|_| Err(self.closed_error()))
-                } else { Err(self.closed_error()) }
+                        .unwrap_or_else(|_| Err(self.closed_error().into()))
+                } else { Err(self.closed_error().into()) }
             }
         }
     }
@@ -436,7 +452,7 @@ impl Client {
             let sender = self.pending.lock().expect("pending lock").remove(&id);
             if let Some(sender) = sender {
                 let outcome = match (message.result, message.error) {
-                    (_, Some(error)) => Err(error.into_error()),
+                    (_, Some(error)) => Err(Failure::Remote(error)),
                     (Some(result), None) => Ok(result),
                     (None, None) => Ok(Value::Null),
                 };
@@ -522,6 +538,28 @@ impl Client {
         err(level = "debug")
     )]
     async fn call<P: Serialize, R: DeserializeOwned>(&self, method: &str, params: &P) -> Result<R> {
+        let value = self
+            .request(method, params)
+            .await
+            .map_err(|failure| match failure {
+                Failure::Remote(error) => error.into_error(),
+                Failure::Local(error) => error,
+            })?;
+        serde_json::from_value(value).map_err(|error| {
+            Error::Transport(TransportError::with_source(
+                "decoding plugin response result",
+                error,
+            ))
+        })
+    }
+
+    /// Sends one request and awaits its reply, leaving remote errors
+    /// undecoded for the caller's protocol version.
+    pub(crate) async fn request<P: Serialize>(
+        &self,
+        method: &str,
+        params: &P,
+    ) -> Result<Value, Failure> {
         let priority = m::traits(method).reserved;
         let _admission = limits::acquire(
             if priority {
@@ -555,22 +593,16 @@ impl Client {
         if self.closed.load(Ordering::SeqCst) {
             // The transport may have died between the drain and our
             // registration. The guard removes this call on return.
-            return Err(self.closed_error());
+            return Err(self.closed_error().into());
         }
         self.outbound
             .send(&Message::request(id, method, params), priority)?;
-        let value = receiver.await.map_err(|error| {
+        receiver.await.map_err(|error| {
             Error::Transport(TransportError::with_source(
                 "receiving plugin response",
                 error,
             ))
-        })??;
-        serde_json::from_value(value).map_err(|error| {
-            Error::Transport(TransportError::with_source(
-                "decoding plugin response result",
-                error,
-            ))
-        })
+        })?
     }
 
     /// Fires an `exec/stop` for each stop token as it fires: a term then
@@ -646,12 +678,12 @@ impl Client {
 
 /// Polls the control call and data pump together. Both futures belong to
 /// this operation, so cancellation drops the channel and its expectation.
-async fn call_with_pump<R, T>(
-    call: impl Future<Output = Result<R>>,
-    pump: impl Future<Output = Result<T>>,
+async fn call_with_pump<R, T, E: From<Error>>(
+    call: impl Future<Output = Result<R, E>>,
+    pump: impl Future<Output = Result<T, E>>,
     accepted: &AtomicBool,
     method: &str,
-) -> Result<(R, T)> {
+) -> Result<(R, T), E> {
     let mut call = pin!(call);
     let mut pump = pin!(pump);
     tokio::select! {
@@ -665,9 +697,9 @@ async fn call_with_pump<R, T>(
                 pump.await?
             } else {
                 time::timeout(LATE_CHANNEL_GRACE, pump).await.map_err(|_| {
-                    Error::Transport(TransportError::new(format!(
+                    E::from(Error::Transport(TransportError::new(format!(
                         "the plugin answered {method} without opening its data channel"
-                    )))
+                    ))))
                 })??
             };
             Ok((result, pumped))

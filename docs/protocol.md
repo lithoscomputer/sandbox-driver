@@ -1118,3 +1118,64 @@ so it **must not** leave work behind in descendants.
 
 The host-side budgets, cache and errors are described under
 [plugin metadata discovery](shared-contract.md#plugin-metadata-discovery).
+
+## 16. Protocol version 3: the shared contract over a process boundary
+
+Version 3 carries [the shared contract](shared-contract.md) between a host and
+a configured third-party plugin. The built-in providers (Host, Docker and
+Daytona) are never served over it: their kinds are reserved, and a plugin uses
+another kind. The framing, envelope, data channels and transport budgets of
+sections 2 and 3 are unchanged. Version 2 stays available on both sides until
+its consumers migrate, and a version 3 host never falls back to it.
+
+**Host side.** `contract::PluginLoader` is the `ProviderFactory` an
+application passes to `Registry::plugins`. `discover` is section 15.
+`activate` rediscovers the entry, refuses schemas that differ from the ones
+the catalog froze, calls `verify_unchanged`, and starts the child with exactly
+the catalog's frozen environment plus the resolved secret values, a cleared
+inherited environment, piped stdin and stdout, and the entry's `args`. Each
+start is a *generation*. Handles keep the generation that issued them and fail
+with `stale` once it ends. The next runtime call starts a new generation,
+which must report the same schemas and namespace (`namespace_mismatch`
+otherwise). Only the transport is restored: the call in flight when the old
+generation died reports an unknown outcome or `lost`, and is never sent again.
+The child is reaped as soon as it exits, so a dead plugin never looks alive to
+its own workloads.
+
+**Handshake.** `initialize` carries `protocol_version: 3`, the data transport,
+the entry name, the entry's `config`, and the *names* of its secrets. Secret
+values never cross the control pipe: the plugin reads the named variables from
+its own environment. The plugin activates its factory inside `initialize`; a
+failure is the factory's error. `describe` must then return the discovered
+schemas.
+
+**Methods.** `describe`, `health`, `create`, `attach`, `list`, `destroy`,
+`status`, `start`, `stop`, `exec`, `exec.stop`, `exec.resize`, `files.get`,
+`files.put`, `files.list`, `ports.expose` and `ports.release`, carrying the
+contract's own types. `exec`, `files.get` and `files.put` are data-channel
+operations: exec stdin and output, and file bytes, travel in frames, and a
+transfer that ends without its `Eof` fails rather than looking short.
+`exec.stop`, `exec.resize`, `stop`, `destroy`, `health` and `ports.release` are
+reserved, so they are answered while the plugin's ordinary capacity is full.
+Dropping an exec future kills its execution. Errors keep their contract
+variant and fields in a report whose kind is `contract`.
+
+**Plugin side.** `contract::Plugin::new(schemas, factory)` and `run_plugin`
+are the SDK entry points. `run_plugin` answers `--describe-schema` before
+constructing anything else, then serves stdio. `Plugin::with_legacy` also
+serves version 2 to hosts that ask for it while callers migrate. `shutdown`
+kills in-flight executions and calls the runtime's `shutdown`.
+
+**Not yet carried.** The optional capability groups are masked from the
+descriptor a version 3 host reports, matching handles that return `None` for
+them. Endpoints (`ssh`, `ssh_revoke`, `shell_command`, `vnc`) and one-shot
+containers (`containers.run`) stay optional for providers and are carried by
+the follow-up “Protocol 3 optional capabilities” story. The lifecycle
+group (pause, resume, archive, recover) is being removed from the contract
+rather than carried; `start` brings a paused sandbox back to running.
+
+`sandbox-driver-fixture-plugins` holds the fixture plugins: built-in runtimes
+served under non-reserved kinds. `sandbox-driver-test-host` serves the Host
+runtime under the kind `test-host`. Its tests drive it through the loader,
+including the shared conformance harness, plugin death and restart, and setup
+errors.

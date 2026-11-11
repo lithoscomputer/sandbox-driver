@@ -112,9 +112,17 @@ pub(crate) struct MethodTraits {
 /// The transport traits of `method`; every trait is false for a method
 /// this table does not name, including unknown ones.
 pub(crate) fn traits(method: &str) -> MethodTraits {
+    use crate::contract::wire as v3;
+    // Version 3 names never contain `/`, so they cannot collide with these.
     let reserved = matches!(
         method,
-        EXEC_STOP
+        v3::EXEC_STOP
+            | v3::EXEC_RESIZE
+            | v3::STOP
+            | v3::DESTROY
+            | v3::HEALTH
+            | v3::PORTS_RELEASE
+            | EXEC_STOP
             | EXEC_STDIO_TERMINATE
             | PTY_CLOSE
             | STREAM_CANCEL
@@ -127,7 +135,10 @@ pub(crate) fn traits(method: &str) -> MethodTraits {
     );
     let uses_io = matches!(
         method,
-        EXEC_STREAM
+        v3::EXEC
+            | v3::FILES_GET
+            | v3::FILES_PUT
+            | EXEC_STREAM
             | ONE_SHOT_RUN
             | EXEC_STDIO_OPEN
             | PTY_OPEN
