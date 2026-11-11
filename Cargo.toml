@@ -83,3 +83,16 @@ rest_pat_in_fully_bound_structs = "warn"
 use_self = "warn"
 wildcard_imports = "warn"
 absolute_paths = "warn"
+
+# Plugin discovery hashes the whole plugin executable with SHA-256 (twice on a
+# cache miss) inside its 5 s budget (`DiscoveryLimits::timeout` in
+# crates/sandbox-driver-protocol/src/metadata.rs). Unoptimized, sha2 hashes
+# about 40 MB/s, so debug tests that discover this repo's 170-300 MB debug
+# plugin binaries time out before the probe runs; optimized it is ~600 MB/s.
+# Cargo honours profiles only in the root manifest, so this does not reach
+# applications that depend on sandbox-driver (fabro, petri). If a debug build
+# there reports "metadata discovery timed out" for a large plugin, add the same
+# override to its root Cargo.toml or raise `DiscoveryLimits::timeout`.
+# See https://github.com/lithoscomputer/sandbox-driver/pull/72.
+[profile.dev.package.sha2]
+opt-level = 3
