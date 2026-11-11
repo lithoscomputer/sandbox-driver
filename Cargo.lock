@@ -2294,6 +2294,7 @@ dependencies = [
  "async-trait",
  "sandbox-driver",
  "sandbox-driver-conformance",
+ "sandbox-driver-docker",
  "sandbox-driver-host",
  "sandbox-driver-protocol",
  "sandbox-driver-testing",

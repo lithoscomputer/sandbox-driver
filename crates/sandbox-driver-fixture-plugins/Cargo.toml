@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 sandbox-driver.workspace = true
+sandbox-driver-docker.workspace = true
 sandbox-driver-host.workspace = true
 sandbox-driver-protocol = { path = "../sandbox-driver-protocol" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
