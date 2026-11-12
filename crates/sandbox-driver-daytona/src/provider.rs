@@ -490,9 +490,9 @@ impl DaytonaProvider {
         spec.validate()?;
         validate_supported_creation_fields(spec)?;
         let mut base = base_params(spec)?;
-        if let Some(labels) = &mut base.labels {
-            labels.extend(extra_labels.iter().map(|(k, v)| (k.clone(), v.clone())));
-        }
+        base.labels
+            .get_or_insert_default()
+            .extend(extra_labels.iter().map(|(k, v)| (k.clone(), v.clone())));
         let nested_docker = provider_config(&spec.provider_config)?.docker;
         let params = match &spec.source {
             SandboxSource::Image { .. } | SandboxSource::Dockerfile { .. } => {

@@ -90,14 +90,7 @@ pub(super) fn refused(error: &Error) -> bool {
 /// Classifies a failed control-plane call that carries its own status.
 pub(super) fn from_sdk(operation: &'static str, error: &DaytonaError) -> Error {
     tracing::debug!(operation, error = ?error, "daytona control-plane call failed");
-    let message = format!("{operation}: {error}");
-    if let DaytonaError::RateLimit { .. } = *error {
-        return Error::ResourceExhausted {
-            message,
-            retry_after_ms: None,
-        };
-    }
-    by_status(error.status_code(), message)
+    by_status(error.status_code(), format!("{operation}: {error}"))
 }
 
 fn by_status(status: Option<u16>, message: String) -> Error {

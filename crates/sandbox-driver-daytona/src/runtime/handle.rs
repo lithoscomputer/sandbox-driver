@@ -243,7 +243,10 @@ impl Workload {
             })?;
         if bytes.len() > BUFFER_LIMIT {
             return Err(Error::Unsupported {
-                capability: format!("{what} beyond 16 MiB for this workload"),
+                capability: format!(
+                    "{what} beyond {} MiB for this workload",
+                    BUFFER_LIMIT / (1024 * 1024)
+                ),
             });
         }
         Ok(bytes)
@@ -466,22 +469,17 @@ impl Sandbox for Workload {
         let stopped = LegacySandbox::stop(self.handle.as_ref()).await;
         // Success is Daytona's own report that the sandbox is stopped, read
         // after the request: an accepted stop is not a fence.
-        match self.state().await {
-            Ok(LegacyState::Stopped | LegacyState::Archived) => Ok(()),
-            Ok(LegacyState::Deleted) => Err(self.absent()),
-            Ok(state) => Err(
-                match stopped.map_err(|error| classify("stopping sandbox", error)) {
-                    Ok(()) => Error::FenceLeaked {
-                        message: format!("the sandbox is {state:?} after stop"),
-                    },
-                    Err(error) if refused(&error) => error,
-                    Err(error) => Error::FenceLeaked {
-                        message: error.to_string(),
-                    },
-                },
-            ),
-            Err(error) => Err(error),
-        }
+        let state = match self.state().await? {
+            LegacyState::Stopped | LegacyState::Archived => return Ok(()),
+            LegacyState::Deleted => return Err(self.absent()),
+            state => state,
+        };
+        let message = match stopped.map_err(|error| classify("stopping sandbox", error)) {
+            Ok(()) => format!("the sandbox is {state:?} after stop"),
+            Err(error) if refused(&error) => return Err(error),
+            Err(error) => error.to_string(),
+        };
+        Err(Error::FenceLeaked { message })
     }
 
     async fn exec(&self, spec: ExecSpec, controls: ExecControls) -> Result<ExecOutcome, Error> {

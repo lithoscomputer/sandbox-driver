@@ -205,7 +205,12 @@ async fn organization(
         200..=299 => {}
         401 => return Err(Error::Unauthenticated { message }),
         403 => return Err(Error::PermissionDenied { message }),
-        _ => return Err(unavailable(&format_args!("HTTP {status}"))),
+        _ => {
+            return Err(Error::Unavailable {
+                message,
+                outcome: MutationOutcome::NotStarted,
+            });
+        }
     }
     let key: CurrentApiKey = response.json().await.map_err(|error| unavailable(&error))?;
     key.organization_id
@@ -382,27 +387,25 @@ impl ProviderRuntime for DaytonaRuntime {
             cleanup::delete_and_confirm(&self.provider.client, id.as_str()),
         )
         .await;
-        let remaining = || {
-            vec![RemainingResource {
+        let message = match confirmed {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) => {
+                let error = classify("destroying sandbox", error);
+                // A refused delete was not admitted; the sandbox is intact.
+                if refused(&error) {
+                    return Err(error);
+                }
+                error.to_string()
+            }
+            Err(_) => "removal was not confirmed within the cleanup budget".to_owned(),
+        };
+        Err(Error::IncompleteCleanup {
+            message,
+            remaining: vec![RemainingResource {
                 kind: "sandbox".to_owned(),
                 id:   id.to_string(),
-            }]
-        };
-        match confirmed {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => match classify("destroying sandbox", error) {
-                // A refused delete was not admitted; the sandbox is intact.
-                error if refused(&error) => Err(error),
-                error => Err(Error::IncompleteCleanup {
-                    message:   error.to_string(),
-                    remaining: remaining(),
-                }),
-            },
-            Err(_) => Err(Error::IncompleteCleanup {
-                message:   "removal was not confirmed within the cleanup budget".to_owned(),
-                remaining: remaining(),
-            }),
-        }
+            }],
+        })
     }
 
     async fn shutdown(&self) -> Result<(), Error> {
@@ -448,6 +451,14 @@ mod tests {
                 .flatten()
                 .map(str::to_owned))
         }
+    }
+
+    /// Daytona's description of the configured API key.
+    const CURRENT_KEY: &str = r#"{"name":"k","permissions":[],"organizationId":"org-42"}"#;
+
+    /// Daytona's answer naming the fake at `address` as the toolbox proxy.
+    fn toolbox_url(address: &impl Display) -> String {
+        format!(r#"{{"url":"http://{address}/toolbox"}}"#)
     }
 
     fn sandbox(id: &str, labels: &serde_json::Value) -> String {
@@ -533,10 +544,9 @@ mod tests {
         );
         let fake = FakeDaytona::start(move |_| {
             Arc::new(move |method, target| match (method, target) {
-                ("GET", target) if target.ends_with("/api-keys/current") => Reply::Json(
-                    200,
-                    r#"{"name":"k","permissions":[],"organizationId":"org-42"}"#.to_owned(),
-                ),
+                ("GET", target) if target.ends_with("/api-keys/current") => {
+                    Reply::Json(200, CURRENT_KEY.to_owned())
+                }
                 ("GET", target) if target.contains("/sandbox/sb-ours?") => {
                     Reply::Json(200, ours.clone())
                 }
@@ -630,14 +640,13 @@ mod tests {
                 let polled = Arc::clone(&polled);
                 move |address| {
                     Arc::new(move |method, target| match (method, target) {
-                        ("GET", target) if target.ends_with("/api-keys/current") => Reply::Json(
-                            200,
-                            r#"{"name":"k","permissions":[],"organizationId":"org-42"}"#.to_owned(),
-                        ),
+                        ("GET", target) if target.ends_with("/api-keys/current") => {
+                            Reply::Json(200, CURRENT_KEY.to_owned())
+                        }
                         ("GET", target)
                             if target.starts_with("/sandbox/sb-1/toolbox-proxy-url") =>
                         {
-                            Reply::Json(200, format!(r#"{{"url":"http://{address}/toolbox"}}"#))
+                            Reply::Json(200, toolbox_url(&address))
                         }
                         ("GET", target) if target.starts_with("/sandbox/sb-1?") => {
                             let generation = if restarted && polled.load(Ordering::SeqCst) {
@@ -698,12 +707,11 @@ mod tests {
     async fn an_oversized_write_is_refused_before_upload() {
         let fake = FakeDaytona::start(|address| {
             Arc::new(move |method, target| match (method, target) {
-                ("GET", target) if target.ends_with("/api-keys/current") => Reply::Json(
-                    200,
-                    r#"{"name":"k","permissions":[],"organizationId":"org-42"}"#.to_owned(),
-                ),
+                ("GET", target) if target.ends_with("/api-keys/current") => {
+                    Reply::Json(200, CURRENT_KEY.to_owned())
+                }
                 ("GET", target) if target.starts_with("/sandbox/sb-1/toolbox-proxy-url") => {
-                    Reply::Json(200, format!(r#"{{"url":"http://{address}/toolbox"}}"#))
+                    Reply::Json(200, toolbox_url(&address))
                 }
                 ("GET", target) if target.starts_with("/sandbox/sb-1?") => {
                     Reply::Json(200, started("2026-11-10T19:22:08.169Z"))

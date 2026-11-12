@@ -313,7 +313,7 @@ pub(crate) fn words<const N: usize>(values: [&str; N]) -> Vec<String> {
     values.into_iter().map(str::to_owned).collect()
 }
 
-pub(crate) fn checked(result: ExecResult, operation: &str) -> Result<ExecResult> {
+fn checked(result: ExecResult, operation: &str) -> Result<ExecResult> {
     if result.success() {
         Ok(result)
     } else {
@@ -432,60 +432,58 @@ impl NestedDocker {
         if !self.targets_container() {
             return Ok(());
         }
-        let mut state = self.state.lock().await;
-        self.bootstrap().await?;
-        self.clean_stale_preparation().await?;
-        if config.options.auto_pull {
-            self.cli
-                .pull(
-                    &config.image,
-                    config.options.registry_auth.as_ref(),
-                    config.options.platform.as_deref(),
-                )
-                .await?;
-        }
-        let services = !config.options.sidecars.is_empty();
-        let network = if services { "none" } else { "bridge" };
-        let args = primary_args(config, env, &self.cli.working_dir, network);
-        self.cli.run(args).await?;
-        // The labeled primary exists before any network or sidecar, so a
-        // crashed allocation always remains owned by the outer sandbox.
-        if services {
-            self.cli
-                .run(words([
-                    "network",
-                    "create",
-                    "--label",
-                    MANAGED_LABEL,
-                    NETWORK,
-                ]))
-                .await?;
-            for sidecar in &config.options.sidecars {
+        self.provision_with(async {
+            self.clean_stale_preparation().await?;
+            if config.options.auto_pull {
                 self.cli
-                    .pull(&sidecar.image, sidecar.registry_auth.as_ref(), None)
+                    .pull(
+                        &config.image,
+                        config.options.registry_auth.as_ref(),
+                        config.options.platform.as_deref(),
+                    )
                     .await?;
-                let name = format!("{NETWORK}-{}", sidecar.name);
-                self.cli.run(sidecar_args(sidecar, &name)).await?;
-                self.cli.run(words(["start", &name])).await?;
             }
-            for sidecar in &config.options.sidecars {
-                if sidecar.health.is_some() {
+            let services = !config.options.sidecars.is_empty();
+            let network = if services { "none" } else { "bridge" };
+            let args = primary_args(config, env, &self.cli.working_dir, network);
+            self.cli.run(args).await?;
+            // The labeled primary exists before any network or sidecar, so a
+            // crashed allocation always remains owned by the outer sandbox.
+            if services {
+                self.cli
+                    .run(words([
+                        "network",
+                        "create",
+                        "--label",
+                        MANAGED_LABEL,
+                        NETWORK,
+                    ]))
+                    .await?;
+                for sidecar in &config.options.sidecars {
                     self.cli
-                        .await_health(&format!("{NETWORK}-{}", sidecar.name))
+                        .pull(&sidecar.image, sidecar.registry_auth.as_ref(), None)
                         .await?;
+                    let name = format!("{NETWORK}-{}", sidecar.name);
+                    self.cli.run(sidecar_args(sidecar, &name)).await?;
+                    self.cli.run(words(["start", &name])).await?;
                 }
+                for sidecar in &config.options.sidecars {
+                    if sidecar.health.is_some() {
+                        self.cli
+                            .await_health(&format!("{NETWORK}-{}", sidecar.name))
+                            .await?;
+                    }
+                }
+                self.cli
+                    .run(words(["network", "disconnect", "none", CONTAINER_NAME]))
+                    .await?;
+                self.cli
+                    .run(words(["network", "connect", NETWORK, CONTAINER_NAME]))
+                    .await?;
             }
-            self.cli
-                .run(words(["network", "disconnect", "none", CONTAINER_NAME]))
-                .await?;
-            self.cli
-                .run(words(["network", "connect", NETWORK, CONTAINER_NAME]))
-                .await?;
-        }
-        self.cli.run(words(["start", CONTAINER_NAME])).await?;
-        self.initialize_runtime_directory().await?;
-        *state = Generation::Ready;
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     pub(crate) fn cli(&self) -> &Arc<DockerCli> {
@@ -495,15 +493,14 @@ impl NestedDocker {
     /// [`Self::create`] for a caller that makes the containers itself:
     /// starts Docker, runs `containers` to create the primary container and
     /// whatever belongs beside it, then starts the primary and marks this
-    /// generation ready.
-    pub(crate) async fn provision_with<F, Fut>(&self, containers: F) -> Result<()>
-    where
-        F: FnOnce(Arc<DockerCli>) -> Fut,
-        Fut: Future<Output = Result<()>>,
-    {
+    /// generation ready. `containers` is polled only once Docker is up.
+    pub(crate) async fn provision_with(
+        &self,
+        containers: impl Future<Output = Result<()>>,
+    ) -> Result<()> {
         let mut state = self.state.lock().await;
         self.bootstrap().await?;
-        containers(Arc::clone(&self.cli)).await?;
+        containers.await?;
         self.cli.run(words(["start", CONTAINER_NAME])).await?;
         self.initialize_runtime_directory().await?;
         *state = Generation::Ready;

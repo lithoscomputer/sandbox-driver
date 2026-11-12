@@ -28,7 +28,7 @@ use crate::labels::{IMAGE_LABEL, INTERNAL_PREFIX, RECIPE_LABEL};
 
 /// The Docker-capable runner a nested workload lives in, unless the provider
 /// entry names another. It provides Docker, `start-docker` and Python 3.
-pub(crate) const DEFAULT_RUNNER_IMAGE: &str =
+pub(super) const DEFAULT_RUNNER_IMAGE: &str =
     "ghcr.io/lithoscomputer/ubuntu-24.04:dind-f8bbbfd81934";
 /// The workspace a nested workload gets when the spec names none.
 const NESTED_WORKSPACE: &str = "/workspace";
@@ -39,8 +39,8 @@ const RUNNER_MIN_MEMORY_MB: u64 = 4096;
 /// SSH. A service on the runner's network cannot take them.
 const RESERVED_PORTS: [u16; 3] = [2280, 22220, 22222];
 
-pub(crate) const DIRECT: &str = "direct";
-pub(crate) const NESTED: &str = "nested";
+const DIRECT: &str = "direct";
+const NESTED: &str = "nested";
 
 /// Per-sandbox options with no provider-neutral meaning. The descriptor's
 /// `spec_schema` describes the same fields.

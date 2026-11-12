@@ -100,7 +100,7 @@ pub(super) async fn provision(
         .as_ref()
         .ok_or_else(|| sandbox_driver::Error::invalid_spec("recipe", "runner has no Docker"))?;
     docker
-        .provision_with(|cli| provision_containers(cli, &nested, &auth))
+        .provision_with(provision_containers(docker.cli(), &nested, &auth))
         .await?;
     // Provisioning pulls images; the requested egress policy applies to
     // everything that runs afterwards.
@@ -113,11 +113,10 @@ pub(super) async fn provision(
 /// The containers of a nested workload: its services, ready before the
 /// workload container is created. The caller starts the workload.
 async fn provision_containers(
-    cli: Arc<DockerCli>,
+    cli: &DockerCli,
     nested: &Nested,
     auth: &ServiceAuth,
 ) -> LegacyResult<()> {
-    let cli = &cli;
     // Downloads dominate provisioning, so every image comes down at once;
     // each pull keeps its own credential directory.
     let pulls = nested
@@ -135,9 +134,9 @@ async fn provision_containers(
         cli.run(words(["start", &container_name(name)])).await
     });
     future::try_join_all(starts).await?;
-    if let Err(error) = await_services(cli, &nested.services).await {
-        return Err(unready(&error));
-    }
+    await_services(cli, &nested.services)
+        .await
+        .map_err(|error| unready(&error))?;
     cli.run(workload_args(
         &cli.working_dir,
         nested.image.reference(),
