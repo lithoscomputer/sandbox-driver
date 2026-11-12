@@ -1,7 +1,7 @@
 //! One activated Daytona provider entry.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::fmt::Display;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -15,26 +15,27 @@ use sandbox_driver::contract::{
     WorkloadAdmission,
 };
 use sandbox_driver::{
-    EventEmitter, HealthStatus, Isolation, SandboxId, SandboxProvider as _,
+    BASH_ENV_VAR, EventEmitter, HealthStatus, Isolation, SandboxId, SandboxProvider as _,
     SandboxState as LegacyState,
 };
 use serde::Deserialize;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
-use super::errors::{classify, from_sdk};
+use super::error::{classify, from_sdk, refused};
 use super::handle::{Workload, contract_state, public_labels};
-use super::recipe::{self, DEFAULT_RUNNER_IMAGE};
+use super::spec::{self, DEFAULT_RUNNER_IMAGE};
 use super::{DaytonaFactory, runner};
 use crate::labels::{MANAGED_LABEL, RECIPE_LABEL};
 use crate::provider::{CurrentApiKey, Provision};
-use crate::sdk::{is_not_found, map_state};
+use crate::sdk::{find_sandbox, map_state};
 use crate::{
     DaytonaProvider, DaytonaSandbox, FAILED_CREATE_CLEANUP_BUDGET, LIST_PAGE_SIZE, cleanup,
 };
 
 const API_KEY: &str = "DAYTONA_API_KEY";
 const JWT_TOKEN: &str = "DAYTONA_JWT_TOKEN";
+const READING_ORGANIZATION: &str = "reading the API key's organization";
 
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -118,13 +119,7 @@ impl DaytonaRuntime {
     }
 
     fn ensure_open(&self) -> Result<(), Error> {
-        if self.closed.is_cancelled() {
-            Err(Error::Stale {
-                outcome: MutationOutcome::NotStarted,
-            })
-        } else {
-            Ok(())
-        }
+        super::ensure_open(&self.closed)
     }
 
     fn reference(&self, id: SandboxId) -> SandboxRef {
@@ -135,23 +130,9 @@ impl DaytonaRuntime {
         }
     }
 
-    fn workload(
-        &self,
-        handle: Arc<DaytonaSandbox>,
-        env: BTreeMap<String, String>,
-        nested: bool,
-    ) -> Workload {
+    fn workload(&self, handle: Arc<DaytonaSandbox>, env: BTreeMap<String, String>) -> Workload {
         let reference = self.reference(handle_id(&handle));
-        let working_dir =
-            PathBuf::from(sandbox_driver::Sandbox::working_directory(handle.as_ref()));
-        Workload::new(
-            reference,
-            handle,
-            working_dir,
-            env,
-            nested,
-            self.closed.clone(),
-        )
+        Workload::new(reference, handle, env, self.closed.clone())
     }
 
     /// The sandbox `id` when it exists and this contract created it.
@@ -159,10 +140,11 @@ impl DaytonaRuntime {
         &self,
         id: &SandboxId,
     ) -> Result<Option<daytona_sdk::Sandbox>, Error> {
-        let sdk = match self.provider.client.get(id.as_str()).await {
-            Ok(sdk) => sdk,
-            Err(error) if is_not_found(&error) => return Ok(None),
-            Err(error) => return Err(from_sdk("fetching sandbox", &error)),
+        let Some(sdk) = find_sandbox(&self.provider.client, id.as_str())
+            .await
+            .map_err(|error| from_sdk("fetching sandbox", &error))?
+        else {
+            return Ok(None);
         };
         if map_state(sdk.state) == LegacyState::Deleted {
             return Ok(None);
@@ -173,6 +155,21 @@ impl DaytonaRuntime {
             return Err(Error::NotOwned { id: id.to_string() });
         }
         Ok(Some(sdk))
+    }
+
+    /// Daytona refuses a duplicate name with a conflict; report the
+    /// existing sandbox's id when it can be read.
+    async fn name_conflict(&self, name: Option<&str>, error: Error) -> Error {
+        let (Some(name), Error::Busy { .. }) = (name, &error) else {
+            return error;
+        };
+        match self.provider.client.get(name).await {
+            Ok(existing) if existing.name == name => Error::AlreadyExists {
+                name: name.to_owned(),
+                id:   existing.id,
+            },
+            _ => error,
+        }
     }
 }
 
@@ -194,26 +191,23 @@ async fn organization(
                 outcome: MutationOutcome::NotStarted,
             });
     }
-    let unavailable = |message: String| Error::Unavailable {
-        message,
+    let unavailable = |detail: &dyn Display| Error::Unavailable {
+        message: format!("{READING_ORGANIZATION}: {detail}"),
         outcome: MutationOutcome::NotStarted,
     };
     let response = provider
         .current_api_key()
         .await
-        .map_err(|error| unavailable(format!("reading the API key's organization: {error}")))?;
+        .map_err(|error| unavailable(&error))?;
     let status = response.status().as_u16();
-    let message = format!("reading the API key's organization: HTTP {status}");
+    let message = format!("{READING_ORGANIZATION}: HTTP {status}");
     match status {
         200..=299 => {}
         401 => return Err(Error::Unauthenticated { message }),
         403 => return Err(Error::PermissionDenied { message }),
-        _ => return Err(unavailable(message)),
+        _ => return Err(unavailable(&format_args!("HTTP {status}"))),
     }
-    let key: CurrentApiKey = response
-        .json()
-        .await
-        .map_err(|error| unavailable(format!("reading the API key's organization: {error}")))?;
+    let key: CurrentApiKey = response.json().await.map_err(|error| unavailable(&error))?;
     key.organization_id
         .filter(|id| !id.is_empty())
         .or_else(|| configured.map(str::to_owned))
@@ -301,9 +295,8 @@ impl ProviderRuntime for DaytonaRuntime {
         self.ensure_open()?;
         let WorkloadAdmission { spec, credentials } = admission;
         spec.validate_for(&self.descriptor)?;
-        let plan = recipe::plan(&spec, &self.runner_image)?;
+        let plan = spec::plan(&spec, &self.runner_image)?;
         let auth = runner::service_auth(&spec.services, &credentials)?;
-        let nested = plan.nested.is_some();
         let provision = plan.nested.map(|nested| -> Provision {
             Box::new(move |handle| runner::provision(handle, nested, auth).boxed())
         });
@@ -318,8 +311,12 @@ impl ProviderRuntime for DaytonaRuntime {
                 return Err(self.name_conflict(spec.name.as_deref(), error).await);
             }
         };
-        tracing::info!(sandbox_id = %handle_id(&handle), nested, "daytona workload created");
-        Ok(Box::new(self.workload(handle, spec.env, nested)))
+        tracing::info!(
+            sandbox_id = %handle_id(&handle),
+            nested = handle.runs_in_container(),
+            "daytona workload created"
+        );
+        Ok(Box::new(self.workload(handle, spec.env)))
     }
 
     async fn attach(&self, id: &SandboxId) -> Result<Box<dyn Sandbox>, Error> {
@@ -331,7 +328,6 @@ impl ProviderRuntime for DaytonaRuntime {
                 resource: "sandbox".to_owned(),
                 id:       id.to_string(),
             })?;
-        let nested = sdk.labels.get(RECIPE_LABEL).map(String::as_str) == Some(recipe::NESTED);
         let env = public_env(&sdk.env);
         let handle = DaytonaSandbox::build(
             &self.provider.client,
@@ -341,7 +337,7 @@ impl ProviderRuntime for DaytonaRuntime {
         )
         .await
         .map_err(|error| classify("attaching sandbox", error))?;
-        Ok(Box::new(self.workload(handle, env, nested)))
+        Ok(Box::new(self.workload(handle, env)))
     }
 
     async fn list(&self, filter: &LabelFilter) -> Result<Vec<SandboxSummary>, Error> {
@@ -396,9 +392,7 @@ impl ProviderRuntime for DaytonaRuntime {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => match classify("destroying sandbox", error) {
                 // A refused delete was not admitted; the sandbox is intact.
-                refused @ (Error::Unauthenticated { .. }
-                | Error::PermissionDenied { .. }
-                | Error::ResourceExhausted { .. }) => Err(refused),
+                error if refused(&error) => Err(error),
                 error => Err(Error::IncompleteCleanup {
                     message:   error.to_string(),
                     remaining: remaining(),
@@ -418,28 +412,11 @@ impl ProviderRuntime for DaytonaRuntime {
     }
 }
 
-impl DaytonaRuntime {
-    /// Daytona refuses a duplicate name with a conflict; report the
-    /// existing sandbox's id when it can be read.
-    async fn name_conflict(&self, name: Option<&str>, error: Error) -> Error {
-        let (Some(name), Error::Busy { .. }) = (name, &error) else {
-            return error;
-        };
-        match self.provider.client.get(name).await {
-            Ok(existing) if existing.name == name => Error::AlreadyExists {
-                name: name.to_owned(),
-                id:   existing.id,
-            },
-            _ => error,
-        }
-    }
-}
-
 /// The workload environment Daytona stores, minus the blank `BASH_ENV`
 /// the provider adds to every sandbox.
 fn public_env(env: &HashMap<String, String>) -> BTreeMap<String, String> {
     env.iter()
-        .filter(|(key, value)| !(key.as_str() == "BASH_ENV" && value.is_empty()))
+        .filter(|(key, value)| !(key.as_str() == BASH_ENV_VAR && value.is_empty()))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
 }

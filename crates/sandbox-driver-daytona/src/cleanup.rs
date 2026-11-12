@@ -37,6 +37,10 @@ pub(crate) async fn delete_and_confirm(client: &DaytonaClient, id: &str) -> Resu
     }
 }
 
+/// The provider error code of a failed create whose cleanup is unconfirmed.
+/// The shared-contract adapter lifts it into `IncompleteCleanup`.
+pub(crate) const INCOMPLETE_CLEANUP_CODE: &str = "incomplete_cleanup";
+
 pub(crate) async fn failed_create(
     client: &DaytonaClient,
     kind: &ProviderKind,
@@ -63,7 +67,7 @@ pub(crate) async fn failed_create(
         format!("failed-create cleanup is unconfirmed for sandbox {id}"),
         cause,
     );
-    error.code = Some("incomplete_cleanup".to_owned());
+    error.code = Some(INCOMPLETE_CLEANUP_CODE.to_owned());
     let remaining = [RemainingResource {
         kind: "sandbox".to_owned(),
         id:   id.to_owned(),
@@ -105,7 +109,7 @@ mod tests {
         let Error::Provider(provider) = error else {
             panic!("expected unconfirmed cleanup, got {error:?}");
         };
-        assert_eq!(provider.code.as_deref(), Some("incomplete_cleanup"));
+        assert_eq!(provider.code.as_deref(), Some(INCOMPLETE_CLEANUP_CODE));
         assert!(!provider.retryable, "uncertain creates are not replayable");
         let detail = provider.detail.as_ref().unwrap();
         assert_eq!(detail["remaining"][0]["id"], "sb-1");

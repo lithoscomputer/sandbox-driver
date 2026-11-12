@@ -237,6 +237,12 @@ impl DaytonaSandbox {
         &self.access
     }
 
+    /// Whether exec and files run in a workload container inside this
+    /// sandbox, rather than in the sandbox itself.
+    pub(crate) fn runs_in_container(&self) -> bool {
+        self.container().is_some()
+    }
+
     fn container(&self) -> Option<&NestedDocker> {
         self.nested
             .as_ref()

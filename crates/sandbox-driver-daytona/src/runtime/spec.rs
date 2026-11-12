@@ -21,6 +21,7 @@ use sandbox_driver::{
 use sandbox_driver_daytona_config::{
     DaytonaProviderConfig, DockerExecutionTarget, NestedDockerConfig, allocation_mib,
 };
+use sandbox_driver_docker_config::DockerProviderConfig;
 use serde::Deserialize;
 
 use crate::labels::{IMAGE_LABEL, INTERNAL_PREFIX, RECIPE_LABEL};
@@ -110,95 +111,37 @@ pub(super) struct Plan {
 pub(super) fn plan(spec: &SandboxSpec, runner_image: &str) -> Result<Plan, Error> {
     reject_reserved(spec)?;
     let options = spec_options(spec)?;
-    let nested = !spec.services.is_empty() || spec.container.is_some();
+    let is_nested = !spec.services.is_empty() || spec.container.is_some();
     let timers = timers(spec)?;
     let network = network(&spec.network);
     let mut labels = BTreeMap::from([(
         RECIPE_LABEL.to_owned(),
-        if nested { NESTED } else { DIRECT }.to_owned(),
+        if is_nested { NESTED } else { DIRECT }.to_owned(),
     )]);
     if let Source::Image(reference) = &spec.source {
         labels.insert(IMAGE_LABEL.to_owned(), reference.clone());
     }
-    let mut legacy;
-    let nested = if nested {
-        let image = match &spec.source {
-            Source::Image(reference) => WorkloadImage::Pull(reference.clone()),
-            Source::Dockerfile(content) => WorkloadImage::Build {
-                content: content.clone(),
-                tag:     build_tag(content),
-            },
-            Source::Snapshot(_) | Source::HostDirectory => {
-                return Err(unsupported(if spec.services.is_empty() {
-                    "container"
-                } else {
-                    "services"
-                }));
-            }
-        };
-        validate_service_ports(&spec.services)?;
-        legacy = LegacySpec::new(SandboxSource::Image {
-            reference: runner_image.to_owned(),
-        });
-        legacy.resources = runner_resources(spec)?;
-        legacy.sandbox_kind = Some(SandboxKind::Container);
-        legacy.working_directory = Some(
-            spec.working_directory
-                .clone()
-                .unwrap_or_else(|| NESTED_WORKSPACE.to_owned()),
-        );
-        legacy.provider_config = DaytonaProviderConfig {
-            outbound_proxy_url: options.outbound_proxy_url,
-            docker:             Some(nested_target(
-                DockerExecutionTarget::Container,
-                image.reference(),
-            )),
-        }
-        .into_value();
-        Some(Nested {
-            image,
-            services: spec.services.clone(),
-            container: spec.container.clone().unwrap_or_default(),
-            user: spec.user.clone(),
-            env: spec.env.clone(),
-            network: network.clone(),
-        })
+    let (mut legacy, nested) = if is_nested {
+        let (legacy, nested) = nested_recipe(spec, runner_image, network)?;
+        (legacy, Some(nested))
     } else {
-        legacy = LegacySpec::new(match &spec.source {
-            Source::Image(reference) => SandboxSource::Image {
-                reference: reference.clone(),
-            },
-            Source::Dockerfile(content) => SandboxSource::Dockerfile {
-                content: content.clone(),
-            },
-            Source::Snapshot(id) => {
-                if spec.resources != Resources::default() {
-                    return Err(Error::InvalidSpec {
-                        path:    "resources".to_owned(),
-                        message: "a Daytona snapshot fixes the resources of its sandboxes"
-                            .to_owned(),
-                    });
-                }
-                SandboxSource::Snapshot { id: id.clone() }
-            }
-            Source::HostDirectory => return Err(unsupported("source")),
-        });
-        legacy.resources = resources(spec);
-        // The descriptor promises container isolation, so a snapshot must be
-        // container-class too; the legacy create refuses any other class.
-        legacy.sandbox_kind = Some(SandboxKind::Container);
-        legacy.working_directory.clone_from(&spec.working_directory);
-        legacy.user.clone_from(&spec.user);
-        legacy.network = network;
-        // One-shot containers run on Docker inside the workload, when the
-        // workload provides it; the target marks that on the sandbox.
-        legacy.provider_config = DaytonaProviderConfig {
-            outbound_proxy_url: options.outbound_proxy_url,
-            docker:             Some(nested_target(DockerExecutionTarget::VirtualMachine, "")),
-        }
-        .into_value();
-        None
+        (direct_recipe(spec, network)?, None)
     };
+    // The descriptor promises container isolation, so a snapshot must be
+    // container-class too; the legacy create refuses any other class.
+    legacy.sandbox_kind = Some(SandboxKind::Container);
+    // Exec runs in the workload container of a nested runner. A direct
+    // workload is the sandbox itself; its target marks that one-shot
+    // containers run on the workload's own Docker, when it provides one.
+    let (target, image) = match &nested {
+        Some(nested) => (DockerExecutionTarget::Container, nested.image.reference()),
+        None => (DockerExecutionTarget::VirtualMachine, ""),
+    };
+    legacy.provider_config = DaytonaProviderConfig {
+        outbound_proxy_url: options.outbound_proxy_url,
+        docker:             Some(nested_target(target, image)),
+    }
+    .into_value();
     legacy.name.clone_from(&spec.name);
     legacy.env.clone_from(&spec.env);
     legacy.labels.clone_from(&spec.labels);
@@ -210,11 +153,82 @@ pub(super) fn plan(spec: &SandboxSpec, runner_image: &str) -> Result<Plan, Error
     })
 }
 
+/// The runner sandbox of a nested workload, and what provisioning puts in it.
+fn nested_recipe(
+    spec: &SandboxSpec,
+    runner_image: &str,
+    network: LegacyNetwork,
+) -> Result<(LegacySpec, Nested), Error> {
+    let image = match &spec.source {
+        Source::Image(reference) => WorkloadImage::Pull(reference.clone()),
+        Source::Dockerfile(content) => WorkloadImage::Build {
+            content: content.clone(),
+            tag:     build_tag(content),
+        },
+        Source::Snapshot(_) | Source::HostDirectory => {
+            return Err(unsupported(if spec.services.is_empty() {
+                "container"
+            } else {
+                "services"
+            }));
+        }
+    };
+    validate_service_ports(&spec.services)?;
+    let mut legacy = LegacySpec::new(SandboxSource::Image {
+        reference: runner_image.to_owned(),
+    });
+    legacy.resources = runner_resources(spec)?;
+    legacy.working_directory = Some(
+        spec.working_directory
+            .clone()
+            .unwrap_or_else(|| NESTED_WORKSPACE.to_owned()),
+    );
+    Ok((legacy, Nested {
+        image,
+        services: spec.services.clone(),
+        container: spec.container.clone().unwrap_or_default(),
+        user: spec.user.clone(),
+        env: spec.env.clone(),
+        network,
+    }))
+}
+
+/// The workload as the Daytona sandbox itself.
+fn direct_recipe(spec: &SandboxSpec, network: LegacyNetwork) -> Result<LegacySpec, Error> {
+    let mut legacy = LegacySpec::new(match &spec.source {
+        Source::Image(reference) => SandboxSource::Image {
+            reference: reference.clone(),
+        },
+        Source::Dockerfile(content) => SandboxSource::Dockerfile {
+            content: content.clone(),
+        },
+        Source::Snapshot(id) => {
+            if spec.resources != Resources::default() {
+                return Err(Error::InvalidSpec {
+                    path:    "resources".to_owned(),
+                    message: "a Daytona snapshot fixes the resources of its sandboxes".to_owned(),
+                });
+            }
+            SandboxSource::Snapshot { id: id.clone() }
+        }
+        Source::HostDirectory => return Err(unsupported("source")),
+    });
+    legacy.resources = resources(spec);
+    legacy.working_directory.clone_from(&spec.working_directory);
+    legacy.user.clone_from(&spec.user);
+    legacy.network = network;
+    Ok(legacy)
+}
+
 /// Records where exec runs. Provisioning is this module's, so only the
 /// target and the workload image are set.
 fn nested_target(target: DockerExecutionTarget, image: &str) -> NestedDockerConfig {
-    serde_json::from_value(serde_json::json!({ "target": target, "image": image }))
-        .expect("a target-only nested Docker configuration is valid")
+    NestedDockerConfig {
+        image: image.to_owned(),
+        target,
+        user: None,
+        options: DockerProviderConfig::default(),
+    }
 }
 
 fn build_tag(content: &str) -> String {
@@ -299,12 +313,11 @@ fn runner_resources(spec: &SandboxSpec) -> Result<LegacyResources, Error> {
 /// Contract timers are milliseconds where zero disables; Daytona counts
 /// whole minutes and reads zero differently per timer.
 fn timers(spec: &SandboxSpec) -> Result<LifecycleTimers, Error> {
-    let duration = |ms: u64| Duration::from_millis(ms);
     let mut timers = LifecycleTimers::default();
     // Wire zero disables auto-stop; the legacy encoding sends `-1` for a
     // disabled auto-delete, since Daytona's zero deletes on stop.
-    timers.auto_stop_after_idle = spec.timers.auto_stop_ms.map(duration);
-    timers.auto_delete_after_stop = spec.timers.auto_delete_ms.map(duration);
+    timers.auto_stop_after_idle = spec.timers.auto_stop_ms.map(Duration::from_millis);
+    timers.auto_delete_after_stop = spec.timers.auto_delete_ms.map(Duration::from_millis);
     timers.auto_archive_after_stop = match spec.timers.auto_archive_ms {
         // Daytona reads zero as its maximum interval; it cannot disable it.
         Some(0) => {
@@ -313,10 +326,14 @@ fn timers(spec: &SandboxSpec) -> Result<LifecycleTimers, Error> {
                 message: "Daytona cannot disable auto-archive; give an interval".to_owned(),
             });
         }
-        other => other.map(duration),
+        other => other.map(Duration::from_millis),
     };
     // Daytona applies no TTL unless one is set, so a disabled TTL is unset.
-    timers.ttl = spec.timers.ttl_ms.filter(|ms| *ms != 0).map(duration);
+    timers.ttl = spec
+        .timers
+        .ttl_ms
+        .filter(|ms| *ms != 0)
+        .map(Duration::from_millis);
     Ok(timers)
 }
 

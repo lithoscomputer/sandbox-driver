@@ -39,6 +39,9 @@ const NETWORK_LABEL: &str = "sh.sandbox-driver.network";
 const SIDECAR_NETWORK_LABEL: &str = "sh.sandbox-driver.sidecar-network";
 const ONE_SHOT_LABEL: &str = "sh.sandbox-driver.one-shot";
 pub(crate) const MANAGED_LABEL: &str = "sh.sandbox-driver.managed=true";
+/// Keeps the primary container alive between execs without an image
+/// entrypoint; exec runs beside it.
+pub(crate) const IDLE: &str = "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done";
 const START_TIMEOUT: Duration = Duration::from_secs(120);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(300);
 const DRAIN_GRACE: Duration = Duration::from_secs(10);
@@ -397,7 +400,7 @@ impl NestedDocker {
         }
     }
 
-    pub(crate) async fn bootstrap(&self) -> Result<()> {
+    async fn bootstrap(&self) -> Result<()> {
         let mut spec = DockerCli::command(Vec::new());
         "start-docker".clone_into(&mut spec.program);
         spec.timeout = Some(START_TIMEOUT);
@@ -489,10 +492,22 @@ impl NestedDocker {
         &self.cli
     }
 
-    /// Records that the caller provisioned Docker, the primary container and
-    /// its services for the current generation itself.
-    pub(crate) async fn mark_ready(&self) {
-        *self.state.lock().await = Generation::Ready;
+    /// [`Self::create`] for a caller that makes the containers itself:
+    /// starts Docker, runs `containers` to create the primary container and
+    /// whatever belongs beside it, then starts the primary and marks this
+    /// generation ready.
+    pub(crate) async fn provision_with<F, Fut>(&self, containers: F) -> Result<()>
+    where
+        F: FnOnce(Arc<DockerCli>) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        let mut state = self.state.lock().await;
+        self.bootstrap().await?;
+        containers(Arc::clone(&self.cli)).await?;
+        self.cli.run(words(["start", CONTAINER_NAME])).await?;
+        self.initialize_runtime_directory().await?;
+        *state = Generation::Ready;
+        Ok(())
     }
 
     pub(super) async fn stopped(&self) {
@@ -584,7 +599,7 @@ impl NestedDocker {
         Ok(())
     }
 
-    pub(crate) async fn initialize_runtime_directory(&self) -> Result<()> {
+    async fn initialize_runtime_directory(&self) -> Result<()> {
         // This is container-local scratch space. Binding the outer runtime
         // would expose Docker credentials and preparation files to the job.
         self.cli
@@ -677,7 +692,7 @@ fn primary_args(
         "/bin/sh",
         &config.image,
         "-c",
-        "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done",
+        IDLE,
     ]));
     args
 }

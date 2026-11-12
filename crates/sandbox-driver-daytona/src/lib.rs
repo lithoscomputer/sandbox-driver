@@ -74,7 +74,6 @@
 
 mod access;
 mod cleanup;
-pub mod contract;
 mod encoded_exec;
 mod exec;
 #[cfg(test)]
@@ -86,6 +85,7 @@ mod logs;
 mod nested;
 mod provider;
 mod pty;
+mod runtime;
 mod sandbox;
 mod sdk;
 mod session;
@@ -110,6 +110,7 @@ pub use crate::git::DaytonaGit;
 pub use crate::logs::DaytonaLogs;
 pub use crate::provider::DaytonaProvider;
 pub use crate::pty::DaytonaPty;
+pub use crate::runtime::DaytonaFactory;
 pub use crate::sandbox::DaytonaSandbox;
 
 pub(crate) const FALLBACK_WORKING_DIR: &str = "/home/daytona";

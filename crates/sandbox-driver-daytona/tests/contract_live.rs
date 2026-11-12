@@ -20,7 +20,7 @@ use sandbox_driver::contract::{
     ServiceSpec, Source, StaticEnvironments, Termination,
 };
 use sandbox_driver_conformance::contract::{Commands, Conformance};
-use sandbox_driver_daytona::contract::DaytonaFactory;
+use sandbox_driver_daytona::DaytonaFactory;
 use tokio::io::AsyncReadExt;
 use tokio::time;
 

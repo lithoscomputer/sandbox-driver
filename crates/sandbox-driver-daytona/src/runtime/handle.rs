@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -29,11 +29,11 @@ use tokio::sync::OnceCell;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
-use super::errors::{classify, from_sdk};
-use super::{recipe, runner};
+use super::error::{classify, from_sdk, refused};
+use super::{runner, spec};
 use crate::labels::{IMAGE_LABEL, INTERNAL_PREFIX};
 use crate::sandbox::status_from_sdk;
-use crate::sdk::{is_not_found, map_state};
+use crate::sdk::{find_sandbox, map_state};
 use crate::{DaytonaSandbox, TRANSITION_BUDGET};
 
 /// How often a running command checks whether its sandbox was stopped.
@@ -44,45 +44,46 @@ const BUFFER_LIMIT: usize = sandbox_driver::DEFAULT_BUFFER_BYTES;
 const DEFAULT_SIGNED_TTL: Duration = Duration::from_secs(3600);
 
 pub(super) struct Workload {
-    reference:   SandboxRef,
-    handle:      Arc<DaytonaSandbox>,
-    working_dir: PathBuf,
-    env:         BTreeMap<String, String>,
-    /// Runs as a container inside the provider's runner, beside services.
-    nested:      bool,
-    closed:      CancellationToken,
+    reference: SandboxRef,
+    handle:    Arc<DaytonaSandbox>,
+    env:       BTreeMap<String, String>,
+    closed:    CancellationToken,
     /// Whether the direct workload provides Docker for one-shots.
-    docker:      OnceCell<bool>,
+    docker:    OnceCell<bool>,
 }
 
 impl Workload {
     pub(super) fn new(
         reference: SandboxRef,
         handle: Arc<DaytonaSandbox>,
-        working_dir: PathBuf,
         env: BTreeMap<String, String>,
-        nested: bool,
         closed: CancellationToken,
     ) -> Self {
         Self {
             reference,
             handle,
-            working_dir,
             env,
-            nested,
             closed,
             docker: OnceCell::new(),
         }
     }
 
     fn ensure_open(&self) -> Result<(), Error> {
-        if self.closed.is_cancelled() {
-            Err(Error::Stale {
-                outcome: MutationOutcome::NotStarted,
-            })
-        } else {
-            Ok(())
-        }
+        super::ensure_open(&self.closed)
+    }
+
+    /// Whether the workload runs as a container inside the provider's
+    /// runner, beside its services, rather than as the sandbox itself.
+    fn nested(&self) -> bool {
+        self.handle.runs_in_container()
+    }
+
+    /// The sandbox as Daytona has it now, or `None` once Daytona no longer
+    /// knows it.
+    async fn fetch(&self, operation: &'static str) -> Result<Option<daytona_sdk::Sandbox>, Error> {
+        find_sandbox(self.handle.client(), self.handle.sdk_id())
+            .await
+            .map_err(|error| from_sdk(operation, &error))
     }
 
     fn absent(&self) -> Error {
@@ -101,11 +102,12 @@ impl Workload {
     /// Daytona's lifecycle state with the record's `updatedAt`, which every
     /// stop and start changes and commands do not.
     async fn observe(&self) -> Result<(LegacyState, Option<String>), Error> {
-        match self.handle.client().get(self.handle.sdk_id()).await {
-            Ok(sdk) => Ok((map_state(sdk.state), sdk.updated_at)),
-            Err(error) if is_not_found(&error) => Ok((LegacyState::Deleted, None)),
-            Err(error) => Err(from_sdk("fetching sandbox state", &error)),
-        }
+        Ok(self
+            .fetch("fetching sandbox state")
+            .await?
+            .map_or((LegacyState::Deleted, None), |sdk| {
+                (map_state(sdk.state), sdk.updated_at)
+            }))
     }
 
     /// Admits work only into a started sandbox and returns the generation
@@ -250,7 +252,7 @@ impl Workload {
     /// Whether the direct workload can run one-shot containers on its own
     /// Docker. Checked once per handle.
     async fn has_docker(&self) -> Result<bool, Error> {
-        if self.nested {
+        if self.nested() {
             return Ok(true);
         }
         self.docker
@@ -258,7 +260,7 @@ impl Workload {
                 let probe = self
                     .handle
                     .exec()
-                    .run(&runner::docker_probe())
+                    .run(&docker_probe())
                     .await
                     .map_err(|error| classify("probing for Docker", error))?;
                 Ok(probe.success())
@@ -266,6 +268,17 @@ impl Workload {
             .await
             .copied()
     }
+}
+
+/// Probes a direct workload for a Docker daemon it can run one-shot
+/// containers on.
+fn docker_probe() -> LegacySpec {
+    LegacySpec::new("sh")
+        .args([
+            "-c",
+            "command -v start-docker >/dev/null && command -v docker >/dev/null && command -v python3 >/dev/null",
+        ])
+        .timeout(Duration::from_secs(30))
 }
 
 fn not_started(error: Error) -> Error {
@@ -373,7 +386,7 @@ impl Sandbox for Workload {
     }
 
     fn working_directory(&self) -> &Path {
-        &self.working_dir
+        Path::new(LegacySandbox::working_directory(self.handle.as_ref()))
     }
 
     fn env(&self) -> &BTreeMap<String, String> {
@@ -382,29 +395,25 @@ impl Sandbox for Workload {
 
     async fn status(&self) -> Result<Status, Error> {
         self.ensure_open()?;
-        let sdk = match self.handle.client().get(self.handle.sdk_id()).await {
-            Ok(sdk) => sdk,
-            Err(error) if is_not_found(&error) => {
-                return Ok(Status {
-                    reference: self.reference(),
-                    state:     SandboxState::Deleted,
-                    name:      None,
-                    labels:    BTreeMap::new(),
-                    image:     None,
-                    snapshot:  None,
-                    resources: Resources::default(),
-                    network:   None,
-                    services:  BTreeMap::new(),
-                    web_url:   None,
-                });
-            }
-            Err(error) => return Err(from_sdk("fetching sandbox", &error)),
+        let Some(sdk) = self.fetch("fetching sandbox").await? else {
+            return Ok(Status {
+                reference: self.reference(),
+                state:     SandboxState::Deleted,
+                name:      None,
+                labels:    BTreeMap::new(),
+                image:     None,
+                snapshot:  None,
+                resources: Resources::default(),
+                network:   None,
+                services:  BTreeMap::new(),
+                web_url:   None,
+            });
         };
         let legacy = status_from_sdk(self.handle.client(), &sdk)
             .map_err(|error| classify("reading sandbox status", error))?;
         let state = contract_state(legacy.state);
         // Addresses are observed now, never remembered from an earlier boot.
-        let services = if self.nested && state == SandboxState::Running {
+        let services = if self.nested() && state == SandboxState::Running {
             runner::service_addresses(&self.handle).await?
         } else {
             BTreeMap::new()
@@ -419,7 +428,7 @@ impl Sandbox for Workload {
                 .snapshot
                 .and_then(|snapshot| SnapshotId::try_new(snapshot).ok()),
             resources: contract_resources(legacy.resources),
-            network: legacy.network.and_then(recipe::contract_network),
+            network: legacy.network.and_then(spec::contract_network),
             services,
             web_url: legacy.web_url,
         })
@@ -440,7 +449,7 @@ impl Sandbox for Workload {
         LegacySandbox::start(self.handle.as_ref())
             .await
             .map_err(|error| classify("starting sandbox", error))?;
-        if self.nested {
+        if self.nested() {
             runner::restart_services(&self.handle).await?;
         }
         Ok(())
@@ -460,19 +469,17 @@ impl Sandbox for Workload {
         match self.state().await {
             Ok(LegacyState::Stopped | LegacyState::Archived) => Ok(()),
             Ok(LegacyState::Deleted) => Err(self.absent()),
-            Ok(state) => Err(stopped.err().map_or_else(
-                || Error::FenceLeaked {
-                    message: format!("the sandbox is {state:?} after stop"),
-                },
-                |error| match classify("stopping sandbox", error) {
-                    refused @ (Error::Unauthenticated { .. }
-                    | Error::PermissionDenied { .. }
-                    | Error::ResourceExhausted { .. }) => refused,
-                    error => Error::FenceLeaked {
+            Ok(state) => Err(
+                match stopped.map_err(|error| classify("stopping sandbox", error)) {
+                    Ok(()) => Error::FenceLeaked {
+                        message: format!("the sandbox is {state:?} after stop"),
+                    },
+                    Err(error) if refused(&error) => error,
+                    Err(error) => Error::FenceLeaked {
                         message: error.to_string(),
                     },
                 },
-            )),
+            ),
             Err(error) => Err(error),
         }
     }
@@ -496,7 +503,7 @@ impl Sandbox for Workload {
         let mut legacy = legacy_spec(&spec);
         let mut legacy_controls = Self::output_controls(sink, term, kill);
         if let Some(stdin) = stdin {
-            if self.nested {
+            if self.nested() {
                 legacy.stdin = Some(Self::buffered(stdin, "stdin").await?);
             } else {
                 legacy_controls.stdin = Some(StdinSource::new(stdin));
@@ -558,7 +565,8 @@ impl Files for Workload {
             .list_dir(path, depth)
             .await
             .map_err(|error| classify("listing directory", error))?;
-        let base = crate::resolve_path(&self.working_dir.to_string_lossy(), path);
+        let base =
+            crate::resolve_path(LegacySandbox::working_directory(self.handle.as_ref()), path);
         Ok(entries
             .into_iter()
             .map(|entry| FileEntry {

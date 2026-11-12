@@ -11,6 +11,8 @@ use daytona_sdk::DaytonaError;
 use sandbox_driver::Error as Legacy;
 use sandbox_driver::contract::{Error, MutationOutcome, RemainingResource};
 
+use crate::cleanup::INCOMPLETE_CLEANUP_CODE;
+
 /// Classifies a legacy error from `operation`. The legacy cause is kept in
 /// the provider's diagnostics; the returned message is safe to expose.
 pub(super) fn classify(operation: &'static str, error: Legacy) -> Error {
@@ -44,7 +46,7 @@ pub(super) fn classify(operation: &'static str, error: Legacy) -> Error {
             _ => Error::Unauthenticated { message },
         },
         Legacy::Provider(ref provider)
-            if provider.code.as_deref() == Some("incomplete_cleanup") =>
+            if provider.code.as_deref() == Some(INCOMPLETE_CLEANUP_CODE) =>
         {
             let remaining = provider
                 .detail
@@ -72,6 +74,17 @@ pub(super) fn classify(operation: &'static str, error: Legacy) -> Error {
             outcome: MutationOutcome::Unknown,
         },
     }
+}
+
+/// Whether Daytona refused the request outright, so nothing was admitted
+/// and the sandbox is as it was.
+pub(super) fn refused(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Unauthenticated { .. }
+            | Error::PermissionDenied { .. }
+            | Error::ResourceExhausted { .. }
+    )
 }
 
 /// Classifies a failed control-plane call that carries its own status.
@@ -165,7 +178,7 @@ mod tests {
     #[test]
     fn incomplete_cleanup_keeps_the_known_remaining_resources() {
         let mut provider = ProviderError::new(kind(), "cleanup unconfirmed");
-        provider.code = Some("incomplete_cleanup".to_owned());
+        provider.code = Some(INCOMPLETE_CLEANUP_CODE.to_owned());
         provider.detail = Some(serde_json::json!({
             "remaining": [{"kind": "sandbox", "id": "sb-7"}],
         }));

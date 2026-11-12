@@ -16,14 +16,14 @@ use futures_util::future;
 use sandbox_driver::contract::{
     ContainerSpec, Error, ReadinessCheck, SecretValues, ServiceAddress, ServiceSpec,
 };
-use sandbox_driver::{ExecSpec, Result as LegacyResult, Sandbox as _};
+use sandbox_driver::{Result as LegacyResult, Sandbox as _};
 use sandbox_driver_docker_config::RegistryAuth;
 use tokio::time;
 
-use super::errors::classify;
-use super::recipe::{Nested, WorkloadImage};
+use super::error::classify;
+use super::spec::{Nested, WorkloadImage};
 use crate::nested::{
-    CONTAINER_NAME, DockerCli, MANAGED_LABEL, NestedDocker, flags, words, workspace_mount,
+    CONTAINER_NAME, DockerCli, IDLE, MANAGED_LABEL, NestedDocker, flags, words, workspace_mount,
 };
 use crate::{DaytonaSandbox, RUNTIME_DIRECTORY};
 
@@ -34,9 +34,9 @@ const READY_LABEL: &str = "sh.sandbox-driver.service-ready";
 const PULL_TIMEOUT: Duration = Duration::from_secs(900);
 /// The host the workload and its one-shots reach services at.
 const SERVICE_HOST: &str = "127.0.0.1";
-/// Keeps the workload container alive between execs without an image
-/// entrypoint; exec runs beside it.
-const IDLE: &str = "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done";
+/// The provider error code a failed readiness check crosses the legacy
+/// create with; the classifier reads it back as `Unhealthy`.
+pub(super) const UNHEALTHY_CODE: &str = "unhealthy";
 
 /// Registry credentials for a service image, parsed before anything is
 /// created so a malformed value fails admission rather than provisioning.
@@ -65,11 +65,11 @@ pub(super) fn service_auth(
             .ok()
             .or_else(|| {
                 let (username, password) = value.split_once(':')?;
-                serde_json::from_value(serde_json::json!({
-                    "username": username,
-                    "password": password,
-                }))
-                .ok()
+                Some(RegistryAuth {
+                    username: username.to_owned(),
+                    password: password.to_owned(),
+                    server:   None,
+                })
             })
             .ok_or_else(|| Error::InvalidSpec {
                 path,
@@ -99,8 +99,25 @@ pub(super) async fn provision(
         .nested
         .as_ref()
         .ok_or_else(|| sandbox_driver::Error::invalid_spec("recipe", "runner has no Docker"))?;
-    let cli = Arc::clone(docker.cli());
-    docker.bootstrap().await?;
+    docker
+        .provision_with(|cli| provision_containers(cli, &nested, &auth))
+        .await?;
+    // Provisioning pulls images; the requested egress policy applies to
+    // everything that runs afterwards.
+    if nested.network != sandbox_driver::NetworkPolicy::ProviderDefault {
+        handle.update_network(&nested.network).await?;
+    }
+    Ok(())
+}
+
+/// The containers of a nested workload: its services, ready before the
+/// workload container is created. The caller starts the workload.
+async fn provision_containers(
+    cli: Arc<DockerCli>,
+    nested: &Nested,
+    auth: &ServiceAuth,
+) -> LegacyResult<()> {
+    let cli = &cli;
     // Downloads dominate provisioning, so every image comes down at once;
     // each pull keeps its own credential directory.
     let pulls = nested
@@ -108,15 +125,17 @@ pub(super) async fn provision(
         .iter()
         .map(|(name, service)| cli.pull(&service.image, auth.get(name), None));
     future::try_join(
-        prepare_workload_image(&cli, &nested.image),
+        prepare_workload_image(cli, &nested.image),
         future::try_join_all(pulls),
     )
     .await?;
-    for (name, service) in &nested.services {
+    // Services are independent containers on the runner's network.
+    let starts = nested.services.iter().map(|(name, service)| async move {
         cli.run(service_args(name, service)?).await?;
-        cli.run(words(["start", &container_name(name)])).await?;
-    }
-    if let Err(error) = await_services(&cli, &nested.services).await {
+        cli.run(words(["start", &container_name(name)])).await
+    });
+    future::try_join_all(starts).await?;
+    if let Err(error) = await_services(cli, &nested.services).await {
         return Err(unready(&error));
     }
     cli.run(workload_args(
@@ -127,14 +146,6 @@ pub(super) async fn provision(
         &nested.env,
     ))
     .await?;
-    cli.run(words(["start", CONTAINER_NAME])).await?;
-    docker.initialize_runtime_directory().await?;
-    docker.mark_ready().await;
-    // Provisioning pulls images; the requested egress policy applies to
-    // everything that runs afterwards.
-    if nested.network != sandbox_driver::NetworkPolicy::ProviderDefault {
-        handle.update_network(&nested.network).await?;
-    }
     Ok(())
 }
 
@@ -151,8 +162,6 @@ fn unready(error: &Error) -> sandbox_driver::Error {
     provider.code = Some(UNHEALTHY_CODE.to_owned());
     sandbox_driver::Error::Provider(provider)
 }
-
-pub(super) const UNHEALTHY_CODE: &str = "unhealthy";
 
 async fn prepare_workload_image(cli: &DockerCli, image: &WorkloadImage) -> LegacyResult<()> {
     match image {
@@ -285,13 +294,7 @@ async fn await_service(
             .inspect(&container)
             .await
             .map_err(|error| classify("inspecting service", error))?;
-        return if inspect["State"]["Running"] == true {
-            Ok(())
-        } else {
-            Err(Error::Unhealthy {
-                message: format!("service {name} is not running"),
-            })
-        };
+        return running(name, &inspect);
     };
     let started = Instant::now();
     let deadline = Duration::from_millis(check.deadline_ms.get());
@@ -323,42 +326,51 @@ async fn await_service(
     })
 }
 
+/// A service without a readiness check is ready once it runs.
+fn running(name: &str, inspect: &serde_json::Value) -> Result<(), Error> {
+    if inspect["State"]["Running"] == true {
+        Ok(())
+    } else {
+        Err(Error::Unhealthy {
+            message: format!("service {name} is not running"),
+        })
+    }
+}
+
 /// After the runner restarts: starts every service it recorded and checks
 /// each again with the check it was admitted with.
 pub(super) async fn restart_services(handle: &DaytonaSandbox) -> Result<(), Error> {
-    let cli = Arc::clone(docker(handle)?.cli());
+    let cli = docker(handle)?.cli();
     let ids = cli
         .ids(SERVICE_LABEL)
         .await
         .map_err(|error| classify("listing services", error))?;
-    let mut checks = Vec::new();
-    for id in ids {
-        cli.run(words(["start", &id]))
-            .await
-            .map_err(|error| classify("starting service", error))?;
-        let inspect = cli
-            .inspect(&id)
-            .await
-            .map_err(|error| classify("inspecting service", error))?;
-        let labels = &inspect["Config"]["Labels"];
-        let name = labels[SERVICE_LABEL]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
-        let ready = labels[READY_LABEL]
-            .as_str()
-            .filter(|ready| !ready.is_empty())
-            .map(serde_json::from_str::<ReadinessCheck>)
-            .transpose()
-            .map_err(|_| Error::Unhealthy {
-                message: format!("service {name} has an unreadable readiness record"),
-            })?;
-        checks.push((name, ready));
+    let restarts = ids.iter().map(|id| restart_service(cli, id));
+    future::try_join_all(restarts).await.map(|_| ())
+}
+
+async fn restart_service(cli: &DockerCli, id: &str) -> Result<(), Error> {
+    cli.run(words(["start", id]))
+        .await
+        .map_err(|error| classify("starting service", error))?;
+    let inspect = cli
+        .inspect(id)
+        .await
+        .map_err(|error| classify("inspecting service", error))?;
+    let labels = &inspect["Config"]["Labels"];
+    let name = labels[SERVICE_LABEL].as_str().unwrap_or_default();
+    let ready = labels[READY_LABEL]
+        .as_str()
+        .filter(|ready| !ready.is_empty())
+        .map(serde_json::from_str::<ReadinessCheck>)
+        .transpose()
+        .map_err(|_| Error::Unhealthy {
+            message: format!("service {name} has an unreadable readiness record"),
+        })?;
+    match ready {
+        Some(check) => await_service(cli, name, Some(&check)).await,
+        None => running(name, &inspect),
     }
-    let checks = checks
-        .iter()
-        .map(|(name, ready)| await_service(&cli, name, ready.as_ref()));
-    future::try_join_all(checks).await.map(|_| ())
 }
 
 /// The services running now, as the workload reaches them.
@@ -367,15 +379,15 @@ pub(super) async fn service_addresses(
 ) -> Result<BTreeMap<String, ServiceAddress>, Error> {
     let cli = docker(handle)?.cli();
     let output = cli
-        .run(vec![
-            "ps".to_owned(),
-            "--filter".to_owned(),
-            format!("label={SERVICE_LABEL}"),
-            "--filter".to_owned(),
-            "status=running".to_owned(),
-            "--format".to_owned(),
-            format!("{{{{.Label \"{SERVICE_LABEL}\"}}}}\t{{{{.Label \"{PORTS_LABEL}\"}}}}"),
-        ])
+        .run(words([
+            "ps",
+            "--filter",
+            &format!("label={SERVICE_LABEL}"),
+            "--filter",
+            "status=running",
+            "--format",
+            &format!("{{{{.Label \"{SERVICE_LABEL}\"}}}}\t{{{{.Label \"{PORTS_LABEL}\"}}}}"),
+        ]))
         .await
         .map_err(|error| classify("listing services", error))?;
     Ok(parse_addresses(&output.stdout_lossy()))
@@ -398,17 +410,6 @@ fn parse_addresses(listing: &str) -> BTreeMap<String, ServiceAddress> {
         })
         .filter(|(name, _)| !name.is_empty())
         .collect()
-}
-
-/// A one-shot exec spec for the outer runner, used to probe the workload
-/// for a Docker daemon on the direct recipe.
-pub(super) fn docker_probe() -> ExecSpec {
-    ExecSpec::new("sh")
-        .args([
-            "-c",
-            "command -v start-docker >/dev/null && command -v docker >/dev/null && command -v python3 >/dev/null",
-        ])
-        .timeout(Duration::from_secs(30))
 }
 
 #[cfg(test)]
