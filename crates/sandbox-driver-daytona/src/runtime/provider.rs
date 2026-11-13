@@ -427,7 +427,7 @@ mod tests {
         OneShotSpec, ProviderEntry, Registry, SandboxSpec, SandboxState, Sandboxes, SecretResolver,
         Source, StaticEnvironments, Termination,
     };
-    use tokio::io::{AsyncReadExt as _, repeat};
+    use tokio::io::{AsyncReadExt as _, duplex, repeat};
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -736,7 +736,7 @@ mod tests {
             .await
             .expect("attach");
         // The writing half stays open, so the stream never ends.
-        let (_writer, reader) = tokio::io::duplex(64);
+        let (_writer, reader) = duplex(64);
         let kill = CancellationToken::new();
         let exec = sandbox.exec(ExecSpec::argv(["cat"]), ExecControls {
             stdin: Some(Box::pin(reader)),

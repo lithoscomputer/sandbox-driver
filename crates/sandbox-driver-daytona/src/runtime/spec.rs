@@ -176,7 +176,9 @@ pub(super) fn workload_env(
     labels: &HashMap<String, String>,
     env: &HashMap<String, String>,
 ) -> BTreeMap<String, String> {
-    let nested = labels.get(RECIPE_LABEL).is_some_and(|recipe| recipe == NESTED);
+    let nested = labels
+        .get(RECIPE_LABEL)
+        .is_some_and(|recipe| recipe == NESTED);
     env.iter()
         .filter_map(|(key, value)| {
             let key = if nested {
