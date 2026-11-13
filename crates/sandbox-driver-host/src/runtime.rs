@@ -1,15 +1,4 @@
 //! Host on the shared contract, registered as the built-in `host` provider.
-//!
-//! Each activation is one instance, and it owns its sandboxes: their process
-//! groups, lifecycle and managed workspaces. Ids carry the instance's
-//! generation, so a ref never leads another instance (or a restarted one) to
-//! adopt them. Another instance's id is refused with `Busy` while its owner is
-//! alive and `Unavailable` otherwise, never `NotFound`. The sandboxes last as
-//! long as the instance: shutdown fences and destroys them, removing managed
-//! workspaces and leaving designated ones in place.
-//!
-//! Host runs commands as local processes in a directory. It implements no
-//! optional capability and refuses every workload field it cannot honour.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
@@ -62,6 +51,17 @@ pub fn schemas() -> ProviderSchemas {
 
 /// Activates one Host instance per configured entry. Applications register
 /// it with `Registry::builtin` under the `host` kind.
+///
+/// Each activation is one instance, and it owns its sandboxes: their process
+/// groups, lifecycle and managed workspaces. Ids carry the instance's
+/// generation, so a ref never leads another instance (or a restarted one) to
+/// adopt them. Another instance's id is refused with `Busy` while its owner is
+/// alive and `Unavailable` otherwise, never `NotFound`. The sandboxes last as
+/// long as the instance: shutdown fences and destroys them, removing managed
+/// workspaces and leaving designated ones in place.
+///
+/// Host runs commands as local processes in a directory. It implements no
+/// optional capability and refuses every workload field it cannot honour.
 pub struct HostFactory;
 
 #[async_trait]
@@ -94,7 +94,7 @@ impl Owned {
     }
 }
 
-pub struct HostRuntime {
+pub(crate) struct HostRuntime {
     entry:      ProviderName,
     provider:   HostProvider,
     generation: String,

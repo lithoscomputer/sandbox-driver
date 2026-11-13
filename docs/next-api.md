@@ -571,7 +571,7 @@ Prior art: Jupyter kernelspecs and `jupyter_client`, Kubernetes CRI and RuntimeC
 registers an adapter, and `Registry::plugins` supplies the ordinary plugin
 loader. Host, Docker and Daytona are built-ins, and their reserved kinds never
 reach the plugin loader, even when the application did not register that
-built-in. `sandbox_driver_host::contract::HostFactory` is Host's built-in: an
+built-in. `sandbox_driver_host::HostFactory` is Host's built-in: an
 `owner_process`, `process`-durable provider where only the instance that
 created a sandbox can operate it; another live instance gets `busy`, and one
 whose owner is gone gets `unavailable`, never `not_found`. Metadata discovery receives

@@ -18,7 +18,7 @@ use sandbox_driver::contract::{
     StaticEnvironments, Termination,
 };
 use sandbox_driver_conformance::contract::{Commands, Conformance};
-use sandbox_driver_host::contract::HostFactory;
+use sandbox_driver_host::HostFactory;
 use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::time;

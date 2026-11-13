@@ -52,11 +52,11 @@
 //! finds a recorded sandbox by its workspace path.
 
 mod access;
-pub mod contract;
 mod exec;
 mod fence;
 mod fs;
 mod registry;
+mod runtime;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -81,6 +81,7 @@ use crate::exec::effective_env;
 use crate::fence::ProcessGroups;
 pub use crate::fs::HostFs;
 use crate::registry::Record;
+pub use crate::runtime::{HostFactory, schemas};
 
 type HandleRegistry = Mutex<HashMap<SandboxId, Arc<HostSandbox>>>;
 
