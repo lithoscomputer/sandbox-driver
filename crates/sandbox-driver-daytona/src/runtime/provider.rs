@@ -632,7 +632,8 @@ mod tests {
 
     /// Daytona can stop and restart a sandbox in about a second and then
     /// answer the dead command's output poll with 400. Only a changed
-    /// record, not the 400 itself, may read as the stop that killed it.
+    /// record, not the 400 itself, may read as the stop that killed it;
+    /// without one the started command's fate is unknown.
     #[tokio::test]
     async fn a_command_whose_sandbox_restarted_under_it_was_killed() {
         for restarted in [true, false] {
@@ -694,9 +695,11 @@ mod tests {
                     "{result:?}"
                 );
             } else {
+                // No restart, so no stop to blame, and the command had
+                // started, so the 400 is not a refused request either.
                 assert!(
-                    !matches!(&result, Ok(outcome) if outcome.termination == Termination::Killed),
-                    "no restart, so no stop to blame: {result:?}"
+                    matches!(&result, Ok(outcome) if outcome.termination == Termination::Lost),
+                    "{result:?}"
                 );
             }
         }

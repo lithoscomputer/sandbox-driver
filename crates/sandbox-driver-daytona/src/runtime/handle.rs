@@ -188,8 +188,16 @@ impl Workload {
                 if self.ended_by_stop(admitted.as_deref()).await {
                     return Ok(outcome_of(Termination::Killed));
                 }
+                // Only a refusal made here, before anything was sent, proves
+                // the command never ran. A 400 from Daytona does not: it
+                // answers the output poll of a dead command with one.
+                let unsent = matches!(
+                    error,
+                    sandbox_driver::Error::InvalidSpec { .. }
+                        | sandbox_driver::Error::Unsupported { .. }
+                );
                 let error = classify("running command", error);
-                if matches!(error, Error::InvalidSpec { .. } | Error::Unsupported { .. }) {
+                if unsent {
                     return Err(error);
                 }
                 tracing::warn!(error = ?error, "daytona command outcome unknown");
