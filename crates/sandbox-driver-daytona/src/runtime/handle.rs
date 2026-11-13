@@ -145,22 +145,36 @@ impl Workload {
     }
 
     /// After execution failed: whether a stop explains it, waiting out a
-    /// stop in progress within the transition budget. A stop and restart
-    /// can both finish before this looks (Daytona restarts in about a
-    /// second), so a sandbox whose record changed since admission also
-    /// counts: the generation the command ran in has ended.
+    /// stop in progress within the transition budget. Only a stop Daytona
+    /// confirms counts; a sandbox still stopping at the end of the budget,
+    /// or in an error state, leaves the command's fate unknown.
+    ///
+    /// A stop and restart can both finish before this looks (Daytona
+    /// restarts in about a second). A sandbox that is running again with a
+    /// record changed since admission therefore also counts: the
+    /// generation the command ran in has ended.
     async fn ended_by_stop(&self, admitted: Option<&str>) -> bool {
         let started = Instant::now();
         loop {
-            match self.observe().await {
-                Ok((state, _)) if Self::stopped(state) => return true,
-                Ok((LegacyState::Stopping, _)) if started.elapsed() < TRANSITION_BUDGET => {
+            let Ok((state, generation)) = self.observe().await else {
+                return false;
+            };
+            match state {
+                state if Self::stopped(state) => return true,
+                // Admission needs a running sandbox, so one that is coming
+                // up again or being archived was stopped in between.
+                LegacyState::Starting | LegacyState::Restoring | LegacyState::Archiving => {
+                    return true;
+                }
+                LegacyState::Stopping | LegacyState::Deleting
+                    if started.elapsed() < TRANSITION_BUDGET =>
+                {
                     time::sleep(WATCH_POLL).await;
                 }
-                Ok((_, generation)) => {
+                state if contract_state(state) == SandboxState::Running => {
                     return admitted.is_some() && generation.as_deref() != admitted;
                 }
-                Err(_) => return false,
+                _ => return false,
             }
         }
     }

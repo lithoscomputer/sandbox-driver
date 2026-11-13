@@ -466,6 +466,11 @@ mod tests {
 
     /// Direct workload `sb-1`, started, last changed at `updated_at`.
     fn started(updated_at: &str) -> String {
+        direct("started", updated_at)
+    }
+
+    /// Direct workload `sb-1` in `state`, last changed at `updated_at`.
+    fn direct(state: &str, updated_at: &str) -> String {
         let mut record: serde_json::Value = serde_json::from_str(&sandbox(
             "sb-1",
             &serde_json::json!({
@@ -475,7 +480,7 @@ mod tests {
             }),
         ))
         .expect("sandbox json");
-        record["state"] = "started".into();
+        record["state"] = state.into();
         record["updatedAt"] = updated_at.into();
         record.to_string()
     }
@@ -623,11 +628,20 @@ mod tests {
 
     /// Daytona can stop and restart a sandbox in about a second and then
     /// answer the dead command's output poll with 400. Only a changed
-    /// record, not the 400 itself, may read as the stop that killed it;
-    /// without one the started command's fate is unknown.
+    /// record on a sandbox that is running again, not the 400 itself, may
+    /// read as the stop that killed it; otherwise the started command's
+    /// fate is unknown.
     #[tokio::test]
     async fn a_command_whose_sandbox_restarted_under_it_was_killed() {
-        for restarted in [true, false] {
+        const ADMITTED: &str = "2026-11-10T19:22:08.169Z";
+        const CHANGED: &str = "2026-11-10T19:22:18.690Z";
+        // The sandbox as Daytona reports it once the command has failed.
+        for (state, updated_at, expected) in [
+            ("started", CHANGED, Termination::Killed),
+            ("started", ADMITTED, Termination::Lost),
+            // A changed record without a confirmed stop blames no stop.
+            ("error", CHANGED, Termination::Lost),
+        ] {
             let polled = Arc::new(AtomicBool::new(false));
             let fake = FakeDaytona::start({
                 let polled = Arc::clone(&polled);
@@ -641,14 +655,14 @@ mod tests {
                         {
                             Reply::Json(200, toolbox_url(&address))
                         }
-                        ("GET", target) if target.starts_with("/sandbox/sb-1?") => {
-                            let generation = if restarted && polled.load(Ordering::SeqCst) {
-                                "2026-11-10T19:22:18.690Z"
+                        ("GET", target) if target.starts_with("/sandbox/sb-1?") => Reply::Json(
+                            200,
+                            if polled.load(Ordering::SeqCst) {
+                                direct(state, updated_at)
                             } else {
-                                "2026-11-10T19:22:08.169Z"
-                            };
-                            Reply::Json(200, started(generation))
-                        }
+                                started(ADMITTED)
+                            },
+                        ),
                         ("POST", "/toolbox/sb-1/process/session") => {
                             Reply::Json(201, "{}".to_owned())
                         }
@@ -680,19 +694,10 @@ mod tests {
                 "the command was polled: {:?}",
                 fake.requests()
             );
-            if restarted {
-                assert!(
-                    matches!(&result, Ok(outcome) if outcome.termination == Termination::Killed),
-                    "{result:?}"
-                );
-            } else {
-                // No restart, so no stop to blame, and the command had
-                // started, so the 400 is not a refused request either.
-                assert!(
-                    matches!(&result, Ok(outcome) if outcome.termination == Termination::Lost),
-                    "{result:?}"
-                );
-            }
+            assert!(
+                matches!(&result, Ok(outcome) if outcome.termination == expected),
+                "{state} at {updated_at}: {result:?}"
+            );
         }
     }
 
