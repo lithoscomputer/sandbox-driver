@@ -6,6 +6,7 @@
 //! ran inside it.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future;
 use std::io::Cursor;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::path::Path;
@@ -250,6 +251,44 @@ impl Workload {
             });
         }
         Ok(bytes)
+    }
+
+    /// Buffers a nested command's stdin before the command starts. Nothing
+    /// has been sent yet, so the fence does not cover this read: the
+    /// caller's controls, the command's timeout and the provider's shutdown
+    /// end it here, as the termination the command would have reported.
+    async fn nested_stdin(
+        &self,
+        input: ByteStream,
+        timeout: Option<Duration>,
+        term: Option<&CancellationToken>,
+        kill: Option<&CancellationToken>,
+    ) -> Result<Result<Vec<u8>, Termination>, Error> {
+        let cancelled = |token: Option<&CancellationToken>| {
+            let token = token.cloned();
+            async move {
+                match token {
+                    Some(token) => token.cancelled().await,
+                    None => future::pending().await,
+                }
+            }
+        };
+        let expired = async {
+            match timeout {
+                Some(timeout) => time::sleep(timeout).await,
+                None => future::pending().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            () = self.closed.cancelled() => Err(Error::Stale {
+                outcome: MutationOutcome::NotStarted,
+            }),
+            () = cancelled(kill) => Ok(Err(Termination::Killed)),
+            () = cancelled(term) => Ok(Err(Termination::Terminated)),
+            () = expired => Ok(Err(Termination::TimedOut)),
+            bytes = Self::buffered(input, "stdin") => bytes.map(Ok),
+        }
     }
 
     /// Whether the direct workload can run one-shot containers on its own
@@ -497,16 +536,24 @@ impl Sandbox for Workload {
             resize: _,
         } = controls;
         // Admission first, so a refused command consumes none of its input.
-        let admitted = self.admit().await?;
+        let mut admitted = self.admit().await?;
         let mut legacy = legacy_spec(&spec);
-        let mut legacy_controls = Self::output_controls(sink, term, kill);
-        if let Some(stdin) = stdin {
-            if self.nested() {
-                legacy.stdin = Some(Self::buffered(stdin, "stdin").await?);
-            } else {
-                legacy_controls.stdin = Some(StdinSource::new(stdin));
+        let mut stdin = stdin;
+        if self.nested() {
+            if let Some(input) = stdin.take() {
+                let timeout = spec.timeout_ms.map(Duration::from_millis);
+                let read = self.nested_stdin(input, timeout, term.as_ref(), kill.as_ref());
+                match read.await? {
+                    Ok(bytes) => legacy.stdin = Some(bytes),
+                    Err(termination) => return Ok(outcome_of(termination)),
+                }
+                // The read can outlast a stop and a restart. The command
+                // runs only in a generation that admits it.
+                admitted = self.admit().await?;
             }
         }
+        let mut legacy_controls = Self::output_controls(sink, term, kill);
+        legacy_controls.stdin = stdin.map(StdinSource::new);
         self.fenced(
             self.handle.exec().run_streaming(&legacy, legacy_controls),
             admitted,

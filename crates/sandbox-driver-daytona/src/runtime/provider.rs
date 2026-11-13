@@ -429,6 +429,7 @@ mod tests {
     use std::io::Cursor;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     use sandbox_driver::contract::{
         CatalogOptions, Environment, EnvironmentName, ExecControls, ExecSpec, OneShotImage,
@@ -699,6 +700,68 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A nested command's stdin is read before the command starts. A caller
+    /// that keeps the stream open must still be able to end the command.
+    #[tokio::test]
+    async fn a_nested_command_waiting_on_open_stdin_can_be_killed() {
+        let fake = FakeDaytona::start(|address| {
+            Arc::new(move |method, target| match (method, target) {
+                ("GET", target) if target.ends_with("/api-keys/current") => {
+                    Reply::Json(200, CURRENT_KEY.to_owned())
+                }
+                ("GET", target) if target.starts_with("/sandbox/sb-1/toolbox-proxy-url") => {
+                    Reply::Json(200, toolbox_url(&address))
+                }
+                ("GET", target) if target.starts_with("/sandbox/sb-1?") => {
+                    let mut record: serde_json::Value = serde_json::from_str(&sandbox(
+                        "sb-1",
+                        &serde_json::json!({
+                            "sh.sandbox-driver.managed": "true",
+                            "sh.sandbox-driver.recipe": "nested",
+                            "sh.sandbox-driver.working-directory": "/workspace",
+                            "sh.sandbox-driver.docker-target": "container",
+                        }),
+                    ))
+                    .expect("sandbox json");
+                    record["state"] = "started".into();
+                    Reply::Json(200, record.to_string())
+                }
+                _ => Reply::Json(404, "{}".to_owned()),
+            })
+        })
+        .await;
+        let sandbox = catalog(&fake, Some("test-key"))
+            .attach(&reference("sb-1"))
+            .await
+            .expect("attach");
+        // The writing half stays open, so the stream never ends.
+        let (_writer, reader) = tokio::io::duplex(64);
+        let kill = CancellationToken::new();
+        let exec = sandbox.exec(ExecSpec::argv(["cat"]), ExecControls {
+            stdin: Some(Box::pin(reader)),
+            kill: Some(kill.clone()),
+            ..ExecControls::default()
+        });
+        tokio::pin!(exec);
+        let waiting = time::timeout(Duration::from_millis(200), &mut exec).await;
+        assert!(waiting.is_err(), "stdin is still open: {waiting:?}");
+        kill.cancel();
+        let result = time::timeout(Duration::from_secs(10), exec)
+            .await
+            .expect("the kill ends the wait for stdin");
+        assert!(
+            matches!(&result, Ok(outcome) if outcome.termination == Termination::Killed),
+            "{result:?}"
+        );
+        assert!(
+            fake.requests()
+                .iter()
+                .all(|request| !request.contains("toolbox/")),
+            "nothing was started: {:?}",
+            fake.requests()
+        );
     }
 
     /// A write longer than the upload limit is refused before anything is
