@@ -511,6 +511,17 @@ impl NestedDocker {
         *self.state.lock().await = Generation::Restarted;
     }
 
+    /// The sandbox was found running by a start that changed nothing. A
+    /// peer may have restarted it since this handle was last ready, so the
+    /// next readiness pass brings Docker up again, but it sweeps nothing:
+    /// containers and preparation in a running sandbox may be in use.
+    pub(super) async fn unconfirmed(&self) {
+        let mut state = self.state.lock().await;
+        if *state == Generation::Ready {
+            *state = Generation::Fresh;
+        }
+    }
+
     /// Brings the nested daemon, and for a container target its primary
     /// container and services, up for the current sandbox generation.
     /// A handle that is already ready does nothing. A handle whose
@@ -1072,6 +1083,45 @@ mod tests {
         .await
         .expect("bounded recovery");
         fs::remove_dir_all(dir).expect("remove test runtime");
+    }
+
+    #[tokio::test]
+    async fn a_start_that_found_the_sandbox_running_removes_no_active_work() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let bootstraps = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&bootstraps);
+        let mut nested = fake_nested(move |spec| {
+            if spec.program == "start-docker" {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }
+            assert!(
+                spec.args.first().is_none_or(|arg| arg != "rm"),
+                "a running one-shot was removed: {:?}",
+                spec.args
+            );
+            assert!(
+                spec.args.get(1) != Some(&CLEAN_STALE_PREPARATION.to_owned()),
+                "active preparation was swept"
+            );
+            if spec.args.first().is_some_and(|arg| arg == "ps") {
+                return response(0, b"running-action\n".to_vec());
+            }
+            response(0, Vec::new())
+        })
+        .await;
+        nested.target = DockerExecutionTarget::VirtualMachine;
+        nested.ensure_ready().await.expect("ready");
+        nested.unconfirmed().await;
+        nested.ensure_ready().await.expect("ready again");
+        assert_eq!(
+            bootstraps.load(Ordering::SeqCst),
+            2,
+            "Docker is brought up again in case a peer restarted the sandbox"
+        );
+        // A stop this handle did see is not forgotten.
+        nested.stopped().await;
+        nested.unconfirmed().await;
+        assert_eq!(*nested.state.lock().await, Generation::Restarted);
     }
 
     #[tokio::test]
