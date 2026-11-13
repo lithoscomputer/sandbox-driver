@@ -33,7 +33,7 @@ impl HostFs {
     }
 }
 
-fn kind_of(file_type: FileType) -> FileKind {
+pub(crate) fn kind_of(file_type: FileType) -> FileKind {
     if file_type.is_file() {
         FileKind::File
     } else if file_type.is_dir() {

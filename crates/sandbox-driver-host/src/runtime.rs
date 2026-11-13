@@ -1,14 +1,14 @@
 //! Host on the shared contract, registered as the built-in `host` provider.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{self, SeekFrom};
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
-use std::{env, fs};
 
 use async_trait::async_trait;
 use nix::errno::Errno;
@@ -30,7 +30,8 @@ use serde_json::json;
 use tokio::fs as tokio_fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, copy as io_copy};
 
-use crate::{HostProvider, host_kind, registry};
+use crate::fs::kind_of;
+use crate::{HostProvider, host_kind, registry, temporary_root};
 
 /// The credential-free metadata `--describe-schema` prints. Host takes no
 /// connection configuration and no secrets.
@@ -75,6 +76,29 @@ impl ProviderFactory for HostFactory {
     }
 }
 
+/// What every Host instance on this machine offers.
+fn descriptor() -> Descriptor {
+    Descriptor {
+        schemas:      schemas(),
+        namespace:    Namespace {
+            id:    machine_namespace(),
+            scope: NamespaceScope::Machine,
+        },
+        isolation:    Isolation::None,
+        durability:   Durability::Process,
+        access:       AccessScope::OwnerProcess,
+        sources:      [SourceKind::HostDirectory].into(),
+        locality:     Locality {
+            host_address:      Some(LOOPBACK.into()),
+            mounts_host_paths: true,
+        },
+        resources:    BTreeSet::default(),
+        network:      [NetworkMode::ProviderDefault].into(),
+        ports:        PortSupport::Any,
+        capabilities: CapabilitySet::default(),
+    }
+}
+
 /// A sandbox this instance created and still owns.
 struct Owned {
     legacy:     Arc<dyn sandbox_driver::Sandbox>,
@@ -94,11 +118,11 @@ impl Owned {
     }
 }
 
-pub(crate) struct HostRuntime {
+struct HostRuntime {
     entry:      ProviderName,
     provider:   HostProvider,
     generation: String,
-    namespace:  NamespaceId,
+    descriptor: Descriptor,
     sequence:   AtomicU64,
     owned:      Mutex<BTreeMap<SandboxId, Arc<Owned>>>,
     /// Held for the instance's life; another instance tests it to tell a
@@ -109,68 +133,51 @@ pub(crate) struct HostRuntime {
 const ID_PREFIX: &str = "host-";
 const SEQUENCE_SEPARATOR: &str = "-s";
 const OWNER_LOCK: &str = "owner.lock";
+/// A Host sandbox is reached on this machine.
+const LOOPBACK: &str = "127.0.0.1";
 
 impl HostRuntime {
     async fn start(entry: ProviderName) -> Result<Self, Error> {
-        let provider = HostProvider::new();
-        let generation = provider
-            .root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("a fresh registry root is named by its generation")
-            .to_owned();
+        let generation = registry::fresh_id();
+        let provider = HostProvider::temporary(&generation);
         registry::private_directory(&provider.root)
             .await
-            .map_err(|error| unavailable(&error.to_string(), MutationOutcome::NotStarted))?;
+            .map_err(|error| unavailable(&error.to_string()))?;
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .open(provider.root.join(OWNER_LOCK))
-            .map_err(|error| unavailable(&error.to_string(), MutationOutcome::NotStarted))?;
-        let owner = Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|_| {
-            unavailable(
-                "the Host instance could not lock its registry",
-                MutationOutcome::NotStarted,
-            )
-        })?;
+            .map_err(|error| unavailable(&error.to_string()))?;
+        let owner = Flock::lock(file, FlockArg::LockExclusiveNonblock)
+            .map_err(|_| unavailable("the Host instance could not lock its registry"))?;
         Ok(Self {
             entry,
             provider,
             generation,
-            namespace: machine_namespace(),
+            descriptor: descriptor(),
             sequence: AtomicU64::new(1),
             owned: Mutex::new(BTreeMap::new()),
             _owner: owner,
         })
     }
 
-    fn descriptor(&self) -> Descriptor {
-        Descriptor {
-            schemas:      schemas(),
-            namespace:    Namespace {
-                id:    self.namespace.clone(),
-                scope: NamespaceScope::Machine,
-            },
-            isolation:    Isolation::None,
-            durability:   Durability::Process,
-            access:       AccessScope::OwnerProcess,
-            sources:      [SourceKind::HostDirectory].into(),
-            locality:     Locality {
-                host_address:      Some("127.0.0.1".into()),
-                mounts_host_paths: true,
-            },
-            resources:    BTreeSet::default(),
-            network:      [NetworkMode::ProviderDefault].into(),
-            ports:        PortSupport::Any,
-            capabilities: CapabilitySet::default(),
-        }
+    fn sandboxes(&self) -> MutexGuard<'_, BTreeMap<SandboxId, Arc<Owned>>> {
+        self.owned.lock().expect("owned lock")
+    }
+
+    /// Every sandbox this instance owns, read without holding the lock.
+    fn snapshot(&self) -> Vec<(SandboxId, Arc<Owned>)> {
+        self.sandboxes()
+            .iter()
+            .map(|(id, owned)| (id.clone(), Arc::clone(owned)))
+            .collect()
     }
 
     fn reference(&self, id: &SandboxId) -> SandboxRef {
         SandboxRef {
             provider:  self.entry.clone(),
-            namespace: self.namespace.clone(),
+            namespace: self.descriptor.namespace.id.clone(),
             id:        id.clone(),
         }
     }
@@ -178,25 +185,19 @@ impl HostRuntime {
     /// This instance's sandbox, or why it cannot be operated from here.
     /// Absence is authoritative only for an id this instance issued.
     fn owned(&self, id: &SandboxId) -> Result<Arc<Owned>, Error> {
-        if let Some(owned) = self.owned.lock().expect("owned lock").get(id) {
+        if let Some(owned) = self.sandboxes().get(id) {
             return Ok(Arc::clone(owned));
         }
         match generation_of(id) {
             Some(generation) if generation == self.generation => Err(not_found(id)),
             Some(generation) => Err(foreign_owner(generation)),
-            None => Err(unavailable(
-                "this id was not issued by a Host instance",
-                MutationOutcome::NotStarted,
-            )),
+            None => Err(unavailable("this id was not issued by a Host instance")),
         }
     }
 
     fn handle(&self, id: &SandboxId, owned: Arc<Owned>) -> Box<dyn Sandbox> {
         Box::new(HostSandbox {
             reference: self.reference(id),
-            files: HostFiles {
-                workspace: owned.workspace.clone(),
-            },
             owned,
         })
     }
@@ -204,7 +205,7 @@ impl HostRuntime {
     async fn destroy_owned(&self, id: &SandboxId, owned: &Owned) -> Result<(), Error> {
         owned.fence_begun();
         owned.legacy.delete().await.map_err(contract_error)?;
-        self.owned.lock().expect("owned lock").remove(id);
+        self.sandboxes().remove(id);
         Ok(())
     }
 }
@@ -212,7 +213,7 @@ impl HostRuntime {
 #[async_trait]
 impl ProviderRuntime for HostRuntime {
     async fn describe(&self) -> Result<Descriptor, Error> {
-        Ok(self.descriptor())
+        Ok(self.descriptor.clone())
     }
 
     async fn health(&self) -> Result<Health, Error> {
@@ -224,51 +225,46 @@ impl ProviderRuntime for HostRuntime {
 
     async fn create(&self, admission: WorkloadAdmission) -> Result<Box<dyn Sandbox>, Error> {
         let spec = admission.spec;
-        spec.validate_for(&self.descriptor())?;
+        spec.validate_for(&self.descriptor)?;
         if spec.user.is_some() {
-            return Err(Error::Unsupported {
-                capability: "user".into(),
-            });
+            return Err(unsupported("user"));
         }
         if !spec.provider_config.is_empty() {
-            return Err(Error::Unsupported {
-                capability: "provider_config".into(),
-            });
+            return Err(unsupported("provider_config"));
         }
         if spec.container.is_some() {
-            return Err(Error::Unsupported {
-                capability: "container".into(),
-            });
+            return Err(unsupported("container"));
         }
         let mut legacy = sandbox_driver::SandboxSpec::new(SandboxSource::HostDirectory);
         legacy.name = spec.name.clone();
         legacy.labels = spec.labels.clone();
         legacy.env = spec.env.clone();
         legacy.workspace_ownership = spec.workspace_ownership;
-        let designated = spec.working_directory.is_some()
-            && spec.workspace_ownership != Some(WorkspaceOwnership::Managed);
-        if let Some(path) = &spec.working_directory {
-            legacy.working_directory = Some(path.clone());
-            if designated {
-                // One owner per directory in this instance: a second live
-                // sandbox would share, and break, the first one's fence.
-                let canonical = fs::canonicalize(path).map_err(|_| Error::InvalidSpec {
+        legacy.working_directory = spec.working_directory.clone();
+        let designated = spec
+            .working_directory
+            .as_ref()
+            .filter(|_| spec.workspace_ownership != Some(WorkspaceOwnership::Managed));
+        if let Some(path) = designated {
+            // One owner per directory in this instance: a second live
+            // sandbox would share, and break, the first one's fence.
+            let canonical = tokio_fs::canonicalize(path)
+                .await
+                .map_err(|_| Error::InvalidSpec {
                     path:    "working_directory".into(),
                     message: "the designated directory does not exist".into(),
                 })?;
-                let taken = self
-                    .owned
-                    .lock()
-                    .expect("owned lock")
-                    .values()
-                    .any(|owned| owned.designated && owned.workspace == canonical);
-                if taken {
-                    return Err(Error::Busy {
-                        message: "another sandbox of this instance owns the directory".into(),
-                    });
-                }
+            let taken = self
+                .sandboxes()
+                .values()
+                .any(|owned| owned.designated && owned.workspace == canonical);
+            if taken {
+                return Err(Error::Busy {
+                    message: "another sandbox of this instance owns the directory".into(),
+                });
             }
         }
+        let designated = designated.is_some();
         let sandbox = self
             .provider
             .create(&legacy, None)
@@ -290,10 +286,7 @@ impl ProviderRuntime for HostRuntime {
             env,
             fences: AtomicU64::new(0),
         });
-        self.owned
-            .lock()
-            .expect("owned lock")
-            .insert(id.clone(), Arc::clone(&owned));
+        self.sandboxes().insert(id.clone(), Arc::clone(&owned));
         Ok(self.handle(&id, owned))
     }
 
@@ -303,16 +296,11 @@ impl ProviderRuntime for HostRuntime {
     }
 
     async fn list(&self, filter: &LabelFilter) -> Result<Vec<SandboxSummary>, Error> {
-        let owned: Vec<_> = self
-            .owned
-            .lock()
-            .expect("owned lock")
-            .iter()
-            .filter(|(_, owned)| filter.matches(&owned.labels))
-            .map(|(id, owned)| (id.clone(), Arc::clone(owned)))
-            .collect();
-        let mut summaries = Vec::with_capacity(owned.len());
-        for (id, owned) in owned {
+        let mut summaries = Vec::new();
+        for (id, owned) in self.snapshot() {
+            if !filter.matches(&owned.labels) {
+                continue;
+            }
             summaries.push(SandboxSummary {
                 reference: self.reference(&id),
                 name:      owned.name.clone(),
@@ -335,15 +323,8 @@ impl ProviderRuntime for HostRuntime {
     /// The instance is ending and its sandboxes with it: every one is fenced
     /// and destroyed. A failure leaves the rest attempted and is reported.
     async fn shutdown(&self) -> Result<(), Error> {
-        let owned: Vec<_> = self
-            .owned
-            .lock()
-            .expect("owned lock")
-            .iter()
-            .map(|(id, owned)| (id.clone(), Arc::clone(owned)))
-            .collect();
         let mut remaining = Vec::new();
-        for (id, owned) in owned {
+        for (id, owned) in self.snapshot() {
             if let Err(error) = self.destroy_owned(&id, &owned).await {
                 tracing::warn!(sandbox_id = %id, error = %error, "host sandbox cleanup failed");
                 remaining.push(RemainingResource {
@@ -367,7 +348,20 @@ impl ProviderRuntime for HostRuntime {
 struct HostSandbox {
     reference: SandboxRef,
     owned:     Arc<Owned>,
-    files:     HostFiles,
+}
+
+impl HostSandbox {
+    /// Relative paths address the workspace; Host has no isolation, so an
+    /// absolute path is the host path it names.
+    fn resolve(&self, path: &str) -> Result<PathBuf, Error> {
+        if path.is_empty() || path.contains('\0') {
+            return Err(Error::InvalidSpec {
+                path:    "path".into(),
+                message: "path must be non-empty and contain no NUL".into(),
+            });
+        }
+        Ok(self.owned.workspace.join(path))
+    }
 }
 
 #[async_trait]
@@ -406,15 +400,11 @@ impl Sandbox for HostSandbox {
     async fn exec(&self, spec: ExecSpec, controls: ExecControls) -> Result<ExecOutcome, Error> {
         spec.validate()?;
         if spec.tty {
-            return Err(Error::Unsupported {
-                capability: "exec.tty".into(),
-            });
+            return Err(unsupported("exec.tty"));
         }
-        let (program, args) = spec.argv.split_first().ok_or_else(|| Error::InvalidSpec {
-            path:    "argv".into(),
-            message: "argv must name a program".into(),
-        })?;
-        let mut legacy = sandbox_driver::ExecSpec::new(program.clone()).args(args.iter().cloned());
+        let mut argv = spec.argv.into_iter();
+        let program = argv.next().expect("validated argv");
+        let mut legacy = sandbox_driver::ExecSpec::new(program).args(argv);
         legacy.timeout = spec.timeout_ms.map(Duration::from_millis);
         legacy.working_dir = spec.working_directory;
         legacy.env = spec.env;
@@ -471,33 +461,15 @@ impl Sandbox for HostSandbox {
         })
     }
     fn files(&self) -> &dyn Files {
-        &self.files
+        self
     }
     fn ports(&self) -> &dyn Ports {
         &HostPorts
     }
 }
 
-struct HostFiles {
-    workspace: PathBuf,
-}
-
-impl HostFiles {
-    /// Relative paths address the workspace; Host has no isolation, so an
-    /// absolute path is the host path it names.
-    fn resolve(&self, path: &str) -> Result<PathBuf, Error> {
-        if path.is_empty() || path.contains('\0') {
-            return Err(Error::InvalidSpec {
-                path:    "path".into(),
-                message: "path must be non-empty and contain no NUL".into(),
-            });
-        }
-        Ok(self.workspace.join(path))
-    }
-}
-
 #[async_trait]
-impl Files for HostFiles {
+impl Files for HostSandbox {
     async fn get(&self, path: &str, range: Option<FileRange>) -> Result<ByteStream, Error> {
         let resolved = self.resolve(path)?;
         let mut file = tokio_fs::File::open(&resolved)
@@ -571,21 +543,14 @@ impl Files for HostFiles {
                 .await
                 .map_err(|error| file_error(path, &error))?
             {
-                let metadata = tokio_fs::symlink_metadata(child.path())
+                let child_path = child.path();
+                let metadata = tokio_fs::symlink_metadata(&child_path)
                     .await
                     .map_err(|error| file_error(path, &error))?;
-                let kind = if metadata.is_dir() {
-                    FileKind::Directory
-                } else if metadata.is_file() {
-                    FileKind::File
-                } else if metadata.file_type().is_symlink() {
-                    FileKind::Symlink
-                } else {
-                    FileKind::Other
-                };
+                let kind = kind_of(metadata.file_type());
                 let entry_path = format!("{prefix}/{}", child.file_name().to_string_lossy());
                 if kind == FileKind::Directory && level < depth {
-                    pending.push((child.path(), entry_path.clone(), level + 1));
+                    pending.push((child_path, entry_path.clone(), level + 1));
                 }
                 entries.push(FileEntry {
                     path: entry_path,
@@ -606,12 +571,10 @@ struct HostPorts;
 impl Ports for HostPorts {
     async fn expose(&self, port: NonZeroU16, options: Expose) -> Result<Exposure, Error> {
         if options.signed {
-            return Err(Error::Unsupported {
-                capability: "ports.signed".into(),
-            });
+            return Err(unsupported("ports.signed"));
         }
         Ok(Exposure {
-            url:           format!("http://127.0.0.1:{port}"),
+            url:           format!("http://{LOOPBACK}:{port}"),
             headers:       BTreeMap::new(),
             expires_at_ms: None,
         })
@@ -669,21 +632,13 @@ fn generation_of(id: &SandboxId) -> Option<&str> {
 /// Another instance's sandbox. Its liveness is visible through the lock it
 /// holds; this instance never takes the sandbox over either way.
 fn foreign_owner(generation: &str) -> Error {
-    let lock = env::temp_dir()
-        .join("sandbox-driver-host")
-        .join(generation)
-        .join(OWNER_LOCK);
-    let live =
-        OpenOptions::new()
-            .read(true)
-            .open(&lock)
-            .ok()
-            .is_some_and(
-                |file| match Flock::lock(file, FlockArg::LockSharedNonblock) {
-                    Ok(_) => false,
-                    Err((_, errno)) => errno == Errno::EWOULDBLOCK,
-                },
-            );
+    let lock = temporary_root(generation).join(OWNER_LOCK);
+    let live = File::open(lock).is_ok_and(|file| {
+        matches!(
+            Flock::lock(file, FlockArg::LockSharedNonblock),
+            Err((_, Errno::EWOULDBLOCK))
+        )
+    });
     if live {
         Error::Busy {
             message: "the sandbox is owned by another live Host instance".into(),
@@ -692,7 +647,6 @@ fn foreign_owner(generation: &str) -> Error {
         unavailable(
             "the Host instance that owned this sandbox cannot be reached; it is not \
              reattachable",
-            MutationOutcome::NotStarted,
         )
     }
 }
@@ -704,10 +658,17 @@ fn not_found(id: &SandboxId) -> Error {
     }
 }
 
-fn unavailable(message: &str, outcome: MutationOutcome) -> Error {
+/// A refusal made before anything was attempted.
+fn unavailable(message: &str) -> Error {
     Error::Unavailable {
         message: message.into(),
-        outcome,
+        outcome: MutationOutcome::NotStarted,
+    }
+}
+
+fn unsupported(capability: &str) -> Error {
+    Error::Unsupported {
+        capability: capability.into(),
     }
 }
 

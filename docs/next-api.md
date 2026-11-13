@@ -82,8 +82,8 @@ The library provisions and operates sandboxes. Scheduling, queueing, lease manag
 | **Provider** | A backend that makes sandboxes. Built in (`docker`, `daytona`) or a plugin (`host`, and any third party's). |
 | **Provider entry** | A named, configured connection to a provider: which plugin, its config, the secrets it needs, and for a plugin its path and checksum. Operator-owned. One entry serves many environments; two entries can use the same plugin (a production and a staging Daytona org). |
 | **Environment** | A named spec template on a provider entry: source, resources, network, timers, labels, env, working directory. User-owned. What clients and workflows name. |
-| **Plugin** | An executable implementing the contract, run as a supervised child process. `host` ships this way, installed separately on each execution machine, and so does every third-party provider. |
-| **Built-in** | `docker` and `daytona`. Library code, compiled in, no child process. They implement the same internal trait a plugin is adapted to, so clients cannot tell the two apart. |
+| **Plugin** | An executable implementing the contract, run as a supervised child process. Every third-party provider ships this way. |
+| **Built-in** | `host`, `docker` and `daytona`. Library code, compiled in, no child process. They implement the same internal trait a plugin is adapted to, so clients cannot tell the two apart. |
 | **Namespace** | The stable, non-secret id a provider reports for where its sandboxes live: a Docker daemon, a Daytona organization, a machine. |
 | **SandboxRef** | `{provider, namespace, id}`. The only identity. Serializable. `attach` resolves it by namespace. |
 | **Durability** | What a provider promises about a sandbox outliving things: `process`, `machine`, or `remote`. |
@@ -273,7 +273,7 @@ Plugins are found in `~/.local/share/sandbox-driver/plugins/<name>/` or any dire
 
 ## Providers
 
-Docker and Daytona are built in. Host is a plugin: installed separately on the machine that runs the work, reached through the same configured loader as any third-party plugin, and never linked into or bundled with Fabro, which a release check proves.
+Host, Docker and Daytona are built in: the application registers each one, and their kinds are reserved, so none of them is ever loaded as a plugin.
 
 |  | host | docker | daytona |
 | --- | --- | --- | --- |
@@ -503,8 +503,8 @@ The suite also verifies that exec and files address the requested workload rathe
 
 - `try_new` checks local provider-entry structure and freezes launch conveniences; it starts nothing and resolves no secrets. Entry errors are reported when that entry is selected.
 - One backend is activated per immutable provider entry per catalog. Editing an environment touches no backend. Changing connection or launch settings requires a new catalog; shutdown explicitly retires the old catalog.
-- Docker and Daytona run in the caller's process. Nothing is spawned for them, ever.
-- Host is a plugin child like any other, installed separately on the execution machine. It keeps its process-group fence state in a temporary directory it owns, which lasts as long as its sandboxes do, and attempts bounded cleanup of them on stdin EOF; process loss alone is not proof that children died.
+- Host, Docker and Daytona run in the caller's process. No provider process is spawned for them, ever.
+- Each Host instance keeps its process-group fence state in a temporary directory it owns, which lasts as long as its sandboxes do. `shutdown()` fences and destroys them; process loss alone is not proof that children died.
 - A third-party plugin child starts on the first call to its entry, one per entry per process, and is supervised. On a crash it is restarted; handles from the old generation return `Error::Stale` and should be re-attached by ref.
 - `shutdown()` ends supervised plugin children with bounded cleanup. Children also exit on stdin EOF. Neither shutdown nor a client or plugin crash proves that remote workload execution has stopped; sandbox durability and the explicit workload lifecycle guarantees determine what remains. Ending a client is not an implicit request to stop or destroy durable sandboxes.
 - Sandboxes outlive the client according to the provider's declared durability, never more.
