@@ -223,6 +223,26 @@ impl DaytonaSandbox {
 }
 
 impl DaytonaSandbox {
+    pub(crate) fn client(&self) -> &DaytonaClient {
+        &self.client
+    }
+
+    pub(crate) fn sdk_id(&self) -> &str {
+        &self.sdk_id
+    }
+
+    /// Preview access through the runner, whatever the exec target: a
+    /// nested workload on the runner's network serves on the runner's ports.
+    pub(crate) fn access(&self) -> &DaytonaAccess {
+        &self.access
+    }
+
+    /// Whether exec and files run in a workload container inside this
+    /// sandbox, rather than in the sandbox itself.
+    pub(crate) fn runs_in_container(&self) -> bool {
+        self.container().is_some()
+    }
+
     fn container(&self) -> Option<&NestedDocker> {
         self.nested
             .as_ref()
@@ -238,8 +258,16 @@ impl DaytonaSandbox {
     }
 
     async fn start_with_docker(&self) -> Result<()> {
-        self.start_inner().await?;
-        self.vm_generation_ended().await;
+        let started = self.start_inner().await?;
+        if let Some(nested) = &self.nested {
+            if started {
+                nested.stopped().await;
+            } else {
+                // Already running: no generation ended here, so whatever
+                // runs in this one is live and must survive.
+                nested.unconfirmed().await;
+            }
+        }
         if let Some(nested) = self.container() {
             nested.ensure_ready().await?;
         }
@@ -335,7 +363,9 @@ impl DaytonaSandbox {
         }
     }
 
-    async fn start_inner(&self) -> Result<()> {
+    /// Starts the sandbox and reports whether it had to: `false` means it
+    /// was already running.
+    async fn start_inner(&self) -> Result<bool> {
         // Start is documented as a no-op on a running sandbox; Daytona
         // rejects a start POST on one, so check first (as fabro did).
         // The check can race another actor — the retry below still
@@ -346,14 +376,15 @@ impl DaytonaSandbox {
             .await
             .map_err(|error| daytona_error("fetching sandbox", error))?;
         if map_state(current.state) == SandboxState::Running {
-            return Ok(());
+            return Ok(false);
         }
         self.retry_through_transition(
             "starting sandbox",
             || async { Ok(self.client.start(&self.sdk_id).await.map(|_| ())) },
             |state| state == SandboxState::Running,
         )
-        .await
+        .await?;
+        Ok(true)
     }
 
     async fn stop_inner(&self) -> Result<()> {

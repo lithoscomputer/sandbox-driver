@@ -33,12 +33,15 @@ use self::operation::{run_command, run_owned};
 use crate::sdk::DaytonaClient;
 use crate::{DaytonaExec, DaytonaFs, DaytonaPty, RUNTIME_DIRECTORY, resolve_path};
 
-pub(super) const CONTAINER_NAME: &str = "sandbox-driver-workspace";
+pub(crate) const CONTAINER_NAME: &str = "sandbox-driver-workspace";
 const NETWORK: &str = "sandbox-driver-services";
 const NETWORK_LABEL: &str = "sh.sandbox-driver.network";
 const SIDECAR_NETWORK_LABEL: &str = "sh.sandbox-driver.sidecar-network";
 const ONE_SHOT_LABEL: &str = "sh.sandbox-driver.one-shot";
-const MANAGED_LABEL: &str = "sh.sandbox-driver.managed=true";
+pub(crate) const MANAGED_LABEL: &str = "sh.sandbox-driver.managed=true";
+/// Keeps the primary container alive between execs without an image
+/// entrypoint; exec runs beside it.
+pub(crate) const IDLE: &str = "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done";
 const START_TIMEOUT: Duration = Duration::from_secs(120);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(300);
 const DRAIN_GRACE: Duration = Duration::from_secs(10);
@@ -60,13 +63,39 @@ with entries:
             shutil.rmtree(entry.path)
 ";
 
+/// Removes the pid files of a Docker daemon or its managed containerd that
+/// is not running. `/var/run` survives a Daytona stop, and a new generation
+/// can reuse a recorded pid, so dockerd would wait on a containerd that is
+/// not there until its start times out. A daemon another handle already
+/// started in this generation is running, and keeps its file.
+const CLEAR_STALE_PID_FILES: &str = r#"
+import os
+running = set()
+for entry in os.listdir("/proc"):
+    if entry.isdigit():
+        try:
+            with open(f"/proc/{entry}/comm") as comm:
+                running.add(comm.read().strip())
+        except OSError:
+            pass
+for name, path in (
+    ("dockerd", "/var/run/docker.pid"),
+    ("containerd", "/var/run/docker/containerd/containerd.pid"),
+):
+    if name not in running:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+"#;
+
 /// Shared native Daytona facets and Docker command construction. Environment
 /// hygiene applies to the CLI itself; user environment belongs inside Docker.
-pub(super) struct DockerCli {
-    pub(super) exec:        Arc<dyn Exec>,
-    pub(super) fs:          Arc<dyn Filesystem>,
+pub(crate) struct DockerCli {
+    pub(crate) exec:        Arc<dyn Exec>,
+    pub(crate) fs:          Arc<dyn Filesystem>,
     pub(super) pty:         Arc<dyn Pty>,
-    pub(super) working_dir: String,
+    pub(crate) working_dir: String,
 }
 
 impl DockerCli {
@@ -91,7 +120,7 @@ impl DockerCli {
         }
     }
 
-    pub(super) fn command(args: Vec<String>) -> ExecSpec {
+    pub(crate) fn command(args: Vec<String>) -> ExecSpec {
         ExecSpec::new("docker")
             .args(args)
             .working_dir("/")
@@ -105,11 +134,11 @@ impl DockerCli {
             )
     }
 
-    pub(super) async fn run(&self, args: Vec<String>) -> Result<ExecResult> {
+    pub(crate) async fn run(&self, args: Vec<String>) -> Result<ExecResult> {
         self.run_spec(&Self::command(args)).await
     }
 
-    pub(super) async fn run_spec(&self, spec: &ExecSpec) -> Result<ExecResult> {
+    pub(crate) async fn run_spec(&self, spec: &ExecSpec) -> Result<ExecResult> {
         checked(self.exec.run(spec).await?, "nested Docker command")
     }
 
@@ -117,7 +146,7 @@ impl DockerCli {
         resolve_path(&self.working_dir, path)
     }
 
-    pub(super) async fn inspect(&self, container: &str) -> Result<Value> {
+    pub(crate) async fn inspect(&self, container: &str) -> Result<Value> {
         let output = self
             .run(words(["inspect", "--type", "container", container]))
             .await?;
@@ -145,7 +174,7 @@ impl DockerCli {
         }
     }
 
-    async fn pull(
+    pub(crate) async fn pull(
         &self,
         image: &str,
         auth: Option<&RegistryAuth>,
@@ -208,7 +237,7 @@ impl DockerCli {
         .await
     }
 
-    async fn ids(&self, label: &str) -> Result<Vec<String>> {
+    pub(crate) async fn ids(&self, label: &str) -> Result<Vec<String>> {
         let output = self
             .run(words([
                 "ps",
@@ -280,7 +309,7 @@ impl DockerCli {
     }
 }
 
-fn words<const N: usize>(values: [&str; N]) -> Vec<String> {
+pub(crate) fn words<const N: usize>(values: [&str; N]) -> Vec<String> {
     values.into_iter().map(str::to_owned).collect()
 }
 
@@ -316,7 +345,7 @@ enum Generation {
     Restarted,
 }
 
-pub(super) struct NestedDocker {
+pub(crate) struct NestedDocker {
     target: DockerExecutionTarget,
     cli:    Arc<DockerCli>,
     exec:   Arc<NestedExec>,
@@ -403,56 +432,75 @@ impl NestedDocker {
         if !self.targets_container() {
             return Ok(());
         }
+        self.provision_with(async {
+            self.clean_stale_preparation().await?;
+            if config.options.auto_pull {
+                self.cli
+                    .pull(
+                        &config.image,
+                        config.options.registry_auth.as_ref(),
+                        config.options.platform.as_deref(),
+                    )
+                    .await?;
+            }
+            let services = !config.options.sidecars.is_empty();
+            let network = if services { "none" } else { "bridge" };
+            let args = primary_args(config, env, &self.cli.working_dir, network);
+            self.cli.run(args).await?;
+            // The labeled primary exists before any network or sidecar, so a
+            // crashed allocation always remains owned by the outer sandbox.
+            if services {
+                self.cli
+                    .run(words([
+                        "network",
+                        "create",
+                        "--label",
+                        MANAGED_LABEL,
+                        NETWORK,
+                    ]))
+                    .await?;
+                for sidecar in &config.options.sidecars {
+                    self.cli
+                        .pull(&sidecar.image, sidecar.registry_auth.as_ref(), None)
+                        .await?;
+                    let name = format!("{NETWORK}-{}", sidecar.name);
+                    self.cli.run(sidecar_args(sidecar, &name)).await?;
+                    self.cli.run(words(["start", &name])).await?;
+                }
+                for sidecar in &config.options.sidecars {
+                    if sidecar.health.is_some() {
+                        self.cli
+                            .await_health(&format!("{NETWORK}-{}", sidecar.name))
+                            .await?;
+                    }
+                }
+                self.cli
+                    .run(words(["network", "disconnect", "none", CONTAINER_NAME]))
+                    .await?;
+                self.cli
+                    .run(words(["network", "connect", NETWORK, CONTAINER_NAME]))
+                    .await?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) fn cli(&self) -> &Arc<DockerCli> {
+        &self.cli
+    }
+
+    /// [`Self::create`] for a caller that makes the containers itself:
+    /// starts Docker, runs `containers` to create the primary container and
+    /// whatever belongs beside it, then starts the primary and marks this
+    /// generation ready. `containers` is polled only once Docker is up.
+    pub(crate) async fn provision_with(
+        &self,
+        containers: impl Future<Output = Result<()>>,
+    ) -> Result<()> {
         let mut state = self.state.lock().await;
         self.bootstrap().await?;
-        self.clean_stale_preparation().await?;
-        if config.options.auto_pull {
-            self.cli
-                .pull(
-                    &config.image,
-                    config.options.registry_auth.as_ref(),
-                    config.options.platform.as_deref(),
-                )
-                .await?;
-        }
-        let services = !config.options.sidecars.is_empty();
-        let network = if services { "none" } else { "bridge" };
-        let args = primary_args(config, env, &self.cli.working_dir, network);
-        self.cli.run(args).await?;
-        // The labeled primary exists before any network or sidecar, so a
-        // crashed allocation always remains owned by the outer sandbox.
-        if services {
-            self.cli
-                .run(words([
-                    "network",
-                    "create",
-                    "--label",
-                    MANAGED_LABEL,
-                    NETWORK,
-                ]))
-                .await?;
-            for sidecar in &config.options.sidecars {
-                self.cli
-                    .pull(&sidecar.image, sidecar.registry_auth.as_ref(), None)
-                    .await?;
-                let name = format!("{NETWORK}-{}", sidecar.name);
-                self.cli.run(sidecar_args(sidecar, &name)).await?;
-                self.cli.run(words(["start", &name])).await?;
-            }
-            for sidecar in &config.options.sidecars {
-                if sidecar.health.is_some() {
-                    self.cli
-                        .await_health(&format!("{NETWORK}-{}", sidecar.name))
-                        .await?;
-                }
-            }
-            self.cli
-                .run(words(["network", "disconnect", "none", CONTAINER_NAME]))
-                .await?;
-            self.cli
-                .run(words(["network", "connect", NETWORK, CONTAINER_NAME]))
-                .await?;
-        }
+        containers.await?;
         self.cli.run(words(["start", CONTAINER_NAME])).await?;
         self.initialize_runtime_directory().await?;
         *state = Generation::Ready;
@@ -461,6 +509,17 @@ impl NestedDocker {
 
     pub(super) async fn stopped(&self) {
         *self.state.lock().await = Generation::Restarted;
+    }
+
+    /// The sandbox was found running by a start that changed nothing. A
+    /// peer may have restarted it since this handle was last ready, so the
+    /// next readiness pass brings Docker up again, but it sweeps nothing:
+    /// containers and preparation in a running sandbox may be in use.
+    pub(super) async fn unconfirmed(&self) {
+        let mut state = self.state.lock().await;
+        if *state == Generation::Ready {
+            *state = Generation::Fresh;
+        }
     }
 
     /// Brings the nested daemon, and for a container target its primary
@@ -475,6 +534,15 @@ impl NestedDocker {
             Generation::Fresh => false,
             Generation::Restarted => true,
         };
+        // Fresh handles clear too: the sandbox may have restarted before
+        // this handle attached.
+        self.cli
+            .run_spec(
+                &ExecSpec::new("python3")
+                    .args(["-c", CLEAR_STALE_PID_FILES])
+                    .timeout(DRAIN_GRACE),
+            )
+            .await?;
         self.bootstrap().await?;
         if sweep {
             self.clean_stale_preparation().await?;
@@ -563,13 +631,13 @@ pub(super) fn one_shot_capabilities() -> OneShotCaps {
     caps
 }
 
-fn flags(args: &mut Vec<String>, name: &str, values: impl IntoIterator<Item = String>) {
+pub(crate) fn flags(args: &mut Vec<String>, name: &str, values: impl IntoIterator<Item = String>) {
     for value in values {
         args.extend([name.to_owned(), value]);
     }
 }
 
-fn workspace_mount(path: &str) -> String {
+pub(crate) fn workspace_mount(path: &str) -> String {
     [
         "type=bind".to_owned(),
         format!("source={path}"),
@@ -632,7 +700,7 @@ fn primary_args(
         "/bin/sh",
         &config.image,
         "-c",
-        "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done",
+        IDLE,
     ]));
     args
 }
@@ -979,7 +1047,9 @@ mod tests {
         fs::create_dir(&unrelated).expect("unrelated directory");
         let runtime = dir.clone();
         let mut nested = fake_nested(move |spec| {
-            if spec.program == "python3" {
+            if spec.program == "python3"
+                && spec.args.get(1) == Some(&CLEAN_STALE_PREPARATION.to_owned())
+            {
                 assert_eq!(spec.timeout, Some(DRAIN_GRACE));
                 let output = Command::new("python3")
                     .args(["-c", CLEAN_STALE_PREPARATION])
@@ -1013,6 +1083,45 @@ mod tests {
         .await
         .expect("bounded recovery");
         fs::remove_dir_all(dir).expect("remove test runtime");
+    }
+
+    #[tokio::test]
+    async fn a_start_that_found_the_sandbox_running_removes_no_active_work() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let bootstraps = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&bootstraps);
+        let mut nested = fake_nested(move |spec| {
+            if spec.program == "start-docker" {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }
+            assert!(
+                spec.args.first().is_none_or(|arg| arg != "rm"),
+                "a running one-shot was removed: {:?}",
+                spec.args
+            );
+            assert!(
+                spec.args.get(1) != Some(&CLEAN_STALE_PREPARATION.to_owned()),
+                "active preparation was swept"
+            );
+            if spec.args.first().is_some_and(|arg| arg == "ps") {
+                return response(0, b"running-action\n".to_vec());
+            }
+            response(0, Vec::new())
+        })
+        .await;
+        nested.target = DockerExecutionTarget::VirtualMachine;
+        nested.ensure_ready().await.expect("ready");
+        nested.unconfirmed().await;
+        nested.ensure_ready().await.expect("ready again");
+        assert_eq!(
+            bootstraps.load(Ordering::SeqCst),
+            2,
+            "Docker is brought up again in case a peer restarted the sandbox"
+        );
+        // A stop this handle did see is not forgotten.
+        nested.stopped().await;
+        nested.unconfirmed().await;
+        assert_eq!(*nested.state.lock().await, Generation::Restarted);
     }
 
     #[tokio::test]

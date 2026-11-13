@@ -1,6 +1,7 @@
 //! Daytona SDK error and state mapping.
 
 use std::fmt::Debug;
+use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use daytona_api_client::models::{
     SandboxClass as DaytonaSandboxClass, SnapshotState as ApiSnapshotState,
     VolumeState as ApiVolumeState,
 };
-use daytona_sdk::{Client, DaytonaError};
+use daytona_sdk::{Client, DaytonaError, Sandbox};
 use sandbox_driver::{
     AuthError, Error, ProviderError, ProviderKind, ResourceKind, Result, SandboxKind, SandboxState,
     SnapshotState, VolumeState,
@@ -19,6 +20,18 @@ pub(crate) type DaytonaClient = Arc<Client>;
 
 pub(crate) fn is_not_found(error: &DaytonaError) -> bool {
     matches!(error, DaytonaError::NotFound { .. })
+}
+
+/// Fetches one sandbox by id; a sandbox Daytona no longer knows is `None`.
+pub(crate) async fn find_sandbox(
+    client: &Client,
+    id: &str,
+) -> StdResult<Option<Sandbox>, DaytonaError> {
+    match client.get(id).await {
+        Ok(sandbox) => Ok(Some(sandbox)),
+        Err(error) if is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// The error mapping for fetching one resource by id: the SDK's not-found
