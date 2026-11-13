@@ -36,13 +36,13 @@ use tokio_util::task::AbortOnDropHandle;
 
 use super::{Client, Failure};
 use crate::channel::{Channel, ChannelListener, FrameKind, TrustedPeer};
-use crate::contract::stream::{Chunk, chunk_stream};
-use crate::contract::wire::{
+use crate::metadata::DiscoveredPlugin;
+use crate::v3::stream::{Chunk, chunk_stream};
+use crate::v3::wire::{
     self as w, CreateParams, ExecParams, ExecResizeParams, ExecStopParams, FilesGetParams,
     FilesListParams, FilesPutParams, IdParams, InitializeParams, InitializeResult, ListParams,
     PortParams, SandboxInfo, from_failure,
 };
-use crate::metadata::DiscoveredPlugin;
 use crate::{TransportLimits, methods as m};
 
 /// Covers process start, the handshake and the plugin's own activation.

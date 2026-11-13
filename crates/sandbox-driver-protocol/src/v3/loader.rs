@@ -6,7 +6,7 @@ use sandbox_driver::contract::{
 };
 
 use crate::TransportLimits;
-use crate::client::contract::{Launch, PluginRuntime};
+use crate::client::v3::{Launch, PluginRuntime};
 use crate::metadata::SchemaDiscovery;
 
 /// The ordinary loader for configured third-party plugins. Discovery

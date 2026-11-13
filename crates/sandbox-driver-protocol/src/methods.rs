@@ -112,7 +112,7 @@ pub(crate) struct MethodTraits {
 /// The transport traits of `method`; every trait is false for a method
 /// this table does not name, including unknown ones.
 pub(crate) fn traits(method: &str) -> MethodTraits {
-    use crate::contract::wire as v3;
+    use crate::v3::wire as v3;
     // Version 3 names never contain `/`, so they cannot collide with these.
     let reserved = matches!(
         method,

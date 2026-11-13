@@ -24,8 +24,8 @@ use tokio_util::task::AbortOnDropHandle;
 use super::registry::Registry;
 use super::{DispatchError, ServerState, parse, to_value};
 use crate::channel::{self, Channel, FrameKind};
-use crate::contract::stream::{Chunk, chunk_stream};
-use crate::contract::wire::{
+use crate::v3::stream::{Chunk, chunk_stream};
+use crate::v3::wire::{
     self as w, CreateParams, ExecParams, ExecResizeParams, ExecStopParams, FilesGetParams,
     FilesListParams, FilesPutParams, IdParams, InitializeParams, InitializeResult, ListParams,
     PortParams, SandboxInfo,
@@ -40,7 +40,7 @@ struct ExecHandle {
     resize: Arc<watch::Sender<TerminalSize>>,
 }
 
-pub(crate) struct ContractState {
+pub(crate) struct V3State {
     schemas:   ProviderSchemas,
     factory:   Arc<dyn ProviderFactory>,
     runtime:   OnceCell<Arc<dyn ProviderRuntime>>,
@@ -49,7 +49,7 @@ pub(crate) struct ContractState {
     closing:   CancellationToken,
 }
 
-impl ContractState {
+impl V3State {
     pub(crate) fn new((schemas, factory): (ProviderSchemas, Arc<dyn ProviderFactory>)) -> Self {
         Self {
             schemas,
@@ -86,8 +86,8 @@ impl ContractState {
     }
 }
 
-fn contract(state: &ServerState) -> Result<&ContractState, Error> {
-    state.contract.as_ref().ok_or_else(|| Error::Unsupported {
+fn served(state: &ServerState) -> Result<&V3State, Error> {
+    state.v3.as_ref().ok_or_else(|| Error::Unsupported {
         capability: format!("protocol version {}", w::PROTOCOL_VERSION),
     })
 }
@@ -99,7 +99,7 @@ impl From<Error> for DispatchError {
 }
 
 pub(super) async fn initialize(state: &ServerState, params: Value) -> Result<Value, DispatchError> {
-    let contract = contract(state)?;
+    let served = served(state)?;
     let request: InitializeParams = parse(params)?;
     if request.data_transport.max_frame_bytes != channel::MAX_FRAME_BYTES {
         return Err(Error::InvalidSpec {
@@ -116,7 +116,7 @@ pub(super) async fn initialize(state: &ServerState, params: Value) -> Result<Val
         .into());
     }
     let _ = state.transport.set(request.data_transport);
-    contract
+    served
         .runtime
         .get_or_try_init(|| async {
             // Named secrets arrive as this process's environment, exactly as
@@ -135,7 +135,7 @@ pub(super) async fn initialize(state: &ServerState, params: Value) -> Result<Val
             let activation = Activation {
                 name: request.entry.clone(),
                 entry: ProviderEntry {
-                    plugin:      contract.schemas.kind.clone(),
+                    plugin:      served.schemas.kind.clone(),
                     config:      request.config,
                     secrets:     request.secrets.clone(),
                     path:        None,
@@ -144,11 +144,11 @@ pub(super) async fn initialize(state: &ServerState, params: Value) -> Result<Val
                     env:         BTreeMap::new(),
                     inherit_env: None,
                 },
-                schemas: contract.schemas.clone(),
+                schemas: served.schemas.clone(),
                 environment,
                 secrets: SecretValues::new(secrets),
             };
-            contract.factory.activate(activation).await
+            served.factory.activate(activation).await
         })
         .await?;
     to_value(&InitializeResult {
@@ -162,8 +162,8 @@ pub(super) async fn dispatch(
     params: Value,
     io_permit: Option<Arc<OwnedSemaphorePermit>>,
 ) -> Result<Value, DispatchError> {
-    let contract = contract(state)?;
-    let runtime = contract.runtime()?;
+    let served = served(state)?;
+    let runtime = served.runtime()?;
     match method {
         w::DESCRIBE => to_value(&runtime.describe().await?),
         w::HEALTH => to_value(&runtime.health().await?),
@@ -175,12 +175,12 @@ pub(super) async fn dispatch(
                     credentials: SecretValues::new(credentials),
                 })
                 .await?;
-            remember(state, contract, sandbox.into())
+            remember(state, served, sandbox.into())
         }
         w::ATTACH => {
             let IdParams { id } = parse(params)?;
             let sandbox = runtime.attach(&id).await?;
-            remember(state, contract, sandbox.into())
+            remember(state, served, sandbox.into())
         }
         w::LIST => {
             let ListParams { filter } = parse(params)?;
@@ -189,28 +189,28 @@ pub(super) async fn dispatch(
         w::DESTROY => {
             let IdParams { id } = parse(params)?;
             runtime.destroy(&id).await?;
-            contract.sandboxes.remove(id.as_str());
+            served.sandboxes.remove(id.as_str());
             to_value(&m::Empty)
         }
         w::STATUS => {
             let IdParams { id } = parse(params)?;
-            to_value(&sandbox(contract, &id).await?.status().await?)
+            to_value(&sandbox(served, &id).await?.status().await?)
         }
         w::START => {
             let IdParams { id } = parse(params)?;
-            sandbox(contract, &id).await?.start().await?;
+            sandbox(served, &id).await?.start().await?;
             to_value(&m::Empty)
         }
         w::STOP => {
             let IdParams { id } = parse(params)?;
-            sandbox(contract, &id).await?.stop().await?;
+            sandbox(served, &id).await?.stop().await?;
             to_value(&m::Empty)
         }
-        w::EXEC => exec(state, contract, parse(params)?, io_permit).await,
+        w::EXEC => exec(state, served, parse(params)?, io_permit).await,
         w::EXEC_STOP => {
             let ExecStopParams { exec, level } = parse(params)?;
             // An exec that already finished needs no stop.
-            if let Some(handle) = contract.execs.get(&exec) {
+            if let Some(handle) = served.execs.get(&exec) {
                 match level {
                     StopLevel::Term => handle.term.cancel(),
                     StopLevel::Kill => handle.kill.cancel(),
@@ -220,13 +220,13 @@ pub(super) async fn dispatch(
         }
         w::EXEC_RESIZE => {
             let ExecResizeParams { exec, size } = parse(params)?;
-            if let Some(handle) = contract.execs.get(&exec) {
+            if let Some(handle) = served.execs.get(&exec) {
                 handle.resize.send_replace(size);
             }
             to_value(&m::Empty)
         }
-        w::FILES_GET => files_get(state, contract, parse(params)?, io_permit).await,
-        w::FILES_PUT => files_put(state, contract, parse(params)?, io_permit).await,
+        w::FILES_GET => files_get(state, served, parse(params)?, io_permit).await,
+        w::FILES_PUT => files_put(state, served, parse(params)?, io_permit).await,
         w::FILES_LIST => {
             let FilesListParams {
                 sandbox: id,
@@ -234,7 +234,7 @@ pub(super) async fn dispatch(
                 depth,
             } = parse(params)?;
             to_value(
-                &sandbox(contract, &id)
+                &sandbox(served, &id)
                     .await?
                     .files()
                     .list(&path, depth)
@@ -252,7 +252,7 @@ pub(super) async fn dispatch(
                 message: "expose requires options".into(),
             })?;
             to_value(
-                &sandbox(contract, &id)
+                &sandbox(served, &id)
                     .await?
                     .ports()
                     .expose(port, options)
@@ -263,7 +263,7 @@ pub(super) async fn dispatch(
             let PortParams {
                 sandbox: id, port, ..
             } = parse(params)?;
-            sandbox(contract, &id).await?.ports().release(port).await?;
+            sandbox(served, &id).await?.ports().release(port).await?;
             to_value(&m::Empty)
         }
         _ => Err(DispatchError::UnknownMethod),
@@ -272,7 +272,7 @@ pub(super) async fn dispatch(
 
 fn remember(
     state: &ServerState,
-    contract: &ContractState,
+    served: &V3State,
     sandbox: Arc<dyn Sandbox>,
 ) -> Result<Value, DispatchError> {
     let info = SandboxInfo {
@@ -280,7 +280,7 @@ fn remember(
         working_directory: sandbox.working_directory().to_path_buf(),
         env:               sandbox.env().clone(),
     };
-    contract.sandboxes.insert_bounded(
+    served.sandboxes.insert_bounded(
         info.reference.id.as_str().to_owned(),
         sandbox,
         state.limits.cached_handles,
@@ -290,11 +290,11 @@ fn remember(
 
 /// A cached handle, or a fresh attach; the runtime decides whether this
 /// instance may operate the id.
-async fn sandbox(contract: &ContractState, id: &SandboxId) -> Result<Arc<dyn Sandbox>, Error> {
-    if let Some(sandbox) = contract.sandboxes.get(id.as_str()) {
+async fn sandbox(served: &V3State, id: &SandboxId) -> Result<Arc<dyn Sandbox>, Error> {
+    if let Some(sandbox) = served.sandboxes.get(id.as_str()) {
         return Ok(sandbox);
     }
-    Ok(contract.runtime()?.attach(id).await?.into())
+    Ok(served.runtime()?.attach(id).await?.into())
 }
 
 async fn open(
@@ -319,7 +319,7 @@ fn transport(error: &sandbox_driver::Error) -> Error {
 }
 
 /// Unregisters an exec id when its call ends, however it ends.
-struct Registered<'a>(&'a ContractState, String);
+struct Registered<'a>(&'a V3State, String);
 
 impl Drop for Registered<'_> {
     fn drop(&mut self) {
@@ -329,7 +329,7 @@ impl Drop for Registered<'_> {
 
 async fn exec(
     state: &ServerState,
-    contract: &ContractState,
+    served: &V3State,
     params: ExecParams,
     permit: Option<Arc<OwnedSemaphorePermit>>,
 ) -> Result<Value, DispatchError> {
@@ -340,7 +340,7 @@ async fn exec(
         stdin,
         channel: request,
     } = params;
-    let sandbox = sandbox(contract, &id).await?;
+    let sandbox = sandbox(served, &id).await?;
     let (resize, resized) = watch::channel(TerminalSize {
         rows:    24.try_into().expect("non-zero"),
         columns: 80.try_into().expect("non-zero"),
@@ -349,10 +349,10 @@ async fn exec(
     // sees the channel always finds this exec.
     let handle = ExecHandle {
         term:   CancellationToken::new(),
-        kill:   contract.closing.child_token(),
+        kill:   served.closing.child_token(),
         resize: Arc::new(resize),
     };
-    if contract
+    if served
         .execs
         .try_insert(exec_id.clone(), handle.clone())
         .is_err()
@@ -363,7 +363,7 @@ async fn exec(
         }
         .into());
     }
-    let _registered = Registered(contract, exec_id);
+    let _registered = Registered(served, exec_id);
     let Channel { mut reader, writer } = open(state, &request, permit).await?;
     let writer = Arc::new(AsyncMutex::new(writer));
     let (input, _input_task) = if stdin {
@@ -426,7 +426,7 @@ async fn exec(
 
 async fn files_get(
     state: &ServerState,
-    contract: &ContractState,
+    served: &V3State,
     params: FilesGetParams,
     permit: Option<Arc<OwnedSemaphorePermit>>,
 ) -> Result<Value, DispatchError> {
@@ -436,7 +436,7 @@ async fn files_get(
         range,
         channel: request,
     } = params;
-    let sandbox = sandbox(contract, &id).await?;
+    let sandbox = sandbox(served, &id).await?;
     let Channel { mut writer, .. } = open(state, &request, permit).await?;
     let mut content = match sandbox.files().get(&path, range).await {
         Ok(content) => content,
@@ -469,7 +469,7 @@ async fn files_get(
 
 async fn files_put(
     state: &ServerState,
-    contract: &ContractState,
+    served: &V3State,
     params: FilesPutParams,
     permit: Option<Arc<OwnedSemaphorePermit>>,
 ) -> Result<Value, DispatchError> {
@@ -478,7 +478,7 @@ async fn files_put(
         path,
         channel: request,
     } = params;
-    let sandbox = sandbox(contract, &id).await?;
+    let sandbox = sandbox(served, &id).await?;
     let Channel {
         mut reader,
         mut writer,

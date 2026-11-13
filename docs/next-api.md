@@ -583,7 +583,7 @@ Field setters override individual template values; map setters merge keys,
 while `spec` explicitly replaces the whole template. Invalid size strings stay
 as admission errors, even if a later setter supplies another value.
 
-`sandbox_driver_protocol::contract::PluginLoader` is the ordinary plugin
+`sandbox_driver_protocol::v3::PluginLoader` is the ordinary plugin
 loader for third-party plugins: protocol version 3 over the existing
 transport, one supervised child per activated entry, and an SDK (`Plugin`,
 `run_plugin`) for plugin executables. The fixture plugin

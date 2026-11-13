@@ -25,8 +25,8 @@ use crate::{TransportLimits, metadata, serve_plugin_with_limits};
 /// What a plugin executable serves: the shared contract through its own
 /// factory, the version 2 provider, or both while callers migrate.
 pub struct Plugin {
-    pub(crate) legacy:   Option<Arc<dyn SandboxProvider>>,
-    pub(crate) contract: Option<(ProviderSchemas, Arc<dyn ProviderFactory>)>,
+    pub(crate) legacy: Option<Arc<dyn SandboxProvider>>,
+    pub(crate) v3:     Option<(ProviderSchemas, Arc<dyn ProviderFactory>)>,
 }
 
 impl Plugin {
@@ -35,16 +35,16 @@ impl Plugin {
     /// entry's config when the host initializes.
     pub fn new(schemas: ProviderSchemas, factory: Arc<dyn ProviderFactory>) -> Self {
         Self {
-            legacy:   None,
-            contract: Some((schemas, factory)),
+            legacy: None,
+            v3:     Some((schemas, factory)),
         }
     }
 
     /// A plugin serving only protocol version 2.
     pub fn legacy(provider: Arc<dyn SandboxProvider>) -> Self {
         Self {
-            legacy:   Some(provider),
-            contract: None,
+            legacy: Some(provider),
+            v3:     None,
         }
     }
 
@@ -64,7 +64,7 @@ pub async fn run_plugin(plugin: Plugin) -> sandbox_driver::Result<()> {
     let mut args = env::args_os().skip(1);
     if let (Some(flag), None) = (args.next(), args.next()) {
         if flag == "--describe-schema" {
-            let Some((schemas, _)) = &plugin.contract else {
+            let Some((schemas, _)) = &plugin.v3 else {
                 return Err(sandbox_driver::Error::invalid_spec(
                     "--describe-schema",
                     "this plugin does not serve the shared contract",

@@ -1128,7 +1128,7 @@ another kind. The framing, envelope, data channels and transport budgets of
 sections 2 and 3 are unchanged. Version 2 stays available on both sides until
 its consumers migrate, and a version 3 host never falls back to it.
 
-**Host side.** `contract::PluginLoader` is the `ProviderFactory` an
+**Host side.** `v3::PluginLoader` is the `ProviderFactory` an
 application passes to `Registry::plugins`. `discover` is section 15.
 `activate` rediscovers the entry, refuses schemas that differ from the ones
 the catalog froze, calls `verify_unchanged`, and starts the child with exactly
@@ -1160,7 +1160,7 @@ reserved, so they are answered while the plugin's ordinary capacity is full.
 Dropping an exec future kills its execution. Errors keep their contract
 variant and fields in a report whose kind is `contract`.
 
-**Plugin side.** `contract::Plugin::new(schemas, factory)` and `run_plugin`
+**Plugin side.** `v3::Plugin::new(schemas, factory)` and `run_plugin`
 are the SDK entry points. `run_plugin` answers `--describe-schema` before
 constructing anything else, then serves stdio. `Plugin::with_legacy` also
 serves version 2 to hosts that ask for it while callers migrate. `shutdown`

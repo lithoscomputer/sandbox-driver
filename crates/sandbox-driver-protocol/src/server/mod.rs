@@ -32,20 +32,20 @@ use self::registry::Registry;
 use self::services::StreamRegistration;
 use self::sessions::{ServerPty, ServerStdio};
 use crate::channel::{self, Channel, ChannelRequest, DataTransport};
-use crate::contract::wire as contract_wire;
+use crate::v3::wire as v3_wire;
 use crate::wire::{
     CODE_APPLICATION, CODE_INVALID_REQUEST, CODE_METHOD_NOT_FOUND, Message, WireError,
 };
 use crate::{Plugin, ServerDiagnostics, TransportLimits, control, limits, methods as m};
 
 mod access;
-pub(crate) mod contract;
 mod exec;
 mod fs;
 mod registry;
 mod sandbox;
 mod services;
 mod sessions;
+pub(crate) mod v3;
 
 /// Serves `provider` over this process's stdin and stdout until EOF or
 /// `shutdown` — the main loop of a plugin binary:
@@ -388,7 +388,7 @@ struct ServerState {
     /// The version 2 provider, when the plugin still serves version 2.
     provider:        Option<Arc<dyn SandboxProvider>>,
     /// The shared-contract runtime, when the plugin serves version 3.
-    contract:        Option<contract::ContractState>,
+    v3:              Option<v3::V3State>,
     /// The version `initialize` negotiated; fixed for the connection.
     version:         OnceLock<u32>,
     /// Set by `initialize`; every data channel opens against it.
@@ -415,7 +415,7 @@ impl ServerState {
     fn new(plugin: Plugin, outbound: control::ControlSender, limits: TransportLimits) -> Self {
         Self {
             provider: plugin.legacy,
-            contract: plugin.contract.map(contract::ContractState::new),
+            v3: plugin.v3.map(v3::V3State::new),
             version: OnceLock::new(),
             transport: OnceLock::new(),
             request_budget: Arc::new(Semaphore::new(limits.provider_requests)),
@@ -487,8 +487,8 @@ impl ServerState {
     }
 
     async fn close_sessions(&self) {
-        if let Some(contract) = &self.contract {
-            contract.close(&self.limits).await;
+        if let Some(v3) = &self.v3 {
+            v3.close(&self.limits).await;
         }
         // A closing connection has no caller left to escalate, so every
         // in-flight exec is killed outright.
@@ -669,7 +669,7 @@ impl DispatchError {
                 data:    None,
             },
             Self::App(error) => WireError::from_error(&error),
-            Self::Contract(error) => contract_wire::to_wire(&error),
+            Self::Contract(error) => v3_wire::to_wire(&error),
         }
     }
 }
@@ -692,14 +692,14 @@ async fn dispatch(
 ) -> Result<Value, DispatchError> {
     if method == m::INITIALIZE {
         let version = params.get("protocol_version").and_then(Value::as_u64);
-        return if version == Some(u64::from(contract_wire::PROTOCOL_VERSION)) {
-            contract::initialize(state, params).await
+        return if version == Some(u64::from(v3_wire::PROTOCOL_VERSION)) {
+            v3::initialize(state, params).await
         } else {
             initialize(state, params)
         };
     }
-    if state.version.get() == Some(&contract_wire::PROTOCOL_VERSION) {
-        return contract::dispatch(state, method, params, io_permit).await;
+    if state.version.get() == Some(&v3_wire::PROTOCOL_VERSION) {
+        return v3::dispatch(state, method, params, io_permit).await;
     }
     let Some((namespace, _)) = method.split_once('/') else {
         return Err(DispatchError::UnknownMethod);
@@ -776,7 +776,7 @@ fn initialize(state: &ServerState, params: Value) -> Result<Value, DispatchError
                 "protocol_version",
                 format!(
                     "plugin speaks protocol version {} but the host asked for {}",
-                    contract_wire::PROTOCOL_VERSION,
+                    v3_wire::PROTOCOL_VERSION,
                     m::PROTOCOL_VERSION
                 ),
             )

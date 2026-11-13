@@ -35,13 +35,13 @@ use crate::channel::{Channel, ChannelListener, ChannelReceiver};
 use crate::wire::{Message, WireError};
 use crate::{TransportLimits, control, limits, methods as m};
 
-pub(crate) mod contract;
 mod exec;
 mod fs;
 mod provider;
 mod pty;
 mod sandbox;
 mod streams;
+pub(crate) mod v3;
 
 pub use provider::PluginProvider;
 
