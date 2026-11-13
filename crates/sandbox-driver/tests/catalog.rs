@@ -524,6 +524,67 @@ async fn repeated_shutdown_preserves_unconfirmed_cleanup() {
 }
 
 #[tokio::test]
+async fn built_in_kinds_are_reserved_from_plugins() {
+    let factory = |kind: &str| {
+        let mut factory = Factory::default();
+        factory.schemas.kind = sandbox_driver::ProviderKind::try_new(kind).expect("kind");
+        Arc::new(factory)
+    };
+    let plugins = factory("acme-docker");
+    let host = factory("host");
+    let registry = Registry::new()
+        .plugins(Arc::new(FactoryAdapter(Arc::clone(&plugins))))
+        .builtin(
+            sandbox_driver::ProviderKind::try_new("host").expect("kind"),
+            Arc::new(FactoryAdapter(Arc::clone(&host))),
+        )
+        .expect("Host registers as a built-in");
+    let entry = |value| serde_json::from_value::<ProviderEntry>(value).expect("entry");
+    let catalog = Sandboxes::try_new(
+        [
+            (name("local"), entry(json!({"plugin": "host"}))),
+            (
+                name("host-plugin"),
+                entry(json!({"plugin": "host", "dev": true})),
+            ),
+            (
+                name("docker-plugin"),
+                entry(json!({"plugin": "docker", "path": "/opt/docker-plugin"})),
+            ),
+            (name("daytona"), entry(json!({"plugin": "daytona"}))),
+            (
+                name("acme-docker"),
+                entry(json!({"plugin": "acme-docker", "dev": true})),
+            ),
+        ],
+        environments(),
+        &registry,
+        Arc::new(Secrets::default()),
+        options(),
+    )
+    .expect("one bad entry does not fail the catalog");
+    let describe = async |entry: &str| catalog.provider(entry).expect("entry").describe().await;
+    describe("local").await.expect("built-in Host");
+    assert_eq!(host.discovery.load(Ordering::SeqCst), 1);
+    for entry in ["host-plugin", "docker-plugin"] {
+        assert!(
+            matches!(describe(entry).await, Err(Error::InvalidConfig { path, .. }) if path == "plugin"),
+            "{entry} must be refused"
+        );
+    }
+    // An unregistered built-in is missing, not handed to the plugin loader.
+    assert!(matches!(
+        describe("daytona").await,
+        Err(Error::Unavailable { .. })
+    ));
+    assert_eq!(plugins.discovery.load(Ordering::SeqCst), 0);
+    describe("acme-docker")
+        .await
+        .expect("other kinds load as plugins");
+    assert_eq!(plugins.discovery.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn explicit_plugin_trust_never_falls_back_to_a_same_kind_builtin() {
     let factory = Arc::new(Factory::default());
     let mut configured = entry();

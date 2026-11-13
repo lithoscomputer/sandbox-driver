@@ -57,7 +57,7 @@ impl Default for Factory {
         }
     }
 }
-struct FactoryAdapter(Arc<Factory>);
+pub(super) struct FactoryAdapter(pub(super) Arc<Factory>);
 #[async_trait]
 impl ProviderFactory for FactoryAdapter {
     async fn discover(&self, _: &PluginLocation) -> Result<ProviderSchemas, Error> {

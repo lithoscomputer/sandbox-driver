@@ -158,8 +158,9 @@ sequence does not require a new transport. Keep JSON control over stdio and a
 separate authenticated per-operation socket connection for output, input, and
 file contents. Preserve reserved control capacity for stop/cancel/health and
 bounded data buffering. The v2 framing is retained unless separately negotiated.
-A failed metadata probe or missing Host must never trigger an in-process Host
-fallback.
+Host, Docker and Daytona are built-in providers. Their kinds are reserved: an
+entry naming one with a plugin path, checksum or development trust is
+`invalid_config`, and a reserved kind is never routed to the plugin loader.
 
 ## Workload and execution targets
 
@@ -255,37 +256,35 @@ into absence or success.
 
 ## Host ownership and retained workspaces
 
-Host's target distribution is **only a separately installed plugin on execution
-machines**, reached through the ordinary configured plugin loader. Fabro must
-not ultimately link or bundle its implementation or executable. Existing Host
-library/executable paths remain for current consumers until migration and
-packaging are proven. Docker and Daytona may remain built-in providers.
+Host is a built-in provider, registered with `Registry::builtin` like Docker
+and Daytona and run in the application's process. The existing Host plugin
+executable remains for current protocol v2 consumers until they migrate.
 
 The initial Host contract is `durability: process`, `access: owner_process`, with
 a machine-scoped namespace that is stable for that installation's machine.
 Sandbox IDs must include or otherwise uniquely bind to their owning runtime
 generation so restarting cannot reuse another live/old sandbox's identity.
-One live plugin instance owns admissions, process groups and lifecycle state.
-A second independently launched plugin is not an observer or a shared registry
-and cannot acquire live access merely from a path or ref. If a conflicting live
+One live runtime instance (one activation) owns admissions, process groups and
+lifecycle state. A second instance, in this process or another, is not an
+observer or a shared registry and cannot acquire live access merely from a path
+or ref. If a conflicting live
 owner is known, refuse with `Busy`; if ownership/liveness cannot be established,
 report `Unavailable`. Never report `NotFound` merely because a local registry
 is empty. An expired handle is `Stale`; reattach after owner death is not promised.
 
-The plugin must attempt bounded owner cleanup on stdin EOF/shutdown, but process
-loss alone is not proof children died. The Host implementation must demonstrate
+The runtime must attempt bounded owner cleanup on shutdown, but process loss
+alone is not proof children died. The Host implementation must demonstrate
 confirmed fencing or honest failure. Separate server/worker processes cannot
 independently attach to the same Host workload under this ownership model.
 Applications needing live UI access must route operations to the actual owner;
 a run record can display history but is not a live sandbox handle. Shared access
-would require a separately designed coordinator and conformance evidence, not
-just moving code into a plugin.
+would require a separately designed coordinator and conformance evidence.
 
 A designated workspace remains caller-owned and is never removed by destroy.
 A managed workspace is provider-owned and removed on confirmed destroy.
 Designated path defaults to designated ownership; no path defaults to a managed
 temporary directory. Explicit managed ownership transfers deletion rights.
-Retained files after a worker/plugin exit are not a running or attachable sandbox,
+Retained files after a worker exit are not a running or attachable sandbox,
 and filesystem existence proves neither execution termination nor ownership.
 Applications may explicitly create a new sandbox over a retained designated
 workspace, after resolving prior-owner safety, or choose a durable provider for
@@ -298,10 +297,12 @@ that selects that entry.
 - **Core API:** consume `contract` types; implement catalog/schema admission,
   environment overrides, immutable bindings, namespace-checked refs, façade,
   fake and validation. Do not synthesize refs for legacy records.
-- **Plugin loader and Host:** implement metadata discovery and configured lazy
-  launch, next-version negotiation/adapters, same control/data transport, stale
-  handles, owner fencing and separate Host distribution. Keep v2 usable until
-  migration.
+- **Plugin loader:** implement metadata discovery and configured lazy launch,
+  next-version negotiation/adapters, same control/data transport and stale
+  handles. Prove it with a fixture plugin of a non-reserved kind. Keep v2
+  usable until migration.
+- **Host:** a built-in with owner fencing, passing the shared conformance
+  harness in-process.
 - **Docker:** translate portable workload/services/container options and
   report real namespace/capabilities; prove readiness and cross-instance fence.
 - **Daytona:** own runner/snapshot/nested-container recipes and route every
@@ -314,8 +315,8 @@ persisted identity independent of environments, namespace refusal, configuration
 and workload decoding, readiness bounds, error uncertainty, schema separation,
 status tolerance and redaction. The existing core/provider/protocol suites must
 continue to pass. These declaration tests are not provider conformance evidence:
-integration tests must exercise actual Host plugin, Docker and Daytona
-behavior before any consumer cutover or legacy removal.
+integration tests must exercise actual Host, Docker and Daytona behavior and a
+fixture plugin before any consumer cutover or legacy removal.
 
 ### Provider interface implementation
 
