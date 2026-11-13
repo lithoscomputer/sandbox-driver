@@ -15,7 +15,7 @@ use sandbox_driver::contract::{
     WorkloadAdmission,
 };
 use sandbox_driver::{
-    BASH_ENV_VAR, EventEmitter, HealthStatus, Isolation, SandboxId, SandboxProvider as _,
+    EventEmitter, HealthStatus, Isolation, SandboxId, SandboxProvider as _,
     SandboxState as LegacyState,
 };
 use serde::Deserialize;
@@ -333,7 +333,7 @@ impl ProviderRuntime for DaytonaRuntime {
                 resource: "sandbox".to_owned(),
                 id:       id.to_string(),
             })?;
-        let env = public_env(&sdk.env);
+        let env = spec::workload_env(&sdk.labels, &sdk.env);
         let handle = DaytonaSandbox::build(
             &self.provider.client,
             self.provider.capabilities(),
@@ -413,15 +413,6 @@ impl ProviderRuntime for DaytonaRuntime {
         self.closed.cancel();
         Ok(())
     }
-}
-
-/// The workload environment Daytona stores, minus the blank `BASH_ENV`
-/// the provider adds to every sandbox.
-fn public_env(env: &HashMap<String, String>) -> BTreeMap<String, String> {
-    env.iter()
-        .filter(|(key, value)| !(key.as_str() == BASH_ENV_VAR && value.is_empty()))
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
 }
 
 #[cfg(test)]

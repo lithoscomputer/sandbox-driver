@@ -6,7 +6,7 @@
 //! with either runs as a container inside a Docker-capable runner sandbox,
 //! beside its services. Callers never select or see the runner.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::time::Duration;
@@ -41,6 +41,8 @@ const RESERVED_PORTS: [u16; 3] = [2280, 22220, 22222];
 
 const DIRECT: &str = "direct";
 const NESTED: &str = "nested";
+/// Prefixes each workload variable in a runner's Daytona environment.
+const RUNNER_ENV_PREFIX: &str = "SANDBOX_DRIVER_WORKLOAD_ENV_";
 
 /// Per-sandbox options with no provider-neutral meaning. The descriptor's
 /// `spec_schema` describes the same fields.
@@ -143,7 +145,11 @@ pub(super) fn plan(spec: &SandboxSpec, runner_image: &str) -> Result<Plan, Error
     }
     .into_value();
     legacy.name.clone_from(&spec.name);
-    legacy.env.clone_from(&spec.env);
+    legacy.env = if nested.is_some() {
+        runner_env(&spec.env)
+    } else {
+        spec.env.clone()
+    };
     legacy.labels.clone_from(&spec.labels);
     legacy.timers = timers;
     Ok(Plan {
@@ -151,6 +157,40 @@ pub(super) fn plan(spec: &SandboxSpec, runner_image: &str) -> Result<Plan, Error
         labels,
         nested,
     })
+}
+
+/// A nested workload's environment as its runner's Daytona record keeps
+/// it for a later attach. The workload container is given the variables
+/// themselves; under their own names in the runner they would steer the
+/// runner's Docker, shell and Python instead (`PATH`, `HTTPS_PROXY`).
+fn runner_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    env.iter()
+        .map(|(key, value)| (format!("{RUNNER_ENV_PREFIX}{key}"), value.clone()))
+        .collect()
+}
+
+/// The workload environment of a sandbox this contract created, read back
+/// from the environment Daytona stores: a nested workload's from its
+/// runner's record, a direct workload's as it is.
+pub(super) fn workload_env(
+    labels: &HashMap<String, String>,
+    env: &HashMap<String, String>,
+) -> BTreeMap<String, String> {
+    let nested = labels.get(RECIPE_LABEL).is_some_and(|recipe| recipe == NESTED);
+    env.iter()
+        .filter_map(|(key, value)| {
+            let key = if nested {
+                key.strip_prefix(RUNNER_ENV_PREFIX)?
+            } else {
+                // The provider adds a blank `BASH_ENV` to every sandbox.
+                if key == BASH_ENV_VAR && value.is_empty() {
+                    return None;
+                }
+                key
+            };
+            Some((key.to_owned(), value.clone()))
+        })
+        .collect()
 }
 
 /// The runner sandbox of a nested workload, and what provisioning puts in it.
@@ -426,6 +466,7 @@ mod tests {
         postgres.ports = vec![NonZeroU16::new(5432).unwrap()];
         spec.services.insert("db".to_owned(), postgres);
         spec.env.insert("CI".to_owned(), "1".to_owned());
+        spec.env.insert("PATH".to_owned(), "/app/bin".to_owned());
         let plan = plan(&spec, "registry.test/runner:pinned").expect("valid");
         let nested = plan.nested.expect("nested recipe");
         // The caller's image is the workload; the runner is the provider's.
@@ -437,6 +478,16 @@ mod tests {
             SandboxSource::Image { reference } if reference == "registry.test/runner:pinned"
         ));
         assert_eq!(nested.env["CI"], "1");
+        // The runner only records the workload's environment; it does not
+        // run under it.
+        let runner = &plan.legacy.env;
+        assert!(!runner.contains_key("PATH") && !runner.contains_key("CI"));
+        // An attach reads it back from the record, beside the blank
+        // `BASH_ENV` the provider adds to every sandbox.
+        let mut stored: HashMap<String, String> = runner.clone().into_iter().collect();
+        stored.insert(BASH_ENV_VAR.to_owned(), String::new());
+        let labels = plan.labels.clone().into_iter().collect();
+        assert_eq!(workload_env(&labels, &stored), spec.env);
         assert_eq!(plan.legacy.resources.cpu_cores, Some(RUNNER_MIN_CPU));
         assert_eq!(plan.legacy.resources.memory_mb, Some(RUNNER_MIN_MEMORY_MB));
         assert_eq!(
