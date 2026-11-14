@@ -29,7 +29,8 @@ async fn main() -> Result<(), Error> {
 
 **API preview:** This README introduces the upcoming `Sandboxes` interface.
 The examples run today against the in-memory provider in `sandbox-driver-testing`.
-Real-provider and plugin integration is still in progress.
+Host, Docker, and Daytona implement it as built-ins, and protocol version 3
+loads third-party plugins; consumer and CLI migration is still in progress.
 See the [target specification](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/next-api.md)
 and the [current provider API](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/design.md).
 
@@ -83,7 +84,7 @@ Host runs processes in a directory and provides no isolation boundary.
 | `sandbox-driver-host` | Embed Host support or build its provider executable |
 | `sandbox-driver-docker-config` | Construct typed Docker options for the current provider API |
 | `sandbox-driver-daytona-config` | Construct typed Daytona options for the current provider API |
-| `sandbox-driver-protocol` | Serve or connect to providers over the current version 2 protocol |
+| `sandbox-driver-protocol` | Load or build third-party plugins over protocol version 3; version 2 remains for current clients |
 | `sandbox-driver-conformance` | Check a provider against the shared behavioral contract |
 | `sandbox-driver-testing` | Test callers with an in-memory provider and scripted commands |
 | `sandbox-driver-cli` | Install the `lithos-sandbox` command |
@@ -201,11 +202,11 @@ will use the environment catalog; those commands are not available yet.
 ## Status and compatibility
 
 - **Maturity:** Pre-1.0; the public API is changing during the migration.
-- **Implemented preview:** The catalog, schema validation, scripted fake, and common conformance suite are available under `contract` modules.
+- **Implemented preview:** The catalog, schema validation, scripted fake, and common conformance suite are available under `contract` modules; Host, Docker, and Daytona provide built-in factories, and `PluginLoader` loads protocol 3 plugins.
 - **Cutover gate:** The shared API, plugin loader, and Docker, Daytona, and Host providers must pass conformance together before real-provider adoption.
 - **MSRV:** Rust 1.85, as declared in the workspace manifest.
 - **CI platforms:** macOS arm64, Linux x86_64, and Linux arm64.
-- **Public formats:** Serialized configuration and sandbox references; plugin protocol version 2 today, version 3 in the target specification.
+- **Public formats:** Serialized configuration and sandbox references; plugin protocol version 3 for the shared API, with version 2 kept for current clients.
 
 Current provider integration tests are separate from the new-contract gate.
 Host and Docker have in-process and plugin checks; Docker needs a daemon.
