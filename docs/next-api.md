@@ -585,6 +585,13 @@ Field setters override individual template values; map setters merge keys,
 while `spec` explicitly replaces the whole template. Invalid size strings stay
 as admission errors, even if a later setter supplies another value.
 
+`sandbox_driver_protocol::v3::PluginLoader` is the ordinary plugin
+loader for third-party plugins: protocol version 3 over the existing
+transport, one supervised child per activated entry, and an SDK (`Plugin`,
+`run_plugin`) for plugin executables. The fixture plugin
+`sandbox-driver-test-host` (in `sandbox-driver-fixture-plugins`) proves the
+path with the Host runtime under the non-reserved kind `test-host`.
+
 Schemas require draft-07, 2019-09 or 2020-12 and are compiled without external
 retrieval, including when another dependency enables the engine's network
 features. Config and spec options are checked separately. Error messages omit

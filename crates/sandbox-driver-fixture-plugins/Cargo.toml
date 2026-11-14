@@ -1,0 +1,24 @@
+[package]
+name = "sandbox-driver-fixture-plugins"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Fixture plugins: built-in provider runtimes served over protocol version 3 under non-reserved kinds"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+sandbox-driver.workspace = true
+sandbox-driver-docker.workspace = true
+sandbox-driver-host.workspace = true
+sandbox-driver-protocol = { path = "../sandbox-driver-protocol" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+sandbox-driver-conformance.workspace = true
+sandbox-driver-testing.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process"] }

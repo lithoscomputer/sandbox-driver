@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use sandbox_driver::contract::Error as ContractError;
 use sandbox_driver::{
     Capability, Error, Event, EventContext, EventObserver, Result, Sandbox, SandboxId,
     SandboxProvider, SnapshotId, SnapshotProvider, TransportError, VolumeId, VolumeProvider,
@@ -31,10 +32,11 @@ use self::registry::Registry;
 use self::services::StreamRegistration;
 use self::sessions::{ServerPty, ServerStdio};
 use crate::channel::{self, Channel, ChannelRequest, DataTransport};
+use crate::v3::wire as v3_wire;
 use crate::wire::{
     CODE_APPLICATION, CODE_INVALID_REQUEST, CODE_METHOD_NOT_FOUND, Message, WireError,
 };
-use crate::{ServerDiagnostics, TransportLimits, control, limits, methods as m};
+use crate::{Plugin, ServerDiagnostics, TransportLimits, control, limits, methods as m};
 
 mod access;
 mod exec;
@@ -43,6 +45,7 @@ mod registry;
 mod sandbox;
 mod services;
 mod sessions;
+pub(crate) mod v3;
 
 /// Serves `provider` over this process's stdin and stdout until EOF or
 /// `shutdown` — the main loop of a plugin binary:
@@ -81,10 +84,21 @@ pub async fn serve_with_limits(
     writer: impl AsyncWrite + Unpin + Send + 'static,
     limits: TransportLimits,
 ) -> Result<()> {
+    serve_plugin_with_limits(Plugin::legacy(provider), reader, writer, limits).await
+}
+
+/// Serves whichever protocol version the host's `initialize` asks for, among
+/// those `plugin` implements.
+pub async fn serve_plugin_with_limits(
+    plugin: Plugin,
+    reader: impl AsyncRead + Unpin + Send + 'static,
+    writer: impl AsyncWrite + Unpin + Send + 'static,
+    limits: TransportLimits,
+) -> Result<()> {
     limits.validate()?;
     let (outbound, outbound_rx) = control::queue(&limits);
     let mut writer_task = spawn_control_writer(writer, outbound_rx, limits.output_progress_timeout);
-    let state = Arc::new(ServerState::new(provider, outbound.clone(), limits));
+    let state = Arc::new(ServerState::new(plugin, outbound.clone(), limits));
     let limits = &state.limits;
     let mut requests = JoinSet::new();
 
@@ -371,7 +385,12 @@ async fn shutdown(
 }
 
 struct ServerState {
-    provider:        Arc<dyn SandboxProvider>,
+    /// The version 2 provider, when the plugin still serves version 2.
+    provider:        Option<Arc<dyn SandboxProvider>>,
+    /// The shared-contract runtime, when the plugin serves version 3.
+    v3:              Option<v3::V3State>,
+    /// The version `initialize` negotiated; fixed for the connection.
+    version:         OnceLock<u32>,
     /// Set by `initialize`; every data channel opens against it.
     transport:       OnceLock<DataTransport>,
     request_budget:  Arc<Semaphore>,
@@ -393,13 +412,11 @@ struct ServerState {
 }
 
 impl ServerState {
-    fn new(
-        provider: Arc<dyn SandboxProvider>,
-        outbound: control::ControlSender,
-        limits: TransportLimits,
-    ) -> Self {
+    fn new(plugin: Plugin, outbound: control::ControlSender, limits: TransportLimits) -> Self {
         Self {
-            provider,
+            provider: plugin.legacy,
+            v3: plugin.v3.map(v3::V3State::new),
+            version: OnceLock::new(),
             transport: OnceLock::new(),
             request_budget: Arc::new(Semaphore::new(limits.provider_requests)),
             reserved_budget: Arc::new(Semaphore::new(limits.reserved_requests)),
@@ -455,7 +472,24 @@ impl ServerState {
         tasks.push(AbortOnDropHandle::new(tokio::spawn(future)));
     }
 
+    /// The version 2 provider; a version 3 connection has none to call.
+    fn provider(&self) -> Result<&Arc<dyn SandboxProvider>> {
+        match (self.version.get(), &self.provider) {
+            (Some(&m::PROTOCOL_VERSION) | None, Some(provider)) => Ok(provider),
+            _ => Err(Error::invalid_spec(
+                "protocol_version",
+                format!(
+                    "this plugin does not serve protocol version {}",
+                    m::PROTOCOL_VERSION
+                ),
+            )),
+        }
+    }
+
     async fn close_sessions(&self) {
+        if let Some(v3) = &self.v3 {
+            v3.close(&self.limits).await;
+        }
         // A closing connection has no caller left to escalate, so every
         // in-flight exec is killed outright.
         // Child tokens also cancel requests that have not yet registered.
@@ -480,7 +514,7 @@ impl ServerState {
         if let Some(handle) = self.handles.get(id) {
             return Ok(handle);
         }
-        let handle = self.provider.attach(&sandbox_id(id)?, None).await?;
+        let handle = self.provider()?.attach(&sandbox_id(id)?, None).await?;
         self.remember(&handle);
         Ok(handle)
     }
@@ -494,13 +528,13 @@ impl ServerState {
     }
 
     fn snapshots(&self) -> Result<&dyn SnapshotProvider> {
-        self.provider
+        self.provider()?
             .snapshots()
             .ok_or_else(|| Error::unsupported(Capability::Snapshots))
     }
 
     fn volumes(&self) -> Result<&dyn VolumeProvider> {
-        self.provider
+        self.provider()?
             .volumes()
             .ok_or_else(|| Error::unsupported(Capability::Volumes))
     }
@@ -601,6 +635,8 @@ enum DispatchError {
     /// host's fault.
     Internal(serde_json::Error),
     App(Error),
+    /// A version 3 failure, carried intact.
+    Contract(ContractError),
 }
 
 impl From<Error> for DispatchError {
@@ -633,6 +669,7 @@ impl DispatchError {
                 data:    None,
             },
             Self::App(error) => WireError::from_error(&error),
+            Self::Contract(error) => v3_wire::to_wire(&error),
         }
     }
 }
@@ -653,11 +690,19 @@ async fn dispatch(
     io_permit: Option<Arc<OwnedSemaphorePermit>>,
     stream: Option<StreamRegistration>,
 ) -> Result<Value, DispatchError> {
-    let Some((namespace, _)) = method.split_once('/') else {
-        return match method {
-            m::INITIALIZE => initialize(state, params),
-            _ => Err(DispatchError::UnknownMethod),
+    if method == m::INITIALIZE {
+        let version = params.get("protocol_version").and_then(Value::as_u64);
+        return if version == Some(u64::from(v3_wire::PROTOCOL_VERSION)) {
+            v3::initialize(state, params).await
+        } else {
+            initialize(state, params)
         };
+    }
+    if state.version.get() == Some(&v3_wire::PROTOCOL_VERSION) {
+        return v3::dispatch(state, method, params, io_permit).await;
+    }
+    let Some((namespace, _)) = method.split_once('/') else {
+        return Err(DispatchError::UnknownMethod);
     };
     match namespace {
         "sandbox" => sandbox::dispatch(state, method, params).await,
@@ -692,7 +737,7 @@ async fn dispatch(
                 })
             }
             m::PROVIDER_HEALTH => {
-                let health = state.provider.health().await?;
+                let health = state.provider()?.health().await?;
                 to_value(&m::HealthResult { health })
             }
             _ => Err(DispatchError::UnknownMethod),
@@ -723,16 +768,37 @@ fn initialize(state: &ServerState, params: Value) -> Result<Value, DispatchError
     if request.data_transport.max_frame_bytes != channel::MAX_FRAME_BYTES {
         return Err(Error::invalid_spec("data_transport.max_frame_bytes", "must be 65536").into());
     }
+    let provider = state
+        .provider
+        .as_ref()
+        .ok_or_else(|| {
+            Error::invalid_spec(
+                "protocol_version",
+                format!(
+                    "plugin speaks protocol version {} but the host asked for {}",
+                    v3_wire::PROTOCOL_VERSION,
+                    m::PROTOCOL_VERSION
+                ),
+            )
+        })?
+        .clone();
+    if state.version.get_or_init(|| m::PROTOCOL_VERSION) != &m::PROTOCOL_VERSION {
+        return Err(Error::invalid_spec(
+            "protocol_version",
+            "the connection already negotiated another version",
+        )
+        .into());
+    }
     // A second initialize keeps the first transport: channels the
     // host is already waiting on were named against it.
     let _ = state.transport.set(request.data_transport);
     to_value(&m::InitializeResult {
         protocol_version: m::PROTOCOL_VERSION,
         provider:         m::ProviderInfo {
-            kind:    state.provider.kind().clone(),
+            kind:    provider.kind().clone(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
         },
-        capabilities:     state.provider.capabilities().clone(),
+        capabilities:     provider.capabilities().clone(),
     })
 }
 

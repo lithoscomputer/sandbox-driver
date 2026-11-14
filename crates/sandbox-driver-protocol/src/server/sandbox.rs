@@ -28,7 +28,7 @@ pub(super) async fn dispatch(
             let request: m::CreateParams = parse(params)?;
             let events = state.event_context(request.events);
             let spec = SandboxSpec::try_from(request.spec)?;
-            let handle = state.provider.create(&spec, events).await?;
+            let handle = state.provider()?.create(&spec, events).await?;
             state.remember(&handle);
             let status = handle.describe().await?;
             to_value(&handle_info(&handle, status))
@@ -37,14 +37,14 @@ pub(super) async fn dispatch(
             let request: m::AttachParams = parse(params)?;
             let id = sandbox_id(&request.sandbox_id)?;
             let events = state.event_context(request.events);
-            let handle = state.provider.attach(&id, events).await?;
+            let handle = state.provider()?.attach(&id, events).await?;
             state.remember(&handle);
             let status = handle.describe().await?;
             to_value(&handle_info(&handle, status))
         }
         m::SANDBOX_LIST => {
             let request: m::ListParams = parse(params)?;
-            let sandboxes = state.provider.list(&request.filter).await?;
+            let sandboxes = state.provider()?.list(&request.filter).await?;
             to_value(&m::ListResult { sandboxes })
         }
         m::SANDBOX_DESCRIBE => {
@@ -83,7 +83,7 @@ pub(super) async fn dispatch(
             } else {
                 let id = sandbox_id(&request.sandbox_id)?;
                 let events = state.event_context(request.events);
-                state.provider.delete(&id, events).await?;
+                state.provider()?.delete(&id, events).await?;
             }
             state.handles.remove(&request.sandbox_id);
             to_value(&m::Empty)
@@ -112,7 +112,7 @@ pub(super) async fn dispatch(
             let request: m::AttachParams = parse(params)?;
             let id = sandbox_id(&request.sandbox_id)?;
             let events = state.event_context(request.events);
-            let handle = state.provider.undelete(&id, events).await?;
+            let handle = state.provider()?.undelete(&id, events).await?;
             state.remember(&handle);
             let status = handle.describe().await?;
             to_value(&handle_info(&handle, status))
