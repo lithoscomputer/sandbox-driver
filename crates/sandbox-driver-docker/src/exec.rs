@@ -77,6 +77,12 @@ impl DockerExec {
         }
     }
 
+    /// The sandbox's configured environment, which every command starts
+    /// from.
+    pub(crate) fn base_env(&self) -> &BTreeMap<String, String> {
+        &self.base_env
+    }
+
     /// The command's environment as `env` arguments: the sandbox's base
     /// env with `BASH_ENV` blanked (an image can carry one, and it would
     /// run inside any `bash -c` a caller sends), then the spec env as
@@ -255,7 +261,7 @@ async fn request_stop(container: &ContainerRef, stop_file: &str, level: StopLeve
         ..Default::default()
     };
     let AttachedExec { id, mut output, .. } = container
-        .start_attached(options, "stop-request exec")
+        .start_control(options, "stop-request exec")
         .await?;
     // Drain to completion so the exit code below is final.
     while let Some(chunk) = output.next().await {

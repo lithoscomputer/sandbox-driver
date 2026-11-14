@@ -8,9 +8,20 @@ use sandbox_driver_daytona_config::DockerExecutionTarget;
 pub(crate) const MANAGED_LABEL: &str = "sh.sandbox-driver.managed";
 pub(crate) const WORKING_DIRECTORY_LABEL: &str = "sh.sandbox-driver.working-directory";
 pub(crate) const TARGET_LABEL: &str = "sh.sandbox-driver.docker-target";
+/// Marks a sandbox created through the shared contract and names the
+/// provider-internal recipe it runs: `direct` or `nested`.
+pub(crate) const RECIPE_LABEL: &str = "sh.sandbox-driver.recipe";
+/// The workload image a shared-contract sandbox runs, when it has one.
+pub(crate) const IMAGE_LABEL: &str = "sh.sandbox-driver.image";
+/// Every internal key starts here; the shared contract refuses caller labels
+/// under it rather than dropping them.
+pub(crate) const INTERNAL_PREFIX: &str = "sh.sandbox-driver.";
 
 pub(crate) fn is_internal_label(key: &str) -> bool {
-    matches!(key, MANAGED_LABEL | WORKING_DIRECTORY_LABEL | TARGET_LABEL)
+    matches!(
+        key,
+        MANAGED_LABEL | WORKING_DIRECTORY_LABEL | TARGET_LABEL | RECIPE_LABEL | IMAGE_LABEL
+    )
 }
 
 /// The labels Daytona stores for a sandbox: the caller's, minus anything

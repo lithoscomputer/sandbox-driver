@@ -66,9 +66,10 @@ An **environment** is a named workload template on a **provider entry**.
 The entry defines the connection, credentials, and plugin trust settings.
 The environment defines what to run: its source, resources, network, and services.
 
-In the target setup, Docker and [Daytona](https://www.daytona.io/), a cloud sandbox
-service, run as in-process providers. Host and third-party providers run as
-separately installed plugins. Applications use the same `Sandboxes` API for each.
+Host, Docker, and [Daytona](https://www.daytona.io/), a cloud sandbox service,
+are built-in providers that run in the application's process. Third-party
+providers run as separately installed plugins. Applications use the same
+`Sandboxes` API for each.
 
 **Out of scope:** Scheduling, queues, leases, and decisions about when to retry
 or delete work belong to the application. Isolation depends on the provider;
@@ -79,7 +80,7 @@ Host runs processes in a directory and provides no isolation boundary.
 | `sandbox-driver` | Build against the shared API; the preview lives in `contract` |
 | `sandbox-driver-docker` | Embed Docker support or build its provider executable |
 | `sandbox-driver-daytona` | Embed Daytona support or build its provider executable |
-| `sandbox-driver-host` | Build the Host executable; its current embedding API remains during migration |
+| `sandbox-driver-host` | Embed Host support or build its provider executable |
 | `sandbox-driver-docker-config` | Construct typed Docker options for the current provider API |
 | `sandbox-driver-daytona-config` | Construct typed Daytona options for the current provider API |
 | `sandbox-driver-protocol` | Serve or connect to providers over the current version 2 protocol |
@@ -173,7 +174,7 @@ async fn main() -> Result<(), Error> {
 The fake executes only scripted commands and advertises no optional capabilities.
 
 With real providers, reattachment depends on their declared durability and access
-scope. The target Host plugin promises access only through its owning process.
+scope. Host promises access only through the instance that created the sandbox.
 A lost connection or dropped execution future does not confirm that work stopped.
 The library does not replay mutations whose outcome is unknown.
 
@@ -208,7 +209,7 @@ will use the environment catalog; those commands are not available yet.
 
 Current provider integration tests are separate from the new-contract gate.
 Host and Docker have in-process and plugin checks; Docker needs a daemon.
-Daytona's live checks require `DAYTONA_API_KEY`.
+Daytona's live checks are opt-in: set `DAYTONA_API_KEY` and run `mise run test:live`.
 See [development and verification](https://github.com/lithoscomputer/sandbox-driver/blob/main/DEVELOPING.md).
 
 ## Part of Lithos

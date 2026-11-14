@@ -1097,3 +1097,24 @@ version-1 `fs/read` or `fs/write` shape is a `-32600` here.
 Native search/service passthrough, local `shell_command`, and
 `host/credentials` (per-call secret fetches from the host) remain
 deferred. They are masked or absent per §5.
+
+## 15. Shared-contract metadata probe
+
+The credential-free discovery step in [the shared contract](shared-contract.md)
+does not change the v2 handshake or make a v2 provider implement the new
+contract. Existing `launch_plugin`, `PluginProvider`, and `serve_stdio` remain
+the v2 entry points.
+
+A plugin that supports discovery is run with exactly one argument,
+`--describe-schema`. The process gets null stdin and no runtime arguments,
+connection configuration, or configured, inherited, or resolved secret
+environment. On Unix its working directory is `/` and its PATH is
+`/usr/bin:/bin`; no HOME or user PATH is forwarded. On Windows only SystemRoot
+is forwarded. The executable **must** write one `ProviderSchemas` JSON object
+to stdout and exit successfully, without constructing its provider or loading
+runtime settings; diagnostics belong on stderr. The host bounds the probe's
+duration and output and, on Unix, kills its process group when the probe ends,
+so it **must not** leave work behind in descendants.
+
+The host-side budgets, cache and errors are described under
+[plugin metadata discovery](shared-contract.md#plugin-metadata-discovery).

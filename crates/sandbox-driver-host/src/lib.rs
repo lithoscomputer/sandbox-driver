@@ -56,6 +56,7 @@ mod exec;
 mod fence;
 mod fs;
 mod registry;
+mod runtime;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -80,8 +81,14 @@ use crate::exec::effective_env;
 use crate::fence::ProcessGroups;
 pub use crate::fs::HostFs;
 use crate::registry::Record;
+pub use crate::runtime::{HostFactory, schemas};
 
 type HandleRegistry = Mutex<HashMap<SandboxId, Arc<HostSandbox>>>;
+
+/// The registry root of the temporary provider named by `generation`.
+pub(crate) fn temporary_root(generation: &str) -> PathBuf {
+    env::temp_dir().join("sandbox-driver-host").join(generation)
+}
 
 /// The provider kind every Host error and event reports.
 pub(crate) fn host_kind() -> ProviderKind {
@@ -113,12 +120,12 @@ impl HostProvider {
     }
 
     pub fn new() -> Self {
-        Self::at(
-            env::temp_dir()
-                .join("sandbox-driver-host")
-                .join(registry::fresh_id()),
-            true,
-        )
+        Self::temporary(&registry::fresh_id())
+    }
+
+    /// A temporary provider whose registry is named by `generation`.
+    pub(crate) fn temporary(generation: &str) -> Self {
+        Self::at(temporary_root(generation), true)
     }
 
     /// Opens a caller-owned registry. Only one provider process may use this

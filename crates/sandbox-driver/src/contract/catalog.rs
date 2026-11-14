@@ -39,22 +39,25 @@ impl Registry {
         self.plugins = Some(factory);
         self
     }
-    /// Host always uses the ordinary plugin loader, never a built-in fallback.
     pub fn builtin(
         mut self,
         kind: ProviderKind,
         factory: Arc<dyn ProviderFactory>,
     ) -> Result<Self, Error> {
-        if kind.as_str() == "host" || self.builtins.contains_key(&kind) {
+        if self.builtins.contains_key(&kind) {
             return Err(Error::Unsupported {
-                capability: "duplicate registration or built-in Host".into(),
+                capability: "duplicate registration".into(),
             });
         }
         self.builtins.insert(kind, factory);
         Ok(self)
     }
+    /// A reserved kind is only ever its built-in, even when the application
+    /// did not register it.
     fn factory(&self, entry: &ProviderEntry) -> Option<Arc<dyn ProviderFactory>> {
-        if entry.path.is_some() || entry.trust.is_some() {
+        if is_reserved(&entry.plugin) {
+            self.builtins.get(&entry.plugin).cloned()
+        } else if entry.path.is_some() || entry.trust.is_some() {
             self.plugins.clone()
         } else {
             self.builtins
@@ -63,6 +66,13 @@ impl Registry {
                 .cloned()
         }
     }
+}
+
+/// The kinds of the built-in providers. A plugin must choose another kind.
+const RESERVED_KINDS: [&str; 3] = ["host", "docker", "daytona"];
+
+fn is_reserved(kind: &ProviderKind) -> bool {
+    RESERVED_KINDS.contains(&kind.as_str())
 }
 
 /// Bounded inventory and explicit process-environment snapshot. Callers may
@@ -440,6 +450,7 @@ impl ProviderHandle {
         })?;
         let metadata = factory
             .discover(&PluginLocation {
+                entry: self.entry.name.clone(),
                 kind:  entry.plugin.clone(),
                 path:  entry.path.clone(),
                 trust: entry.trust.clone(),
@@ -756,6 +767,14 @@ fn unavailable(message: &str, outcome: MutationOutcome) -> Error {
     }
 }
 fn validate_entry(name: &ProviderName, entry: &ProviderEntry) -> Result<(), Error> {
+    if is_reserved(&entry.plugin) && (entry.path.is_some() || entry.trust.is_some()) {
+        return Err(Error::invalid_config(
+            name,
+            "plugin",
+            "host, docker and daytona are built-in providers, not plugins; a plugin must use \
+             another kind",
+        ));
+    }
     validate_env("env", &entry.env)
         .map_err(|_| Error::invalid_config(name, "env", "invalid launch environment"))?;
     let secrets: HashSet<_> = entry.secrets.iter().collect();
