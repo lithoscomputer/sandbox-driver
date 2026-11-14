@@ -1,15 +1,17 @@
 # sandbox-driver
 
-> **Status: target, not yet the README.** This document describes the API
-> that `sandbox_driver::contract` is building toward. It is the
-> specification every lane of the sandbox refactor implements against, and
-> it changes in the same PR as the `contract` module. The API an
-> application can call today is described in [docs/design.md](design.md)
-> and the current README; the implementation handoff for providers is
-> [docs/shared-contract.md](shared-contract.md). This file replaces the
-> README once the shared `Sandboxes` API, the plugin loader, and the Docker,
-> Daytona and Host providers pass conformance together (the "providers
-> ready" gate); its "Status" section then lists what is still not true.
+> **Status: target API, provider integration in progress.** This document
+> specifies the API that `sandbox_driver::contract` is building toward and
+> changes in the same PR as that module. The
+> [README](https://github.com/lithoscomputer/sandbox-driver/blob/main/README.md)
+> introduces it with runnable in-memory examples. Current real-provider usage
+> remains in [the existing API design](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/design.md)
+> and [CLI guide](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/cli.md).
+> The [shared contract](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/shared-contract.md)
+> is the implementation handoff. Real-provider adoption still requires the
+> shared `Sandboxes` API, plugin loader, and Docker, Daytona, and Host providers
+> to pass conformance together. This document remains the detailed specification;
+> the README remains the short introduction.
 
 One interface to any sandbox. Clients name an environment; providers own the sandboxes; the library owns everything in between.
 
