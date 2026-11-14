@@ -36,6 +36,7 @@ mod limits;
 pub mod metadata;
 mod server;
 mod supervisor;
+pub mod v3;
 mod wire;
 
 pub mod methods;
@@ -44,6 +45,7 @@ pub use client::PluginProvider;
 pub use diagnostics::{ClientDiagnostics, ServerDiagnostics, TransportDiagnostics};
 pub use discovery::{PluginConfig, PluginLaunch, file_sha256, launch_plugin};
 pub use limits::TransportLimits;
-pub use server::{serve, serve_stdio, serve_with_limits};
+pub use server::{serve, serve_plugin_with_limits, serve_stdio, serve_with_limits};
 pub use supervisor::{PluginGeneration, PluginSupervisor};
+pub use v3::{Plugin, PluginLoader, run_plugin};
 pub use wire::{Message, WireError, WireErrorData};
