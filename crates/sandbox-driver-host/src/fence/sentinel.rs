@@ -24,7 +24,6 @@ use tokio::task::spawn_blocking;
 use tokio::{fs, time};
 
 use super::observation::{group_is_live, live_groups};
-use crate::exec::BASH_ENV_VAR;
 use crate::host_kind;
 
 const POLL: Duration = Duration::from_millis(25);
@@ -51,11 +50,15 @@ fn sentinel_shell() -> &'static str {
 }
 
 const SENTINEL_SCRIPT: &str = r#"
-sf="$1"; gf="$2"; fence="$3"; owner="$4"; startup_set="$5"; startup="$6"; shift 6
+sf="$1"; gf="$2"; fence="$3"; owner="$4"; vars="$5"; shift 5
 printf '%s\n' "$$" > "$gf.tmp" && /bin/mv "$gf.tmp" "$gf" || exit 125
 if [ -e "$fence" ]; then exit 0; fi
+while [ "$vars" -gt 0 ]; do
+  vars=$((vars - 1))
+  eval "set -- \"\$SANDBOX_DRIVER_ENV_$vars\" \"\$@\"; unset SANDBOX_DRIVER_ENV_$vars"
+done
 exec 3<&0
-if [ "$startup_set" = 1 ]; then BASH_ENV="$startup" "$@" <&3 & else "$@" <&3 & fi
+/usr/bin/env -i -- "$@" <&3 &
 w=$!
 trap '' TERM
 exec >/dev/null 2>&1
@@ -239,14 +242,22 @@ impl GroupState {
     }
 }
 
+/// Names the variables that carry the command's environment through the
+/// sentinel shell, one `NAME=value` entry each. The sentinel script reads
+/// them by this name.
+const ENV_CARRIER: &str = "SANDBOX_DRIVER_ENV_";
+
 /// The sentinel invocation that runs `program` with `args` in `env` and
 /// reports through `paths`, after `configure` has set its directory and
 /// pipes.
 ///
 /// `env` is the command's whole environment, but the sentinel is a shell
-/// that starts first, and Bash sources the file `BASH_ENV` names at startup.
-/// So the sentinel starts without the variable and sets a configured value
-/// on the command alone.
+/// that starts first, and a shell acts on what it finds there: Bash sources
+/// the file `BASH_ENV` names, applies `SHELLOPTS`, and defines exported
+/// functions over its own builtins. So the sentinel starts with nothing but
+/// numbered carrier variables, and `env -i` rebuilds the command's
+/// environment from them. The entries pass through the argument list of that
+/// `env` process until it replaces itself with the program.
 fn sentinel_command(
     paths: &RecordPaths,
     program: &str,
@@ -257,8 +268,9 @@ fn sentinel_command(
     let mut command = Command::new(sentinel_shell());
     configure(&mut command);
     command.env_clear();
-    command.envs(env.iter().filter(|(name, _)| *name != BASH_ENV_VAR));
-    let startup = env.get(BASH_ENV_VAR);
+    for (index, (name, value)) in env.iter().enumerate() {
+        command.env(format!("{ENV_CARRIER}{index}"), format!("{name}={value}"));
+    }
     command
         .arg("-c")
         .arg(SENTINEL_SCRIPT)
@@ -267,8 +279,7 @@ fn sentinel_command(
         .arg(&paths.group)
         .arg(&paths.marker)
         .arg(process::id().to_string())
-        .arg(if startup.is_some() { "1" } else { "0" })
-        .arg(startup.map_or("", String::as_str))
+        .arg(env.len().to_string())
         .arg(program)
         .args(args);
     command
@@ -308,6 +319,14 @@ impl ProcessGroups {
         env: &BTreeMap<String, String>,
         configure: impl FnOnce(&mut Command),
     ) -> Result<HostChild> {
+        // `env` reads a leading `NAME=value` word as one more variable, so it
+        // would run the first argument in the program's place.
+        if program.contains('=') {
+            return Err(Error::invalid_spec(
+                "program",
+                "a program name cannot contain `=`",
+            ));
+        }
         let mut state = self.state.lock().await;
         if !state.accepting_work {
             return Err(

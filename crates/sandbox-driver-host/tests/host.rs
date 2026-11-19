@@ -420,6 +420,53 @@ async fn exec_gives_a_spec_bash_env_to_the_command_alone() {
 }
 
 #[tokio::test]
+async fn exec_env_reaches_the_command_without_changing_the_sentinel_shell() {
+    let provider = HostProvider::new();
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+
+    // Bash reads both of these when it starts: the first turns tracing on,
+    // and the second defines a function over a builtin the sentinel uses to
+    // record its process group.
+    let cases = [
+        ("SHELLOPTS", "xtrace"),
+        ("BASH_FUNC_printf%%", "() { echo hijacked; }"),
+    ];
+    for (name, value) in cases {
+        let spec = ExecSpec::new("printenv").args([name]).env_var(name, value);
+        let result = sandbox
+            .exec()
+            .run(&spec.timeout(Duration::from_secs(10)))
+            .await
+            .expect("exec");
+        assert!(result.success(), "stderr: {}", result.stderr_lossy());
+        assert_eq!(result.stdout_lossy(), format!("{value}\n"), "{name}");
+        assert_eq!(result.stderr_lossy(), "", "{name}");
+    }
+
+    // Delete signals each recorded process group, so it fails on a record
+    // the sentinel could not write.
+    sandbox.delete().await.expect("delete");
+}
+
+#[tokio::test]
+async fn exec_refuses_a_program_named_like_an_assignment() {
+    let provider = HostProvider::new();
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+
+    let error = sandbox
+        .exec()
+        .run(&ExecSpec::new("NAME=value").timeout(Duration::from_secs(10)))
+        .await
+        .expect_err("the program would be read as an assignment");
+    assert!(
+        matches!(&error, Error::InvalidSpec { field, .. } if field == "program"),
+        "{error:?}"
+    );
+
+    sandbox.delete().await.expect("delete");
+}
+
+#[tokio::test]
 async fn exec_resolves_the_program_through_the_spec_path() {
     let provider = HostProvider::new();
     let sandbox = provider.create(&host_spec(), None).await.expect("create");
