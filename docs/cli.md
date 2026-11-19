@@ -3,7 +3,7 @@
 The `sandbox-driver-cli` crate builds the `lithos-sandbox` executable, the
 command-line client of the library. It uses the same catalog an embedding
 application does: provider entries and environments, as
-[next-api.md](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/next-api.md#cli)
+the [design](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/design.md#configuration)
 describes. Host, Docker and Daytona are linked into the CLI and run in its
 process. Every other provider kind is a plugin, launched over protocol
 version 3 by the ordinary plugin loader.

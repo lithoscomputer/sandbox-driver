@@ -1,621 +1,559 @@
-# sandbox-driver: Rust Interface Design
+# sandbox-driver design
 
-The next API is specified in [docs/next-api.md](next-api.md), with its
-implementation handoff in the [shared contract](shared-contract.md). The
-design below describes the current compatible API. Host, Docker and Daytona are
-built-in providers under the next API as well; only third-party providers are
-plugins.
+> **Status:** This is the specification of the `Sandboxes` API that the
+> `sandbox_driver` crate root exports, and of what every provider behind it
+> must guarantee. It changes in the same PR as the code. Host, Docker and
+> Daytona implement it as built-ins, and protocol version 3 loads third-party
+> plugins. The
+> [README](https://github.com/lithoscomputer/sandbox-driver/blob/main/README.md)
+> introduces the API with runnable in-memory examples.
+>
+> Still in the tree but being removed: the old provider API in the hidden
+> `sandbox_driver::legacy` module, protocol version 2, the Host, Docker and
+> Daytona provider executables, and the `sandbox-driver-docker-config` and
+> `sandbox-driver-daytona-config` crates. If you need them, pin tag
+> [`v2`](https://github.com/lithoscomputer/sandbox-driver/tree/v2).
 
-Sandbox providers for managing sandboxes, snapshots, and volumes. Initial providers: **Daytona**, **Docker**, **Host** (local). Petri and fabro are the primary consumers. The Rust traits are the contract: provider implementations, the protocol client, and tests all speak them. The original Fabro `Sandbox` trait informed the operation set and the migration map below.
-
-Two supported ways to reach a provider, one trait family:
-
-- **In-process embedding.** The bundled provider crates (`sandbox-driver-host`, `sandbox-driver-docker`, `sandbox-driver-daytona`) are libraries with a supported public API. An application links them and constructs `Arc<dyn SandboxProvider>` directly. There is no IPC and no wire mask; the Host filesystem facet is direct Tokio filesystem I/O. Fabro embeds the bundled providers this way.
-- **JSON-RPC plugins.** Each provider package also builds an executable that serves the same provider over `sandbox-driver-protocol`. Third-party providers ship only as plugins, and an operator may run a bundled provider out of process by configuration alone. Petri uses plugins for every provider.
-
-Application code is written once against the traits. Only construction differs between the two paths, plus the wire mask in `docs/protocol.md` §5 for capabilities that cannot cross a process boundary. The conformance suite runs every bundled provider both in-process and over the wire so the two paths cannot drift. Daytona reuses the Docker library internally for nested Docker.
-
-## Inputs
-
-- **fabro** — the de-facto trait: filesystem, exec (buffered / streaming / bidirectional stdio), grep/glob/walk, lifecycle, preview URLs, SSH, auto-stop, events, the bash probe, plus a git/credential surface we deliberately leave above this crate. Fabro's exec took Bash source; this library takes an argument vector and offers Bash as a helper (see Exec below).
-- **Daytona** (docs + `daytona-sdk-rust`) — the richest provider: pause/resume distinct from stop/start, archive, fork with ancestry, live-sandbox snapshots including memory, TTL and four auto-intervals, snapshots and volumes as first-class resources, per-region toolbox daemon (fs/git/process/PTY/LSP/computer-use), preview links with signed URLs, SSH tokens, network block/allow lists. The normalized interface includes resize, but the current Daytona API and SDK do not expose a working resize operation.
-- **boxd** (deferred) — considered only where its behavior overlaps the normalized interface. Boxd-only capabilities are not included yet.
-
-## Security and trust boundary
-
-"Sandbox" is a resource name here, **not a security claim** — isolation is a per-provider property, declared in `Capabilities` (`isolation: none | container | vm`) and never assumed:
-
-- **Host is not an isolation boundary.** Commands run as the calling user; file operations can reach anything that user can, including outside the working directory. It exists for parity and local development and declares `isolation: none`.
-- **Docker isolates filesystem and processes but shares the host kernel**, and the Docker socket is host-root-equivalent — the Docker provider is host-trusted by definition.
-- **Daytona and boxd are VM-backed**; their isolation is the vendor's guarantee, reported as declared.
-
-Trust flows as in the fabro plugin plan: **a provider — in-process or JSON-RPC plugin — is inside the trust domain of every sandbox it drives.** It has full exec, so it can read anything the workload can; per-call credential injection is not a defense against that. What the library does enforce is the *host-side* boundary: a provider receives only the secrets explicitly passed in a spec or fetched per-call through the host callback interface — never ambient environment or vault contents — so one provider's compromise does not expose another's credentials. Transport-level trust for plugins (checksum pinning, scrubbed environment, deny-by-default discovery) is host policy, specified in the protocol document, not this trait. The in-process Host provider applies the same posture to its own ambient environment: it clears the process env for every sandboxed command and rebuilds it through a fail-closed secret filter (safelist plus secret-name suffixes), so worker credentials never reach sandboxed code — explicit spec env is the one trusted channel for secrets.
-
-The default network policy is the provider's default (Docker: bridge; Daytona: allow-all); a closed sandbox requires an explicit `NetworkPolicy::Block` in the spec. The capability schema records which network modes a provider supports so callers can preflight the strictness they need.
-
-## Resource model
-
-Three managed resource types, one provider object:
-
-```
-SandboxProvider (per backend: daytona, docker, host, …)
- ├── sandboxes: create / attach / list  ──►  Sandbox (handle)
- ├── snapshots: Option<&dyn SnapshotProvider>
- └── volumes:   Option<&dyn VolumeProvider>
-```
-
-A `Sandbox` is a **stateless handle**: an ID plus a provider connection. It holds no cached state; `describe()` returns the current observed status. This is what makes the handle serializable across the JSON-RPC boundary and lets a restarted host or plugin re-attach by ID (cloud sandboxes are identified by remote IDs the caller persists).
+One interface to any sandbox. Clients name an environment; providers own the sandboxes; the library owns everything in between.
 
 ```rust
-pub struct SandboxId(String);     // validated newtypes; also SnapshotId, VolumeId
+// Shared by requests within the Fabro server process.
+// Worker processes construct their own instance from resolved configuration.
+let sandboxes = Sandboxes::try_new(
+    settings.sandbox.providers.clone(), environments, &registry, secrets,
+    CatalogOptions::default(),
+)?;
+
+// A run starts on the "cloud" environment.
+let sandbox = sandboxes.builder("cloud").await?             // seeded from the environment's template
+    .label("fabro.run", &run.id)
+    .create()
+    .await?;
+
+sandbox.exec(ExecSpec::argv(["git", "clone", &repo, "."]), ExecControls::default()).await?;
+run.sandbox_ref = Some(sandbox.reference());         // {provider, namespace, id}, stored with the run
+
+// Later, from the sandbox page in another request.
+let sandbox = sandboxes.attach(&run.sandbox_ref).await?;
+let port = NonZeroU16::new(3000).unwrap();
+let exposure = sandbox.ports().expose(port, Expose { signed: true, ttl_ms: Some(3_600_000) }).await?;
+
+// Everything this run created, across every provider.
+let leftovers = sandboxes.find(LabelFilter::eq("fabro.run", &run.id)).await?;
 ```
 
-### State model
+`"cloud"` is an **environment**: a named template on a **provider entry**. The entry says how to reach a backend; the environment says what to build on it. Many environments share one entry.
 
-Adopted from Daytona's split, which is the cleanest of the three: a small **typed state enum** for logic, plus the provider's raw state string for display and debugging.
+```toml
+[providers.daytona]                      # a connection, named by the operator
+plugin  = "daytona"                      # built in
+config  = { api_url = "https://app.daytona.io/api", organization = "org_…" }
+secrets = ["DAYTONA_API_KEY"]
+
+[environments.cloud]
+provider = "daytona"
+
+[environments.cloud.spec]
+source    = { dockerfile = "FROM buildpack-deps:noble\n" }   # or { image = "buildpack-deps:noble" }
+resources = { cpu = 2, memory = "4GB" }
+network   = { mode = "allow_all" }
+timers    = { auto_stop = "60m" }
+```
+
+Fabro keeps provider entries in its server settings and environments in its database, edited in the UI. A workflow selects one with `[run.environment] id = "cloud"`, and says what happens to the sandbox when the run ends with `[run.lifecycle]`, which is Fabro's policy and not part of the environment. The values above are Fabro's seeded default for Daytona; a workflow that needs more, like Fabro's own code review, gives a longer Dockerfile that installs its tools on the same base. The Daytona provider builds the source into a Daytona snapshot named by its inputs and reuses it on later runs. The library itself ships no provider entries or environments.
+
+Everything in the template rides along on `create()`. A caller that needs something different for one sandbox overrides it on the builder, and the provider validates the override against what it supports:
 
 ```rust
-#[non_exhaustive]
-pub enum SandboxState {
-    Creating, Starting, Running, Stopping, Stopped,
-    Pausing, Paused, Resuming,
-    Archiving, Archived, Restoring,
-    Resizing, Forking, Snapshotting,
-    Deleting, Deleted,
-    Error, Unknown,
+let sandbox = sandboxes.builder("cloud").await?.memory("8GB").create().await?;
+```
+
+Clients pass the environment name and never the provider's. Whether `cloud` points at the built-in Daytona provider, the built-in Docker one, or a plugin someone wrote last week, the code above is the same.
+
+## What it is
+
+- A **client API**: one `Sandboxes` value built once, a sandbox builder, and the `Sandbox` trait. That is all an embedding program sees.
+- A **provider interface**: the `ProviderFactory` and `Provider` traits a built-in implements in Rust, and the same calls carried over protocol version 3 for a plugin in another process. A provider owns all state for its sandboxes; the library stores only refs.
+- A **catalog** in two levels: provider entries (which provider, its connection, its trust settings) and environments (a named spec template on an entry). The client decides where each level is stored and whether it changes at runtime; the library defines what an entry means.
+- Everything **between them**: discovery, trust, supervision, restart, identity, admission checks, a fake for tests, and a conformance suite for provider authors.
+
+The library provisions and operates sandboxes. Scheduling, queueing, lease management and run-end policy belong to the caller.
+
+## Concepts
+
+| Term | Meaning |
+| --- | --- |
+| **Provider** | A backend that makes sandboxes. Built in (`host`, `docker`, `daytona`) or a plugin. |
+| **Provider entry** | A named, configured connection to a provider: which provider, its config, the secrets it needs, and for a plugin its path and trust. Operator-owned. One entry serves many environments; two entries can use the same provider (a production and a staging Daytona org). |
+| **Environment** | A named spec template on a provider entry: source, resources, network, timers, labels, env, working directory. User-owned. What clients and workflows name. |
+| **Built-in** | `host`, `docker` and `daytona`. Library code the application registers with `Registry::builtin`; it runs in the application's process. |
+| **Plugin** | Any other provider: an executable speaking protocol version 3, run as a supervised child process. Clients cannot tell it from a built-in. |
+| **Namespace** | The stable, non-secret id a provider reports for where its sandboxes live: a Docker daemon, a Daytona organization, a machine. |
+| **SandboxRef** | `{provider, namespace, id}`. The only identity. Serializable. `attach` resolves it by namespace. |
+| **Durability** | What a provider promises about a sandbox outliving things: `process`, `machine`, or `remote`. |
+| **Descriptor** | What a provider reports about itself: capabilities as data. Clients branch on it, never on a kind name. |
+
+Kind names (`docker`, `daytona`, `lima`) appear in provider entries and nowhere else.
+
+## Client API
+
+`Sandboxes` is the entry point. It reads like a collection: attach one, build one, find many.
+
+```rust
+pub struct Sandboxes { /* private */ }
+
+impl Sandboxes {
+    /// Checks local structure only. Discovery, secrets and activation are lazy per entry.
+    pub fn try_new(
+        providers: impl IntoIterator<Item = (ProviderName, ProviderEntry)>,
+        environments: Arc<dyn EnvironmentSource>,
+        registry: &Registry,
+        secrets: Arc<dyn SecretResolver>,
+        options: CatalogOptions,
+    ) -> Result<Self, Error>;
+    /// Both levels from one file (the CLI, a bare Petri run).
+    pub async fn from_config_file(
+        path: &Path, registry: &Registry, secrets: Arc<dyn SecretResolver>,
+        options: CatalogOptions,
+    ) -> Result<Self, Error>;
+
+    // Sandboxes
+    pub async fn builder(&self, environment: &str) -> Result<SandboxBuilder, Error>;   // NoEnvironment if unknown
+    pub async fn attach(&self, r: &SandboxRef) -> Result<Box<dyn Sandbox>, Error>;
+    pub async fn find(&self, filter: LabelFilter) -> Result<Found, Error>;       // across every provider
+    pub async fn destroy(&self, r: &SandboxRef) -> Result<(), Error>;
+
+    // The catalog
+    pub fn providers(&self) -> Vec<ProviderName>;
+    pub fn provider(&self, name: &str) -> Result<ProviderHandle, Error>;
+    pub async fn environments(&self) -> Result<Vec<EnvironmentName>, Error>;
+    pub async fn environment(&self, name: &str) -> Result<Environment, Error>;
+    pub async fn diagnostics(&self) -> Result<Vec<CatalogDiagnostic>, Error>;
+
+    pub async fn shutdown(self) -> Result<(), Error>;
 }
 
-pub struct SandboxStatus {
-    pub id: SandboxId,
-    pub name: Option<String>,             // provider display name, distinct from id
-    pub state: SandboxState,
-    pub provider_state: String,          // raw, e.g. Daytona's "pulling_snapshot"
-    pub error_reason: Option<String>,
-    pub resources: Option<Resources>,
-    pub sandbox_kind: Option<SandboxKind>, // observed container or virtual_machine provisioning form
-    pub region: Option<String>,
-    pub labels: BTreeMap<String, String>,
-    pub web_url: Option<String>,         // provider console page, when one exists
-    pub created_at: Option<SystemTime>,
-    // …timestamps, network summary
+impl SandboxBuilder {
+    pub fn image(self, r: &str) -> Self;             // and dockerfile, env, working_directory, user,
+    pub fn label(self, k: &str, v: &str) -> Self;    // network, timers, cpu, disk, provider_config
+    pub fn memory(self, v: &str) -> Self;
+    pub fn spec(self, spec: SandboxSpec) -> Self;    // for callers that already hold a spec as data
+    pub async fn create(self) -> Result<Box<dyn Sandbox>, Error>;
 }
-```
 
-The library ships one generic wait helper (poll `describe`, fail on `Error`, succeed on target state, configurable interval/deadline) instead of N hand-written loops — both the Daytona SDK and fabro grew several of those independently.
-
-## Lifecycle actions
-
-The full vocabulary. **Core** actions are required of every provider. Everything else is optional and capability-gated; calling an unsupported action returns `Error::Unsupported` naming the capability, so callers can preflight instead of failing mid-run.
-
-| Action | Meaning | Core? | Host | Docker | Daytona | boxd |
-| --- | --- | --- | --- | --- | --- | --- |
-| `create` | Provision from a spec | core | ✔ (dir: designated or managed) | ✔ | ✔ | ✔ |
-| `describe` | Observed status | core | ✔ | ✔ | ✔ | ✔ |
-| `start` / `stop` | Cold boot / shutdown; disk persists | core¹ | no-op | ✔ | ✔ | ✔ |
-| `delete` | Destroy; idempotent (unknown ID succeeds) | core | ✔ (cleanup) | ✔ | ✔ | ✔ |
-| `pause` / `resume` | Freeze with memory kept; distinct from stop | opt | — | ✔ (`docker pause`) | ✔ (VM classes; per-sandbox caps narrow it, resume = Daytona's start) | ✔ (hibernate) |
-| `archive` | Stopped → cold storage; `start` restores | opt | — | — | ✔ (container class; per-sandbox caps mask it on VM/android/windows) | — |
-| `fork` | Clone a Running sandbox → new Running sandbox; preserve filesystem, memory, running processes, and PIDs | opt | — | — | ✔ (VM classes) | ✔ |
-| `resize` | Change cpu/memory/disk | opt | — | \~ (`docker update`, cpu/mem only) | —² | ? |
-| `snapshot` | Capture a sandbox in `Filesystem` or `LiveProcessState` mode → SnapshotProvider | opt | — | \~ (`docker commit`) | ✔ (cold/hot) | ✔ |
-| `recover` | Provider-assisted recovery from Error state | opt | — | — | — | — |
-| `undelete` | Restore a deleted sandbox within the recovery window; provider-level (a deleted sandbox cannot be attached), returns a fresh handle | opt | — | — | ✔ (24h, Daytona's "recover") | — |
-| `refresh_activity` | Keepalive; reset idle timers | opt | no-op | no-op | ✔ | ? |
-| `set_timers` | auto\_stop, auto\_pause, auto\_archive, auto\_delete, ttl | opt | — | — | ✔ | ? |
-| `set_labels` | Replace label map | opt | — | ✔ | ✔ | ✔ (tags) |
-| `update_network` | Change network policy on a live sandbox | opt | — | — | ✔ | ✔ |
-
-¹ On Linux and macOS, Host `stop` ends sandbox process groups and `start` permits a new generation. They do not stop or boot the machine.
-
-² The current Daytona API returns a route-level 404 for resize, and the
-current official SDK leaves resize disabled. Daytona reports
-`lifecycle.resize: false`.
-
-Deliberate merges:
-
-- **`activate` (fabro) is not a provider action.** It is a provided convenience: "ensure running" = describe → start if stopped/archived, or resume if paused → wait → run the health probe. Lives in the library, implemented once over the core.
-- **`restore` from archive is implicit in `start`** (Daytona's model); no separate verb.
-- **Ephemeral is a first-class spec flag**, not `auto_delete_interval == 0` — Daytona's encoding leaks into every wait loop (`stop` tolerating NotFound); we translate the flag per provider instead.
-- **Fork has one meaning.** The source and result are Running. The clone preserves filesystem state, memory, running processes, and process IDs. There is no disk-only fork option.
-- **Daytona builds images and Dockerfiles into cached snapshots.** A Daytona create from an image or Dockerfile first ensures a snapshot named by the source, resources, and kind under the credential (`sandbox-driver-<hex>`), reporting the build through the create's events, then creates from that snapshot; the same inputs reuse it. The resources on such a create size the snapshot.
-- **Sandbox snapshots have explicit modes.** `Filesystem` captures persistent files without live process state. `LiveProcessState` also captures memory, running processes, and process IDs. Daytona maps these modes to its cold (`includeMemory: false`, source Stopped) and hot (`includeMemory: true`, source Running) snapshots.
-- **Checkpoint and in-place restore are not public operations.** They are Boxd-only today. They can be added when Boxd work starts and a consumer needs them.
-- **Consumer ownership is a wrapper, not a provider concern.** A provider's backend is shared with every other application, so a consumer that persists ids needs proof that a sandbox is still its own before stopping or deleting it. `OwnedProvider` wraps any provider — in-process or plugin — with an `Ownership` label set: it stamps the labels on every create, narrows every list to sandboxes carrying them, and refuses `attach`, `undelete`, and `delete` with `NotOwned` otherwise. A consumer widens the label set to narrow the scope (one label for everything it manages, one more for a single run). Providers store and filter labels; they never know which labels mean ownership.
-- **Host workspace ownership.** A Host sandbox is either a **designated** caller-owned directory or a **managed** temporary workspace the library created; the distinction is set in the spec and visible in `SandboxStatus`. `delete` removes managed workspaces only — on a designated directory it releases the handle and never touches caller data.
-
-### Timers
-
-```rust
-pub struct LifecycleTimers {
-    pub auto_stop_after_idle: Option<Duration>,
-    pub auto_pause_after_idle: Option<Duration>,   // mutually exclusive with auto_stop
-    pub auto_archive_after_stop: Option<Duration>,
-    pub auto_delete_after_stop: Option<Duration>,
-    pub ttl: Option<Duration>,                     // wall clock since create
+impl ProviderHandle {
+    pub async fn describe(&self) -> Result<Descriptor, Error>;
+    pub async fn validate_spec(&self, spec: &SandboxSpec) -> Result<(), Error>;
+    pub async fn health(&self) -> Result<Health, Error>;
 }
-```
 
-Timer semantics: an unset timer inherits the provider's default — Daytona's server-side auto-stop default is **15 idle minutes**, shorter than a single long inference call, so callers running long commands set it explicitly. `Duration::ZERO` is the explicit "never": it disables the timer where the provider supports disabling. Daytona encodes that per timer — `0` for auto-stop, auto-pause, and ttl, `-1` for auto-delete (whose wire `0` means delete-on-stop and is reserved for the ephemeral flag), and `0` for auto-archive, which Daytona reads as "the maximum interval" rather than disabled. All five timers map on Daytona; auto-stop and auto-pause are mutually exclusive (at most one non-zero), and enabling auto-pause via `set_timers` without mentioning auto-stop disables auto-stop first, the documented upstream sequence.
-
-## Sandbox features (facets)
-
-Per-sandbox functionality is grouped into small **facet traits** (per the style guide: cohesive, behavior-named, minimal). A sandbox exposes each facet through an accessor; optional facets return `Option`, so *absence is visible in the type system*, and the serializable `Capabilities` struct carries the fine-grained flags inside each facet for preflight and the wire protocol.
-
-| Facet | Contents | Host | Docker | Daytona | boxd |
-| --- | --- | --- | --- | --- | --- |
-| `Exec` (core) | Buffered run; streaming run (callback sink, stdin, term/kill, timeout); literal argv, Bash as a helper | ✔ | ✔ | ✔ (streams via log-poll fallback) | ✔ |
-| `StdioProcess` | Spawn long-lived bidirectional process (ACP backends) | ✔ | ✔ | ✔ (command sessions; UTF-8 payloads only — the ACP case) | ? |
-| `Filesystem` (core) | read/write/delete/exists/stat/list/move/mkdir/permissions, upload/download (binary-safe, chunked) | native | native | native (toolbox FS) | ✔ |
-| `Search` (core, derived) | grep, glob, walk — default impl derived from `Exec` (rg with grep/find fallback); provider may override | derived | derived | derived (native find/replace exists) | derived |
-| `Git` | clone, fetch, status, add, add_all, commit, push, pull, branches, checkout, rev_parse, is_ancestor, diff (entries, numstat, patch), log, blob sizes and contents, config_set, untracked_files, set_ambient_credentials — low-level plumbing only, hardened by default (no hooks, fsmonitor, path quoting, or signing; read verbs refuse the file transport); providers hide native, derived, or hybrid selection; per-call credentials for the facet's own network operations, a credential store for the workload's git commands; over the wire, clone is the plugin's own (`git/clone`) and the rest derive on the host | derived | derived | hybrid: native branch clone, derived pinned clone and remainder | derived |
-| `Services` (derived) | Background processes that outlive their exec (MCP servers, dev servers): spawn / status / logs / stop, plus wait_for_port (readiness of a listener) and listening_ports (what listens where) — default impl derived from `Exec` (`setsid` + pidfile, fabro's proven pattern); state is per-boot | derived | derived | derived | derived |
-| `Pty` | create/resize/kill + bidirectional byte stream (fabro's `TerminalSession`) | ✔ | ✔ (exec+tty) | ✔ (websocket) | ✔ (console) |
-| `Logs` | Provider-side logs: build/provision logs, entrypoint output, sandbox event log; streaming follow | — | ✔ (container logs) | ✔ | ? |
-| `OneShot` | Ephemeral containers in the sandbox's world: same workspace, same network namespace, own image (registry or built from the workspace); stream, term/kill, timeout; ended by the sandbox's `stop`/`delete` | — | ✔ (workspace volume, `container:` network) | ✔ (with nested Docker configured) | — |
-| `PreviewUrls` | port → `{ url, headers }`; release; signed expiring URLs | ✔ (`http://127.0.0.1:<port>`) | ✔ (a loopback port forward bridged into the container; released explicitly or with the sandbox) | ✔ | ✔ (HTTPS proxies) |
-| `SshAccess` | Return a ready-to-run SSH command; optional exact TTL and token revocation are separate capabilities | — | — | ✔ | ✔ |
-| `ShellCommand` | A local command string that opens a shell (Docker's `docker exec -it …`) — distinct from real SSH | trivial | ✔ | — | — |
-| `WebTerminal` | URL to a browser terminal | — | — | ✔ | ✔ |
-| `Vnc` | Desktop viewing: connection URL/credentials | — | — | ✔ (Computer Use + signed noVNC URL) | — |
-| `NetworkLimits` | Spec-time: block-all / CIDR allow-list / domain allow-list / outbound proxy. Runtime update where supported | — | \~ (none/bridge only) | ✔ | ✔ |
-
-Legend: ✔ supported · \~ partial/approximated · — unsupported (facet returns `None`) · ? unknown until boxd work starts.
-
-Notes:
-
-- **Services hide native-versus-derived selection.** `Sandbox::services()` returns one normalized facet or `None`. Host, Docker, and Daytona use the shared exec-derived `setsid`/pidfile implementation; a provider with native service management can override it. Derived services require `bash`, `mktemp`, `basename`, `cat`, `tail`, `seq`, and `sleep`; `setsid` is optional. Service state is per-boot, and ids from before a sandbox restart report not running.
-- **Search and Git hide implementation selection.** `Sandbox::search()` and `Sandbox::git()` return normalized facets or `None`; callers never construct a fallback. Host, Docker, and Daytona derive Search through `Exec`. Search requires `find`, `grep`, and `head`; `rg` is optional acceleration. Daytona follows Fabro's battle-tested Git hybrid: native toolbox clone for a branch, then exec-derived status, add, commit, push, pull, branch, and checkout operations. A clone pinned to a commit or tag is exec-derived on Daytona too: the toolbox clones the branch and checks the pin out afterwards, which cannot honor a pin outside a shallow window and fails outright for a local remote, while the derived clone fetches the pin itself. Host and Docker derive every Git operation.
-- **Derived git is hardened by default.** Every derived git call disables background maintenance, repository hooks, the fsmonitor daemon, path quoting, and commit and tag signing, and runs with terminal prompts and external diff drivers off; the read verbs (`rev_parse`, `is_ancestor`, the diffs, `log`, the blob reads, `untracked_files`) also refuse the file transport. A consumer that wants a hook to run runs it itself.
-- **Git is a sandbox environment prerequisite.** When `git.supported` is true, the image, snapshot, or Host environment must provide a `git` executable on `PATH`. Providers do not probe for it. Daytona also requires it because only clone is native; the remaining operations use the executable. A missing executable is a non-conforming environment, not a reason for callers to choose another implementation; a command that fails because of it is classified `GitFailureKind::GitUnavailable` so the caller can say so.
-- **Ambient credentials are a store file, never a URL.** `Git::set_ambient_credentials` is how a workload's own git commands authenticate: the facet writes one git-credential-store line under the sandbox's runtime directory (inside the repository's git directory when the sandbox has none) and points the repository's local `credential.helper` at it. Rotation rewrites the file; removal deletes it and the helper entry. The remote URL is never rewritten, so no secret shows in `git remote -v` or the repository configuration. Which credential, and when to rotate it, stays with the consumer.
-- **Git here is plumbing only.** Fabro's credential machinery (`refresh_push_credentials`, `push_token_source`, `git_push_ref` retry/lease engine, `setup_git` intent, clone orchestration and repo layout) stays in fabro, layered on `Exec` + `Git`. Those 6 of fabro's 34 methods do not move into this crate.
-- **Tailscale and other VPN clients are guest software.** Callers install
-  and configure them through `Exec`; they are not sandbox-driver
-  resources or facets.
-- **The sandbox owns its workspace.** A Docker sandbox's working directory is a volume created with the container and removed with it; nothing is bind-mounted from the host unless the caller asks. One-shot containers mount the same volume, so a host that reaches the sandbox over the plugin wire — possibly a remote daemon — never needs a filesystem in common with it. File I/O goes through the `Filesystem` facet, which Docker serves from the archive API without a shell in the image.
-- Daytona's **LSP, code interpreter, and computer-use input automation** are out of scope for v1 — real surfaces, but no consumer yet. The capability schema reserves names for them. Command sessions were originally deferred with them, but the Daytona provider now uses them internally as the transport for streaming, cancellation, and partial-output-on-timeout execs (plain buffered runs keep the cheaper one-shot endpoint); sessions remain unexposed as an API surface.
-
-## Capability discovery
-
-Two complementary mechanisms, by design:
-
-1. **Typed accessors** — `fn pty(&self) -> Option<&dyn Pty>`: absence is unrepresentable-misuse at compile time for Rust protocol clients and provider implementations.
-2. **Serializable `Capabilities`** — a data structure for preflight checks, `Unsupported` error payloads, and the JSON-RPC `initialize` handshake. Fine-grained flags live here (`exec.live_streaming`, `exec.streams_separated`, `fs.native`, `lifecycle.pause`, `snapshots.live_process_state_from_sandbox`, `network.modes`, …).
-
-```rust
-#[non_exhaustive]
-pub struct Capabilities {
-    pub isolation: Isolation,         // none | container | vm — declared by the provider, never assumed
-    pub lifecycle: LifecycleCaps,     // pause, archive, fork, resize, recover, undelete, timers…
-    pub exec: ExecCaps,               // live_streaming, streams_separated, stdin, stop, stdio_process
-    pub fs: FsCaps,                   // native, upload, download, permissions
-    pub search: SearchCaps,           // supported plus native diagnostic
-    pub git: GitCaps,                 // supported plus native/hybrid diagnostic
-    pub services: ServiceCaps,        // supported plus native diagnostic
-    pub pty: Option<PtyCaps>,
-    pub logs: Option<LogsCaps>,
-    pub one_shot: Option<OneShotCaps>, // build
-    pub access: AccessCaps,           // preview_urls { signed }, ssh { ttl, revoke }, shell_command, web_terminal, vnc
-    pub network: NetworkCaps,         // modes: block_all, allow_all, cidr_allow_list, domain_allow_list, proxy
-    pub snapshots: Option<SnapshotCaps>,  // image/dockerfile × container/VM, sandbox capture modes; activation
-    pub volumes: Option<VolumeCaps>,
+/// What `find` returns: every match it could reach, and the providers it could not.
+pub struct Found {
+    pub sandboxes: Vec<SandboxSummary>,              // reference, name, state, labels
+    pub unavailable: Vec<ProviderName>,              // every entry whose query failed
+    pub failures: Vec<ProviderFailure>,              // entry plus structured error
 }
-```
 
-The contract, taken from CSI and the prior fabro plan: **capabilities are load-bearing.** A missing capability changes behavior at *preflight* (the caller adapts, derives, or refuses with a message naming the provider) — never as a mid-run `Err("not supported")`, which is what fabro's silent `Ok(None)` defaults produce today and which is indistinguishable from "supported, nothing to report."
-
-Callers use `Capabilities::supports(Capability)` for a consistent preflight check. The method maps the public capability vocabulary to the nested capability fields. Reserved or unknown capabilities return `false`.
-
-Capabilities are **negotiated metadata, not live state**. They are captured once, at `create`/`attach` (for plugin providers, that is the JSON-RPC `initialize` handshake), and are immutable for the life of the handle — the one piece of data a handle carries besides its ID. Re-attaching yields a fresh set; that is how a provider upgrade is observed. `resize` does not change capabilities: they describe supported operations, not current resources. `SandboxProvider::capabilities()` is the provider's **upper bound** — the union of what it can offer, for pre-create decisions; the per-sandbox set (`Sandbox::capabilities()`) is authoritative and may be narrower depending on the spec (Daytona: linux-vm vs container vs android classes). Preflight catches predictable mismatches, but every capability-gated method still returns a structured `Unsupported` when a stale or misreported capability meets reality — capabilities optimize failure timing; they are not the enforcement mechanism.
-
-### Wire compatibility
-
-The protocol crate owns wire compatibility; domain types never absorb a wire break. The `initialize` handshake negotiates a protocol version, a data transport, and a capability set. Control messages are JSON on the plugin's stdio; every byte stream — exec output and stdin, stdio and PTY traffic, logs, file contents — rides a per-operation Unix-socket data channel the plugin opens back to the host, so no base64 crosses the control connection and a slow consumer of one stream stalls only that stream (see `docs/protocol.md` §2.1). Readers ignore unknown optional object fields and return a structured protocol error for unknown required semantics. Enums define stable string values and an unknown-value policy. Durations, timestamps, paths, and byte payloads use explicit wire formats. Provider configuration carries a provider kind and schema version and is validated at the provider boundary. In v1 the wire DTOs may share their serde shape with core domain types, verified by behavioral compatibility tests in the protocol crate (era-JSON decoding, per-field encoding checks, `#[serde(default)]` field tolerance) and by `#[serde(other)]` unknown-variant fallbacks on state enums; when a shape needs to diverge, the protocol crate grows a dedicated DTO and conversion — core types are never broken for wire reasons.
-
-## Durable Host recovery
-
-`HostProvider::with_registry(directory)` stores private records in a caller-owned directory. The Host plugin reads that directory from `SANDBOX_DRIVER_HOST_REGISTRY`. One provider process owns the directory at a time. Records preserve resource identity, labels, environment, workspace ownership, and lifecycle state. Attach and list work after a plugin restart. Delete retains a tombstone and removes only managed workspaces. Deleted sandboxes leave the in-memory handle cache. Dropping an unused or drained process-group handle does not start a cleanup task.
-
-A second process reaches that registry's sandboxes through `HostProvider::observe_registry(directory)`: a temporary provider that also reads the owner's records and never writes them. `attach` by id and `attach_directory` by workspace path return read-only handles that describe the sandbox from the owner's current record (id, labels, ownership, state), run commands in the workspace, and read and write its files; `start`, `stop`, and `delete` fail with `Error::ReadOnly`, so the owner stays the only writer. The handle's process groups are the observer's own and admit work whatever the owner's state, so a stopped sandbox's retained workspace stays usable; they end when the observer drops. A directory no record names is `NotFound` by path and is still designated by its path-derived id.
-
-On Linux and macOS, each exec runs under a sentinel in its own process group. The provider holds the unreaped sentinel until stop, so live signals cannot reach a recycled id. The sentinel publishes its group record before checking its generation's fence marker and starting the workload. An in-group watcher observes that marker and the owning provider process every 250 milliseconds. A fence or owner death kills its own group, including active work, without waiting for a replacement provider to recover the registry. After the workload has exited and its status is written, the idle sentinel keeps watching the fence and its owner once a second, so background descendants end on owner death too. This applies both to a plugin crash and to the death of a worker embedding the provider. Recovery writes markers first and then observes process death through procfs or libproc. It never signals a saved id. A group that does not drain within five seconds reports provider code `fence_leaked`; stop and delete remain retryable after the operator ends it. Stream output and stdin use the same provider exec implementation.
-
-Tests cross a real plugin process boundary: crash during exec, verify writes stop before recovery, reopen the registry, preserve binary workspace files, isolate new exit status, reject work in a prefenced generation, and leave an unrelated saved process-group id alive. This fence covers the recorded process groups; Host remains an environment with no isolation boundary.
-
-## The traits
-
-Sketches, not final signatures. All async via `async_trait`, all object-safe (`dyn`-usable — required for the plugin boundary), all `Send + Sync`. Open for external implementation (that is the point of the crate), so every public type they touch follows semver discipline: `#[non_exhaustive]` on growable structs/enums, builder-style spec construction.
-
-**Runtime contract.** The crates are async on **Tokio** (1.x); the caller creates the runtime. Tokio appears in the public API deliberately and minimally: `StdioProcess` carries `tokio::io::{AsyncRead, AsyncWrite}` streams, and `ExecControls` carries `tokio_util::sync::CancellationToken`. The core crate spawns no tasks and does no blocking I/O. Event observation is awaited directly. Provider and protocol crates document their own task and blocking behavior.
-
-**Workspace and dependency rules.** Provider and protocol crates depend on `sandbox-driver` (core); the graph is acyclic and core depends on no provider or protocol crate. Concrete SDK types (Daytona SDK, Docker client) never appear in core's public API — provider detail crosses boundaries as `ProviderError`/`provider_config` values. Features stay minimal and additive; each public item has one canonical path (the crate root re-export). All crates share the workspace MSRV (Rust 1.85) and version; everything is `publish = false` today, and publishability to crates.io is a pending decision recorded in the open questions, not an accident of config.
-
-**Compatibility rule: only the core is required.** Identity accessors, `describe`, `start`/`stop`/`delete`, and the core facets (`exec`, `fs`) are required methods. Every optional lifecycle method ships with a provided default body returning `Error::Unsupported`, and every optional facet accessor defaults to `None` — so adding the next optional action or facet is a **non-breaking** change for external implementors. Adding a required method is a major version.
-
-```rust
-#[async_trait]
-pub trait SandboxProvider: Send + Sync {
-    fn kind(&self) -> &ProviderKind;                     // open string newtype, not an enum
-    fn capabilities(&self) -> &Capabilities;
-
-    async fn create(&self, spec: &SandboxSpec, events: Option<EventContext>)
-        -> Result<Arc<dyn Sandbox>, Error>;
-    async fn attach(&self, id: &SandboxId, events: Option<EventContext>)
-        -> Result<Arc<dyn Sandbox>, Error>;               // re-attach by persisted ID
-    async fn undelete(&self, id: &SandboxId, events: Option<EventContext>)
-        -> Result<Arc<dyn Sandbox>, Error>;               // optional; restore a deleted sandbox
-    async fn delete(&self, id: &SandboxId, events: Option<EventContext>)
-        -> Result<(), Error>;                             // by id, no handle; idempotent; default = attach + delete
-    async fn list(&self, filter: &SandboxFilter) -> Result<Vec<SandboxStatus>, Error>; // may lag recent creates/deletes; attach by id for current state
-
-    /// Reachability + credential check for preflight and diagnostics.
-    /// Always callable; an unhealthy provider is an Ok(report), never Err.
-    async fn health(&self) -> Result<ProviderHealth, Error>;
-        // ProviderHealth { status: ok|unreachable|unauthorized|unknown,
-        //                  message, missing_permissions }
-
-    fn snapshots(&self) -> Option<&dyn SnapshotProvider>;
-    fn volumes(&self) -> Option<&dyn VolumeProvider>;
-}
-```
-
-`create` **provisions and returns a handle** — this collapses fabro's split between `SandboxProvider::create` (provisions, discards the handle) and `SandboxSpec::build` (builds the handle, doesn't provision), whose two spec types have already drifted apart.
-
-```rust
 #[async_trait]
 pub trait Sandbox: Send + Sync {
-    fn id(&self) -> &SandboxId;
-    fn capabilities(&self) -> &Capabilities;
-    async fn describe(&self) -> Result<SandboxStatus, Error>;
-
-    // Core lifecycle (required).
-    async fn start(&self) -> Result<(), Error>;
+    fn reference(&self) -> SandboxRef;
+    fn working_directory(&self) -> &Path;
+    fn env(&self) -> &BTreeMap<String, String>;      // the sandbox's ambient variables
+    async fn status(&self) -> Result<Status, Error>;
+    async fn start(&self) -> Result<(), Error>;      // also brings a paused sandbox back
     async fn stop(&self) -> Result<(), Error>;
-    async fn delete(&self) -> Result<(), Error>;                       // idempotent
-
-    // Optional actions. Each has a provided default body returning
-    // Error::Unsupported { capability }; implementing is opt-in.
-    async fn pause(&self) -> Result<(), Error>;
-    async fn resume(&self) -> Result<(), Error>;
-    async fn archive(&self) -> Result<(), Error>;
-    async fn fork(&self, opts: &ForkOptions) -> Result<Arc<dyn Sandbox>, Error>;
-    async fn resize(&self, resources: &Resources) -> Result<(), Error>;
-    async fn snapshot(&self, opts: &SandboxSnapshotOptions) -> Result<SnapshotId, Error>;
-    async fn refresh_activity(&self) -> Result<(), Error>;
-    async fn set_timers(&self, timers: &LifecycleTimers) -> Result<(), Error>;
-    async fn set_labels(&self, labels: &BTreeMap<String, String>) -> Result<(), Error>;
-    async fn update_network(&self, policy: &NetworkPolicy) -> Result<(), Error>;
-
-    // Introspection fabro depends on
-    fn working_directory(&self) -> &str;
-    fn runtime_directory(&self) -> Option<&str>;          // host-tool scratch outside any checkout
-    async fn platform_info(&self) -> Result<PlatformInfo, Error>;   // os, arch, version
-
-    // Facets. exec and fs are required; the rest have provided defaults
-    // (None, or the library's exec-derived implementation for search/git).
-    fn exec(&self) -> &dyn Exec;
-    fn fs(&self) -> &dyn Filesystem;
-    fn search(&self) -> Option<SearchFacet<'_>>;          // provider selects native or derived
-    fn git(&self) -> Option<GitFacet<'_>>;                // provider selects native, hybrid, or derived
-    fn services(&self) -> Option<ServicesFacet<'_>>;      // provider selects native or derived
-    fn pty(&self) -> Option<&dyn Pty>;                    // default: None
-    fn logs(&self) -> Option<&dyn Logs>;                  // default: None
-    fn preview_urls(&self) -> Option<&dyn PreviewUrls>;   // default: None
-    fn ssh(&self) -> Option<&dyn SshAccess>;              // default: None
-    fn shell_command(&self) -> Option<&dyn ShellCommand>; // default: None
-    fn web_terminal(&self) -> Option<&dyn WebTerminal>;   // default: None
-    fn vnc(&self) -> Option<&dyn Vnc>;                    // default: None
+    async fn exec(&self, spec: ExecSpec, controls: ExecControls) -> Result<ExecOutcome, Error>;
+    fn files(&self) -> &dyn Files;                   // get, put, list
+    fn ports(&self) -> &dyn Ports;                   // expose, release
+    fn endpoints(&self) -> Option<&dyn Endpoints> { None }   // optional capability: ssh, shell command, vnc
+    fn containers(&self) -> Option<&dyn Containers> { None } // optional capability: one-shot containers
 }
 ```
 
-Why lifecycle verbs are flat methods rather than one `perform(Action)` method: callers read naturally, signatures differ (`fork` returns a handle and `snapshot` returns an ID), and the JSON-RPC mapping is one method per verb either way. The `Unsupported` error plus capability flags carries the optionality.
-
-### Exec (and the argv contract)
+`Sandboxes` is a concrete type built once per process. Provider entries are given at construction. Environments are read from their source each time one is used, so a catalog that changes while the process runs, like Fabro's environment store, needs no rebuild. `Sandbox` is a trait because the value behind it is a built-in provider, a plugin child, or the fake, and the caller must not care which.
 
 ```rust
 #[async_trait]
-pub trait Exec: Send + Sync {
-    async fn run(&self, spec: &ExecSpec) -> Result<ExecResult, Error>;
-    async fn run_streaming(&self, spec: &ExecSpec, controls: ExecControls)
-        -> Result<ExecStreamingResult, Error>;
-    async fn spawn_stdio(&self, spec: &SpawnSpec) -> Result<StdioProcess, Error>;  // gated: exec.stdio_process
+pub trait EnvironmentSource: Send + Sync {
+    async fn names(&self) -> Result<Vec<EnvironmentName>, Error>;
+    /// `Ok(None)` means the store has no environment with this name.
+    async fn get(&self, name: &str) -> Result<Option<Environment>, Error>;
 }
 ```
 
-The normative contract, and the load-bearing invariant of the whole system:
+The library provides `StaticEnvironments`, a fixed list; `from_config_file` loads a file into one. A client whose environments are editable at runtime implements the trait over its own store. The trait is async and fallible because Fabro's store is a database: a storage failure is `Unavailable`, and only `Ok(None)` means the environment does not exist, so a flaky store is never read as a missing environment. `Environment::validate(&Descriptor)` is public so such a client can reject a bad edit when it is saved rather than when it is used.
 
-- `ExecSpec` names a `program` and its `args`. A provider executes that vector directly, with `execvp` semantics: the program is resolved through the command's `PATH` when it has no slash, and every argument reaches the process unchanged. No shell is involved anywhere, so nothing is split, globbed, or expanded. A provider whose backend only takes a shell string (Daytona) quotes the vector so it stays literal.
-- Buffered and streaming exec must not differ in how the vector is run.
-- **Bash is a helper, not a provider rule.** `ExecSpec::bash(script)` is the argv `bash -c <script>`, non-login, with Bash's options untouched (no `errexit`/`pipefail`/POSIX mode) and `BASH_ENV` blanked in the spec env. It is the one place the old Bash contract is written down. The exec-derived facets (filesystem, search, git, services) are Bash scripts and use it, so a sandbox that serves them needs `bash` on `PATH`; a caller that only runs its own programs (Petri's step runner) needs nothing but the program.
-- Providers still blank `BASH_ENV` at the sandbox level (Docker container env, Daytona sandbox env, the host's inherited env), because an image can carry the variable and a caller may send `bash -c` by hand.
-- The library ships the **bash probe** (`fabro-bash-ready` check) as a helper; the `activate` convenience runs it. It verifies the helper works in a sandbox, and goes into the conformance suite.
+`builder`, `environment` and `environments` are async because their source may be a database. A builder freezes the selected environment and provider binding. Field setters override individual template values; map setters merge keys, while `spec` replaces the whole template. An invalid size string stays an admission error, even if a later setter supplies another value.
 
-This replaced fabro's rule that every command is Bash source. That rule made the primary consumer quote `exec 'prog' 'arg'…` into a script only for the provider to wrap it in a shell again, forced a per-image "which shell" setting on Docker, and made `attach` run a probe exec. An argv contract has none of that.
+`find` fans out to every provider entry and merges the results. A provider that does not answer is listed in `unavailable`, with its structured reason in `failures`, rather than failing the whole query, so a sweep can act on what it found and come back for the rest. Neither list implies absence or authorizes a replay. Inventory runs eight entries at a time with thirty seconds per entry by default, configurable through `CatalogOptions`. Results and failures are ordered deterministically by entry and identity. Equal duplicate refs collapse; conflicting duplicates or foreign refs invalidate that entry's batch. Different entry aliases remain different refs.
 
-`ExecSpec` is a plain owned serializable value — program, args, timeout, working dir, env vars, optional stdin bytes (write-then-EOF), and output sanitization — and is exactly what crosses the JSON-RPC boundary. `OutputSanitization` has three policies: `Raw` preserves every byte and is the default; `StripAnsi` removes ANSI terminal escape sequences but preserves standalone control characters; `StripAll` also removes standalone C0/C1 control characters except tab, line feed, and carriage return. Providers apply the policy before output reaches the sink, retained result, or capture statistics. Stateful filtering prevents an escape sequence from leaking when it spans streaming chunks. The policies apply only to `run` and `run_streaming`; PTY sessions and long-lived bidirectional stdio remain raw. Non-raw policies are lossy and callers must use `Raw` for binary output.
+Rules every method obeys:
 
-A relative working dir resolves against the sandbox working directory on every provider — a conformance case pins it. Process-local control objects travel separately in `ExecControls`: the `term` and `kill` stop tokens, the async output sink, and the retention cap (head+tail with `omitted_bytes` accounting — fabro's `OutputCaptureBuffer` moves here). On the wire, controls map to negotiated IDs — a host-generated `execId` routes `exec/output` notifications and `exec/stop` — never to serialized fields, and buffered `run` carries no streaming controls at all.
+1. **Wire-expressible.** Data in, data or an opaque `Sandbox` out. No process handles, file descriptors, closures, or client-local paths. This is what lets protocol 3 carry a call to a child process and lets the fake serve the same API in memory.
+2. **Identity is the ref.** Nothing else identifies a sandbox. Clients store refs and derive nothing. `attach` resolves only the saved provider-entry binding and checks its namespace before dispatch, so renaming or deleting the environment a sandbox was created from does not orphan the sandbox.
+3. **Capabilities are data.** To know whether a sandbox can do something, read the descriptor or check an extension accessor for `Some`. Kind names are never a basis for behavior.
 
-Control contracts, normative: **stops are signals, not a policy.** `term` sends SIGTERM to the command's process group once and the call keeps waiting; the command may exit (`termination: Cancelled`) or ignore it until `kill` sends SIGKILL (`termination: Killed`). The escalation ladder — TERM, a grace so traps run and locks release (a killed `git` otherwise leaves `.git/index.lock`), then KILL — runs only when the caller asks for it with `ExecSpec::stop_grace`, which names how long to wait; the provider then runs one ladder for the timeout, a failing sink, and the caller's `term` (`run_with_stop_grace`), so the consumer's ladder and the provider's never race each other. Below the ladder, `drain_with_stops` is the one raw stop race every bundled provider drains output under: it races the drain against `term`, `kill`, the timeout, and a failed sink, asks the command to stop through a provider callback, and bounds the drain after a kill. Without a grace the provider's own stops (`spec.timeout`, a failing sink) kill outright. A provider that cannot deliver a signal (Daytona ends a command by deleting its session) ends the command on either token and reports the level it received. A provider that does not support stdin or stops rejects a call that supplies them with `Unsupported` (`exec.stdin` / `exec.stop`) — never runs the command with the input silently dropped. The output sink is awaited per chunk — a slow consumer backpressures the read loop rather than growing an unbounded buffer; output beyond the retention cap is still drained (and counted in `omitted_bytes`), never left to block the process. A sink that returns an error cancels the exec and reports it as such. `ExecResult` keeps `streams_separated` and `live_streaming` honesty flags — Daytona's combined-output and log-polling degradations are *reported*, not hidden.
+### Exec
 
-`StdioProcess` keeps fabro's shape: `AsyncWrite` stdin, `AsyncRead` stdout, bounded stderr tail collector, and a handle with `terminate()`/`wait()`. This is the facet the JSON-RPC side-channel transport exists for.
+`ExecSpec` is argv (no shell), env, working directory, timeout, and `tty`. `ExecControls` is a streamed stdin, an output sink, two cancellation levels (`term` then `kill`) and a terminal resize receiver. `ExecOutcome` reports `termination` (`exited`, `timed_out`, `terminated`, `killed`, `lost`), `exit_code`, `signal`, and output-loss counts. No built-in provider supports `tty` yet; each refuses it with `Unsupported`. Dropping the future requests cancellation; it does not confirm that the command has stopped. The provider owns bounded cleanup after the drop. `lost` means the execution outcome is unknown, not that the command or sandbox is known to be gone. Only a confirmed termination outcome or a successful sandbox `stop` establishes that the affected execution has ended.
 
-`ExecControls::default()` retains no output copy. `Some(n)` requests finite
-head/tail capture for each stream. `ExecControls::buffered()` requests up to
-16 MiB per stream. `Exec::run` returns a complete value or a limit error;
-`ExecStreamingResult::into_complete()` refuses omitted, abandoned, or lost
-output. Omitted capture, failed delivery, and transport loss remain separate
-accounting facts.
+### Files and ports
 
-**Daytona's encoded exec is lossy, and says so.** The toolbox carries command
-output as text, so a Bash wrapper encodes every chunk of stdout and stderr as
-a bounded ASCII record (`printf '%s%q\n'` with a stream tag, under 512 bytes)
-and the provider decodes the records before sanitization, delivery, and
-retention accounting. Under a fast run of small writes the toolbox tears that
-stream: a record arrives without its tag, two arrive glued, or the output ends
-inside one. The decoder never fails the exec for it. It discards the
-unreadable record through its newline, resyncs on the next record, and counts
-what it threw away in `ExecStreamingResult::output_loss` (`dropped_frames`,
-`dropped_bytes`, encoded bytes); because the lost record's stream is unknown,
-a loss also sets `truncated` on both captures, so `Exec::run` and
-`into_complete()` refuse it while `run_streaming` completes with the command's
-exit status and the report. The report crosses the plugin wire unchanged. A
-tear that leaves a well-formed record is undetectable and decodes to wrong
-bytes; the loss counts are a floor, never silently zero.
+`Files` is `get(path, range)`, `put(path, bytes)` creating parents, and `list(path, depth)`. Paths address the workload; a relative path resolves against its working directory. Bytes move as owned streams, so a plugin transport keeps them off its control connection.
 
-Plugin transport limits and their accounting are specified in protocol §2.2.
-A local hard-cancel drain deadline does not prove remote termination or cleanup.
-`Error::Incomplete` reports abandoned output, stop acknowledgment, confirmed
-termination, and cleanup as separate facts. Dropped persistent handles use
-bounded owned cleanup. `PluginProvider::cleanup_error()` reports cleanup
-failures, which retain admission without closing unrelated channels.
-Daytona whole-response fallbacks stop collecting at 16 MiB; its file downloads
-stream. A failed final-log fetch cannot establish complete output.
-Old handles remain tied to a failed connection. `PluginSupervisor` is the
-provider an application holds for a plugin: it implements `SandboxProvider`
-(and the snapshot and volume services the plugin declares) by forwarding
-each call to the live generation, and `current()` serializes replacement for
-new work under a fixed configuration and frozen credential environment. It
-never replays an uncertain call. Generations are numbered from 1 in launch
-order (`PluginGeneration::number`), so an application that keeps handles
-records the number each came from and fences a resource once when a later
-call answers from a higher one. Every generation is health-probed before it
-serves — an unreachable backend or a rejected credential ends the launch
-with the probe's report — and a replacement that reports a different
-resource namespace (`ProviderHealth::identity`) than the first generation is
-refused, so recovery never continues into another account. Applications
-bound the number of supervisors and reconstruct handles for the new
-generation.
+`Ports` is `expose(port, Expose { signed, ttl_ms }) -> Exposure { url, headers, expires_at_ms }` and `release(port)`. Some providers hold a real local forward until `release`.
 
-### Snapshots and volumes
+### Errors
+
+A closed set with stable snake-case codes, the same in Rust and on the wire:
+
+`NoProvider`, `NoEnvironment`, `InvalidConfig { entry, path, message }`, `MissingSecret { entry, name }`, `NotFound`, `AlreadyExists { name, id }`, `NotOwned`, `NamespaceMismatch`, `Unavailable` (currently unreachable; does not establish that execution stopped or a resource was deleted), `Unauthenticated` (the backend rejected the configured credentials), `PermissionDenied` (valid credentials that do not permit this operation), `ResourceExhausted { retry_after_ms }` (a quota or rate limit refused admission), `Busy` (a prior instance is still going away or another mutating owner holds the fence), `Unsupported { capability }`, `Unhealthy { message }`, `Stale` (the plugin restarted; re-attach by ref), `InvalidSpec { path, message }`, `IncompleteCleanup { remaining }` (destroy or a failed create could not confirm cleanup; an empty list means the ids are unknown, not that nothing remains), `FenceLeaked`, `Transport`.
+
+The three refusals are distinct from `Unavailable` so a client can tell bad credentials from a backend that is down, and none of them is a retry hint. `Unavailable`, `Stale` and `Transport` carry an `outcome` of `not_started` or `unknown`; it defaults to `unknown`, and `not_started` requires proof that nothing was admitted. A future unknown error code is a decoding failure with an unknown outcome, never `NotFound` or success.
+
+## Configuration
+
+`try_new` takes both levels of the catalog from wherever the client keeps them. Provider entries are operator-owned and rarely change. Environments come from any `EnvironmentSource`: a fixed list or a live store whose edits are visible on the next use. A client with neither calls `from_config_file` with an explicit path, so tools on one machine can share a catalog. Names at both levels are chosen by the operator; the library ships none.
+
+```toml
+[providers.docker]
+plugin = "docker"                 # built in
+config = { host = "unix:///var/run/docker.sock" }
+
+[providers.daytona]
+plugin  = "daytona"               # built in
+config  = { api_url = "https://app.daytona.io/api", organization = "org_…" }
+secrets = ["DAYTONA_API_KEY"]     # resolved through the application's SecretResolver, never stored here
+
+[providers.local]
+plugin = "host"                   # built in, durability: process
+
+[providers.lima]
+plugin = "lima"                   # a plugin: an absolute path and a checksum pin
+path   = "/opt/sandbox-driver/plugins/sandbox-driver-lima"
+sha256 = "9f2c…"                  # or dev = true during development
+
+[environments.ci-linux]
+provider = "docker"
+
+[environments.ci-linux.spec]
+source  = { image = "ghcr.io/lithoscomputer/ubuntu-24.04:slim-f8bbbfd81934" }   # Petri's pinned runner image
+network = { mode = "block" }
+
+[environments.cloud]
+provider = "daytona"
+
+[environments.cloud.spec]
+source    = { dockerfile = "FROM buildpack-deps:noble\n" }
+resources = { cpu = 2, memory = "4GB" }
+timers    = { auto_stop = "60m" }
+
+[environments.scratch]
+provider = "local"
+
+[environments.lima-dev]
+provider = "lima"
+
+[environments.lima-dev.spec]
+source = { image = "ubuntu-lts" }
+```
+
+Per provider entry: `plugin` (the provider kind), `config` (whatever that provider's `config_schema` accepts, validated when the entry is first activated so a typo fails with the field named; the library never reads its contents), `secrets`, and for a plugin `path`, `sha256` or `dev`, `args`, `env`, `inherit_env`. A plugin entry must name an absolute `path` and either a `sha256` pin or `dev = true`; there is no search of `PATH` or of a plugin directory. A `sha256` pin together with `dev = true` is a decoding error, so a pin is never silently skipped. The two trust keys are flat because operators write them by hand; in Rust they decode to `PluginTrust`. The kinds `host`, `docker` and `daytona` are reserved for the built-in providers: an entry naming one of them with `path`, `sha256` or `dev` is `InvalidConfig`, and a reserved kind is never routed to the plugin loader, even when the application did not register that built-in. A third-party plugin picks another kind, such as `acme-daytona`.
+
+Credentials and conveniences take different paths:
+
+- **`secrets`** names the credentials the entry needs. The library resolves each name at entry activation through the explicitly supplied `SecretResolver` (Fabro uses its vault), and an unresolvable name is a `MissingSecret` error naming the entry. Values reach a built-in as `SecretValues` in its activation and a plugin child as explicit environment variables. A provider that accepts one of several credential forms says so in its `config_schema`; the library never guesses. Service `credential` names in a spec use the same resolver, at workload admission.
+- **`inherit_env`** carries conveniences only. Every plugin child starts from an empty environment. An omitted list selects `PATH`, `HOME`, `TMPDIR` and `USER`; an explicit list replaces those defaults, and `inherit_env = []` yields exactly explicit `env` and resolved secrets. Values are copied from the supplied snapshot and frozen for the life of the entry. An unset convenience name is simply not set. A value in `env` wins over an inherited one; an `env` name that collides with a secret is a configuration error.
+- Built-ins take their configuration only from the entry's `config` and resolved secrets, never from the ambient environment, which is what makes one process safe to run entries for different owners. Host's commands do inherit the calling process's environment, with secrets filtered out.
+
+Secret values never appear in descriptors, saved specs, or errors. Provider config, explicit environment and arguments may contain sensitive values, so their `Debug` output is redacted.
+
+Per environment: `provider` (an entry name) and `spec`, a `SandboxSpec` template the sandbox builder starts from: `source`, `resources`, `network`, `timers`, `labels`, `env`, `working_directory`, `workspace_ownership`, `user`, `services` and `container` (a typed workload description, below), and `provider_config` for the few per-sandbox settings that have no provider-neutral meaning, validated against the provider's `spec_schema` when it declares one. `Environment` and `ProviderEntry` derive `Deserialize`, so a client's own settings types can embed them directly.
+
+Sizes are written with a unit and read the way Docker and systemd read them: `4GB`, `4G`, `4GiB` and `4Gi` all mean 4096 MiB, and `cpu` is whole cores. The library parses once; providers receive integers and never see the string. A provider that allocates in coarser units rounds up and reports what it gave you in `status`.
+
+That single parse happens when a `SandboxSpec` is decoded. `resources` accepts `cpu`, `memory` and `disk` with units, and `timers` accepts `auto_stop`, `auto_archive`, `auto_delete` and `ttl` as durations (`60m`, `1h 30m`, `500ms`; `0s` explicitly disables a timer). The value is stored and always serialized in the integer form, `cpu_cores`, `memory_mb`, `disk_mb` and `*_ms`, which is also accepted on input. The grammar is exported as `parse_size_mib` and `parse_duration_ms` for the builder's `memory("8GB")` and for UIs that validate before saving.
+
+Request types reject unknown fields rather than dropping instructions. That includes fields the selected mode does not take: an `allow` list on a network mode that is not an allow list is a decoding error. Descriptors may gain object fields, but an unknown enum capability fails decoding rather than being read as supported. An unknown status state becomes `unknown`, never a terminal state.
+
+The `ci-linux` environment uses the image Petri runs process scopes in on Docker. Petri publishes these runners as `ghcr.io/lithoscomputer/ubuntu-<version>:<flavor>-<pin>`. Clients select the workload source; choosing an outer runner or a Docker-in-Docker helper image is provider implementation detail. If Daytona needs an outer runner to host that workload, the Daytona provider provisions it and routes operations to the workload, with no different recipe in Fabro or Petri.
+
+## Identity and admission
+
+`SandboxRef { provider, namespace, id }` is the durable identity value. `provider` is the operator's **provider-entry name**, not its kind and not an environment. `namespace` is a non-secret, backend-issued resource-domain identifier. The same configured backend reports the same namespace across reconnects; a different backend must report a different namespace even if sandbox ids happen to match. Identifiers are non-empty, at most 256 bytes, and contain no whitespace or control characters. Namespace values are opaque: clients must not synthesize them from URLs, credentials, the current environment, or provider-kind guesses.
+
+`attach` and `destroy` resolve the saved provider binding and compare the provider's namespace with `SandboxRef::check_namespace` **before sending a sandbox operation**. A mismatch is `NamespaceMismatch`. A missing binding is `NoProvider`; failed contact is `Unavailable`. Neither is evidence of deletion. The library never scans for another kind or entry and silently redirects a ref. An operator may move a provider-entry name to a new entry after verifying the same namespace and access rights; renaming an entry otherwise needs an alias or rewriting the saved records. Deleting or editing an environment needs neither: refs and inventory do not depend on environments.
+
+A ref is routing data, not authorization or proof of ownership. Applications' own ownership checks and lease records remain necessary; namespace agreement does not bypass them.
+
+Admission saves the resolved spec and provider binding; a later start or recovery never rereads an edited environment. Applications persist their own admission and lease records. The provider persists whatever state its declared durability needs.
+
+### Lazy startup
+
+A cold catalog does not start every plugin or require every executable, backend and credential to be available. `try_new` checks local structure only. An environment that names a missing entry, or an entry with invalid structure, is recorded as a diagnostic (`Sandboxes::diagnostics`) and rejected when selected; unrelated entries stay usable.
+
+On an entry's first use, the catalog:
+
+1. **Discovers its schemas.** A built-in factory returns them directly. For a plugin, the loader verifies the executable against its `sha256` pin (or explicit `dev = true`) and runs it once with `--describe-schema`, a bounded, short-lived process given only the minimal platform environment and no config, secrets or backend access. See [plugin metadata discovery](#plugin-metadata-discovery).
+2. **Validates and freezes the entry.** Config is checked against `config_schema`, required secrets are resolved, and the launch inputs are frozen. One provider is activated per entry per catalog. Editing an environment touches no backend; changing connection or launch settings needs a new catalog.
+3. **Activates the provider.** A built-in factory builds it in process. The plugin loader starts the child, sends the config in `initialize`, and passes secret values in its environment. The provider's descriptor must match the discovered kind, version and schemas; disagreement fails before any sandbox operation.
+4. **Checks each spec before mutation.** `SandboxSpec::validate_for` checks portable invariants and the descriptor's capabilities, and the catalog validates `provider_config` against `spec_schema`. A schema must declare draft-07, 2019-09 or 2020-12 and is compiled without fetching external references. Config and spec options are checked separately, and error messages omit instance values. No schema means the provider validates opaque options itself; it never means ignoring them.
+
+## Providers
+
+Host, Docker and Daytona are built in: the application registers each one with `Registry::builtin`, and their kinds are reserved, so none of them is ever loaded as a plugin. `Registry::plugins` registers the plugin loader for every other kind.
+
+|  | host | docker | daytona |
+| --- | --- | --- | --- |
+| Factory | `sandbox_driver_host::HostFactory` | `sandbox_driver_docker::DockerFactory` | `sandbox_driver_daytona::DaytonaFactory` |
+| Namespace | `host:<machine-id>` | `docker:<engine-id>` | `daytona:<org>` |
+| Durability | `process` | `machine` | `remote` |
+| Access | `owner_process` | `shared` | `shared` |
+| Isolation | `none` | `container` | `container` |
+| Sources | host directory | image | image, dockerfile, snapshot |
+| Mounts host paths | yes | local daemon only | no |
+| Network policy | provider default only | allow all, block | allow all, block, CIDR list, domain list |
+| Resources | none | cpu, memory | cpu, memory, disk |
+| Timers | none | none | auto stop, auto archive, auto delete, ttl |
+| Optional capabilities | none | endpoints (shell command), services, containers | services, containers |
+
+Each of these facts comes from the provider's descriptor at runtime; the table summarizes them. A request the descriptor does not list is refused with `Unsupported` before anything is admitted.
+
+**Host** runs commands as child processes in a directory, on the machine of the process that activated it. One live Host instance owns its sandboxes, their process groups and their lifecycle; see [Host ownership and workspaces](#host-ownership-and-workspaces). Use `docker` for local sandboxes that must outlive the caller.
+
+**Docker** takes one `config` key, `host` (`unix://`, `tcp://` or `http://`; default `unix:///var/run/docker.sock`). Services become sidecars on the workload's network, reached by service name. `provider_config` takes `auto_pull`, `platform`, `binds` and `host_network`; `binds` is refused unless the daemon is local. The stop fence is a daemon-scoped claim shared by every provider instance using that daemon; [Docker lifecycle coordination](docker-lifecycle.md) describes it.
+
+**Daytona** takes `api_url`, `organization`, `target` (the Daytona region) and `runner_image` in `config`, and names `DAYTONA_API_KEY`, or `DAYTONA_JWT_TOKEN` together with `organization`, under `secrets`. Without services or `container` options, the workload is the Daytona sandbox itself, built from an image or Dockerfile into a snapshot named by its inputs and reused, or created from a Daytona snapshot. With services or `container` options, the provider creates a runner sandbox from a Docker-capable image and runs the workload as a container on the runner's network, beside its services, which it reaches at `127.0.0.1:<port>`. One-shot containers run on Docker inside the workload, so a direct workload needs an image that provides `docker`, `start-docker` and `python3`; without them `run` returns `Unsupported` before admitting anything. Daytona's control plane holds each sandbox's lifecycle state, so every provider instance shares one fence.
+
+## Workloads
+
+`create` receives the environment's template merged with the caller's overrides, after the library has validated it and converted every size and duration. Every field except `source` is optional; a field a provider does not support is refused with `Unsupported` naming it, never silently ignored.
+
+```json
+{
+  "name": "petri-01jabc-l3",
+  "source": {"image": "ghcr.io/lithoscomputer/ubuntu-24.04:slim-f8bbbfd81934"},
+  "resources": {"cpu_cores": 2, "memory_mb": 4096, "disk_mb": 20480, "gpus": 0},
+  "network": {"mode": "cidr_allow_list", "allow": ["10.0.0.0/8"]},
+  "timers": {"auto_stop_ms": 3600000},
+  "labels": {"fabro.run": "01JABC…", "petri.workspace": "01JABC…/build"},
+  "env": {"CI": "1"},
+  "working_directory": "/workspace",
+  "user": "root",
+  "services": {
+    "postgres": {"image": "postgres:16", "env": {"POSTGRES_PASSWORD": "x"}, "ports": [5432],
+                 "ready": {"command": ["pg_isready"], "interval_ms": 2000, "timeout_ms": 1000,
+                           "retries": 30, "deadline_ms": 60000}}
+  },
+  "container": {"init": true, "capabilities_add": ["SYS_PTRACE"]},
+  "provider_config": {}
+}
+```
+
+- `source` is exactly one of `{"image": …}`, `{"dockerfile": …}` (the file's text), `{"snapshot": …}` (a provider-known id) or the bare string `"host_directory"`. The descriptor's `sources` lists which a provider accepts. A host directory has no image: the directory is `working_directory`, and `workspace_ownership` says whether it is `designated` (caller-owned, never removed by destroy; the default when a path is given) or `managed` (provider-owned, removed on confirmed destroy; a temporary directory when no path is given). Ownership is only valid with a host directory source.
+- `resources` are whole cores and MiB. A provider rounds up if its backend allocates in coarser units and reports the result in `status`. A non-zero `gpus` it cannot provide is `Unsupported`, never dropped.
+- `network.mode` is `provider_default`, `allow_all`, `block`, `cidr_allow_list` or `domain_allow_list`; the descriptor's `network` lists which a provider honours. A mode it does not list is `Unsupported`, except `provider_default`, which every provider honours whether listed or not, so a spec without `network` is accepted everywhere. The two allow-list modes carry their entries under one `allow` key.
+- `timers` are milliseconds. The descriptor's `capabilities.timers` lists each enforced timer; a request for an unlisted one is `Unsupported`.
+- `labels` and `env` are string maps. Labels round-trip exactly; env reaches every process in the sandbox. Env keys must be non-empty and contain no `=` or NUL, and values contain no NUL, because either would change the variable the workload receives.
+- `working_directory` and `user` are where commands run and as whom; the working directory actually used is returned on the sandbox handle.
+- `services` are named containers beside the workload, keyed by lowercase DNS label: an image, env, TCP ports, an optional registry credential name, and an optional readiness check. See below.
+- `container` is the typed subset of container options a job can ask for: `init`, `privileged`, `capabilities_add`, `capabilities_drop`, `dns`, `extra_hosts`, `shm_size_mb`. `None` is unspecified, while `Some(false)` is an explicit request. The descriptor's `capabilities.container_fields` lists exactly which a provider honours, independently of service support; the rest are `Unsupported`, including unsupported explicit false values.
+- `provider_config` belongs to the provider, for the few settings with no provider-neutral meaning. A provider describes it with a `spec_schema` and the library validates overrides against it; otherwise the provider validates it.
+
+`source` describes the workload the caller wants to execute, not a provider's VM runner or nested-Docker helper. Sandbox `exec`, `working_directory`, ambient `env`, and file operations address that workload and its workspace. There is no caller-selectable outer-runner execution target. A one-shot container uses its own requested image but shares the workload's workspace, network and service reachability. Any outer runner, nested Docker setup, helper image, snapshot cache or backend-specific job recipe is the provider's responsibility; Petri and Fabro supply the same portable workload spec regardless of provider.
+
+### Services
+
+A service's ports are reachable **from the workload** and its one-shot containers, not published on the host. `status.services` reports the host and port the workload uses, because on Docker that is a network alias and on a Daytona runner it is localhost. Addresses may change across a restart, and an unavailable status does not present stale addresses as current.
+
+A readiness check is argv run inside its service, without an implicit shell; exit zero passes. It states its whole budget: `interval_ms`, a per-attempt `timeout_ms`, `retries` and an overall `deadline_ms`, all required and non-zero. The deadline bounds the wait even when the attempts would take longer. A timeout longer than the deadline, or an interval that leaves no room for a second attempt, is `InvalidSpec`, because the check could never use its budget. Without a check the provider only confirms the service started; it makes no claim about application readiness.
+
+### Status
+
+`Status` carries the reference, state, name, labels, the image and snapshot in use, the resources actually allocated after rounding, the effective network policy, the service addresses, and `web_url`, a console URL when the provider has one. An absent field was not reported, not zero. States include `unavailable` (unreachable, not known gone) and `lost` (established gone without a confirmed destroy, never inferred from failed contact), and the backend's own `paused` and `archived`.
+
+### What crosses a provider
+
+- **The name is a hint.** `spec.name` is what the caller would like the sandbox called. A provider uses it as is, adapts it to its backend's rules, or generates its own, and reports the name it used. If the backend enforces unique names and the hint collides, it may return `AlreadyExists` with the existing id; it is not required to detect duplicates. Callers find sandboxes again by labels and by ref, never by name.
+- **Labels round-trip exactly.** Whatever keys and values the caller sets come back unchanged from `status` and match in `list` filters. A backend that cannot store a value as given encodes it reversibly; one that cannot store it at all refuses with `InvalidSpec` naming the label. A provider never truncates or drops one.
+- **Unavailable is not lost.** When a provider cannot reach a sandbox but does not know it to be gone, it reports state `unavailable` and fails commands with `Unavailable`. The library does not infer deletion or replace the sandbox because contact was lost. The caller decides how its application responds to the uncertainty.
+
+## Lifecycle, fences and uncertain outcomes
+
+There is no pause, resume, archive or recover. When the backend paused or archived a sandbox, on its own timer or through another tool, `start` brings it back to running; status reports `paused` or `archived` until then. Docker unpauses the container, so its processes carry on.
+
+- **Create and start.** Both succeed only once the workload accepts execution and every declared readiness check has passed. Start uses the admitted spec, restores services from it, and checks readiness again. A failed create attempts bounded cleanup of everything it provisioned.
+- **Stop.** `stop` and `start` are a fence around the whole sandbox workload. Before draining, `stop` blocks new exec, service and one-shot admissions. It succeeds only after every previously admitted command, service and one-shot container has ended and the workspace is intact. This includes execution admitted through another handle or provider instance. Providers coordinate one fence across instances (`access: shared`), or enforce one mutating owner (`access: owner_process`) and reject conflicting mutations with `Busy`. `start` fails with `Busy` while a previous stop is still draining; after stop then start, no execution from before the stop remains.
+- **A stop acknowledgement is not a fence.** Unconfirmed termination is `FenceLeaked`; failed contact is `Unavailable` or `Transport` with an unknown outcome. No timeout, lost connection or plugin exit is ever reported as a successful stop.
+- **Destroy.** `destroy` stops execution and confirms removal of everything the provider manages for the sandbox: services, one-shot containers, networks and helpers. An already-absent sandbox is success only once no associated managed resources remain. If cleanup cannot be confirmed, the error is `IncompleteCleanup` with any known remaining resource kinds and ids; an empty list means the ids are unknown, not that nothing remains. The provider keeps labels or other discovery data on what remains, including partially created resources, so the caller can reconcile them.
+- **Absence.** `NotFound` requires authoritative absence in the checked namespace. `Unavailable`, status `unknown` and exec termination `lost` do not mean gone. A failed readiness check may follow partial creation. No error code alone is an instruction to retry safely.
+- **Restarts and replays.** Connection loss, a plugin crash, or `Stale` does not establish whether an in-flight mutation took effect or whether its command stopped. Restarting a plugin restores the transport only; reattaching a sandbox restores access only. The library never automatically replays a mutation whose outcome is uncertain, and never restarts a sandbox workload. Fabro or Petri decides whether to wait, inspect, stop, retry, replace, or fail its work using these primitives.
+
+## Host ownership and workspaces
+
+Host is `durability: process` and `access: owner_process`, with a namespace stable for the machine. Sandbox ids are bound to the provider instance that created them, so a restart cannot reuse another sandbox's identity. One live instance owns admissions, process groups and lifecycle state. A second instance, in this process or another, is not an observer or a shared registry and cannot gain access from a path or a ref: if the owner is alive it gets `Busy`, and if the owner is gone it gets `Unavailable`, never `NotFound`. Reattaching after the owner dies is not promised.
+
+Each Host instance keeps its process-group fence state in a temporary directory it owns. `shutdown()` fences and destroys its sandboxes with bounded cleanup; process loss alone is not proof that children died. Separate server and worker processes cannot both attach to the same Host workload; an application that needs live access from another process routes operations to the owner. A run record can show history but is not a live sandbox handle.
+
+A designated workspace stays caller-owned and is never removed by destroy. A managed workspace is provider-owned and removed on confirmed destroy. Files left after a worker exits are not a running or attachable sandbox, and their existence proves neither that execution ended nor who owns them. An application may create a new sandbox over a retained designated workspace once it has settled that the prior owner is gone, or choose a durable provider for restartable execution. That is application recovery policy, never an automatic Host restart or adoption. A missing or unconfigured Host entry affects only work that selects it.
+
+## The provider interface
+
+A provider, built in or plugin, implements two traits from the crate root.
+
+- `ProviderFactory::discover(&PluginLocation)` receives only the entry name (for errors), kind, path and trust, and returns `ProviderSchemas`. Built-in factories return their metadata directly; the plugin loader verifies and probes the executable.
+- `ProviderFactory::activate(Activation)` receives the selected entry name, frozen connection and launch configuration, discovered schemas, resolved launch environment and separate redacted `SecretValues`, and returns an `Arc<dyn Provider>`.
+- `Provider` supplies `describe`, `health`, `create(WorkloadAdmission)`, `attach(&SandboxId)`, `list(&LabelFilter)`, `destroy(&SandboxId)` and `shutdown`. The catalog checks the namespace before routing `attach` and `destroy`. A provider also keeps a reconnect from moving an admitted call to another namespace, and invalidates old sandbox handles when its generation changes. `WorkloadAdmission` separates credential values from the persistable spec; a provider keeps the admission for restart.
+- `Sandbox` supplies the reference, workload environment and workspace, `status`, `start`, `stop`, `exec`, `files` and `ports`. Optional `endpoints` and `containers` return `None` unless supported. All errors are `sandbox_driver::Error`.
+- `ExecControls` carries one owned stdin reader, an awaited output sink, `term` and `kill` tokens and a latest-value terminal resize receiver.
+- `OneShotSpec` takes its own `OneShotImage`, never the workload `Source`: a registry `image`, or a `build` from a context directory in the workload workspace, resolved against the sandbox working directory, with an optional Dockerfile path, a tag that keys the build cache, and a `reuse` flag. Its command is an optional `entrypoint` plus `args`, not exec argv, so arguments alone reach the image's own entrypoint, as a GitHub Docker action expects. A one-shot's execution participates in the stop fence, and its resources are removed when it finishes or the sandbox is destroyed.
+
+`SandboxSpec::validate_for` and `Environment::validate` check portable invariants and descriptor capabilities. They do not replace JSON Schema or backend validation.
+
+### The descriptor
+
+```json
+{
+  "schemas": {
+    "kind": "lima", "version": "0.3.0",
+    "config_schema": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "properties": {"vm_type": {"type": "string"}}},
+    "spec_schema": null,
+    "secrets": []
+  },
+  "namespace": {"id": "lima:7f3a…", "scope": "machine"},
+  "isolation": "vm",
+  "durability": "machine",
+  "access": "owner_process",
+  "sources": ["image"],
+  "locality": {"host_address": "192.168.5.2", "mounts_host_paths": true},
+  "resources": ["cpu", "memory"],
+  "network": ["allow_all"],
+  "ports": {"exposable": "any"},
+  "capabilities": {"endpoints": [], "services": false, "containers": false,
+                   "container_fields": [], "timers": ["auto_stop"]}
+}
+```
+
+`schemas` is the credential-free part: `kind`, `version`, `config_schema` (a JSON Schema for the entry's `config`; use `oneOf` when you accept alternative forms), an optional `spec_schema` for the spec's `provider_config`, and `secrets`, the credential names the provider expects, so a catalog can check an entry names them all. None of it may need a backend.
+
+`namespace.id` must be stable across restarts and must differ when the sandboxes would. The library refuses a descriptor without one. `isolation` is the workload's security boundary: `none`, `container` or `vm`. `access` is `owner_process` when only the live instance that created a sandbox can operate it, or `shared` when instances reaching the same namespace coordinate one stop fence. `capabilities.container_fields` lists exactly which `container` options the provider honours and `capabilities.timers` which timers it enforces, so a client knows in advance what will be refused. Every advertised list is a set; order and repetition carry no meaning.
+
+`durability` is a promise about restarts. A provider that declares `machine` or `remote` must make `attach` and `list` work after it is stopped and started again with the same entry, from whatever it chose to persist. Where it keeps that state is its own choice; a `state_dir` key in its `config_schema` keeps two entries from sharing one. `process` promises nothing across a restart.
+
+### Optional capabilities
+
+Three groups of calls and fields that only some providers can offer. They are defined here, not by providers: a provider declares which it implements in `capabilities`, and a client checks before relying on one. A provider cannot add a fourth; a new group is added only when a second client and a second provider both need it. Pause, resume, archive and recover were left out because no client calls them; they can return as a group when one does.
+
+- `endpoints`: a set from `ssh` (`ssh(ttl_ms)`, `ssh_revoke(token)`), `shell_command`, `vnc`, reached through `Sandbox::endpoints`.
+- `services`: `true` if `create` accepts the spec's `services`.
+- `containers`: `true` if `Sandbox::containers` runs one-shot containers (`OneShotSpec`), streamed like exec.
+
+Docker offers all three, with `shell_command` as its only endpoint. Daytona offers services and containers. Host offers none: it runs commands as processes in a directory and has nothing to put a service in. Protocol 3 does not carry endpoints or one-shot containers yet, so a plugin cannot offer them; the loader masks them out of a plugin's descriptor.
+
+## Plugins
+
+A plugin is an executable that serves one provider over protocol version 3. The library starts it, writes JSON-RPC requests to its stdin and reads responses from its stdout; stderr is captured as plugin logs. [The plugin protocol](protocol.md#16-protocol-version-3-providers-over-a-process-boundary) specifies the wire: framing, the data channels that carry exec and file bytes outside the control pipe, transport budgets, and the method list. The rest of that document describes protocol version 2, which is being removed.
+
+### Using a plugin
+
+Add a provider entry that names the plugin's kind, the absolute path of its executable, and a checksum pin (or `dev = true` while developing it), then give it an environment:
+
+```toml
+[providers.lima]
+plugin = "lima"
+path   = "/opt/sandbox-driver/plugins/sandbox-driver-lima"
+sha256 = "9f2c…"
+config = { vm_type = "vz" }
+
+[environments.lima-dev]
+provider = "lima"
+
+[environments.lima-dev.spec]
+source = { image = "ubuntu-lts" }
+```
+
+The application registers the loader once, with `Registry::new().plugins(Arc::new(PluginLoader::default()))` beside its built-ins. Nothing else in the calling program knows the environment is served by a child process:
 
 ```rust
-#[async_trait]
-pub trait SnapshotProvider: Send + Sync {
-    async fn create(&self, spec: &SnapshotSpec) -> Result<SnapshotId, Error>;
-        // SnapshotSource::Image(ref) | Dockerfile { content } | Sandbox { id, mode }
-    async fn get(&self, id: &SnapshotId) -> Result<SnapshotStatus, Error>;   // states: building, active, error…
-    async fn list(&self, filter: &SnapshotFilter) -> Result<Vec<SnapshotStatus>, Error>;
-    async fn delete(&self, id: &SnapshotId) -> Result<(), Error>;
-    async fn build_logs(&self, id: &SnapshotId, follow: bool, sink: LogSink) -> Result<(), Error>;
-    // Gated on snapshots.activation: Daytona deactivates snapshots unused
-    // for two weeks; content-addressed reuse needs a way back.
-    async fn activate(&self, id: &SnapshotId) -> Result<(), Error>;
-    async fn deactivate(&self, id: &SnapshotId) -> Result<(), Error>;
-    // Default, composed from the methods above: look the named snapshot
-    // up, activate or create it as needed, and wait within `budget` for
-    // it to become active. Every consumer wants exactly this sequence
-    // before creating a sandbox from a content-addressed snapshot, and it
-    // works over the wire without a method of its own.
-    async fn ensure(&self, spec: &SnapshotSpec, budget: Duration) -> Result<SnapshotId, Error>;
-}
-
-pub struct SnapshotSpec {
-    pub name: Option<String>,
-    pub source: SnapshotSource,
-    pub sandbox_kind: Option<SandboxKind>,
-    pub region: Option<String>,
-    pub resources: Resources,
-    pub provider_config: serde_json::Value,
-}
-
-pub struct SnapshotStatus {
-    pub id: SnapshotId,
-    pub state: SnapshotState,
-    pub sandbox_kind: Option<SandboxKind>,
-    pub regions: Vec<String>,
-    pub resources: Option<Resources>,
-    // …name, error, size, timestamps
-}
-
-#[async_trait]
-pub trait VolumeProvider: Send + Sync {
-    async fn create(&self, spec: &VolumeSpec) -> Result<VolumeId, Error>;
-    async fn get(&self, id: &VolumeId) -> Result<VolumeStatus, Error>;
-    async fn list(&self) -> Result<Vec<VolumeStatus>, Error>;
-    async fn delete(&self, id: &VolumeId) -> Result<(), Error>;
-}
+let sandbox = sandboxes.builder("lima-dev").await?.create().await?;
 ```
 
-Volumes attach at **create time only** (`SandboxSpec.volumes: Vec<VolumeMount { volume, mount_path, subpath }>`) — Daytona has no runtime attach/detach and we don't invent one. Snapshot build progress flows through events and `build_logs`; content-addressed snapshot naming (fabro's HMAC scheme) stays in fabro — this crate takes names.
+On first use the catalog verifies the executable, checks the entry's `config` against the plugin's `config_schema` with the field named on failure, and resolves its `secrets`. If the plugin's own backend is down, `sandboxes.provider("lima")?.health().await` says so before any sandbox is attempted.
 
-`SandboxKind` selects the provisioning form: `Container` or `VirtualMachine`. It is separate from `Isolation`, which describes the provider's security boundary. `SnapshotSpec.sandbox_kind` selects the snapshot class. `SandboxSpec.sandbox_kind` is a required-result constraint: a provider must honor it or reject the request. It must not silently change the kind or create a hidden intermediate snapshot. Daytona supports image-based snapshots for both kinds and Dockerfile-based snapshots for containers only. A Daytona sandbox created from a snapshot inherits that snapshot's class; the provider validates a requested kind before and after creation.
+In Fabro the two levels live where they already do: the provider entry in server settings, the environment in the environments UI, where the form shows the plugin's config fields from its schema.
 
-### The creation spec
+### Writing a plugin
+
+`sandbox_driver_protocol::v3::Plugin::new(schemas, factory)` and `run_plugin` are the Rust SDK. A plugin implements `ProviderFactory` and `Provider` exactly as a built-in does; `run_plugin` answers `--describe-schema` before constructing anything else, then serves stdio. `sandbox-driver-fixture-plugins` is the worked example: it serves the Host and Docker built-ins under the non-reserved kinds `test-host` and `test-docker`. A plugin in another language implements the wire directly.
+
+What the library promises a plugin, and expects of it:
+
+- **The schema probe.** Run with `--describe-schema`, the plugin prints its `ProviderSchemas` as one JSON object on stdout and exits, without config, secrets or backend access.
+- **Supervision.** The plugin loader starts one child per activated entry, on that entry's first use, with exactly the frozen environment described under [Configuration](#configuration) plus the resolved secret values, and the entry's `args`. Each start is a generation. Handles keep the generation that issued them and fail with `Stale` once it ends; the next call starts a new generation, which must report the same schemas and namespace. Only the transport is restored: the call in flight when a child died reports an unknown outcome or `lost`, and is never sent again.
+- **The handshake.** `initialize` carries the protocol version, the data transport, the entry name, the entry's `config` (already validated) and the *names* of its secrets. Secret values never cross the control pipe; the plugin reads them from its environment. Do not depend on any other environment variable being set. `describe` must then return the discovered schemas.
+- **Bounded work.** `shutdown` ends supervised children with bounded cleanup, and a child exits on stdin EOF. Neither proves that remote workload execution has stopped.
+
+### Plugin metadata discovery
+
+`sandbox_driver_protocol::metadata` implements the credential-free discovery step, and the [plugin protocol](protocol.md#15-plugin-metadata-probe) specifies the probe a plugin answers.
+
+`SchemaDiscovery` starts nothing when constructed. A `discover` call takes only a `PluginLocation` (entry name, kind, path, trust), never the entry's config, arguments, environment or secrets. The path must be absolute; there is no search of the caller's `PATH`. Discovery checks the checksum, or explicit development trust, and only then runs the executable. Probe stderr is logged when the probe fails and never put in an error. A Rust plugin can call `metadata::write_schema` before constructing its provider or loading settings, then exit.
+
+Default budgets are five seconds for the whole discovery call, 1 MiB of stdout, 64 KiB of stderr, four concurrent probes, and 64 cached binaries. A probe beyond the concurrency budget waits within its caller's timeout; concurrent discoveries of one binary share a single probe. Both pipes are drained concurrently and bounded. On Unix the probe runs in its own process group, which is killed when the probe returns, fails, times out or is cancelled, so descendants do not outlive it.
+
+The cache holds metadata only, keyed by the actual SHA-256 of the executable. Every lookup rehashes the executable and checks that location's trust, even on a cache hit. Changed bytes require rediscovery; failed probes are not cached. `DiscoveredPlugin` keeps the canonical executable path, digest, schemas, and whether a pin was verified. The loader calls `verify_unchanged` immediately before starting the child, and the catalog compares the provider's descriptor with the discovered schemas before any sandbox operation. Cached metadata never supplies namespace or capability facts. The configured kind must match the discovered one.
+
+A missing, relative, non-executable or mismatched executable is `InvalidConfig` naming the entry and the `path`, `sha256` or `plugin` field; a mismatch reports both digests. A probe that fails, times out or prints anything but one schemas object is `Unavailable` with outcome `not_started`.
+
+Probing executes trusted code, not sandboxed code. The executable is hashed and then executed by path, so installation directories and executables must be protected against concurrent modification. The checksum covers the executable bytes, not interpreters, shared libraries, or dependencies.
+
+## Conformance
+
+`sandbox_driver_conformance::Conformance` runs against a catalog, an environment and a set of provider-specific commands (a probe with its expected output, and a long-running command). It creates one sandbox per check and cleans it up afterwards, and reports each executed check: identity and inventory (including a label with awkward values that must round-trip), binary file ranges and preservation, streamed exec, and the stop fence across two handles. With `with_peer` and a second, separately activated catalog for the same entry, it also checks the fence across provider instances.
+
+The same suite runs against the fake in the routine tests, against Host in the routine tests, against Docker with `mise run test:docker`, against Daytona with `mise run test:live`, and against the fixture plugins over protocol 3. Passing it is not certification of everything above: workload targeting, services and one-shot containers, restart recovery for durable providers, failure injection and transport loss are checked by each provider crate's own integration tests.
+
+## Testing
 
 ```rust
-pub struct SandboxSpec {
-    pub name: Option<String>,
-    pub source: SandboxSource,            // Image(ref) | Dockerfile { content } | Snapshot { id }
-    pub resources: Resources,             // optional cpu_cores, memory_mb, disk_mb, gpus fields
-    pub sandbox_kind: Option<SandboxKind>, // required result when set
-    pub env: BTreeMap<String, String>,
-    pub labels: BTreeMap<String, String>,
-    pub user: Option<String>,
-    pub working_directory: Option<String>,
-    pub workspace_ownership: Option<WorkspaceOwnership>, // Host only
-    pub network: NetworkPolicy,           // AllowAll | Block | CidrAllowList | DomainAllowList | proxy
-    pub volumes: Vec<VolumeMount>,
-    pub timers: LifecycleTimers,
-    pub ephemeral: bool,                  // first-class; providers translate
-    pub public: Option<bool>,
-    pub region: Option<String>,
-    pub provider_config: serde_json::Value,   // typed escape hatch, per provider, schema-documented
-}
+let sandboxes = sandbox_driver_testing::fake();
 ```
 
-`provider_config` is the pressure valve: Daytona's GPU type preference lists, spot instances, linked sandboxes, warm-pool hints, and future boxd golden-image options live there without polluting the common spec. It crosses the JSON-RPC boundary opaquely. The configuration crates export these shapes as types — such as `sandbox-driver-docker-config`'s `DockerProviderConfig` with `into_value()` — so a protocol client builds it type-checked and the provider parses it back through the same type; only the wire sees untyped JSON.
+The fake lives in `sandbox-driver-testing`, which consumers add as a dev-dependency; the core library exports no fake. It implements the required in-memory lifecycle, identity, files and scripted streaming execution. Use `FakeProvider::script` to define command responses and `FakeProvider::sandboxes` to keep access to its call log. Unscripted commands fail; no command executes on the host. Clones share workload state and call history. It advertises no optional services, container, endpoint or port capabilities.
 
-### Nested Docker on Daytona
+## CLI
 
-`sandbox-driver-daytona-config` defines `DaytonaProviderConfig`. Its optional `docker` field contains `NestedDockerConfig`: an `image`, an execution `target` (`container` or `virtual_machine`), an optional container `user`, and Docker provider `options`. Unknown fields are rejected. The outer sandbox source, provisioning kind, resources, and timers still describe the Daytona sandbox.
+`lithos-sandbox` is the command-line client of this API and uses the same catalog: provider entries and environments, read from one file. Host, Docker and Daytona are linked into it and run in its process; every other kind is a plugin, launched over protocol version 3 by the plugin loader. With no catalog file it has one entry and one environment of the same name for each built-in.
 
-The runner must provide `start-docker`, the Docker CLI, and Python 3. Nested Docker operations run through Daytona's native process APIs against the sandbox's private Unix socket. Command output uses bounded encoding to preserve binary bytes through the SDK's text session logs. File bytes use Daytona's native file API and Docker archive commands. The provider does not create a Docker API listener or preview connection. Failed operations are not replayed.
-
-With the `container` target, execution, files, environment, git, PTY, services, and one-shot containers use the nested job container. With `virtual_machine`, ordinary operations stay in the outer sandbox; Docker starts only when a one-shot needs it. One-shots use the outer workspace and host network without a helper container. Sidecar containers require the `container` target. The provider owns workspace binds and network placement. The Docker provider separately supports `host_network: true` with unrestricted networking and no sidecars.
-
-The VM owns all nested resources. Stop fences the whole VM; delete removes it. Restart reattaches the existing named job container and preserves its workspace. It does not replace a missing job container. Docker start sweeps old one-shots only after this handle observes the generation ending. Fresh attachment preserves other handles’ active one-shots and preparation files. Only the execution target is stored in Daytona labels. Registry credentials and container configuration are not stored there. Nested containers retain VM lifecycle capabilities; VM desktop, SSH, and log facets are absent from a container execution target.
-
-Local tests cover Docker command construction, lifecycle behavior, and binary file transfers. The ignored live gate additionally requires `DAYTONA_API_KEY` and `SANDBOX_DRIVER_DAYTONA_DIND_SNAPSHOT`, a runner snapshot with at least 2 CPUs and 4 GiB of memory. That gate verifies the complete hosted nested Docker workflow.
-
-`working_directory` is the final workspace directory chosen before creation. A provider creates it when needed, uses it as the default for relative file and process operations, and returns the same value from handles created by `attach`. The Host provider treats an explicit path as designated and does not delete it by default. Setting `workspace_ownership: Managed` explicitly transfers creation and deletion of that named directory to Host. Other sources reject explicit workspace ownership.
-
-When `runtime_directory()` returns a path, the provider creates that directory outside the workspace with owner-only permissions (`0700`) before returning from `create`. The path remains stable across `attach`. Host returns `None`; Docker and Daytona return `/tmp/sandbox-driver/runtime` inside the sandbox.
-
-**The spec is an unvalidated serializable request.** Its fields are public and it can express combinations no provider accepts. The protocol adapter maps it to the stable version-1 wire DTO; in particular, the public typed snapshot `id` still crosses as `source.snapshot.name`. Validation happens at the provider boundary: every provider calls `SandboxSpec::validate()` (the cross-provider invariants — known sandbox kind, mutually exclusive idle timers, absolute mount paths, non-empty ids) and layers its own provider-specific checks, returning the typed `Error::InvalidSpec` naming the field. A provider must reject every explicit value it cannot honor; it must never silently ignore a requested resource, identity, lifecycle, network, access, region, or provider-specific setting. The builder setters are construction convenience, not an invariant guarantee.
-
-**Not in the spec:** clone URLs, branches, tags, commit SHAs, GitHub credentials. Fabro's spec carries these today, but cloning is an orchestration recipe over `Exec` + `Git`, not a provisioning concern — it stays in fabro (with its repo-layout, pinned-revision, and retry logic).
-
-## Events
-
-```rust
-#[non_exhaustive]
-pub struct Event {
-    pub id: EventId,                    // source_id + monotonic sequence
-    pub occurred_at: SystemTime,
-    pub provider: ProviderKind,
-    pub subject: EventSubject,          // provider | sandbox | snapshot | volume
-    pub operation_id: Option<OperationId>,
-    pub correlation_id: Option<CorrelationId>,
-    pub body: EventBody,
-}
-
-#[non_exhaustive]
-pub enum EventBody {
-    OperationStarted { action: Action },
-    OperationProgress { action: Action, progress: Progress },
-    OperationCompleted { action: Action, duration: Duration },
-    OperationFailed { action: Action, duration: Duration, error: ErrorReport },
-    StateObserved { previous: Option<ResourceState>, current: ResourceState },
-    Notice { code: String, message: String },
-    Unknown,
-}
-
-#[async_trait]
-pub trait EventObserver: Send + Sync {
-    async fn observe(&self, event: Event);
-}
+```
+lithos-sandbox providers                     # provider entries from the catalog
+lithos-sandbox provider describe daytona
+lithos-sandbox provider health daytona
+lithos-sandbox environments
+lithos-sandbox create ci-linux --label job=1842
+lithos-sandbox exec <ref> -- make test
+lithos-sandbox cp <ref>:/workspace/out ./out
+lithos-sandbox find --label job=1842         # across every provider
+lithos-sandbox destroy <ref>
 ```
 
-`Event` is the one public event type for all sandbox-driver control-plane facts. Consumers can qualify it as `sandbox_driver::Event` or alias the import. Exec output, PTY bytes, file-transfer chunks, and logs stay on their dedicated streaming APIs.
+The [CLI guide](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/cli.md) describes every command, where the catalog file is found, and its defaults.
 
-The attachment is explicit. `create`, `attach`, and `undelete` take an optional `EventContext`, which the returned sandbox handle retains. Snapshot and volume mutation methods also take an optional context. Clones of one context share an event source and sequence space. A consumer can add an opaque `CorrelationId` to associate events with its run, job, or request.
+## Design rules
 
-`EventEmitter::run` is the provider-side lifecycle boundary. Once an operation is accepted, it emits `OperationStarted` and exactly one `OperationCompleted` or `OperationFailed` with the same `OperationId`. The terminal event is observed before the method returns. Durations measure the real operation. A create operation starts with a name-only subject when necessary and updates the terminal subject after the provider assigns the resource ID. Long operations use structured `Progress` values with stable codes; display messages are not control data. Failures carry a bounded `ErrorReport { kind, message, retryable, causes }`, so the error taxonomy survives the event and wire boundary.
+The rules the library holds itself and its clients to. Contributions are reviewed against them.
 
-In-process delivery through `EventContext` is direct and ordered. The plugin
-client delivers events through a bounded ordered worker. It does not await an
-application observer in the shared control reader. Responses can precede the
-observer callback. `PluginProvider::event_delivery_error()` reports queue
-exhaustion, callback timeout, or an expired route. The application must treat
-that subscription as incomplete. Durable persistence requires an explicit
-application boundary; blocking an observer does not delay all control calls.
+1. Clients never see a kind name except as data in a descriptor.
+2. Every client-facing method is wire-expressible.
+3. A provider reports its namespace, durability, and capabilities. The library trusts the descriptor and nothing else.
+4. The required interface grows only when a second provider and a second client both need the call. Vendor-only operations are optional capabilities or stay out.
+5. Built-ins get no special API. They implement the same traits a plugin does, and the conformance suite runs against them too.
+6. The library owns config, discovery, trust, and supervision. Clients configure them.
+7. Connection and trust settings live on provider entries; what to build lives on environments. Neither level repeats the other.
+8. Bulk bytes never share a pipe with control messages. Streams get their own connections; stop and health are never queued behind data.
 
-sandbox-driver does not store or replay events. A consumer that needs a durable event log persists events in its observer. Re-attach starts a new live source. `describe()` and the snapshot and volume status methods remain authoritative for current durable resource state. This keeps operation telemetry separate from state reconciliation.
+## Status
 
-## Errors
+Protocol version 3. The crates are pre-1.0 and the public API may change before 1.0.
 
-Per the style guide (library errors, taxonomy at layer boundaries):
-
-```rust
-#[non_exhaustive]
-pub enum Error {
-    NotFound { resource: ResourceKind, id: String },
-    Unsupported { capability: CapabilityPath },        // machine-readable, preflightable
-    InvalidState { current: SandboxState, action: Action },
-    InvalidSpec { field: String, reason: String },
-    Timeout { operation: String, elapsed: Duration },
-    Auth(AuthError),
-    RateLimited { retry_after: Option<Duration> },
-    Exec(ExecError),                                    // bounded, classified; raw output behind accessors
-    Git(GitFailure),                                    // a git operation classified by what the remote said
-    Provider(ProviderError),                            // structured provider detail, serializable
-    Transport(TransportError),                          // out-of-process provider communication
-    Io { context: String, source: io::Error },          // local filesystem and process I/O
-}
-```
-
-The `Exec` variant preserves fabro's redaction boundary: `Display` shows bounded classified metadata only; raw stdout/stderr is available through explicit accessors so callers control exposure. Redaction hooks stay caller-side (fabro keeps `fabro_redact`).
-
-The `Git` variant classifies a failed git operation once, in this crate, from the command's output or the provider's native failure: the remote rejected the credential, the remote is unavailable, the revision does not exist, access is denied, the target exists, the sandbox has no usable `git` executable, or unclassified. Every provider and both transports produce the same class for the same failure, so a consumer decides about retries by matching the class and never parses git output. Whether a rejected credential is worth retrying depends on the credential's provenance, which only the consumer knows.
-
-Provider adapters retain SDK errors as opaque sources on `AuthError` and
-`ProviderError`. The protocol adapter classifies framing, encoding, and
-connection failures as `Transport`. It reconstructs every public error
-variant and its rendered remote source chain at the process boundary.
-
-## What deliberately stays out of this crate
-
-- Git credentials and push machinery: `refresh_push_credentials`, `push_token_source`, `git_push_ref` (lease/retry engine), `setup_git` intents, `resume_setup_commands`, `origin_url`.
-- Clone orchestration: clone-source decisions, repo layout (`/repos/<owner>/<repo>` + symlink), pinned revisions, clone depth, clone events.
-- Content-addressed snapshot naming (HMAC of manifest).
-- Secret redaction policy: output sanitization is portable through `ExecSpec`, but provider-independent secret detection and redaction remain the caller's responsibility.
-- Fabro's run lifecycle: `initialize`-then-probe sequencing, cleanup scope guards, `--preserve-sandbox`, reconnect. These consume the crate's core + wait helper.
-
-Each of these is implementable over `Exec`/`Git`/core — the fabro survey confirmed both remote providers already implement them via exec today.
-
-## Fabro migration map (34 methods → new home)
-
-| fabro `Sandbox` method(s) | New home |
-| --- | --- |
-| read/write/delete/exists/list/upload/download | `Filesystem` facet |
-| `read_file` (numbered lines), `read_file_text` | fabro-side formatting over `Filesystem` |
-| grep / walk\_files / glob | `Search` facet (derived impl in-crate) |
-| exec\_command / exec\_command\_streaming / spawn\_stdio\_process | `Exec` facet |
-| initialize / activate / start / stop / delete / cleanup | core lifecycle + `activate` convenience + probe helper |
-| working\_directory / runtime\_directory / platform / os\_version / sandbox\_info | handle metadata + `describe()` / `platform_info()` |
-| snapshot\_info | `SandboxStatus` (`snapshot` field) |
-| set\_autostop\_interval | `set_timers` |
-| ssh\_access\_command | `Access` facet (`SshAccess` / `ShellCommand`, now distinguishable) |
-| get\_preview\_url | `Access` facet (`PreviewUrls`) |
-| setup\_git, git\_push\_ref, refresh\_push\_credentials, push\_token\_source, resume\_setup\_commands, origin\_url | **stays in fabro**, over `Exec` + `Git` |
-| `TerminalSession` (terminal.rs) | `Pty` facet |
-| sandbox events + callback | `Event` + `EventObserver` (uniform resource shape) |
-| `SandboxProvider` + registry | `SandboxProvider` (create now returns the handle); registry stays caller-side |
-
-## Verification and compatibility gates
-
-- Run a common conformance suite against every provider for lifecycle, Bash, filesystem, term and kill, and capability honesty.
-- Test public workflows and JSON-RPC round trips at integration boundaries. Add property tests for protocol decoding, unknown fields, and state-transition invariants where useful.
-- Verify Rust 1.85 with default, minimal, and all supported features.
-- Before a public release, run semver checks and validate the package artifact. Record MSRV bumps, public dependency changes, and intentional protocol or API breaks.
-
-## Settled (adopted defaults — flag any you disagree with)
-
-1. **Facet accessors are separate small traits** — `Option<&dyn SshAccess>`, `Option<&dyn PreviewUrls>`, `Option<&dyn ShellCommand>`, `Option<&dyn WebTerminal>` — not one `Access` grab-bag. Matches the style guide and the per-method JSON-RPC mapping.
-2. **Streaming exec sink is a callback** (object-safe, maps 1:1 to `exec/output` notifications); a `Stream` adapter is provided on top for idiomatic consumption.
-3. **`create`/`attach`/`fork` return `Arc<dyn Sandbox>`** — fabro shares handles across tasks.
-4. **The bash health probe is a library helper** run by the `activate` convenience, not a trait method. Providers implement exec; the probe is a contract test over it.
-5. **Command sessions**: capability name reserved in the schema; no trait in v1.
-6. **`Logs` is follow-style streams only** in v1; historical querying is a later capability.
-7. **Workspace layout**: ten packages: `sandbox-driver` (core types, traits, derived implementations, and helpers), `sandbox-driver-protocol`, `sandbox-driver-conformance`, `sandbox-driver-testing` (scripted in-memory `Sandbox` and `SandboxProvider` doubles for consumers' unit tests, so no consumer writes its own fake of the traits), `sandbox-driver-cli`, `sandbox-driver-{docker,daytona}-config`, and `sandbox-driver-{host,docker,daytona}`. Each provider package contains a library with a supported public API for in-process embedding and a plugin executable serving the same provider over JSON-RPC. Both are supported application boundaries; third-party providers use JSON-RPC only.
-8. **VNC v1 returns browser connection information.** VPN clients are
-   guest software managed through exec.
-9. **The Docker image contract requires `setsid`** alongside bash, `stat`, `find`, and `base64` — reliable kill semantics need a separate session, and an image without it fails every exec with a clear message rather than degrading silently.
-10. **`recover` and `undelete` are separate verbs.** `recover` repairs a live sandbox in the `Error` state; `undelete` (provider-level, returns a fresh handle) restores a deleted one. Daytona's "recover" endpoint is our `undelete`; it declares `lifecycle.recover: false`.
-11. **Chunked file transfer is `read_range`/`write_append`**, not a streaming transfer protocol: stateless, additive on `fs/read`/`fs/write`, with efficient overrides per provider (seek on Host, `tail`/`>>` on exec-derived) and correct read-and-slice / read-concat-write defaults everywhere else.
-12. **The event envelope owns operation identity.** Each accepted operation gets an `OperationId`; a wire-only `route_id` sends early create events to the correct observer before a resource ID exists. The optional consumer `CorrelationId` crosses the wire unchanged. Cancellation of long operations is a later additive step.
-13. **Provider health is a report, not an error**: `health()` always answers; non-`ok` statuses (`unreachable`, `unauthorized` with `missing_permissions`) are successful responses, and `Err` is reserved for the check itself failing.
-14. **Git is an environment prerequisite when advertised.** Images and snapshots used by Docker or Daytona, and the Host process environment, provide `git` on `PATH`. Providers do not probe for it or change immutable capabilities based on guest package discovery.
-15. **Services are normalized when advertised.** `services.supported` reports complete availability; `services.native` is diagnostic only. The sandbox chooses the provider implementation or `DerivedServices`, so consumers never construct the fallback.
-16. **Search is normalized when advertised.** `search.supported` reports complete availability; `search.native` is diagnostic only. The sandbox chooses the provider implementation or `DerivedSearch`. Derived Search requires `find`, `grep`, and `head`; `rg` remains optional.
+Prior art: Jupyter kernelspecs and `jupyter_client`, Kubernetes CRI and RuntimeClass, the OCI runtime spec, HashiCorp go-plugin, MCP servers.

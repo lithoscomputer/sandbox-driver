@@ -1,9 +1,11 @@
 # sandbox-driver plugin protocol, version 2
 
-The additive [shared contract](shared-contract.md) defines next-API data and
-schema bootstrap requirements. It does not change this version's handshake,
-error encoding, operation DTOs, or transport. New adapters require explicit
-version negotiation; new workload specs must not be sent as v2 specs.
+The [design](design.md) specifies the `Sandboxes` API and what its providers
+guarantee. Section 16 specifies protocol version 3, which carries that provider
+interface to a plugin; sections 1 to 14 describe version 2, which is still in
+the tree but being removed. Version 3 does not change version 2's handshake,
+error encoding, operation DTOs, or transport, and a `SandboxSpec` is never sent
+as a version 2 spec.
 
 This is the normative specification of the wire protocol between a
 **host** (an application using the protocol client, primarily Petri) and a **plugin** (an executable serving one sandbox provider). It
@@ -1098,12 +1100,13 @@ Native search/service passthrough, local `shell_command`, and
 `host/credentials` (per-call secret fetches from the host) remain
 deferred. They are masked or absent per §5.
 
-## 15. Shared-contract metadata probe
+## 15. Plugin metadata probe
 
-The credential-free discovery step in [the shared contract](shared-contract.md)
-does not change the v2 handshake or make a v2 provider implement the new
-contract. Existing `launch_plugin`, `PluginProvider`, and `serve_stdio` remain
-the v2 entry points.
+The catalog's credential-free discovery step, described under
+[lazy startup](design.md#lazy-startup), runs this probe. It is not part of the
+version 2 handshake, and answering it does not make a version 2 plugin serve
+the `Sandboxes` API. `launch_plugin`, `PluginProvider`, and `serve_stdio`
+remain the version 2 entry points.
 
 A plugin that supports discovery is run with exactly one argument,
 `--describe-schema`. The process gets null stdin and no runtime arguments,
@@ -1117,16 +1120,16 @@ duration and output and, on Unix, kills its process group when the probe ends,
 so it **must not** leave work behind in descendants.
 
 The host-side budgets, cache and errors are described under
-[plugin metadata discovery](shared-contract.md#plugin-metadata-discovery).
+[plugin metadata discovery](design.md#plugin-metadata-discovery).
 
-## 16. Protocol version 3: the shared contract over a process boundary
+## 16. Protocol version 3: providers over a process boundary
 
-Version 3 carries [the shared contract](shared-contract.md) between a host and
-a configured third-party plugin. The built-in providers (Host, Docker and
-Daytona) are never served over it: their kinds are reserved, and a plugin uses
-another kind. The framing, envelope, data channels and transport budgets of
-sections 2 and 3 are unchanged. Version 2 stays available on both sides until
-its consumers migrate, and a version 3 host never falls back to it.
+Version 3 carries the [provider interface](design.md#the-provider-interface)
+between a host and a configured third-party plugin. The built-in providers
+(Host, Docker and Daytona) are never served over it: their kinds are reserved,
+and a plugin uses another kind. The framing, envelope, data channels and
+transport budgets of sections 2 and 3 are unchanged. Version 2 is still in the
+tree but being removed, and a version 3 host never falls back to it.
 
 **Host side.** `v3::PluginLoader` is the `ProviderFactory` an
 application passes to `Registry::plugins`. `discover` is section 15.
@@ -1152,25 +1155,25 @@ schemas.
 **Methods.** `describe`, `health`, `create`, `attach`, `list`, `destroy`,
 `status`, `start`, `stop`, `exec`, `exec.stop`, `exec.resize`, `files.get`,
 `files.put`, `files.list`, `ports.expose` and `ports.release`, carrying the
-contract's own types. `exec`, `files.get` and `files.put` are data-channel
+provider interface's own types. `exec`, `files.get` and `files.put` are data-channel
 operations: exec stdin and output, and file bytes, travel in frames, and a
 transfer that ends without its `Eof` fails rather than looking short.
 `exec.stop`, `exec.resize`, `stop`, `destroy`, `health` and `ports.release` are
 reserved, so they are answered while the plugin's ordinary capacity is full.
-Dropping an exec future kills its execution. Errors keep their contract
+Dropping an exec future kills its execution. Errors keep their `Error`
 variant and fields in a report whose kind is `contract`.
 
 **Plugin side.** `v3::Plugin::new(schemas, factory)` and `run_plugin`
 are the SDK entry points. `run_plugin` answers `--describe-schema` before
 constructing anything else, then serves stdio. `Plugin::with_legacy` also
-serves version 2 to hosts that ask for it while callers migrate. `shutdown`
+serves version 2 to hosts that ask for it; it goes with version 2. `shutdown`
 kills in-flight executions and calls the runtime's `shutdown`.
 
 **Not yet carried.** The optional capability groups are masked from the
 descriptor a version 3 host reports, matching handles that return `None` for
 them. Endpoints (`ssh`, `ssh_revoke`, `shell_command`, `vnc`) and one-shot
 containers (`containers.run`) stay optional for providers and are carried by
-the follow-up “Protocol 3 optional capabilities” story. The contract has no
+the follow-up “Protocol 3 optional capabilities” story. The provider interface has no
 lifecycle group (pause, resume, archive, recover) to carry; `start` brings a
 paused sandbox back to running.
 

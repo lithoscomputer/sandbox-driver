@@ -27,16 +27,14 @@ async fn main() -> Result<(), Error> {
 }
 ```
 
-**Status:** `Sandboxes` is the sandbox-driver API, exported from the crate root.
-The examples run against the in-memory
-provider in `sandbox-driver-testing`. Host, Docker, and Daytona implement it as
-built-ins, and protocol version 3 loads third-party plugins. See the
-[API specification](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/next-api.md).
+The examples run against the in-memory provider in `sandbox-driver-testing`.
+Host, Docker, and Daytona implement the API as built-ins, and protocol version 3
+loads third-party plugins. See the
+[design](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/design.md).
 
-The older provider API ([design](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/design.md)),
-protocol version 2, and the Host, Docker, and Daytona provider executables are
-still in the tree but are being removed. If you need them, pin tag
-[`v2`](https://github.com/lithoscomputer/sandbox-driver/tree/v2).
+The old provider API, protocol version 2, and the Host, Docker, and Daytona
+provider executables are still in the tree but are being removed. If you need
+them, pin tag [`v2`](https://github.com/lithoscomputer/sandbox-driver/tree/v2).
 
 Part of [Lithos](#part-of-lithos), a family of Rust building blocks for AI tools.
 
@@ -54,7 +52,7 @@ tool that creates sandboxes, runs commands, and returns to them later.
 
 **Look elsewhere if** you need scheduling, queues, or workflow execution;
 [Petri](https://github.com/lithoscomputer/petri) is the workflow engine in this family.
-Use a provider's own SDK when you need operations outside the shared contract.
+Use a provider's own SDK when you need operations this API does not cover.
 
 ## What does it do?
 
@@ -89,7 +87,7 @@ Host runs processes in a directory and provides no isolation boundary.
 | `sandbox-driver-docker-config` | Construct typed Docker options for the old provider API, which is being removed |
 | `sandbox-driver-daytona-config` | Construct typed Daytona options for the old provider API, which is being removed |
 | `sandbox-driver-protocol` | Load or build third-party plugins over protocol version 3; version 2 is being removed |
-| `sandbox-driver-conformance` | Check a provider against the shared behavioral contract |
+| `sandbox-driver-conformance` | Check a provider against the shared behavioral requirements |
 | `sandbox-driver-testing` | Test callers with an in-memory provider and scripted commands |
 | `sandbox-driver-cli` | Install the `lithos-sandbox` command |
 
@@ -125,7 +123,7 @@ or environments. The fake's `default` environment is a test fixture.
 Provider entries stay fixed for the catalog's lifetime. Environments can come
 from a static list, a configuration file, or an application store.
 Applications register provider adapters explicitly; core does not install them.
-See [catalog configuration](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/next-api.md#configuration)
+See [catalog configuration](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/design.md#configuration)
 for the full setup.
 
 Save a `SandboxRef` to return to a sandbox. It contains the provider entry,
@@ -183,8 +181,8 @@ scope. Host promises access only through the instance that created the sandbox.
 A lost connection or dropped execution future does not confirm that work stopped.
 The library does not replay mutations whose outcome is unknown.
 
-More detail: [client API](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/next-api.md#client-api),
-[provider contract](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/shared-contract.md),
+More detail: [client API](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/design.md#client-api),
+[provider guarantees](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/design.md#lifecycle-fences-and-uncertain-outcomes),
 and [diagnostics](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/diagnostics.md).
 
 ### Use it from the command line

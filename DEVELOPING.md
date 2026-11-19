@@ -72,11 +72,15 @@ Review the draft before publishing it.
 
 ## Provider verification
 
-The current Host and Docker conformance checks exercise both in-process and
-plugin access. Docker checks need a running daemon. Daytona's live suite
-needs `DAYTONA_API_KEY`.
+Host runs the shared conformance suite in the routine tests. Docker's live
+checks need a running daemon: run `mise run test:docker`, which
+[Docker lifecycle coordination](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/docker-lifecycle.md#verification)
+describes. Daytona's live suite needs `DAYTONA_API_KEY`: run `mise run test:live`.
+Many provider tests still use the old API, including the old conformance
+suite, which exercises in-process and protocol 2 plugin access; they are being
+ported or removed with it.
 
-The hosted nested Docker gate also needs
+The hosted nested Docker gate for Daytona also needs
 `SANDBOX_DRIVER_DAYTONA_DIND_SNAPSHOT`. Set it to a runner snapshot with
 `start-docker`, the Docker CLI, and Python 3, at least 2 CPUs, and 4 GiB of memory:
 
@@ -84,25 +88,22 @@ The hosted nested Docker gate also needs
 cargo nextest run --locked -p sandbox-driver-daytona --test nested_docker --run-ignored only
 ```
 
-See the [nested Docker design](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/design.md#nested-docker-on-daytona)
-for the current configuration and restart behavior. Local tests cover command
-construction and binary transfers; they do not replace this hosted gate.
+This gate drives the old Daytona provider's nested Docker configuration, which
+is being removed. Local tests cover command construction and binary
+transfers; they do not replace it.
 
-## README examples and API migration
+## README examples
 
 The root README follows the Lithos README guide and template. Its examples use
-the `sandbox_driver` crate root with the in-memory provider, so they can run before
-real-provider migration is complete. The core crate includes them as doctests;
-`mise run test:doc` and the routine gate compile and execute them.
+the `sandbox_driver` crate root with the in-memory provider from
+`sandbox-driver-testing`, so they need no daemon or credentials. The core crate
+includes them as doctests; `mise run test:doc` and the routine gate compile and
+execute them. Examples that need a daemon or credentials must use `rust,no_run`
+so they still compile as doctests.
 
-Keep the [target specification](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/next-api.md)
-as the detailed API contract. Before removing the README's preview notice,
-verify the shared API, plugin loader, and all three providers pass conformance
-together. Then replace the hero's fake setup with a working provider catalog,
-update the CLI installation and examples, and recheck provider packaging and
-protocol-version claims. Examples that need a daemon or credentials must use
-`rust,no_run` so they still compile as doctests.
-
-The existing [provider API](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/design.md)
-and [version 2 protocol](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/protocol.md)
-remain the references for current consumers during migration.
+The [design](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/design.md)
+is the detailed specification of the API the README introduces. Change it in
+the same pull request as the code it describes. The
+[plugin protocol](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/protocol.md)
+specifies version 3 in section 16; its other sections describe version 2, which
+is being removed.

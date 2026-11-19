@@ -5,7 +5,7 @@
 //! activates one [`Provider`] per entry, and a provider creates, attaches,
 //! lists and destroys [`Sandbox`] handles.
 //!
-//! Providers must implement the guarantees in `docs/shared-contract.md`.
+//! Providers must implement the guarantees in `docs/design.md`.
 //! Serialization here defines common data, not a negotiated wire protocol.
 
 mod admission;

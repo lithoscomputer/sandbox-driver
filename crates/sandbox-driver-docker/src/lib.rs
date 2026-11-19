@@ -49,8 +49,8 @@
 //! restarts. Admissions and lifecycle changes coordinate through an unstarted,
 //! daemon-owned claim container. Conflicting lifecycle calls return provider
 //! code `busy`; cancellation or unknown daemon outcomes retain the claim for
-//! explicit reconciliation. See `docs/docker-lifecycle.md` for the scope,
-//! operation bounds, and migration limitations.
+//! explicit reconciliation. See `docs/docker-lifecycle.md` for the claim,
+//! its operation bounds, and reconciliation.
 
 mod access;
 mod config;

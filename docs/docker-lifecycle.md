@@ -2,9 +2,9 @@
 
 The Docker provider serializes resource creation, command admission, one-shot
 admission, and lifecycle mutations through a daemon-scoped claim. Independent
-provider instances that connect to the same daemon use the same claim. Existing
-library calls and protocol v2 use this implementation; it does not declare that
-the Docker provider implements the entire next API.
+provider instances that connect to the same daemon use the same claim. This is
+the stop fence behind the `access: shared` that `DockerFactory`'s provider
+reports.
 
 The claim is an unstarted container with a unique Docker name. It carries
 `sh.sandbox-driver.fence` and `sh.sandbox-driver.fence-operation` labels and is
@@ -32,10 +32,9 @@ can start.
 Stop holds the claim while removing one-shots, stopping the primary container,
 and stopping its services. It inspects the primary and services to confirm they
 are no longer running; missing or still-running state returns `fence_leaked`
-and retains the claim. Start, exec, one-shot admission, pause, resume, and
-delete cannot overtake that drain. A competing lifecycle claim is refused as a
-legacy `ProviderError` with code `busy`. Any operation waits up to five
-seconds behind a held admission claim, since admissions release quickly; a held
+and retains the claim. Start, exec, one-shot admission and destroy cannot
+overtake that drain. A competing lifecycle claim is refused with `Busy`. Any
+operation waits up to five seconds behind a held admission claim, since admissions release quickly; a held
 lifecycle claim refuses it at once. Describe and inventory remain
 available while a claim is held, and so do the stop-request and PTY cleanup
 execs that end already-admitted commands: they start no new work, so a held
@@ -46,10 +45,18 @@ claim must not keep a command from being stopped.
 A completed daemon refusal releases the claim so the application can decide
 whether to retry. A transport failure, deadline, or dropped caller retains it:
 the provider cannot establish that the remote mutation finished. There is no
-lease expiry, automatic takeover, or mutation replay. The error uses code
-`transport`, with `outcome: unknown` and the known claim container ID or name in
-`detail` (or the sandbox ID if acquisition did not reveal the claim). A cancelled future cannot return an error, so the labels provide the
-reconciliation record.
+lease expiry, automatic takeover, or mutation replay. The caller receives
+`Transport` with outcome `unknown`. A cancelled future cannot return an error,
+so the labels provide the reconciliation record.
+
+Inside the provider, these failures are old-API `ProviderError`s whose codes
+(`busy`, `fence_leaked`, `transport`, `incomplete_cleanup`) and structured
+`detail` the paragraphs below name. That error type is in the
+`sandbox_driver::legacy` module, which is being removed. The `Sandboxes` API
+maps it to `Busy`, `FenceLeaked`, `Transport` with an unknown outcome, and
+`IncompleteCleanup` with the `remaining` resources, including a retained claim
+as a `fence_container` resource. Other detail fields reach the caller only as
+diagnostic text.
 
 HTTP 502 and 504 responses also retain ownership. A gateway can return these
 after forwarding a mutation, without establishing the daemon's outcome. This
@@ -60,9 +67,7 @@ Internally, operation failures carry a typed claim disposition separately from
 their diagnostic error. Combining primary/service or creation/cleanup outcomes
 retains any requirement for reconciliation before choosing the public error.
 The selected diagnostic cannot turn an unresolved operation into a releasable
-claim. Both stop failures remain available, including over the plugin protocol,
-using `related_error` in provider detail (nested under `cause` when wrapped as a
-transport failure).
+claim.
 
 If claim release fails, `detail.operation_outcome` distinguishes completed work
 from failed work. `operation_error` and `release_error` preserve both reports,
@@ -80,7 +85,7 @@ The claim must not be removed merely because its creator disconnected or a
 period of time passed. An operator or application recovery procedure must first
 establish that the original request can no longer change the sandbox and that
 any required termination or cleanup is complete. Then it removes the claim named
-in the error's `fence_container` with `docker rm <fence_container>`. Claims are
+as the error's `fence_container` with `docker rm <fence_container>`. Claims are
 unstarted containers, so `docker container prune` and `docker system prune`
 remove held and retained claims without any check; do not prune a daemon that
 has managed sandboxes in use. Different clients, including
@@ -89,9 +94,9 @@ coordination while managed work is active. The mechanism coordinates cooperating
 provider clients; it is not an authorization boundary against Docker admins.
 
 Each daemon call that acquires, discovers, or releases a claim has a 60-second
-bound. Execution admission, stop, pause, resume, and delete have a 60-second
-operation bound; create and start have a six-minute bound to allow the service
-readiness budget. Create pulls the primary and service images before it takes
+bound. Execution admission, stop and destroy have a 60-second operation
+bound; create and start have a six-minute bound to allow the service readiness
+budget. Create pulls the primary and service images before it takes
 the claim. Under the claim, the work after the primary exists is bounded to five
 minutes, and a timeout runs the same failed-create cleanup as any other creation
 failure. Services are started together and share one five-minute readiness
@@ -100,7 +105,7 @@ even if the workload mutation completed.
 
 A failed create attempts dependent cleanup before removing the primary, with a
 30-second cleanup budget. Unconfirmed cleanup uses `incomplete_cleanup` and
-serializes the shared contract's `IncompleteCleanup` error in `detail`, including
+serializes the `IncompleteCleanup` error in `detail`, including
 resource identifiers whose removal remains unconfirmed, plus the original
 creation failure as an error report under `cause` and the cleanup failure under
 `cleanup_cause`. A transport failure during either creation or cleanup retains
@@ -108,61 +113,20 @@ the claim and includes it in the remaining resources, even if the other failure
 was a completed daemon refusal. Creation failures whose cleanup succeeds
 preserve their original error.
 
-## Verification and migration scope
-
-Run the Docker verification path against a real daemon:
-
-```sh
-mise run test:docker
-```
-
-This builds the provider executables, runs failure injection and concurrent
-in-process/wire conformance, explicitly enables the live fence tests, and runs
-the `lithos-sandbox` CLI workflow with live Docker required. The CLI links the
-Docker provider in; the process-boundary fence test starts two independent
-driver executables against the same sandbox. An
-unreachable daemon fails this task instead of silently skipping live coverage.
-
-To run only the real-daemon fence tests:
-
-```sh
-cargo test --locked -p sandbox-driver-docker --test fence -- --ignored
-```
-
-They exercise independent provider clients, stop versus exec/one-shots/services,
-start during draining, cancelled ownership, and attachment during creation.
-The separate-process case runs a command and a one-shot through one executable,
-stops their sandbox through the other, observes `busy` during draining, and
-checks that services stop and the old command stays dead after restart.
-The lifecycle failure-injection tests cover release failure, uncertain admission,
-retained ownership after primary removal, and incomplete creation cleanup.
-
-For a direct manual CLI check after `mise run dev`:
-
-```sh
-sb=$(target/debug/lithos-sandbox create docker \
-  --image ghcr.io/lithoscomputer/ubuntu-24.04:slim-df708f910111)
-target/debug/lithos-sandbox exec "$sb" -- uname -a
-target/debug/lithos-sandbox stop "$sb"
-target/debug/lithos-sandbox start "$sb"
-target/debug/lithos-sandbox destroy "$sb"
-```
-
-## Shared contract runtime
+## The provider
 
 `sandbox_driver_docker::DockerFactory` registers Docker as a built-in with a
 `sandbox_driver::Registry`. An entry's only `config` key is `host` (`unix://`,
 `tcp://` or `http://`; default `unix:///var/run/docker.sock`); nothing is read
-from the ambient environment. The runtime drives the same container plan,
-claims and stop fence described above, so legacy and new-contract clients
-coordinate on one daemon.
+from the ambient environment.
 
 The descriptor reports the namespace `docker:<engine ID>` (stable across daemon
 restarts, different per daemon), `durability: machine`, `access: shared`, image
 sources, cpu and memory, the `allow_all` and `block` network modes, every
-`container` field, services, one-shot containers, pause and resume, and the
-shell-command endpoint. No timers are enforced, so any timer request is
-`unsupported`, as are disk, GPUs, other sources and allow-list networks.
+`container` field, services, one-shot containers, and the shell-command
+endpoint. No timers are enforced, so any timer request is `Unsupported`, as are
+disk, GPUs, other sources and allow-list networks. `start` on a container the
+daemon paused out of band unpauses it, so its processes carry on.
 
 - **Services** become sidecars on the workload's network, reachable by their
   service name. A readiness check runs as an exec-form Docker health check in
@@ -171,9 +135,8 @@ shell-command endpoint. No timers are enforced, so any timer request is
   starts, so `interval_ms` must be shorter than `deadline_ms`. A service
   without a check is only confirmed started, and its image's own
   `HEALTHCHECK` is turned off. `status.services` lists only services running
-  now. A service
-  `credential` names a secret whose value is a JSON object with `username`,
-  `password` and an optional `server`.
+  now. A service `credential` names a secret whose value is a JSON object with
+  `username`, `password` and an optional `server`.
 - **`provider_config`** takes `auto_pull`, `platform`, `binds` and
   `host_network`, described by the descriptor's `spec_schema`. `binds` is
   refused unless the daemon is local (`unix://`), matching the descriptor's
@@ -187,23 +150,61 @@ shell-command endpoint. No timers are enforced, so any timer request is
   sandbox that is not running is refused, never reported as an outcome. A
   command that loses its stream reports `killed` only once its container run
   is confirmed ended: at once if the run changed, or after waiting up to ten
-  seconds while a stop or delete holds the claim; otherwise the transport
+  seconds while a stop or destroy holds the claim; otherwise the transport
   error is returned. `files.list` uses POSIX `sh` and `find`, so it needs no
   `bash`; a directory that exists but cannot be read fails the listing
-  instead of reporting `not_found`.
-- **Errors:** a daemon 404 maps to `not_found` only when the primary is gone;
-  a missing image or service is `unhealthy`, so callers do not treat the
+  instead of reporting `NotFound`.
+- **Ports** are exposed as unsigned local forwards without a TTL; signed or
+  expiring exposure is `Unsupported`.
+- **Errors:** a daemon 404 maps to `NotFound` only when the primary is gone;
+  a missing image or service is `Unhealthy`, so callers do not treat the
   sandbox as removed.
 - **Reconciliation:** sidecars and their network carry
   `sh.sandbox-driver.sandbox=<full sandbox ID>`. Destroying a sandbox whose
   primary is already gone removes them by that label before reporting success.
-  Neither inventory reports sidecars or one-shots as sandboxes.
+  Inventory reports neither sidecars nor one-shots as sandboxes.
 
-`cargo test -p sandbox-driver-docker --test provider -- --ignored` runs the
-shared conformance suite (with a second activated catalog for the
-cross-instance fence), the services and one-shot workload, label round-trip
-and exec on a stopped sandbox, refusal before admission, and reconciliation
-of a vanished primary against a live daemon.
-Ports are exposed as unsigned local forwards without a TTL; signed or expiring
-exposure is `unsupported`. Plugin-protocol transport for this runtime is the
-plugin lane's work.
+## Verification
+
+Run the Docker verification path against a real daemon:
+
+```sh
+mise run test:docker
+```
+
+An unreachable daemon fails this task instead of silently skipping live
+coverage. It runs the provider's tests (`--test provider`): the shared
+conformance suite, with a second activated catalog for the cross-instance
+fence; services and one-shots sharing the workload; label round-trip and exec
+on a stopped sandbox; start after an out-of-band pause; refusal before
+admission; and reconciliation of a vanished primary. It runs the same provider
+over protocol 3 as the `test-docker` fixture plugin, the live fence and
+lifecycle failure-injection tests, and the old API's conformance suite
+(`--test conformance`). It also runs the `lithos-sandbox` CLI workflow, with
+the Docker provider linked into the CLI.
+
+To run only the real-daemon fence tests:
+
+```sh
+cargo test --locked -p sandbox-driver-docker --test fence -- --ignored
+```
+
+They exercise independent provider clients, stop versus exec, one-shots and
+services, start during draining, cancelled ownership, and attachment during
+creation. The lifecycle failure-injection tests cover release failure,
+uncertain admission, retained ownership after primary removal, and incomplete
+creation cleanup. These files and `--test conformance` still drive the old
+provider API, and one fence
+case runs two `sandbox-driver-docker` executables over protocol 2; they are
+being ported or removed with it.
+
+For a direct manual CLI check after `mise run dev`:
+
+```sh
+sb=$(target/debug/lithos-sandbox create docker \
+  --image ghcr.io/lithoscomputer/ubuntu-24.04:slim-df708f910111)
+target/debug/lithos-sandbox exec "$sb" -- uname -a
+target/debug/lithos-sandbox stop "$sb"
+target/debug/lithos-sandbox start "$sb"
+target/debug/lithos-sandbox destroy "$sb"
+```
