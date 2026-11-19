@@ -15,7 +15,7 @@ use sandbox_driver::legacy::{
     Action, AuthError, Capability, Error, ErrorReport, ExecFailure, GitFailure, GitFailureKind,
     ProviderError, ProviderKind, ResourceKind, SandboxState, Termination, TransportError,
 };
-use sandbox_driver::{ExecOutcome, OutputLoss, OutputTail, legacy};
+use sandbox_driver::{CapturedOutput, ExecOutcome, OutputLoss, legacy};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -294,10 +294,6 @@ fn exec_failure(detail: ExecDetail) -> Option<ExecFailure> {
     ) else {
         return None;
     };
-    let whole = |bytes| OutputTail {
-        bytes,
-        omitted_bytes: 0,
-    };
     Some(ExecFailure {
         context:     detail.label,
         outcome:     ExecOutcome {
@@ -306,8 +302,8 @@ fn exec_failure(detail: ExecDetail) -> Option<ExecFailure> {
             signal:      None,
             output_loss: OutputLoss::default(),
         },
-        stdout_tail: whole(stdout),
-        stderr_tail: whole(stderr),
+        stdout_tail: CapturedOutput::whole(stdout),
+        stderr_tail: CapturedOutput::whole(stderr),
         duration:    detail.duration_ms.map(Duration::from_millis),
     })
 }

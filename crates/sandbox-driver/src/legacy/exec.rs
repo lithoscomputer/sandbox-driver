@@ -17,7 +17,7 @@ use crate::legacy::capabilities::Capability;
 use crate::legacy::error::{Error, ExecFailure, Result};
 use crate::legacy::sanitize::OutputSanitization;
 use crate::redact::EnvKeys;
-use crate::{ExecOutcome, OutputTail};
+use crate::{CapturedOutput, ExecOutcome};
 pub use crate::{OutputLoss, StopLevel, stop_signal};
 
 /// The interpreter [`ExecSpec::bash`] names, resolved through `PATH`
@@ -550,10 +550,6 @@ impl ExecResult {
             termination,
             duration,
         } = self;
-        let whole = |bytes| OutputTail {
-            bytes,
-            omitted_bytes: 0,
-        };
         ExecFailure {
             context:     label.into(),
             outcome:     ExecOutcome {
@@ -562,8 +558,8 @@ impl ExecResult {
                 signal,
                 output_loss: OutputLoss::default(),
             },
-            stdout_tail: whole(stdout),
-            stderr_tail: whole(stderr),
+            stdout_tail: CapturedOutput::whole(stdout),
+            stderr_tail: CapturedOutput::whole(stderr),
             duration:    Some(duration),
         }
     }

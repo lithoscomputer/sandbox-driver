@@ -37,9 +37,22 @@ impl CapturedOutput {
         (self.bytes.len() as u64).saturating_add(self.omitted_bytes)
     }
 
+    /// A stream kept whole: `bytes` is everything the command wrote to it.
+    pub fn whole(bytes: Vec<u8>) -> Self {
+        Self {
+            head_bytes: bytes.len(),
+            bytes,
+            omitted_bytes: 0,
+        }
+    }
+
     /// The last `max_bytes` the command wrote to this stream, or fewer when
-    /// fewer were kept, and how many bytes it wrote before them.
-    pub(crate) fn newest(&self, max_bytes: usize) -> (&[u8], u64) {
+    /// fewer were kept, with every byte it wrote before them counted as
+    /// omitted.
+    pub(crate) fn newest(&self, max_bytes: usize) -> Self {
+        if self.omitted_bytes == 0 && self.bytes.len() <= max_bytes {
+            return self.clone();
+        }
         // With a gap, the first bytes are not contiguous with the newest.
         let newest = if self.omitted_bytes == 0 {
             &self.bytes[..]
@@ -47,10 +60,11 @@ impl CapturedOutput {
             &self.bytes[self.head_bytes.min(self.bytes.len())..]
         };
         let newest = &newest[newest.len().saturating_sub(max_bytes)..];
-        (
-            newest,
-            self.observed_bytes().saturating_sub(newest.len() as u64),
-        )
+        Self {
+            bytes:         newest.to_vec(),
+            omitted_bytes: self.observed_bytes().saturating_sub(newest.len() as u64),
+            head_bytes:    0,
+        }
     }
 }
 
@@ -92,11 +106,6 @@ impl Captured {
         stdout: &[u8],
         stderr: &[u8],
     ) -> Self {
-        let whole = |bytes: &[u8]| CapturedOutput {
-            bytes:         bytes.to_vec(),
-            omitted_bytes: 0,
-            head_bytes:    bytes.len(),
-        };
         Self {
             outcome:  ExecOutcome {
                 termination,
@@ -104,8 +113,8 @@ impl Captured {
                 signal: None,
                 output_loss: super::OutputLoss::default(),
             },
-            stdout:   whole(stdout),
-            stderr:   whole(stderr),
+            stdout:   CapturedOutput::whole(stdout.to_vec()),
+            stderr:   CapturedOutput::whole(stderr.to_vec()),
             duration: Duration::from_millis(1500),
         }
     }
@@ -383,15 +392,19 @@ mod tests {
     #[test]
     fn the_newest_bytes_never_reach_back_across_the_gap() {
         // Whole stream: the newest bytes are a plain suffix.
+        let newest = |output: &CapturedOutput, max_bytes| {
+            let tail = output.newest(max_bytes);
+            (tail.bytes, tail.omitted_bytes)
+        };
         let whole = retain(10, &[b"0123456789"]);
-        assert_eq!(whole.newest(3), (b"789".as_slice(), 7));
-        assert_eq!(whole.newest(99), (b"0123456789".as_slice(), 0));
+        assert_eq!(newest(&whole, 3), (b"789".to_vec(), 7));
+        assert_eq!(newest(&whole, 99), (b"0123456789".to_vec(), 0));
         // Limit 5 keeps "01" and "789" around a gap of five bytes. Asking for
         // more than the three after the gap must not return "1789".
         let gapped = retain(5, &[b"0123456789"]);
-        assert_eq!(gapped.newest(4), (b"789".as_slice(), 7));
-        assert_eq!(gapped.newest(2), (b"89".as_slice(), 8));
-        assert_eq!(gapped.newest(0), (b"".as_slice(), 10));
+        assert_eq!(newest(&gapped, 4), (b"789".to_vec(), 7));
+        assert_eq!(newest(&gapped, 2), (b"89".to_vec(), 8));
+        assert_eq!(newest(&gapped, 0), (Vec::new(), 10));
     }
 
     #[test]
