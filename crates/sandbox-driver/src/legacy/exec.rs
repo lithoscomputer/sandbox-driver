@@ -638,6 +638,15 @@ impl ExecStreamingResult {
         Ok(self.result)
     }
 
+    /// The loss a new-API outcome reports for this run: the transport's
+    /// counts, marked truncated when either capture is.
+    #[must_use]
+    pub fn delivery_loss(&self) -> OutputLoss {
+        let mut loss = self.output_loss;
+        loss.truncated |= self.stdout_capture.truncated || self.stderr_capture.truncated;
+        loss
+    }
+
     /// Wraps a buffered result with the honesty flags at their degraded
     /// defaults (`streams_separated: false`, `live_streaming: false`);
     /// providers set the flags they actually deliver. Capture stats
@@ -981,6 +990,20 @@ mod tests {
             matches!(&error, Error::Io { context, .. } if context == "writing"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn delivery_loss_is_truncated_when_either_capture_is() {
+        let mut result = ExecStreamingResult::new(ExecResult::new(
+            Termination::Exited,
+            Some(0),
+            Duration::ZERO,
+        ));
+        assert!(!result.delivery_loss().is_lossy());
+        result.stderr_capture.truncated = true;
+        let loss = result.delivery_loss();
+        assert!(loss.truncated && loss.is_lossy());
+        assert_eq!(loss.dropped_frames, 0);
     }
 
     #[test]
