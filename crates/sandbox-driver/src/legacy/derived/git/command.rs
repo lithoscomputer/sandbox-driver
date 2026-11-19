@@ -6,7 +6,7 @@ use std::time::Duration;
 use std::{fmt, io};
 
 use crate::legacy::derived::shell_quote;
-use crate::legacy::error::{Error, ExecFailure, GitFailure};
+use crate::legacy::error::{Error, GitFailure};
 use crate::legacy::exec::{ExecResult, ExecSpec};
 
 pub(super) const GIT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -154,17 +154,7 @@ pub(super) fn git_spec(
 /// to run it at all (transport, timeout) is passed through by the caller
 /// unchanged.
 pub(super) fn git_failure(label: &str, result: ExecResult) -> Error {
-    Error::Git(GitFailure::from_command(
-        label,
-        ExecFailure::new(
-            label,
-            result.termination,
-            result.exit_code,
-            result.stdout,
-            result.stderr,
-        )
-        .with_duration(result.duration),
-    ))
+    Error::Git(GitFailure::from_command(label, result.into_failure(label)))
 }
 
 /// Output that git could not be trusted to have produced whole, or that

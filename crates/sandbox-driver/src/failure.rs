@@ -48,9 +48,10 @@ impl fmt::Debug for OutputTail {
 /// A command that ran and left its caller without a result, kept with the
 /// end of what it wrote.
 ///
-/// `Display` says what the command was for and how it ended. It never
-/// includes output, so it is safe wherever an [`Error`] message is.
-/// [`Self::display_for_log`] adds the output.
+/// `Display` says what the command was for and how it ended, with a fixed
+/// hint for a failure its stderr identifies. It never includes output, so
+/// it is safe wherever an [`Error`] message is. [`Self::display_for_log`]
+/// adds the output.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandFailure {
     /// What the command was for, such as `stat`; never the command itself.
@@ -58,7 +59,9 @@ pub struct CommandFailure {
     pub outcome:     ExecOutcome,
     pub stdout_tail: OutputTail,
     pub stderr_tail: OutputTail,
-    pub duration:    Duration,
+    /// How long the command ran, when whoever reported the failure measured
+    /// it. [`Self::new`] always has it.
+    pub duration:    Option<Duration>,
 }
 
 impl CommandFailure {
@@ -70,7 +73,23 @@ impl CommandFailure {
             outcome:     captured.outcome.clone(),
             stdout_tail: OutputTail::of(&captured.stdout),
             stderr_tail: OutputTail::of(&captured.stderr),
-            duration:    captured.duration,
+            duration:    Some(captured.duration),
+        }
+    }
+
+    /// A bounded diagnosis matched from stderr. It is static text only, so
+    /// raw output never enters `Display`. Only classes that hold on every
+    /// provider live here.
+    fn hint(&self) -> Option<&'static str> {
+        let stderr = String::from_utf8_lossy(&self.stderr_tail.bytes).to_ascii_lowercase();
+        if stderr.contains("could not resolve host") || stderr.contains("network is unreachable") {
+            Some("network failure inside the sandbox — check DNS / egress")
+        } else if stderr.contains("not a git repository")
+            || stderr.contains("does not appear to be a git repository")
+        {
+            Some("no git repository at the working directory")
+        } else {
+            None
         }
     }
 
@@ -109,7 +128,13 @@ impl fmt::Display for CommandFailure {
             (Termination::Killed, _) => f.write_str("was killed")?,
             (Termination::Lost, _) => f.write_str("ended with an unknown outcome")?,
         }
-        write!(f, " after {} ms", self.duration.as_millis())
+        if let Some(duration) = self.duration {
+            write!(f, " after {} ms", duration.as_millis())?;
+        }
+        if let Some(hint) = self.hint() {
+            write!(f, " — hint: {hint}")?;
+        }
+        Ok(())
     }
 }
 
@@ -176,6 +201,23 @@ mod tests {
                 "git fetch failed: the command exited with code 128 after 1500 ms\n--- stderr \
                  (bytes=35, omitted_bytes=0) ---\nfatal: bad token {secret}\n"
             )
+        );
+    }
+
+    #[test]
+    fn display_adds_a_hint_read_from_stderr_and_never_quotes_it() {
+        let failure = CommandFailure::new(
+            "git clone",
+            &exited(
+                128,
+                b"",
+                b"fatal: could not resolve host: github.com/secret-org",
+            ),
+        );
+        assert_eq!(
+            failure.to_string(),
+            "git clone failed: the command exited with code 128 after 1500 ms \u{2014} hint: \
+             network failure inside the sandbox \u{2014} check DNS / egress"
         );
     }
 

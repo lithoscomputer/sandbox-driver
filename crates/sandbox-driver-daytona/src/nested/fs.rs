@@ -8,8 +8,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sandbox_driver::legacy::{
-    DerivedFs, DirEntry, Error, Exec, ExecFailure, ExecSpec, FileMetadata, Filesystem,
-    ResourceKind, Result,
+    DerivedFs, DirEntry, Error, Exec, ExecSpec, FileMetadata, Filesystem, ResourceKind, Result,
 };
 use serde::Deserialize;
 use tokio::fs;
@@ -297,16 +296,7 @@ impl Filesystem for NestedFs {
         spec.stdin = Some(content.to_vec());
         let result = self.exec.run(&spec).await?;
         if !result.success() {
-            return Err(Error::Exec(
-                ExecFailure::new(
-                    "appending nested file",
-                    result.termination,
-                    result.exit_code,
-                    result.stdout,
-                    result.stderr,
-                )
-                .with_duration(result.duration),
-            ));
+            return Err(result.into_failure("appending nested file").into());
         }
         Ok(())
     }

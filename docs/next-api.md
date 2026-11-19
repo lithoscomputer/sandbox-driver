@@ -224,11 +224,11 @@ pub enum CommandError {
 }
 pub struct CommandFailure {
     pub context: String, pub outcome: ExecOutcome,
-    pub stdout_tail: OutputTail, pub stderr_tail: OutputTail, pub duration: Duration,
+    pub stdout_tail: OutputTail, pub stderr_tail: OutputTail, pub duration: Option<Duration>,
 }
 ```
 
-`CommandFailure::new(context, &captured)` builds one from any `Captured`, keeping the last 8 KiB of each stream. `context` says what the command was for, such as `stat`, never the command itself. `Display` gives the context and how the command ended and never includes output; `display_for_log()` adds the tails, which can carry credentials, so redact its result before it leaves the process.
+`CommandFailure::new(context, &captured)` builds one from any `Captured`, keeping the last 8 KiB of each stream. `context` says what the command was for, such as `stat`, never the command itself. `Display` gives the context, how the command ended and a fixed hint for a failure its stderr identifies (no network, no git repository), and never includes output; `display_for_log()` adds the tails, which can carry credentials, so redact its result before it leaves the process.
 
 `ExecSpec::bash(script)` is the one place a shell is implied. It is `bash -c <script>` with a blank `BASH_ENV`, so the script runs in a non-login shell that sources no startup file. The workload must provide `bash` on its `PATH`; no other shell is tried.
 

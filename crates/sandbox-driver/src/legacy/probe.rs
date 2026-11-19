@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::legacy::error::{Error, ExecFailure, Result};
+use crate::legacy::error::Result;
 use crate::legacy::exec::{Exec, ExecControls, ExecResult, ExecSpec, OutputSink};
 use crate::legacy::sandbox::Sandbox;
 use crate::legacy::state::SandboxState;
@@ -54,16 +54,7 @@ fn check_probe_result(label: &str, result: ExecResult) -> Result<()> {
     if result.success() && result.stdout_lossy().trim() == PROBE_OK_MARKER {
         return Ok(());
     }
-    Err(Error::Exec(
-        ExecFailure::new(
-            label,
-            result.termination,
-            result.exit_code,
-            result.stdout,
-            result.stderr,
-        )
-        .with_duration(result.duration),
-    ))
+    Err(result.into_failure(label).into())
 }
 
 /// Ensures a sandbox is running and healthy: describe, then start (or

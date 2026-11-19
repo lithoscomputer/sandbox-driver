@@ -642,10 +642,10 @@ fn every_error_kind_decodes_from_its_era_detail() {
     let Error::Exec(failure) = exec else {
         panic!("expected exec: {exec:?}");
     };
-    assert_eq!(failure.label(), "probe");
-    assert_eq!(failure.exit_code(), Some(3));
-    assert_eq!(failure.stdout(), b"out");
-    assert_eq!(failure.duration(), None, "duration_ms is additive");
+    assert_eq!(failure.context, "probe");
+    assert_eq!(failure.outcome.exit_code, Some(3));
+    assert_eq!(failure.stdout_tail.bytes, b"out");
+    assert_eq!(failure.duration, None, "duration_ms is additive");
 
     let git = wire_error(
         "git",
@@ -663,7 +663,7 @@ fn every_error_kind_decodes_from_its_era_detail() {
     assert_eq!(failure.operation(), "git clone");
     assert_eq!(failure.kind(), GitFailureKind::RefNotFound);
     assert_eq!(
-        failure.output().expect("command output").exit_code(),
+        failure.output().expect("command output").outcome.exit_code,
         Some(128)
     );
 
