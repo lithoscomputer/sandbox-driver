@@ -203,6 +203,8 @@ pub enum FileKind {
 pub struct FileEntry {
     pub path: String,
     pub kind: FileKind,
+    /// The byte length of a file. It is unspecified for every other kind, so
+    /// read it only when `kind` is [`FileKind::File`].
     pub size: u64,
 }
 
@@ -211,7 +213,9 @@ pub trait Files: Send + Sync {
     async fn get(&self, path: &str, range: Option<FileRange>) -> Result<ByteStream, Error>;
     /// Creates parents. Success confirms the complete stream was written.
     async fn put(&self, path: &str, bytes: ByteStream) -> Result<(), Error>;
-    /// Depth zero returns immediate children; paths address the workload.
+    /// Lists what is under the directory `path`, never the directory itself.
+    /// Depth zero returns its immediate children, and each increment adds
+    /// one more level. Paths address the workload.
     async fn list(&self, path: &str, depth: u32) -> Result<Vec<FileEntry>, Error>;
 }
 
