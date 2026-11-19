@@ -1,8 +1,7 @@
 //! File operations the [`Files`](super::Files) capability leaves out, derived
 //! over [`Sandbox::exec`]. They are library code, not a provider capability,
-//! so they work unchanged on every provider and plugin whose workload has a
-//! POSIX shell with `stat`, `mv`, `rm`, `rmdir` and `mkdir`: GNU, `BusyBox`
-//! or BSD.
+//! so they work unchanged on every provider and plugin whose workload has
+//! Bash with `stat`, `mv`, `rm`, `rmdir` and `mkdir`: GNU, `BusyBox` or BSD.
 //!
 //! A relative path resolves against the directory a command starts in, which
 //! is the sandbox's working directory.
@@ -50,7 +49,7 @@ pub async fn stat_path(sandbox: &dyn Sandbox, path: &str) -> Result<FileStat, Co
         missing = if_missing("p"),
     );
     let captured = run(sandbox, script).await?;
-    read_stat(path, &captured)
+    read_stat(path, captured)
 }
 
 /// Whether something is at `path`. A symbolic link is followed, so a link to
@@ -107,7 +106,7 @@ pub async fn rename_path(sandbox: &dyn Sandbox, from: &str, to: &str) -> Result<
         missing = if_missing("p"),
     );
     let captured = run(sandbox, script).await?;
-    read_rename(from, &captured)
+    read_rename(from, captured)
 }
 
 /// Creates the directory `path` and any missing parents. A directory that is
@@ -151,13 +150,16 @@ fn succeeded(context: &str, captured: &Captured) -> Result<(), CommandError> {
     }
 }
 
-/// The script's stdout as text without its final newline, once the command
-/// succeeded with nothing lost.
+/// The capture of a command that succeeded with nothing lost.
+fn complete(context: &str, captured: Captured) -> Result<Captured, CommandError> {
+    succeeded(context, &captured)?;
+    captured
+        .into_complete()
+        .map_err(|incomplete| unreadable(context, &incomplete.captured))
+}
+
+/// The script's stdout as text without its final newline.
 fn answer<'a>(context: &str, captured: &'a Captured) -> Result<&'a str, CommandError> {
-    succeeded(context, captured)?;
-    if !captured.is_complete() {
-        return Err(unreadable(context, captured));
-    }
     let text = str::from_utf8(&captured.stdout.bytes).map_err(|_| unreadable(context, captured))?;
     Ok(text.strip_suffix('\n').unwrap_or(text))
 }
@@ -173,7 +175,8 @@ fn not_found(path: &str) -> CommandError {
     })
 }
 
-fn read_stat(path: &str, captured: &Captured) -> Result<FileStat, CommandError> {
+fn read_stat(path: &str, captured: Captured) -> Result<FileStat, CommandError> {
+    let captured = &complete("stat", captured)?;
     let text = answer("stat", captured)?;
     if text == MISSING {
         return Err(not_found(path));
@@ -216,7 +219,8 @@ fn read_exists(captured: &Captured) -> Result<bool, CommandError> {
     }
 }
 
-fn read_rename(from: &str, captured: &Captured) -> Result<(), CommandError> {
+fn read_rename(from: &str, captured: Captured) -> Result<(), CommandError> {
+    let captured = &complete("rename", captured)?;
     match answer("rename", captured)? {
         "" => Ok(()),
         MISSING => Err(not_found(from)),
@@ -240,7 +244,7 @@ mod tests {
     fn stat_reads_what_gnu_and_bsd_print() {
         // GNU and BusyBox: `%F|%s|%a|%Y`.
         assert_eq!(
-            read_stat("f", &exited(0, "regular file|42|644|1700000000\n")),
+            read_stat("f", exited(0, "regular file|42|644|1700000000\n")),
             Ok(FileStat {
                 kind:           FileKind::File,
                 size:           42,
@@ -249,12 +253,12 @@ mod tests {
             })
         );
         assert_eq!(
-            read_stat("f", &exited(0, "regular empty file|0|4755|1\n")).map(|stat| stat.mode),
+            read_stat("f", exited(0, "regular empty file|0|4755|1\n")).map(|stat| stat.mode),
             Ok(Some(0o4755))
         );
         // BSD: `%HT|%z|%Mp%Lp|%m`.
         assert_eq!(
-            read_stat("d", &exited(0, "Directory|96|1777|1700000000\n")),
+            read_stat("d", exited(0, "Directory|96|1777|1700000000\n")),
             Ok(FileStat {
                 kind:           FileKind::Directory,
                 size:           96,
@@ -269,7 +273,7 @@ mod tests {
             ("Character Device", FileKind::Other),
         ] {
             assert_eq!(
-                read_stat("p", &exited(0, &format!("{text}|0|644|1\n"))).map(|stat| stat.kind),
+                read_stat("p", exited(0, &format!("{text}|0|644|1\n"))).map(|stat| stat.kind),
                 Ok(kind),
                 "{text}"
             );
@@ -279,14 +283,14 @@ mod tests {
     #[test]
     fn stat_tells_a_missing_path_from_a_failed_and_an_unreadable_command() {
         assert_eq!(
-            read_stat("gone/file", &exited(0, &format!("{MISSING}\n"))),
+            read_stat("gone/file", exited(0, &format!("{MISSING}\n"))),
             Err(CommandError::Sandbox(Error::NotFound {
                 resource: "file".into(),
                 id:       "gone/file".into(),
             }))
         );
         assert!(matches!(
-            read_stat("f", &exited(1, "")),
+            read_stat("f", exited(1, "")),
             Err(CommandError::Failed(failure)) if failure.context == "stat"
         ));
         // Too few fields, a size that is not a number, and output a provider
@@ -300,7 +304,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    read_stat("f", &captured),
+                    read_stat("f", captured.clone()),
                     Err(CommandError::UnexpectedOutput(_))
                 ),
                 "{captured:?}"
@@ -328,13 +332,13 @@ mod tests {
 
     #[test]
     fn rename_reports_a_missing_source_as_not_found() {
-        assert_eq!(read_rename("a", &exited(0, "")), Ok(()));
+        assert_eq!(read_rename("a", exited(0, "")), Ok(()));
         assert_eq!(
-            read_rename("a", &exited(0, &format!("{MISSING}\n"))),
+            read_rename("a", exited(0, &format!("{MISSING}\n"))),
             Err(not_found("a"))
         );
         assert!(matches!(
-            read_rename("a", &exited(1, "")),
+            read_rename("a", exited(1, "")),
             Err(CommandError::Failed(failure)) if failure.context == "rename"
         ));
     }

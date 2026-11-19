@@ -236,7 +236,7 @@ Host, Docker and Daytona keep `BASH_ENV` blank for that argv, and for the same o
 
 ### Files and ports
 
-`Files` is `get(path, range)`, `put(path, bytes)` creating parents, and `list(path, depth)`. Everything else is derived over exec by the library and works on every provider whose workload has a POSIX shell with `stat`, `mv`, `rm`, `rmdir` and `mkdir` (GNU, BusyBox or BSD):
+`Files` is `get(path, range)`, `put(path, bytes)` creating parents, and `list(path, depth)`. Everything else is derived over exec by the library and works on every provider whose workload has Bash with `stat`, `mv`, `rm`, `rmdir` and `mkdir` (GNU, BusyBox or BSD):
 
 ```rust
 pub async fn stat_path(sandbox: &dyn Sandbox, path: &str) -> Result<FileStat, CommandError>;
