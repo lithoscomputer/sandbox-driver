@@ -145,6 +145,8 @@ impl SandboxBuilder {
 impl ProviderHandle {
     pub async fn describe(&self) -> Result<Descriptor, Error>;
     pub async fn health(&self) -> Result<Health, Error>;
+    /// One entry's inventory, with the checks `find` runs per entry and no deadline.
+    pub async fn list(&self, filter: &LabelFilter) -> Result<Vec<SandboxSummary>, Error>;
 }
 
 /// What `find` returns: every match it could reach, and the providers it could not.
