@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use crate::id::ServiceId;
 use crate::legacy::derived::shell_quote;
-use crate::legacy::error::{Error, ExecFailure, Result};
+use crate::legacy::error::{Error, Result};
 use crate::legacy::exec::{Exec, ExecResult, ExecSpec};
 use crate::legacy::service::{ListeningPort, ServiceSpec, ServiceStatus, Services};
 
@@ -70,16 +70,7 @@ impl<'e> DerivedServices<'e> {
         if result.success() {
             return Ok(result);
         }
-        Err(Error::Exec(
-            ExecFailure::new(
-                label,
-                result.termination,
-                result.exit_code,
-                result.stdout,
-                result.stderr,
-            )
-            .with_duration(result.duration),
-        ))
+        Err(result.into_failure(label).into())
     }
 }
 
@@ -211,16 +202,7 @@ impl Services for DerivedServices<'_> {
                 operation: format!("waiting for port {port}"),
                 elapsed:   timeout,
             }),
-            _ => Err(Error::Exec(
-                ExecFailure::new(
-                    "service port wait",
-                    result.termination,
-                    result.exit_code,
-                    result.stdout,
-                    result.stderr,
-                )
-                .with_duration(result.duration),
-            )),
+            _ => Err(result.into_failure("service port wait").into()),
         }
     }
 

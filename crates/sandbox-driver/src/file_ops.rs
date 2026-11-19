@@ -123,7 +123,7 @@ pub async fn create_dir_all(sandbox: &dyn Sandbox, path: &str) -> Result<(), Com
 }
 
 async fn run(sandbox: &dyn Sandbox, script: String) -> Result<Captured, Error> {
-    let mut spec = ExecSpec::shell(script);
+    let mut spec = ExecSpec::bash(script);
     spec.timeout_ms = Some(TIMEOUT_MS);
     run_captured(sandbox, spec).await
 }
@@ -226,30 +226,14 @@ fn read_rename(from: &str, captured: &Captured) -> Result<(), CommandError> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
-    use crate::{CapturedOutput, ExecOutcome, OutputLoss};
 
     fn exited(exit_code: i32, stdout: &str) -> Captured {
         ended(Termination::Exited, Some(exit_code), stdout)
     }
 
     fn ended(termination: Termination, exit_code: Option<i32>, stdout: &str) -> Captured {
-        Captured {
-            outcome:  ExecOutcome {
-                termination,
-                exit_code,
-                signal: None,
-                output_loss: OutputLoss::default(),
-            },
-            stdout:   CapturedOutput {
-                bytes:         stdout.as_bytes().to_vec(),
-                omitted_bytes: 0,
-            },
-            stderr:   CapturedOutput::default(),
-            duration: Duration::ZERO,
-        }
+        Captured::ended(termination, exit_code, stdout.as_bytes(), b"")
     }
 
     #[test]

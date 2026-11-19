@@ -31,7 +31,7 @@ fn missing_platform(error: &Error) -> bool {
     let Error::Exec(failure) = error else {
         return false;
     };
-    [failure.stdout(), failure.stderr()]
+    [&failure.stdout_tail.bytes, &failure.stderr_tail.bytes]
         .into_iter()
         .any(|output| String::from_utf8_lossy(output).contains("no matching manifest"))
 }

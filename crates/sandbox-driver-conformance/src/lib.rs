@@ -12,7 +12,7 @@ use std::time::Duration;
 use sandbox_driver::{
     AccessScope, CommandError, Error, ExecControls, ExecSpec, FileKind, FileRange, LabelFilter,
     MutationOutcome, OutputSink, Sandbox, SandboxRef, SandboxState, Sandboxes, Termination,
-    create_dir_all, path_exists, remove_path, rename_path, run_shell, stat_path,
+    create_dir_all, path_exists, remove_path, rename_path, run_bash, stat_path,
 };
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
@@ -50,7 +50,7 @@ pub struct Conformance {
     peer:        Option<Sandboxes>,
     environment: String,
     commands:    Commands,
-    shell:       bool,
+    bash:        bool,
     pub timeout: Duration,
 }
 
@@ -59,7 +59,7 @@ enum Scenario<'a> {
     Identity,
     Files,
     Exec,
-    Shell,
+    Bash,
     DerivedFiles,
     /// Stops the sandbox through a handle attached from this catalog.
     Fence(&'a Sandboxes),
@@ -89,7 +89,7 @@ impl Conformance {
             peer: None,
             environment: environment.into(),
             commands,
-            shell: false,
+            bash: false,
             timeout: Duration::from_secs(30),
         }
     }
@@ -101,14 +101,15 @@ impl Conformance {
         self
     }
 
-    /// Declares that the environment's workload provides POSIX `sh` with
-    /// `stat`, `mv`, `rm`, `rmdir`, `mkdir` and `ln`, which adds checks of the
-    /// library's shell helper and of the file operations it derives over
-    /// exec. The exec contract itself assumes no shell, so the checks are
-    /// opt-in.
+    /// Declares that the environment's workload provides Bash with `stat`,
+    /// `mv`, `rm`, `rmdir`, `mkdir` and `ln`. It adds a check that the
+    /// provider carries a Bash spec's argv intact, keeps stdout and stderr
+    /// apart, and reports the script's exit code, and a check of the file
+    /// operations the library derives over exec. The exec contract itself
+    /// assumes no shell, so the checks are opt-in.
     #[must_use]
-    pub fn with_shell(mut self) -> Self {
-        self.shell = true;
+    pub fn with_bash(mut self) -> Self {
+        self.bash = true;
         self
     }
 
@@ -123,8 +124,8 @@ impl Conformance {
             ("streamed_exec", Scenario::Exec),
             ("cross_handle_stop_fence", Scenario::Fence(&self.catalog)),
         ];
-        if self.shell {
-            scenarios.push(("captured_shell", Scenario::Shell));
+        if self.bash {
+            scenarios.push(("captured_bash", Scenario::Bash));
             scenarios.push(("derived_files", Scenario::DerivedFiles));
         }
         if let Some(peer) = &self.peer {
@@ -147,7 +148,7 @@ impl Conformance {
                     Scenario::Identity => self.identity(sandbox).await,
                     Scenario::Files => Self::files(sandbox).await,
                     Scenario::Exec => self.exec(sandbox).await,
-                    Scenario::Shell => Self::shell(sandbox).await,
+                    Scenario::Bash => Self::bash(sandbox).await,
                     Scenario::DerivedFiles => Self::derived_files(sandbox).await,
                     Scenario::Fence(catalog) => self.fence_with(sandbox, catalog).await,
                 }
@@ -289,22 +290,22 @@ impl Conformance {
             "probe output differed",
         )
     }
-    async fn shell(sandbox: &dyn Sandbox) -> CheckOutcome {
+    async fn bash(sandbox: &dyn Sandbox) -> CheckOutcome {
         let script = "printf 'to stdout'; printf 'to stderr' >&2; exit 3";
-        let captured = run_shell(sandbox, script).await?;
+        let captured = run_bash(sandbox, script).await?;
         require(
             captured.outcome.termination == Termination::Exited
                 && captured.outcome.exit_code == Some(3),
             "the script's exit status was not the command's",
         )?;
-        require(captured.is_complete(), "shell output was lost")?;
+        require(captured.is_complete(), "bash output was lost")?;
         require(
             captured.stdout.bytes == b"to stdout",
-            "shell stdout differed",
+            "bash stdout differed",
         )?;
         require(
             captured.stderr.bytes == b"to stderr",
-            "shell stderr differed",
+            "bash stderr differed",
         )
     }
     async fn derived_files(sandbox: &dyn Sandbox) -> CheckOutcome {
@@ -357,7 +358,7 @@ impl Conformance {
         )?;
 
         // A link to a directory is described and removed as the link.
-        let linked = run_shell(
+        let linked = run_bash(
             sandbox,
             r#"cd "conformance/derived/it's -a \$(dir)" && ln -s . link"#,
         )

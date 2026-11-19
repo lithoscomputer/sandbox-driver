@@ -16,9 +16,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use sandbox_driver::legacy::{
-    Capabilities, DirEntry, Error, Exec, ExecControls, ExecFailure, ExecResult, ExecSpec,
-    ExecStreamingResult, FileMetadata, Filesystem, OneShotCaps, Pty, PtyOptions, PtySession,
-    Result, SandboxSpec, SpawnSpec, StdioProcess,
+    Capabilities, DirEntry, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
+    FileMetadata, Filesystem, OneShotCaps, Pty, PtyOptions, PtySession, Result, SandboxSpec,
+    SpawnSpec, StdioProcess,
 };
 use sandbox_driver_daytona_config::{DockerExecutionTarget, NestedDockerConfig};
 use sandbox_driver_docker_config::{RegistryAuth, Sidecar};
@@ -317,16 +317,7 @@ fn checked(result: ExecResult, operation: &str) -> Result<ExecResult> {
     if result.success() {
         Ok(result)
     } else {
-        Err(Error::Exec(
-            ExecFailure::new(
-                operation,
-                result.termination,
-                result.exit_code,
-                result.stdout,
-                result.stderr,
-            )
-            .with_duration(result.duration),
-        ))
+        Err(result.into_failure(operation).into())
     }
 }
 
