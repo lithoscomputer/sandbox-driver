@@ -25,6 +25,9 @@ pub struct CapturedOutput {
     /// Bytes dropped between the first and the newest to stay within the
     /// limit.
     pub omitted_bytes: u64,
+    /// How many of `bytes` are the stream's first ones. The omitted bytes
+    /// fall after them, and the stream's newest bytes are the rest.
+    pub head_bytes:    usize,
 }
 
 impl CapturedOutput {
@@ -35,16 +38,14 @@ impl CapturedOutput {
 
     /// The last `max_bytes` the command wrote to this stream, or fewer when
     /// fewer were kept, and how many bytes it wrote before them.
-    pub fn newest(&self, max_bytes: usize) -> (&[u8], u64) {
-        // With a gap, the bytes after it are the half of `bytes` that
-        // `Retained` kept from the end of the stream; the first half sits
-        // before the gap and is not contiguous with them.
-        let contiguous = if self.omitted_bytes == 0 {
-            self.bytes.len()
+    pub(crate) fn newest(&self, max_bytes: usize) -> (&[u8], u64) {
+        // With a gap, the first bytes are not contiguous with the newest.
+        let newest = if self.omitted_bytes == 0 {
+            &self.bytes[..]
         } else {
-            self.bytes.len() - self.bytes.len() / 2
+            &self.bytes[self.head_bytes.min(self.bytes.len())..]
         };
-        let newest = &self.bytes[self.bytes.len() - contiguous.min(max_bytes)..];
+        let newest = &newest[newest.len().saturating_sub(max_bytes)..];
         (
             newest,
             self.observed_bytes().saturating_sub(newest.len() as u64),
@@ -75,6 +76,36 @@ pub struct Captured {
     /// provider. It includes the provider's own setup and the time the
     /// caller's sink took.
     pub duration: Duration,
+}
+
+#[cfg(test)]
+impl Captured {
+    /// The one fixture for this crate's tests: a command that ended as
+    /// `termination` after 1500 ms and wrote `stdout` and `stderr`, all of
+    /// it kept.
+    pub(crate) fn ended(
+        termination: Termination,
+        exit_code: Option<i32>,
+        stdout: &[u8],
+        stderr: &[u8],
+    ) -> Self {
+        let whole = |bytes: &[u8]| CapturedOutput {
+            bytes:         bytes.to_vec(),
+            omitted_bytes: 0,
+            head_bytes:    bytes.len(),
+        };
+        Self {
+            outcome:  ExecOutcome {
+                termination,
+                exit_code,
+                signal: None,
+                output_loss: super::OutputLoss::default(),
+            },
+            stdout:   whole(stdout),
+            stderr:   whole(stderr),
+            duration: Duration::from_millis(1500),
+        }
+    }
 }
 
 impl Captured {
@@ -281,6 +312,7 @@ impl Retained {
 
     fn take(&mut self) -> CapturedOutput {
         let mut bytes = mem::take(&mut self.head);
+        let head_bytes = bytes.len();
         // Taking the tail frees its buffer even while a provider keeps the
         // sink alive.
         let tail = mem::take(&mut self.tail);
@@ -291,6 +323,7 @@ impl Retained {
         CapturedOutput {
             bytes,
             omitted_bytes: mem::take(&mut self.omitted),
+            head_bytes,
         }
     }
 }
@@ -313,6 +346,7 @@ mod tests {
         let output = retain(5, &[b"01", b"234"]);
         assert_eq!(output.bytes, b"01234");
         assert_eq!(output.omitted_bytes, 0);
+        assert_eq!(output.head_bytes, 2);
     }
 
     #[test]
@@ -326,6 +360,7 @@ mod tests {
             let output = retain(5, chunks);
             assert_eq!(output.bytes, b"01789", "{chunks:?}");
             assert_eq!(output.omitted_bytes, 5, "{chunks:?}");
+            assert_eq!(output.head_bytes, 2, "{chunks:?}");
             assert_eq!(output.observed_bytes(), 10, "{chunks:?}");
         }
     }
@@ -352,17 +387,10 @@ mod tests {
     }
 
     fn captured(stdout: CapturedOutput, output_loss: OutputLoss) -> Captured {
-        Captured {
-            outcome: ExecOutcome {
-                termination: Termination::Exited,
-                exit_code: Some(0),
-                signal: None,
-                output_loss,
-            },
-            stdout,
-            stderr: CapturedOutput::default(),
-            duration: Duration::ZERO,
-        }
+        let mut captured = Captured::ended(Termination::Exited, Some(0), b"", b"");
+        captured.stdout = stdout;
+        captured.outcome.output_loss = output_loss;
+        captured
     }
 
     #[test]

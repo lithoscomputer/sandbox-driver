@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use super::{Captured, CapturedOutput, Error, ExecOutcome, Termination};
 
-/// How much of each stream a [`CommandFailure`] keeps.
-pub const FAILURE_TAIL_BYTES: usize = 8 * 1024;
+/// How much of each stream [`CommandFailure::new`] keeps.
+const TAIL_BYTES: usize = 8 * 1024;
 
 /// The newest bytes of one stream of a command.
 #[derive(Clone, Default, Eq, PartialEq)]
@@ -23,7 +23,7 @@ pub struct OutputTail {
 
 impl OutputTail {
     fn of(output: &CapturedOutput) -> Self {
-        let (bytes, omitted_bytes) = output.newest(FAILURE_TAIL_BYTES);
+        let (bytes, omitted_bytes) = output.newest(TAIL_BYTES);
         Self {
             bytes: bytes.to_vec(),
             omitted_bytes,
@@ -62,8 +62,8 @@ pub struct CommandFailure {
 }
 
 impl CommandFailure {
-    /// The failure a finished command describes, keeping the last
-    /// [`FAILURE_TAIL_BYTES`] of each stream.
+    /// The failure a finished command describes, keeping the last 8 KiB of
+    /// each stream.
     pub fn new(context: impl Into<String>, captured: &Captured) -> Self {
         Self {
             context:     context.into(),
@@ -152,23 +152,9 @@ impl CommandError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::OutputLoss;
 
-    fn captured(exit_code: i32, stdout: &[u8], stderr: CapturedOutput) -> Captured {
-        Captured {
-            outcome: ExecOutcome {
-                termination: Termination::Exited,
-                exit_code:   Some(exit_code),
-                signal:      None,
-                output_loss: OutputLoss::default(),
-            },
-            stdout: CapturedOutput {
-                bytes:         stdout.to_vec(),
-                omitted_bytes: 0,
-            },
-            stderr,
-            duration: Duration::from_millis(1500),
-        }
+    fn exited(exit_code: i32, stdout: &[u8], stderr: &[u8]) -> Captured {
+        Captured::ended(Termination::Exited, Some(exit_code), stdout, stderr)
     }
 
     #[test]
@@ -176,10 +162,7 @@ mod tests {
         let secret = "ghs_notarealtoken";
         let failure = CommandFailure::new(
             "git fetch",
-            &captured(128, b"", CapturedOutput {
-                bytes:         format!("fatal: bad token {secret}\n").into_bytes(),
-                omitted_bytes: 0,
-            }),
+            &exited(128, b"", format!("fatal: bad token {secret}\n").as_bytes()),
         );
         assert_eq!(
             failure.to_string(),
@@ -199,21 +182,15 @@ mod tests {
     #[test]
     fn a_failure_keeps_only_the_end_of_a_long_stream_and_counts_the_rest() {
         let mut bytes = vec![b'a'; 100];
-        bytes.extend(vec![b'z'; FAILURE_TAIL_BYTES]);
-        let failure = CommandFailure::new(
-            "build",
-            &captured(1, b"", CapturedOutput {
-                bytes,
-                omitted_bytes: 0,
-            }),
-        );
-        assert_eq!(failure.stderr_tail.bytes, vec![b'z'; FAILURE_TAIL_BYTES]);
+        bytes.extend(vec![b'z'; TAIL_BYTES]);
+        let failure = CommandFailure::new("build", &exited(1, b"", &bytes));
+        assert_eq!(failure.stderr_tail.bytes, vec![b'z'; TAIL_BYTES]);
         assert_eq!(failure.stderr_tail.omitted_bytes, 100);
     }
 
     #[test]
     fn an_error_names_its_command_only_when_one_ran() {
-        let failure = CommandFailure::new("stat", &captured(0, b"??", CapturedOutput::default()));
+        let failure = CommandFailure::new("stat", &exited(0, b"??", b""));
         let unreadable = CommandError::UnexpectedOutput(Box::new(failure.clone()));
         assert_eq!(
             unreadable.to_string(),

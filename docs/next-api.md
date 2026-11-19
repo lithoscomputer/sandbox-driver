@@ -208,11 +208,11 @@ pub async fn run_captured_with(
 pub async fn run_bash(sandbox: &dyn Sandbox, script: &str) -> Result<Captured, Error>;
 
 pub struct Captured { pub outcome: ExecOutcome, pub stdout: CapturedOutput, pub stderr: CapturedOutput, pub duration: Duration }
-pub struct CapturedOutput { pub bytes: Vec<u8>, pub omitted_bytes: u64 }
+pub struct CapturedOutput { pub bytes: Vec<u8>, pub omitted_bytes: u64, pub head_bytes: usize }
 impl Captured { pub fn into_complete(self) -> Result<Captured, IncompleteOutput>; }
 ```
 
-A command that exits nonzero is a `Captured`, not an error; `success()` is true only for an exit with code zero. Output beyond the limit is still read, so the command never blocks, and is counted in `omitted_bytes`: the first half of the limit is kept from the start of the stream and the rest from its end. `is_complete()` is false when anything was omitted or the provider reported output loss. `into_complete()` turns that into an `IncompleteOutput` error that still holds the capture; call it before parsing output, so a short read is an error and not a wrong answer. `duration` is how long the caller waited for the command, measured by the library around the exec.
+A command that exits nonzero is a `Captured`, not an error; `success()` is true only for an exit with code zero. Output beyond the limit is still read, so the command never blocks, and is counted in `omitted_bytes`: the first half of the limit is kept from the start of the stream and the rest from its end, and `head_bytes` says how many of `bytes` came from the start. `is_complete()` is false when anything was omitted or the provider reported output loss. `into_complete()` turns that into an `IncompleteOutput` error that still holds the capture; call it before parsing output, so a short read is an error and not a wrong answer. `duration` is how long the caller waited for the command, measured by the library around the exec.
 
 The library's own helpers that run commands fail with `CommandError`, because a failed command is an outcome, not an `Error`, and `Error` carries no command output:
 
