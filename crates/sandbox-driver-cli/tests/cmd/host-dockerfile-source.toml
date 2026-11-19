@@ -1,20 +1,10 @@
 bin.name = "lithos-sandbox"
-args = [
-  "--provider",
-  "host",
-  "--events",
-  "off",
-  "sandbox",
-  "run",
-  "--dockerfile",
-  "Dockerfile",
-  "--",
-  "/bin/true",
-]
+args = ["run", "host", "--dockerfile", "Dockerfile", "--", "/bin/true"]
 status.code = 1
 stdout = ""
 stderr = """
-error: invalid spec: source: the host provider only supports SandboxSource::HostDirectory
+error: creating a sandbox from environment host
+  caused by: unsupported capability: source
 """
 
 [env]

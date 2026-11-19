@@ -18,6 +18,7 @@ pub const DEFAULT_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 
 /// One stream of a captured command.
 #[derive(Clone, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct CapturedOutput {
     /// The stream's first bytes followed by its newest ones. It is the whole
     /// stream when `omitted_bytes` is zero.
@@ -66,6 +67,7 @@ impl fmt::Debug for CapturedOutput {
 
 /// A finished command and the output it wrote.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct Captured {
     pub outcome:  ExecOutcome,
     /// Also holds the single terminal stream of a command run with
@@ -117,10 +119,13 @@ impl Captured {
     }
 
     /// Whether `stdout` and `stderr` hold every byte the command wrote, as
-    /// far as the provider can tell: nothing was omitted to stay within the
-    /// limit, and the provider reported no output loss.
+    /// far as the provider can tell: the command exited on its own, nothing
+    /// was omitted to stay within the limit, and the provider reported no
+    /// output loss. A command that was stopped, timed out, or lost is never
+    /// complete, because nothing reads the rest of its output.
     pub fn is_complete(&self) -> bool {
-        self.stdout.omitted_bytes == 0
+        self.outcome.termination == Termination::Exited
+            && self.stdout.omitted_bytes == 0
             && self.stderr.omitted_bytes == 0
             && !self.outcome.output_loss.is_lossy()
     }
@@ -146,6 +151,7 @@ impl Captured {
 /// A command that finished without its output being captured whole. The
 /// message gives sizes only; `captured` holds what was kept.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct IncompleteOutput {
     pub captured: Box<Captured>,
 }
@@ -158,13 +164,21 @@ impl fmt::Display for IncompleteOutput {
             outcome,
             ..
         } = &*self.captured;
-        write!(
-            f,
-            "command output is incomplete: {} bytes of stdout and {} of stderr were omitted",
-            stdout.omitted_bytes, stderr.omitted_bytes
-        )?;
+        let mut separator = "command output is incomplete: ";
+        if outcome.termination != Termination::Exited {
+            write!(f, "{separator}the command did not exit on its own")?;
+            separator = "; ";
+        }
+        if stdout.omitted_bytes != 0 || stderr.omitted_bytes != 0 {
+            write!(
+                f,
+                "{separator}{} bytes of stdout and {} of stderr were omitted",
+                stdout.omitted_bytes, stderr.omitted_bytes
+            )?;
+            separator = "; ";
+        }
         if outcome.output_loss.is_lossy() {
-            f.write_str(", and the provider lost output")?;
+            write!(f, "{separator}the provider lost output")?;
         }
         Ok(())
     }
@@ -420,7 +434,30 @@ mod tests {
         assert!(truncated.success());
         assert!(!truncated.is_complete());
         let error = truncated.into_complete().expect_err("provider loss");
-        assert!(error.to_string().ends_with("and the provider lost output"));
+        assert_eq!(
+            error.to_string(),
+            "command output is incomplete: the provider lost output"
+        );
+    }
+
+    #[test]
+    fn a_command_that_did_not_exit_on_its_own_is_incomplete() {
+        for termination in [
+            Termination::TimedOut,
+            Termination::Terminated,
+            Termination::Killed,
+            Termination::Lost,
+        ] {
+            let mut stopped = captured(retain(5, &[b"01"]), OutputLoss::default());
+            stopped.outcome.termination = termination;
+            stopped.outcome.exit_code = None;
+            let error = stopped.into_complete().expect_err("stopped command");
+            assert_eq!(
+                error.to_string(),
+                "command output is incomplete: the command did not exit on its own",
+                "{termination:?}"
+            );
+        }
     }
 
     #[test]

@@ -1,0 +1,19 @@
+bin.name = "lithos-sandbox"
+args = ["providers"]
+status = "success"
+stdout = """
+NAME\tPLUGIN\tPATH
+daytona\tdaytona\tbuilt in
+docker\tdocker\tbuilt in
+host\thost\tbuilt in
+"""
+stderr = ""
+
+[env]
+inherit = false
+
+[env.add]
+NO_COLOR = "1"
+PATH = "/usr/bin:/bin"
+RUST_LOG = "off"
+XDG_CONFIG_HOME = "tests/cmd/no-config"
