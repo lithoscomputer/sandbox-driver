@@ -18,6 +18,7 @@ pub const DEFAULT_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 
 /// One stream of a captured command.
 #[derive(Clone, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct CapturedOutput {
     /// The stream's first bytes followed by its newest ones. It is the whole
     /// stream when `omitted_bytes` is zero.
@@ -46,6 +47,7 @@ impl fmt::Debug for CapturedOutput {
 
 /// A finished command and the output it wrote.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct Captured {
     pub outcome:  ExecOutcome,
     /// Also holds the single terminal stream of a command run with
@@ -99,6 +101,7 @@ impl Captured {
 /// A command that finished without its output being captured whole. The
 /// message gives sizes only; `captured` holds what was kept.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct IncompleteOutput {
     pub captured: Box<Captured>,
 }
