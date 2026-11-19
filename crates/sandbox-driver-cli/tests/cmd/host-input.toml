@@ -1,23 +1,5 @@
 bin.name = "lithos-sandbox"
-args = [
-  "--provider",
-  "host",
-  "--events",
-  "off",
-  "sandbox",
-  "run",
-  "--workspace",
-  ".",
-  "--env",
-  "CREATED_ENV=created",
-  "--exec-env",
-  "EXEC_ENV=exec",
-  "--stdin",
-  "--",
-  "/bin/sh",
-  "-c",
-  "read input; printf '%s:%s:%s\\n' \"$CREATED_ENV\" \"$EXEC_ENV\" \"$input\"; printf 'stderr-value\\n' >&2",
-]
+args = ["run", "host", "--workspace", ".", "--env", "CREATED_ENV=created", "-e", "EXEC_ENV=exec", "--stdin", "--", "/bin/sh", "-c", "read input; printf '%s:%s:%s\\n' \"$CREATED_ENV\" \"$EXEC_ENV\" \"$input\"; printf 'stderr-value\\n' >&2"]
 stdin = "payload\n"
 status = "success"
 stdout = """

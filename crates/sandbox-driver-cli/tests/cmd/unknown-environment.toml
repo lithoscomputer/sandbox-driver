@@ -1,9 +1,10 @@
 bin.name = "lithos-sandbox"
-args = ["--provider", "host", "sandbox", "create", "--host-directory"]
+args = ["run", "nowhere", "--", "/bin/true"]
 status.code = 1
 stdout = ""
 stderr = """
-error: Host sandbox handles do not survive CLI process exit; use `lithos-sandbox --provider host sandbox run`
+error: environment nowhere is not configured
+hint: `lithos-sandbox environments` lists them
 """
 
 [env]

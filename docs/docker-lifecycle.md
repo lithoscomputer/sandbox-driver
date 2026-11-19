@@ -180,9 +180,8 @@ on a stopped sandbox; start after an out-of-band pause; refusal before
 admission; and reconciliation of a vanished primary. It runs the same provider
 over protocol 3 as the `test-docker` fixture plugin, the live fence and
 lifecycle failure-injection tests, and the old API's conformance suite
-(`--test conformance`). It also runs the `lithos-sandbox` CLI
-workflow, which still launches the `sandbox-driver-docker` protocol 2
-executable; that executable is being removed.
+(`--test conformance`). It also runs the `lithos-sandbox` CLI workflow, with
+the Docker provider linked into the CLI.
 
 To run only the real-daemon fence tests:
 
@@ -198,3 +197,14 @@ creation cleanup. These files and `--test conformance` still drive the old
 provider API, and one fence
 case runs two `sandbox-driver-docker` executables over protocol 2; they are
 being ported or removed with it.
+
+For a direct manual CLI check after `mise run dev`:
+
+```sh
+sb=$(target/debug/lithos-sandbox create docker \
+  --image ghcr.io/lithoscomputer/ubuntu-24.04:slim-df708f910111)
+target/debug/lithos-sandbox exec "$sb" -- uname -a
+target/debug/lithos-sandbox stop "$sb"
+target/debug/lithos-sandbox start "$sb"
+target/debug/lithos-sandbox destroy "$sb"
+```
