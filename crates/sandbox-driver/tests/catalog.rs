@@ -161,7 +161,7 @@ async fn config_and_spec_schemas_are_separate_and_rejections_precede_create() {
         .expect("spec schema rejects connection key");
     assert!(matches!(error, Error::InvalidSpec { .. }));
     assert!(!error.to_string().contains("secret-spec"));
-    assert_eq!(factory.creates.load(Ordering::SeqCst), 0);
+    assert_eq!(factory.admissions.lock().await.len(), 0);
     catalog
         .builder("test")
         .await
@@ -408,7 +408,7 @@ async fn the_workload_credential_is_resolved_by_name_and_travels_beside_the_spec
         create(only_the_service).await,
         Some(Error::MissingSecret { name, .. }) if name == "workload-registry"
     ));
-    assert_eq!(factory.creates.load(Ordering::SeqCst), 0);
+    assert_eq!(factory.admissions.lock().await.len(), 0);
 
     let both = Secrets {
         values: BTreeMap::from([
@@ -455,7 +455,7 @@ async fn uncertain_create_is_not_replayed() {
             ..
         })
     ));
-    assert_eq!(factory.creates.load(Ordering::SeqCst), 1);
+    assert_eq!(factory.admissions.lock().await.len(), 1);
     assert_eq!(factory.activations.lock().await.len(), 1);
 }
 
