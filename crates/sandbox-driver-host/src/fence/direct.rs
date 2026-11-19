@@ -4,6 +4,7 @@
 //! no process records are written, and `stop` fences nothing: this backend
 //! keeps the pre-fence behavior of those platforms.
 
+use std::collections::BTreeMap;
 use std::io;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -51,10 +52,13 @@ impl ProcessGroups {
         self: &Arc<Self>,
         program: &str,
         args: &[String],
+        env: &BTreeMap<String, String>,
         configure: impl FnOnce(&mut Command),
     ) -> Result<HostChild> {
         let mut command = Command::new(program);
         command.args(args);
+        command.env_clear();
+        command.envs(env);
         configure(&mut command);
         #[cfg(unix)]
         command.process_group(0);
