@@ -1,5 +1,5 @@
 bin.name = "lithos-sandbox"
-args = ["--provider", "host", "--events", "off", "provider", "health"]
+args = ["provider", "health", "host"]
 status = "success"
 stdout = """
 provider: host

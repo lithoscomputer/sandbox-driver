@@ -189,8 +189,10 @@ pub struct OutputLoss {
     pub dropped_bytes:  u64,
     /// The provider stopped reading output before a stream ended, as when a
     /// process that outlived the command kept it open past the provider's
-    /// bound. How much is missing is unknown. Additive on the wire: an
-    /// older peer reports `false`.
+    /// bound. How much is missing is unknown. Set only for a command that
+    /// exited on its own: one that was stopped or timed out always leaves
+    /// output unread, and its termination reports that. Additive on the
+    /// wire: an older peer reports `false`.
     pub truncated:      bool,
 }
 

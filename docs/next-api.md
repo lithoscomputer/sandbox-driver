@@ -193,7 +193,7 @@ Rules every method obeys:
 
 ### Exec
 
-`ExecSpec` is argv (no shell), env, working directory, timeout, and `tty`. `ExecControls` is a streamed stdin, an output sink, and two cancellation levels: `term` then `kill`. `ExecOutcome` reports `termination` (`exited`, `timed_out`, `terminated`, `killed`, `lost`), `exit_code`, `signal`, and `output_loss`: counts of output the provider's transport dropped, and `truncated` when the provider stopped reading a stream before it ended. With `tty: true` the sink receives one stream and the controls gain `resize`. Dropping the future requests cancellation; it does not confirm that the command has stopped. The library owns bounded cleanup after the drop. `lost` means the execution outcome is unknown, not that the command or sandbox is known to be gone. Only a confirmed termination outcome or a successful sandbox `stop` establishes that the affected execution has ended.
+`ExecSpec` is argv (no shell), env, working directory, timeout, and `tty`. `ExecControls` is a streamed stdin, an output sink, and two cancellation levels: `term` then `kill`. `ExecOutcome` reports `termination` (`exited`, `timed_out`, `terminated`, `killed`, `lost`), `exit_code`, `signal`, and `output_loss`: counts of output the provider's transport dropped, and `truncated` when the provider stopped reading a stream of a command that exited on its own. A stopped or timed-out command always leaves output unread, which its `termination` reports. With `tty: true` the sink receives one stream and the controls gain `resize`. Dropping the future requests cancellation; it does not confirm that the command has stopped. The library owns bounded cleanup after the drop. `lost` means the execution outcome is unknown, not that the command or sandbox is known to be gone. Only a confirmed termination outcome or a successful sandbox `stop` establishes that the affected execution has ended.
 
 The library adds whole-command helpers over `exec`. They are functions, not a capability, so they work on every provider and plugin with no wire support:
 
@@ -212,7 +212,7 @@ pub struct CapturedOutput { pub bytes: Vec<u8>, pub omitted_bytes: u64, pub head
 impl Captured { pub fn into_complete(self) -> Result<Captured, IncompleteOutput>; }
 ```
 
-A command that exits nonzero is a `Captured`, not an error; `success()` is true only for an exit with code zero. Output beyond the limit is still read, so the command never blocks, and is counted in `omitted_bytes`: the first half of the limit is kept from the start of the stream and the rest from its end, and `head_bytes` says how many of `bytes` came from the start. `is_complete()` is false when anything was omitted or the provider reported output loss. `into_complete()` turns that into an `IncompleteOutput` error that still holds the capture; call it before parsing output, so a short read is an error and not a wrong answer. `duration` is how long the caller waited for the command, measured by the library around the exec.
+A command that exits nonzero is a `Captured`, not an error; `success()` is true only for an exit with code zero. Output beyond the limit is still read, so the command never blocks, and is counted in `omitted_bytes`: the first half of the limit is kept from the start of the stream and the rest from its end, and `head_bytes` says how many of `bytes` came from the start. `is_complete()` is true only when the command exited on its own, nothing was omitted, and the provider reported no output loss; a command that was stopped, timed out, or lost is never complete. `into_complete()` turns that into an `IncompleteOutput` error that still holds the capture; call it before parsing output, so a short read is an error and not a wrong answer. `duration` is how long the caller waited for the command, measured by the library around the exec. `Captured`, `CapturedOutput`, and `IncompleteOutput` are `#[non_exhaustive]`: callers read their fields but do not build them, and a pattern that destructures one ends with `..`, so the library can add fields. The one constructor is `CapturedOutput::whole(bytes)`, for a stream that was kept whole.
 
 The library's own helpers that run commands fail with `CommandError`, because a failed command is an outcome, not an `Error`, and `Error` carries no command output:
 
@@ -224,11 +224,11 @@ pub enum CommandError {
 }
 pub struct CommandFailure {
     pub context: String, pub outcome: ExecOutcome,
-    pub stdout_tail: OutputTail, pub stderr_tail: OutputTail, pub duration: Option<Duration>,
+    pub stdout_tail: CapturedOutput, pub stderr_tail: CapturedOutput, pub duration: Option<Duration>,
 }
 ```
 
-`CommandFailure::new(context, &captured)` builds one from any `Captured`, keeping the last 8 KiB of each stream. `context` says what the command was for, such as `stat`, never the command itself. `Display` gives the context, how the command ended and a fixed hint for a failure its stderr identifies (no network, no git repository), and never includes output; `display_for_log()` adds the tails, which can carry credentials, so redact its result before it leaves the process.
+`CommandFailure::new(context, &captured)` builds one from any `Captured`, keeping the last 8 KiB of each stream; a tail's `omitted_bytes` counts everything the command wrote before it. `context` says what the command was for, such as `stat`, never the command itself. `Display` gives the context, how the command ended and a fixed hint for a failure its stderr identifies (no network, no git repository), and never includes output; `display_for_log()` adds the tails, which can carry credentials, so redact its result before it leaves the process.
 
 `ExecSpec::bash(script)` is the one place a shell is implied. It is `bash -c <script>` with a blank `BASH_ENV`, so the script runs in a non-login shell that sources no startup file. The workload must provide `bash` on its `PATH`; no other shell is tried.
 

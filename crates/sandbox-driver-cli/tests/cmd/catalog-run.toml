@@ -1,0 +1,16 @@
+bin.name = "lithos-sandbox"
+args = ["--config", "config.toml", "run", "scratch", "--", "/bin/sh", "-c", "echo $FROM_CATALOG"]
+status = "success"
+stdout = """
+catalog
+"""
+stderr = ""
+
+[env]
+inherit = false
+
+[env.add]
+NO_COLOR = "1"
+PATH = "/usr/bin:/bin"
+RUST_LOG = "off"
+XDG_CONFIG_HOME = "tests/cmd/no-config"

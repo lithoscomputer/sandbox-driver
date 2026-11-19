@@ -118,9 +118,9 @@ mise run test:docker
 
 This builds the provider executables, runs failure injection and concurrent
 in-process/wire conformance, explicitly enables the live fence tests, and runs
-the `lithos-sandbox` CLI workflow with live Docker required. The CLI launches the
-actual `sandbox-driver-docker` executable; the process-boundary fence test also
-starts two independent driver executables against the same sandbox. An
+the `lithos-sandbox` CLI workflow with live Docker required. The CLI links the
+Docker provider in; the process-boundary fence test starts two independent
+driver executables against the same sandbox. An
 unreachable daemon fails this task instead of silently skipping live coverage.
 
 To run only the real-daemon fence tests:
@@ -140,13 +140,12 @@ retained ownership after primary removal, and incomplete creation cleanup.
 For a direct manual CLI check after `mise run dev`:
 
 ```sh
-export SANDBOX_DRIVER_PLUGIN_DEV=1
-id=$(target/debug/lithos-sandbox --provider docker --output id sandbox create \
+sb=$(target/debug/lithos-sandbox create docker \
   --image ghcr.io/lithoscomputer/ubuntu-24.04:slim-df708f910111)
-target/debug/lithos-sandbox --provider docker sandbox exec "$id" -- uname -a
-target/debug/lithos-sandbox --provider docker sandbox stop "$id" --wait
-target/debug/lithos-sandbox --provider docker sandbox start "$id" --wait
-target/debug/lithos-sandbox --provider docker sandbox delete "$id"
+target/debug/lithos-sandbox exec "$sb" -- uname -a
+target/debug/lithos-sandbox stop "$sb"
+target/debug/lithos-sandbox start "$sb"
+target/debug/lithos-sandbox destroy "$sb"
 ```
 
 ## Shared contract runtime

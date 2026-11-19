@@ -54,7 +54,7 @@ pub use execution::{
     ExecControls, ExecOutcome, ExecSpec, OutputLoss, OutputSink, OutputStream, StopLevel,
     TerminalSize, Termination, stop_signal,
 };
-pub use failure::{CommandError, CommandFailure, OutputTail};
+pub use failure::{CommandError, CommandFailure};
 pub use file_ops::{FileStat, create_dir_all, path_exists, remove_path, rename_path, stat_path};
 pub use git::{
     GitChange, GitCommit, GitDiffEntry, GitDiffOptions, GitError, GitFailure, GitFailureKind,
