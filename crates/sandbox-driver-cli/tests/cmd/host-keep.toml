@@ -1,9 +1,9 @@
 bin.name = "lithos-sandbox"
-args = ["--provider", "host", "sandbox", "run", "--keep", "--", "/bin/true"]
+args = ["run", "host", "--keep", "--", "/bin/true"]
 status.code = 1
 stdout = ""
 stderr = """
-error: Host sandboxes cannot be reattached after this command exits; remove --keep or use a persistent provider
+error: sandboxes of provider host end when this command exits, so --keep would leave nothing behind; use `lithos-sandbox run` without --keep
 """
 
 [env]

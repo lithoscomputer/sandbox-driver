@@ -1,18 +1,9 @@
 bin.name = "lithos-sandbox"
-args = [
-  "--provider",
-  "host",
-  "--output",
-  "json",
-  "sandbox",
-  "run",
-  "--",
-  "/bin/true",
-]
+args = ["--output", "json", "run", "host", "--", "/bin/true"]
 status.code = 1
 stdout = ""
 stderr = """
-error: sandbox run streams raw output and requires --output table
+error: run streams the command's own output and requires --output table
 """
 
 [env]

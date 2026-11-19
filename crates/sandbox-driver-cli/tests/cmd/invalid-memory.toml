@@ -1,0 +1,17 @@
+bin.name = "lithos-sandbox"
+args = ["run", "host", "--memory", "4", "--", "/bin/true"]
+status.code = 1
+stdout = ""
+stderr = """
+error: creating a sandbox from environment host
+  caused by: invalid spec at resources.memory: requires a positive size with units
+"""
+
+[env]
+inherit = false
+
+[env.add]
+NO_COLOR = "1"
+PATH = "/usr/bin:/bin"
+RUST_LOG = "off"
+XDG_CONFIG_HOME = "tests/cmd/no-config"

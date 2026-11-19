@@ -638,6 +638,21 @@ impl ExecStreamingResult {
         Ok(self.result)
     }
 
+    /// The loss a new-API outcome reports for this run: the transport's
+    /// counts, marked truncated when a command that exited on its own left
+    /// either capture truncated. A command that was stopped or timed out
+    /// always leaves output unread; its termination says so, and marking
+    /// it truncated as well would make every stop look like a lossy
+    /// provider.
+    #[must_use]
+    pub fn delivery_loss(&self) -> OutputLoss {
+        let mut loss = self.output_loss;
+        if self.result.termination == Termination::Exited {
+            loss.truncated |= self.stdout_capture.truncated || self.stderr_capture.truncated;
+        }
+        loss
+    }
+
     /// Wraps a buffered result with the honesty flags at their degraded
     /// defaults (`streams_separated: false`, `live_streaming: false`);
     /// providers set the flags they actually deliver. Capture stats
@@ -981,6 +996,31 @@ mod tests {
             matches!(&error, Error::Io { context, .. } if context == "writing"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn delivery_loss_is_truncated_when_an_exited_command_left_either_capture_truncated() {
+        let mut result = ExecStreamingResult::new(ExecResult::new(
+            Termination::Exited,
+            Some(0),
+            Duration::ZERO,
+        ));
+        assert!(!result.delivery_loss().is_lossy());
+        result.stderr_capture.truncated = true;
+        let loss = result.delivery_loss();
+        assert!(loss.truncated && loss.is_lossy());
+        assert_eq!(loss.dropped_frames, 0);
+    }
+
+    #[test]
+    fn delivery_loss_leaves_a_stopped_command_to_its_termination() {
+        for termination in [Termination::TimedOut, Termination::Killed] {
+            let mut result =
+                ExecStreamingResult::new(ExecResult::new(termination, None, Duration::ZERO));
+            result.stdout_capture.truncated = true;
+            result.stderr_capture.truncated = true;
+            assert!(!result.delivery_loss().is_lossy(), "{termination:?}");
+        }
     }
 
     #[test]
