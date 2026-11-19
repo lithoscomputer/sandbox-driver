@@ -127,10 +127,25 @@ async fn run(sandbox: &dyn Sandbox, script: String) -> Result<Captured, Error> {
     run_captured(sandbox, spec).await
 }
 
-/// `value` as one single-quoted shell word.
+/// `value`, once it is valid as one argument, quoted for Bash source.
 fn quoted(field: &str, value: &str) -> Result<String, Error> {
     validate_name(field, value)?;
-    Ok(format!("'{}'", value.replace('\'', "'\\''")))
+    Ok(shell_quote(value))
+}
+
+/// Quotes a string for safe interpolation into Bash source.
+pub(crate) fn shell_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for c in value.chars() {
+        if c == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(c);
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 /// Shell that prints [`MISSING`] and stops when nothing is at `$variable`,
@@ -186,7 +201,7 @@ fn read_stat(path: &str, captured: Captured) -> Result<FileStat, CommandError> {
         return Err(unreadable("stat", captured));
     };
     Ok(FileStat {
-        kind:           file_kind(kind),
+        kind:           parse_kind(kind),
         size:           size.parse().map_err(|_| unreadable("stat", captured))?,
         mode:           u32::from_str_radix(mode, 8).ok(),
         modified_at_ms: modified
@@ -196,18 +211,14 @@ fn read_stat(path: &str, captured: Captured) -> Result<FileStat, CommandError> {
     })
 }
 
-/// GNU and `BusyBox` print `regular file` or `regular empty file`; BSD
-/// prints `Regular File`.
-fn file_kind(text: &str) -> FileKind {
-    let text = text.to_ascii_lowercase();
-    if text.starts_with("regular") {
-        FileKind::File
-    } else if text == "directory" {
-        FileKind::Directory
-    } else if text == "symbolic link" {
-        FileKind::Symlink
-    } else {
-        FileKind::Other
+/// The kind a `stat` type string names. GNU and `BusyBox` print `regular
+/// file` or `regular empty file`; BSD prints `Regular File`.
+pub(crate) fn parse_kind(text: &str) -> FileKind {
+    match text.to_ascii_lowercase().as_str() {
+        "regular file" | "regular empty file" => FileKind::File,
+        "directory" => FileKind::Directory,
+        "symbolic link" => FileKind::Symlink,
+        _ => FileKind::Other,
     }
 }
 
@@ -241,6 +252,13 @@ mod tests {
     }
 
     #[test]
+    fn quotes_single_quotes_safely() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote("a b;c$d"), "'a b;c$d'");
+    }
+
+    #[test]
     fn stat_reads_what_gnu_and_bsd_print() {
         // GNU and BusyBox: `%F|%s|%a|%Y`.
         assert_eq!(
@@ -270,6 +288,7 @@ mod tests {
             ("symbolic link", FileKind::Symlink),
             ("Symbolic Link", FileKind::Symlink),
             ("fifo", FileKind::Other),
+            ("socket", FileKind::Other),
             ("Character Device", FileKind::Other),
         ] {
             assert_eq!(

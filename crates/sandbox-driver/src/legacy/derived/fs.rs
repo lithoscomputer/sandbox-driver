@@ -5,6 +5,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use async_trait::async_trait;
 use tokio::fs as tokio_fs;
 
+use crate::file_ops::parse_kind;
 use crate::legacy::derived::shell_quote;
 use crate::legacy::error::{Error, Result};
 use crate::legacy::exec::{Exec, ExecResult, ExecSpec};
@@ -45,15 +46,6 @@ impl DerivedFs {
             return Ok(result);
         }
         Err(result.into_failure(label).into())
-    }
-}
-
-fn parse_kind(text: &str) -> FileKind {
-    match text {
-        "regular file" | "regular empty file" => FileKind::File,
-        "directory" => FileKind::Directory,
-        "symbolic link" => FileKind::Symlink,
-        _ => FileKind::Other,
     }
 }
 
@@ -310,13 +302,5 @@ mod tests {
         // NUL records keep a newline or '|' in a name verbatim instead
         // of corrupting the entry and its neighbors.
         assert_eq!(names, vec!["a|b", "line\nbreak.txt", "sub"]);
-    }
-
-    #[test]
-    fn stat_kinds_map_to_file_kinds() {
-        assert_eq!(parse_kind("regular file"), FileKind::File);
-        assert_eq!(parse_kind("directory"), FileKind::Directory);
-        assert_eq!(parse_kind("symbolic link"), FileKind::Symlink);
-        assert_eq!(parse_kind("socket"), FileKind::Other);
     }
 }
