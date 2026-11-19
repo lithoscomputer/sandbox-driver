@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
-use std::{fmt, future, mem};
+use std::{error, fmt, future, mem};
 
 use tokio::time::Instant;
 
@@ -66,15 +66,61 @@ impl Captured {
         self.outcome.termination == Termination::Exited && self.outcome.exit_code == Some(0)
     }
 
-    /// Whether `stdout` and `stderr` hold every byte the command wrote:
-    /// nothing was omitted to stay within the limit, and the provider
-    /// reported no output loss. Check this before parsing the output.
+    /// Whether `stdout` and `stderr` hold every byte the command wrote, as
+    /// far as the provider can tell: nothing was omitted to stay within the
+    /// limit, and the provider reported no output loss.
     pub fn is_complete(&self) -> bool {
         self.stdout.omitted_bytes == 0
             && self.stderr.omitted_bytes == 0
             && !self.outcome.output_loss.is_lossy()
     }
+
+    /// Returns the capture only when it [is complete](Self::is_complete).
+    /// Call this before parsing the output, so a short read is an error
+    /// and not a wrong answer.
+    ///
+    /// # Errors
+    ///
+    /// [`IncompleteOutput`], which still holds the capture.
+    pub fn into_complete(self) -> Result<Self, IncompleteOutput> {
+        if self.is_complete() {
+            Ok(self)
+        } else {
+            Err(IncompleteOutput {
+                captured: Box::new(self),
+            })
+        }
+    }
 }
+
+/// A command that finished without its output being captured whole. The
+/// message gives sizes only; `captured` holds what was kept.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncompleteOutput {
+    pub captured: Box<Captured>,
+}
+
+impl fmt::Display for IncompleteOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Captured {
+            stdout,
+            stderr,
+            outcome,
+            ..
+        } = &*self.captured;
+        write!(
+            f,
+            "command output is incomplete: {} bytes of stdout and {} of stderr were omitted",
+            stdout.omitted_bytes, stderr.omitted_bytes
+        )?;
+        if outcome.output_loss.is_lossy() {
+            f.write_str(", and the provider lost output")?;
+        }
+        Ok(())
+    }
+}
+
+impl error::Error for IncompleteOutput {}
 
 /// Runs `spec` to completion and keeps up to [`DEFAULT_CAPTURE_BYTES`] of
 /// each stream.
@@ -234,6 +280,7 @@ impl Retained {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::OutputLoss;
 
     fn retain(limit: usize, chunks: &[&[u8]]) -> CapturedOutput {
         let mut retained = Retained::new(limit);
@@ -270,6 +317,49 @@ mod tests {
         let output = retain(0, &[b"hello ", b"world"]);
         assert!(output.bytes.is_empty());
         assert_eq!(output.omitted_bytes, 11);
+    }
+
+    fn captured(stdout: CapturedOutput, output_loss: OutputLoss) -> Captured {
+        Captured {
+            outcome: ExecOutcome {
+                termination: Termination::Exited,
+                exit_code: Some(0),
+                signal: None,
+                output_loss,
+            },
+            stdout,
+            stderr: CapturedOutput::default(),
+            duration: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn a_whole_capture_converts_and_a_short_one_is_an_error_that_keeps_it() {
+        let whole = captured(retain(5, &[b"01234"]), OutputLoss::default());
+        assert_eq!(whole.clone().into_complete(), Ok(whole));
+
+        let over_limit = captured(retain(4, &[b"0123456789"]), OutputLoss::default());
+        let error = over_limit
+            .clone()
+            .into_complete()
+            .expect_err("omitted bytes");
+        assert_eq!(*error.captured, over_limit);
+        assert_eq!(
+            error.to_string(),
+            "command output is incomplete: 6 bytes of stdout and 0 of stderr were omitted"
+        );
+    }
+
+    #[test]
+    fn output_the_provider_stopped_reading_is_incomplete_though_nothing_was_omitted() {
+        let truncated = captured(retain(5, &[b"01"]), OutputLoss {
+            truncated: true,
+            ..OutputLoss::default()
+        });
+        assert!(truncated.success());
+        assert!(!truncated.is_complete());
+        let error = truncated.into_complete().expect_err("provider loss");
+        assert!(error.to_string().ends_with("and the provider lost output"));
     }
 
     #[test]

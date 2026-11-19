@@ -175,7 +175,10 @@ pub struct ExecOutcome {
 /// counts what it threw away here. The bytes those records would have
 /// decoded to, and the stream they belonged to, are unknown, so a loss
 /// also sets `CaptureStats::truncated` on both streams. Every other
-/// provider reports zero.
+/// provider reports zero counts.
+///
+/// `truncated` is the loss no count describes: any provider can stop
+/// reading a stream before it ends.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 #[serde(default)]
@@ -184,11 +187,16 @@ pub struct OutputLoss {
     pub dropped_frames: u64,
     /// Encoded bytes those records held, their newline included.
     pub dropped_bytes:  u64,
+    /// The provider stopped reading output before a stream ended, as when a
+    /// process that outlived the command kept it open past the provider's
+    /// bound. How much is missing is unknown. Additive on the wire: an
+    /// older peer reports `false`.
+    pub truncated:      bool,
 }
 
 impl OutputLoss {
     /// Whether any output was lost.
     pub fn is_lossy(self) -> bool {
-        self.dropped_frames != 0 || self.dropped_bytes != 0
+        self.dropped_frames != 0 || self.dropped_bytes != 0 || self.truncated
     }
 }
