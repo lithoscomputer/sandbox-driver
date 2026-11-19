@@ -1,7 +1,7 @@
 //! Content search and file walks inside a sandbox, derived over
 //! [`Sandbox::exec`]. They are library code, not a provider capability, so
-//! they work unchanged on every provider and plugin whose workload has a
-//! POSIX shell with the tools each function names.
+//! they work unchanged on every provider and plugin whose workload has Bash
+//! and the tools each function names.
 //!
 //! A relative path resolves against the directory a command starts in, which
 //! is the sandbox's working directory.
@@ -12,7 +12,7 @@ use std::str;
 use globset::GlobBuilder;
 use serde::{Deserialize, Serialize};
 
-use super::file_ops::{quoted, shell_word, succeeded, unreadable};
+use super::file_ops::{quoted, shell_quote, succeeded, unreadable};
 use super::{
     Captured, CommandError, CommandFailure, Error, ExecSpec, Sandbox, Termination, run_captured,
 };
@@ -166,7 +166,7 @@ pub async fn walk_files(
 }
 
 async fn run(sandbox: &dyn Sandbox, script: String) -> Result<Captured, Error> {
-    let mut spec = ExecSpec::shell(script);
+    let mut spec = ExecSpec::bash(script);
     spec.timeout_ms = Some(TIMEOUT_MS);
     run_captured(sandbox, spec).await
 }
@@ -176,7 +176,7 @@ fn word(field: &str, value: &str) -> Result<String, Error> {
     if value.contains('\0') {
         return Err(Error::invalid_spec(field, "must be NUL-free"));
     }
-    Ok(shell_word(value))
+    Ok(shell_quote(value))
 }
 
 fn grep_script(pattern: &str, path: &str, options: &GrepOptions) -> Result<String, Error> {
@@ -288,7 +288,7 @@ fn walk_script(base: &str, options: &WalkOptions) -> Result<String, Error> {
 fn symlink_guard(base: &str) -> String {
     let mut guard = String::new();
     if base.starts_with('/') {
-        let _ = write!(guard, " && [ ! -L {} ]", shell_word(base));
+        let _ = write!(guard, " && [ ! -L {} ]", shell_quote(base));
         return guard;
     }
     let mut prefix = String::new();
@@ -297,7 +297,7 @@ fn symlink_guard(base: &str) -> String {
             prefix.push('/');
         }
         prefix.push_str(segment);
-        let _ = write!(guard, " && [ ! -L {} ]", shell_word(&prefix));
+        let _ = write!(guard, " && [ ! -L {} ]", shell_quote(&prefix));
     }
     guard
 }
@@ -319,26 +319,10 @@ fn read_walk(stdout: &[u8]) -> Vec<WalkedFile> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
-    use crate::{CapturedOutput, ExecOutcome, OutputLoss};
 
     fn ended(termination: Termination, exit_code: Option<i32>, stdout: &[u8]) -> Captured {
-        Captured {
-            outcome:  ExecOutcome {
-                termination,
-                exit_code,
-                signal: None,
-                output_loss: OutputLoss::default(),
-            },
-            stdout:   CapturedOutput {
-                bytes:         stdout.to_vec(),
-                omitted_bytes: 0,
-            },
-            stderr:   CapturedOutput::default(),
-            duration: Duration::ZERO,
-        }
+        Captured::ended(termination, exit_code, stdout, b"")
     }
 
     fn exited(exit_code: i32, stdout: &[u8]) -> Captured {

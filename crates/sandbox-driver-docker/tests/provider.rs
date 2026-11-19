@@ -22,8 +22,8 @@ use sandbox_driver_docker::DockerFactory;
 
 const IMAGE: &str = "ghcr.io/fabro-sh/dhi-alpine-base:3.23-dev-2026-06-17";
 const SERVICE_IMAGE: &str = "redis:7-alpine";
-/// A GNU userland, for what `BusyBox` cannot do.
-const GNU_IMAGE: &str = "ghcr.io/lithoscomputer/ubuntu-24.04:slim-df708f910111";
+/// `IMAGE` has no Bash.
+const BASH_IMAGE: &str = "ghcr.io/lithoscomputer/ubuntu-24.04:slim-df708f910111";
 
 struct NoSecrets;
 
@@ -100,7 +100,6 @@ async fn docker_passes_the_shared_contract_suite() {
         long_running: ExecSpec::argv(["sh", "-c", "echo ready; exec sleep 600"]),
     })
     .with_peer(peer.clone())
-    .with_shell()
     .run()
     .await;
     eprintln!("{report}");
@@ -109,22 +108,24 @@ async fn docker_passes_the_shared_contract_suite() {
     catalog.shutdown().await.expect("shutdown");
 }
 
-/// `BusyBox` `grep` cannot serve the search the library derives over exec, so
-/// that check runs on a GNU userland.
+/// What the library derives over a Bash exec is checked on an image that
+/// has Bash. Its GNU `grep` also serves the search, which `BusyBox` `grep`
+/// cannot.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a live Docker daemon"]
 #[expect(
     clippy::print_stderr,
     reason = "the per-check report is the test's evidence"
 )]
-async fn docker_passes_the_derived_search_check_on_a_gnu_userland() {
-    let workload = SandboxSpec::new(Source::Image(GNU_IMAGE.to_owned()));
-    let catalog = catalog(BTreeMap::from([("gnu", workload)]));
-    let report = Conformance::new(catalog.clone(), "gnu", Commands {
+async fn docker_passes_the_bash_checks_on_an_image_with_bash() {
+    let workload = SandboxSpec::new(Source::Image(BASH_IMAGE.to_owned()));
+    let catalog = catalog(BTreeMap::from([("bash", workload)]));
+    let report = Conformance::new(catalog.clone(), "bash", Commands {
         probe:        ExecSpec::argv(["printf", "workload\\n"]),
         probe_output: b"workload\n".to_vec(),
         long_running: ExecSpec::argv(["sh", "-c", "echo ready; exec sleep 600"]),
     })
+    .with_bash()
     .with_search()
     .run()
     .await;

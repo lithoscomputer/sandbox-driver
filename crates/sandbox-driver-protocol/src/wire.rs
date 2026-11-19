@@ -11,11 +11,11 @@ use std::{error, fmt, io};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use sandbox_driver::legacy;
 use sandbox_driver::legacy::{
     Action, AuthError, Capability, Error, ErrorReport, ExecFailure, GitFailure, GitFailureKind,
     ProviderError, ProviderKind, ResourceKind, SandboxState, Termination, TransportError,
 };
+use sandbox_driver::{ExecOutcome, OutputLoss, OutputTail, legacy};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -261,14 +261,28 @@ struct GitDetail {
 }
 
 fn exec_detail(failure: &ExecFailure) -> ExecDetail {
+    // This wire has no field for the signal, for output loss, or for bytes
+    // left out of a tail. A failure the old API builds has none of them.
+    let ExecFailure {
+        context,
+        outcome:
+            ExecOutcome {
+                termination,
+                exit_code,
+                signal: _,
+                output_loss: _,
+            },
+        stdout_tail,
+        stderr_tail,
+        duration,
+    } = failure;
     ExecDetail {
-        label:       failure.label().to_owned(),
-        termination: failure.termination(),
-        exit_code:   failure.exit_code(),
-        stdout_b64:  encode_bytes(failure.stdout()),
-        stderr_b64:  encode_bytes(failure.stderr()),
-        duration_ms: failure
-            .duration()
+        label:       context.clone(),
+        termination: (*termination).into(),
+        exit_code:   *exit_code,
+        stdout_b64:  encode_bytes(&stdout_tail.bytes),
+        stderr_b64:  encode_bytes(&stderr_tail.bytes),
+        duration_ms: duration
             .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
     }
 }
@@ -280,17 +294,22 @@ fn exec_failure(detail: ExecDetail) -> Option<ExecFailure> {
     ) else {
         return None;
     };
-    let mut failure = ExecFailure::new(
-        detail.label,
-        detail.termination,
-        detail.exit_code,
-        stdout,
-        stderr,
-    );
-    if let Some(duration_ms) = detail.duration_ms {
-        failure = failure.with_duration(Duration::from_millis(duration_ms));
-    }
-    Some(failure)
+    let whole = |bytes| OutputTail {
+        bytes,
+        omitted_bytes: 0,
+    };
+    Some(ExecFailure {
+        context:     detail.label,
+        outcome:     ExecOutcome {
+            termination: detail.termination.into(),
+            exit_code:   detail.exit_code,
+            signal:      None,
+            output_loss: OutputLoss::default(),
+        },
+        stdout_tail: whole(stdout),
+        stderr_tail: whole(stderr),
+        duration:    detail.duration_ms.map(Duration::from_millis),
+    })
 }
 
 /// A provider error without its in-process source, for the wire.
@@ -532,7 +551,7 @@ fn typed_error(kind: &str, detail: Value, causes: &[String]) -> Option<Error> {
             copy.detail = provider.detail;
             Error::Provider(copy)
         }
-        "exec" => Error::Exec(exec_failure(read::<ExecEnvelope>(detail)?.exec)?),
+        "exec" => exec_failure(read::<ExecEnvelope>(detail)?.exec)?.into(),
         "git" => {
             let GitEnvelope { git } = read(detail)?;
             let mut failure = GitFailure::classified(git.operation, git.kind, git.provider);
@@ -579,6 +598,8 @@ fn unknown_kind() -> sandbox_driver::ProviderKind {
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
+
+    use sandbox_driver::legacy::ExecResult;
 
     use super::*;
 
@@ -712,33 +733,21 @@ mod tests {
             "daemon disconnected"
         );
 
-        let error = Error::Exec(
-            ExecFailure::new(
-                "probe",
-                Termination::Exited,
-                Some(3),
-                b"out".to_vec(),
-                b"err".to_vec(),
-            )
-            .with_duration(Duration::from_millis(1500)),
-        );
+        let mut result = ExecResult::new(Termination::Exited, Some(3), Duration::from_millis(1500));
+        result.stdout = b"out".to_vec();
+        result.stderr = b"err".to_vec();
+        let sent = result.into_failure("probe");
+        let error = Error::from(sent.clone());
         let Error::Exec(failure) = WireError::from_error(&error).into_error() else {
             panic!("expected exec failure");
         };
-        assert_eq!(failure.label(), "probe");
-        assert_eq!(failure.exit_code(), Some(3));
-        assert_eq!(failure.stdout(), b"out");
-        assert_eq!(failure.duration(), Some(Duration::from_millis(1500)));
+        assert_eq!(*failure, sent);
 
+        let mut result = ExecResult::new(Termination::Exited, Some(128), Duration::ZERO);
+        result.stderr = b"fatal: couldn't find remote ref refs/tags/v9".to_vec();
         let error = Error::Git(GitFailure::from_command(
             "git clone",
-            ExecFailure::new(
-                "git fetch",
-                Termination::Exited,
-                Some(128),
-                Vec::new(),
-                b"fatal: couldn't find remote ref refs/tags/v9".to_vec(),
-            ),
+            result.into_failure("git fetch"),
         ));
         let wire = WireError::from_error(&error);
         assert_eq!(
@@ -751,8 +760,8 @@ mod tests {
         assert_eq!(failure.operation(), "git clone");
         assert_eq!(failure.kind(), GitFailureKind::RefNotFound);
         let output = failure.output().expect("command output crosses");
-        assert_eq!(output.exit_code(), Some(128));
-        assert!(String::from_utf8_lossy(output.stderr()).contains("refs/tags/v9"));
+        assert_eq!(output.outcome.exit_code, Some(128));
+        assert!(String::from_utf8_lossy(&output.stderr_tail.bytes).contains("refs/tags/v9"));
 
         let mut native = ProviderError::new(provider.clone(), "authentication failed");
         native.code = Some("auth".into());

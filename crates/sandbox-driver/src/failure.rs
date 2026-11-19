@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use super::{Captured, CapturedOutput, Error, ExecOutcome, Termination};
 
-/// How much of each stream a [`CommandFailure`] keeps.
-pub const FAILURE_TAIL_BYTES: usize = 8 * 1024;
+/// How much of each stream [`CommandFailure::new`] keeps.
+const TAIL_BYTES: usize = 8 * 1024;
 
 /// The newest bytes of one stream of a command.
 #[derive(Clone, Default, Eq, PartialEq)]
@@ -23,7 +23,7 @@ pub struct OutputTail {
 
 impl OutputTail {
     fn of(output: &CapturedOutput) -> Self {
-        let (bytes, omitted_bytes) = output.newest(FAILURE_TAIL_BYTES);
+        let (bytes, omitted_bytes) = output.newest(TAIL_BYTES);
         Self {
             bytes: bytes.to_vec(),
             omitted_bytes,
@@ -48,9 +48,10 @@ impl fmt::Debug for OutputTail {
 /// A command that ran and left its caller without a result, kept with the
 /// end of what it wrote.
 ///
-/// `Display` says what the command was for and how it ended. It never
-/// includes output, so it is safe wherever an [`Error`] message is.
-/// [`Self::display_for_log`] adds the output.
+/// `Display` says what the command was for and how it ended, with a fixed
+/// hint for a failure its stderr identifies. It never includes output, so
+/// it is safe wherever an [`Error`] message is. [`Self::display_for_log`]
+/// adds the output.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandFailure {
     /// What the command was for, such as `stat`; never the command itself.
@@ -58,19 +59,37 @@ pub struct CommandFailure {
     pub outcome:     ExecOutcome,
     pub stdout_tail: OutputTail,
     pub stderr_tail: OutputTail,
-    pub duration:    Duration,
+    /// How long the command ran, when whoever reported the failure measured
+    /// it. [`Self::new`] always has it.
+    pub duration:    Option<Duration>,
 }
 
 impl CommandFailure {
-    /// The failure a finished command describes, keeping the last
-    /// [`FAILURE_TAIL_BYTES`] of each stream.
+    /// The failure a finished command describes, keeping the last 8 KiB of
+    /// each stream.
     pub fn new(context: impl Into<String>, captured: &Captured) -> Self {
         Self {
             context:     context.into(),
             outcome:     captured.outcome.clone(),
             stdout_tail: OutputTail::of(&captured.stdout),
             stderr_tail: OutputTail::of(&captured.stderr),
-            duration:    captured.duration,
+            duration:    Some(captured.duration),
+        }
+    }
+
+    /// A bounded diagnosis matched from stderr. It is static text only, so
+    /// raw output never enters `Display`. Only classes that hold on every
+    /// provider live here.
+    fn hint(&self) -> Option<&'static str> {
+        let stderr = String::from_utf8_lossy(&self.stderr_tail.bytes).to_ascii_lowercase();
+        if stderr.contains("could not resolve host") || stderr.contains("network is unreachable") {
+            Some("network failure inside the sandbox — check DNS / egress")
+        } else if stderr.contains("not a git repository")
+            || stderr.contains("does not appear to be a git repository")
+        {
+            Some("no git repository at the working directory")
+        } else {
+            None
         }
     }
 
@@ -109,7 +128,13 @@ impl fmt::Display for CommandFailure {
             (Termination::Killed, _) => f.write_str("was killed")?,
             (Termination::Lost, _) => f.write_str("ended with an unknown outcome")?,
         }
-        write!(f, " after {} ms", self.duration.as_millis())
+        if let Some(duration) = self.duration {
+            write!(f, " after {} ms", duration.as_millis())?;
+        }
+        if let Some(hint) = self.hint() {
+            write!(f, " — hint: {hint}")?;
+        }
+        Ok(())
     }
 }
 
@@ -152,23 +177,9 @@ impl CommandError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::OutputLoss;
 
-    fn captured(exit_code: i32, stdout: &[u8], stderr: CapturedOutput) -> Captured {
-        Captured {
-            outcome: ExecOutcome {
-                termination: Termination::Exited,
-                exit_code:   Some(exit_code),
-                signal:      None,
-                output_loss: OutputLoss::default(),
-            },
-            stdout: CapturedOutput {
-                bytes:         stdout.to_vec(),
-                omitted_bytes: 0,
-            },
-            stderr,
-            duration: Duration::from_millis(1500),
-        }
+    fn exited(exit_code: i32, stdout: &[u8], stderr: &[u8]) -> Captured {
+        Captured::ended(Termination::Exited, Some(exit_code), stdout, stderr)
     }
 
     #[test]
@@ -176,10 +187,7 @@ mod tests {
         let secret = "ghs_notarealtoken";
         let failure = CommandFailure::new(
             "git fetch",
-            &captured(128, b"", CapturedOutput {
-                bytes:         format!("fatal: bad token {secret}\n").into_bytes(),
-                omitted_bytes: 0,
-            }),
+            &exited(128, b"", format!("fatal: bad token {secret}\n").as_bytes()),
         );
         assert_eq!(
             failure.to_string(),
@@ -197,23 +205,34 @@ mod tests {
     }
 
     #[test]
+    fn display_adds_a_hint_read_from_stderr_and_never_quotes_it() {
+        let failure = CommandFailure::new(
+            "git clone",
+            &exited(
+                128,
+                b"",
+                b"fatal: could not resolve host: github.com/secret-org",
+            ),
+        );
+        assert_eq!(
+            failure.to_string(),
+            "git clone failed: the command exited with code 128 after 1500 ms \u{2014} hint: \
+             network failure inside the sandbox \u{2014} check DNS / egress"
+        );
+    }
+
+    #[test]
     fn a_failure_keeps_only_the_end_of_a_long_stream_and_counts_the_rest() {
         let mut bytes = vec![b'a'; 100];
-        bytes.extend(vec![b'z'; FAILURE_TAIL_BYTES]);
-        let failure = CommandFailure::new(
-            "build",
-            &captured(1, b"", CapturedOutput {
-                bytes,
-                omitted_bytes: 0,
-            }),
-        );
-        assert_eq!(failure.stderr_tail.bytes, vec![b'z'; FAILURE_TAIL_BYTES]);
+        bytes.extend(vec![b'z'; TAIL_BYTES]);
+        let failure = CommandFailure::new("build", &exited(1, b"", &bytes));
+        assert_eq!(failure.stderr_tail.bytes, vec![b'z'; TAIL_BYTES]);
         assert_eq!(failure.stderr_tail.omitted_bytes, 100);
     }
 
     #[test]
     fn an_error_names_its_command_only_when_one_ran() {
-        let failure = CommandFailure::new("stat", &captured(0, b"??", CapturedOutput::default()));
+        let failure = CommandFailure::new("stat", &exited(0, b"??", b""));
         let unreadable = CommandError::UnexpectedOutput(Box::new(failure.clone()));
         assert_eq!(
             unreadable.to_string(),
