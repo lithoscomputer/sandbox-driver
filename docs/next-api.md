@@ -201,7 +201,7 @@ Rules every method obeys:
 
 `Ports` is `expose(port, Expose { signed, ttl }) -> Exposure { url, headers, expires_at }` and `release(port)`. Some providers hold a real local forward until `release`.
 
-`list(path, depth)` returns what is under the directory and never the directory itself: depth 0 is its immediate children, and each increment adds one more level. `FileEntry.size` is the byte length of a file. For a directory, a link or anything else it is unspecified, so read it only when `kind` is `file`.
+`list(path, depth)` returns what is under the directory and never the directory itself: depth 0 is its immediate children, and each increment adds one more level. Each entry's `path` is its path below that directory, `/`-separated with no leading `/` or `./`: listing `src` reports `src/main.rs` as `main.rs`, whether `src` was given as a relative or an absolute path. `FileEntry.size` is the byte length of a file. For a directory, a link or anything else it is unspecified, so read it only when `kind` is `file`.
 
 ### Errors
 
@@ -390,7 +390,7 @@ Each stream has its own connection, so a slow reader stalls only that stream, a 
 | `status(id)` | `{reference, state, name, labels, image, snapshot, resources, network, services, web_url}`; `resources` is what you actually allocated; states include `unavailable` (unreachable, not known gone) and `lost` (established gone without a confirmed destroy); `services` maps each service name to the address the sandbox reaches it at |
 | `start(id)`, `stop(id)` | `{}`; stop fences all workload execution, services and one-shot containers while keeping the workspace; start waits for declared service readiness and fails with `Busy` while a prior instance is still going away |
 | `exec(sandbox, spec)` | streamed, then the outcome |
-| `files.get(sandbox, path, range)`, `files.put(sandbox, path)`, `files.list(sandbox, path, depth)` | bytes stream, `{}`, entries; `list` at depth 0 returns the directory's children, each increment adds a level, and an entry's `size` is a file's byte length |
+| `files.get(sandbox, path, range)`, `files.put(sandbox, path)`, `files.list(sandbox, path, depth)` | bytes stream, `{}`, entries; `list` at depth 0 returns the directory's children, each increment adds a level, an entry's `path` is relative to the listed directory, and its `size` is a file's byte length |
 | `ports.expose(sandbox, port, signed, ttl_ms)`, `ports.release(sandbox, port)` | `{url, headers, expires_at}`, `{}` |
 | `list(labels)` | `[{id, labels, state}]` |
 | `destroy(id)` | `{}`; not-found is success |

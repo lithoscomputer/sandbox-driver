@@ -212,6 +212,8 @@ impl Conformance {
         )?;
         // Depth counts levels below the listed directory, which is never an
         // entry itself: zero is its children, and each increment adds a level.
+        // An entry is named by its path below that directory, however the
+        // directory was spelled.
         sandbox
             .files()
             .put(
@@ -231,16 +233,24 @@ impl Conformance {
             sandbox_driver::FileKind::File,
             Some(3),
         );
-        for (depth, expected) in [
-            (0, vec![nested]),
-            (1, vec![nested, binary, deep]),
-            (2, vec![nested, binary, deep, inner]),
+        for (directory, depth, expected) in [
+            ("conformance", 0, vec![nested]),
+            ("conformance", 1, vec![nested, binary, deep]),
+            ("conformance", 2, vec![nested, binary, deep, inner]),
+            ("conformance/", 1, vec![nested, binary, deep]),
+            ("conformance/nested", 0, vec![
+                ("binary.dat", binary.1, binary.2),
+                ("deep", deep.1, deep.2),
+            ]),
         ] {
-            let entries = sandbox.files().list("conformance", depth).await?;
+            let entries = sandbox.files().list(directory, depth).await?;
             let listed = listing(&entries);
             require(
                 listed == expected,
-                &format!("list at depth {depth} returned {listed:?}, expected {expected:?}"),
+                &format!(
+                    "list of {directory} at depth {depth} returned {listed:?}, expected \
+                     {expected:?}"
+                ),
             )?;
         }
         sandbox.stop().await?;
@@ -353,21 +363,16 @@ async fn read(
         .map_err(|error| format!("reading {path} failed: {error}"))?;
     Ok(bytes)
 }
-/// Each entry under the suite's `conformance` directory as its path below
-/// that directory, its kind and, for a file, its size, in path order. A
-/// size is only defined for a file.
+/// Each entry's path, kind and, for a file, its size, in path order. A size
+/// is only defined for a file.
 fn listing(
     entries: &[sandbox_driver::FileEntry],
 ) -> Vec<(&str, sandbox_driver::FileKind, Option<u64>)> {
     let mut listed: Vec<_> = entries
         .iter()
         .map(|entry| {
-            let path = entry
-                .path
-                .rsplit_once("conformance/")
-                .map_or(entry.path.as_str(), |(_, below)| below);
             let size = (entry.kind == sandbox_driver::FileKind::File).then_some(entry.size);
-            (path, entry.kind, size)
+            (entry.path.as_str(), entry.kind, size)
         })
         .collect();
     listed.sort_unstable_by_key(|(path, ..)| *path);

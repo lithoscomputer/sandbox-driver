@@ -531,8 +531,10 @@ impl Files for HostSandbox {
     async fn list(&self, path: &str, depth: u32) -> Result<Vec<FileEntry>, Error> {
         let root = self.resolve(path)?;
         let mut entries = Vec::new();
-        let mut pending = vec![(root, path.trim_end_matches('/').to_owned(), 0)];
-        while let Some((directory, prefix, level)) = pending.pop() {
+        // `below` is a directory's path below `root`, which is what names
+        // its entries; it is empty for `root` itself.
+        let mut pending = vec![(root, String::new(), 0)];
+        while let Some((directory, below, level)) = pending.pop() {
             let mut children = tokio_fs::read_dir(&directory)
                 .await
                 .map_err(|error| file_error(path, &error))?;
@@ -546,7 +548,13 @@ impl Files for HostSandbox {
                     .await
                     .map_err(|error| file_error(path, &error))?;
                 let kind = kind_of(metadata.file_type());
-                let entry_path = format!("{prefix}/{}", child.file_name().to_string_lossy());
+                let name = child.file_name();
+                let name = name.to_string_lossy();
+                let entry_path = if below.is_empty() {
+                    name.into_owned()
+                } else {
+                    format!("{below}/{name}")
+                };
                 if kind == FileKind::Directory && level < depth {
                     pending.push((child_path, entry_path.clone(), level + 1));
                 }

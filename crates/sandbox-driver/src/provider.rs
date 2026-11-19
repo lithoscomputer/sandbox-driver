@@ -201,6 +201,9 @@ pub enum FileKind {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileEntry {
+    /// The entry's path below the directory that was listed: `/`-separated,
+    /// with no leading `/` or `./`. Listing `src` reports `src/main.rs` as
+    /// `main.rs`, whether `src` was given as a relative or an absolute path.
     pub path: String,
     pub kind: FileKind,
     /// The byte length of a file. It is unspecified for every other kind, so
@@ -215,7 +218,8 @@ pub trait Files: Send + Sync {
     async fn put(&self, path: &str, bytes: ByteStream) -> Result<(), Error>;
     /// Lists what is under the directory `path`, never the directory itself.
     /// Depth zero returns its immediate children, and each increment adds
-    /// one more level. Paths address the workload.
+    /// one more level. `path` addresses the workload, and each entry's path
+    /// is relative to it.
     async fn list(&self, path: &str, depth: u32) -> Result<Vec<FileEntry>, Error>;
 }
 

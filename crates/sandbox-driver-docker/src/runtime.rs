@@ -678,7 +678,7 @@ impl Files for DockerContractSandbox {
                 ),
             });
         }
-        parse_listing(&root, &result.stdout)
+        parse_listing(&result.stdout)
     }
 }
 
@@ -700,7 +700,9 @@ done' sh {} +"#;
 const LIST_MISSING: i32 = 3;
 const LIST_TIMEOUT: Duration = Duration::from_secs(60);
 
-fn parse_listing(root: &str, output: &[u8]) -> Result<Vec<FileEntry>, ContractError> {
+/// Each entry's path is the one `find .` printed without its `./`, which is
+/// its path below the listed directory.
+fn parse_listing(output: &[u8]) -> Result<Vec<FileEntry>, ContractError> {
     let malformed = || ContractError::Transport {
         message: "the directory listing was malformed".to_owned(),
         outcome: MutationOutcome::NotStarted,
@@ -724,11 +726,7 @@ fn parse_listing(root: &str, output: &[u8]) -> Result<Vec<FileEntry>, ContractEr
             _ => legacy::FileKind::Other,
         };
         entries.push(FileEntry {
-            path: format!(
-                "{}/{}",
-                root.trim_end_matches('/'),
-                relative.trim_start_matches("./")
-            ),
+            path: relative.strip_prefix("./").unwrap_or(relative).to_owned(),
             kind,
             size: size.parse().map_err(|_| malformed())?,
         });
@@ -848,26 +846,26 @@ mod tests {
     #[test]
     fn listings_keep_names_with_spaces_and_newlines() {
         let output = b"d 0 ./dir\0f 12 ./dir/a file\0f 3 ./line\nbreak\0l 0 ./link\0o 0 ./fifo\0";
-        let entries = parse_listing("/work/", output).expect("listing");
+        let entries = parse_listing(output).expect("listing");
         let found: Vec<(&str, legacy::FileKind, u64)> = entries
             .iter()
             .map(|entry| (entry.path.as_str(), entry.kind, entry.size))
             .collect();
         assert_eq!(found, vec![
-            ("/work/dir", legacy::FileKind::Directory, 0),
-            ("/work/dir/a file", legacy::FileKind::File, 12),
-            ("/work/fifo", legacy::FileKind::Other, 0),
-            ("/work/line\nbreak", legacy::FileKind::File, 3),
-            ("/work/link", legacy::FileKind::Symlink, 0),
+            ("dir", legacy::FileKind::Directory, 0),
+            ("dir/a file", legacy::FileKind::File, 12),
+            ("fifo", legacy::FileKind::Other, 0),
+            ("line\nbreak", legacy::FileKind::File, 3),
+            ("link", legacy::FileKind::Symlink, 0),
         ]);
-        assert!(parse_listing("/work", b"").expect("empty").is_empty());
+        assert!(parse_listing(b"").expect("empty").is_empty());
     }
 
     #[test]
     fn a_malformed_listing_is_refused() {
         for output in [&b"f ./missing-size\0"[..], b"f big ./file\0"] {
             assert!(matches!(
-                parse_listing("/work", output),
+                parse_listing(output),
                 Err(ContractError::Transport { .. })
             ));
         }

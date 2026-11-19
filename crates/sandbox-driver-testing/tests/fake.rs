@@ -87,7 +87,7 @@ async fn fake_files_resolve_against_workspace_and_list_implicit_parents() {
     assert_eq!(bytes, [1, 0, 255]);
     let entries = sandbox.files().list("/workspace", 0).await.expect("list");
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].path, "/workspace/nested");
+    assert_eq!(entries[0].path, "nested");
 }
 
 /// A sandbox whose `long` command emits one output chunk and then waits for

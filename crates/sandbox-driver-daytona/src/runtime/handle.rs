@@ -631,12 +631,10 @@ impl Files for Workload {
             .list_dir(path, depth)
             .await
             .map_err(|error| classify("listing directory", error))?;
-        let base =
-            crate::resolve_path(LegacySandbox::working_directory(self.handle.as_ref()), path);
         Ok(entries
             .into_iter()
             .map(|entry| FileEntry {
-                path: format!("{}/{}", base.trim_end_matches('/'), entry.path),
+                path: entry.path,
                 kind: entry.kind,
                 size: entry.size.unwrap_or(0),
             })

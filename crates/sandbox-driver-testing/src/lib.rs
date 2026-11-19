@@ -591,7 +591,7 @@ impl Files for Handle {
         for (path, bytes) in below {
             let parts: Vec<_> = path[prefix.len()..].split('/').collect();
             for index in 0..parts.len().min((depth as usize).saturating_add(1)) {
-                let entry_path = format!("{}{}", prefix, parts[..=index].join("/"));
+                let entry_path = parts[..=index].join("/");
                 let (kind, size) = if index + 1 == parts.len() {
                     (FileKind::File, bytes.len() as u64)
                 } else {
