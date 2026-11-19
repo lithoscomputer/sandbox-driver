@@ -452,7 +452,7 @@ Docker offers all three, with `shell_command` as its only endpoint. Daytona offe
 
 ## Plugins
 
-A plugin is an executable that serves one provider over protocol version 3. The library starts it, writes JSON-RPC requests to its stdin and reads responses from its stdout; stderr is captured as plugin logs. [The plugin protocol](protocol.md#16-protocol-version-3-the-shared-contract-over-a-process-boundary) specifies the wire: framing, the data channels that carry exec and file bytes outside the control pipe, transport budgets, and the method list. The rest of that document describes protocol version 2, which is being removed.
+A plugin is an executable that serves one provider over protocol version 3. The library starts it, writes JSON-RPC requests to its stdin and reads responses from its stdout; stderr is captured as plugin logs. [The plugin protocol](protocol.md#16-protocol-version-3-providers-over-a-process-boundary) specifies the wire: framing, the data channels that carry exec and file bytes outside the control pipe, transport budgets, and the method list. The rest of that document describes protocol version 2, which is being removed.
 
 ### Using a plugin
 
@@ -495,7 +495,7 @@ What the library promises a plugin, and expects of it:
 
 ### Plugin metadata discovery
 
-`sandbox_driver_protocol::metadata` implements the credential-free discovery step, and the [plugin protocol](protocol.md#15-shared-contract-metadata-probe) specifies the probe a plugin answers.
+`sandbox_driver_protocol::metadata` implements the credential-free discovery step, and the [plugin protocol](protocol.md#15-plugin-metadata-probe) specifies the probe a plugin answers.
 
 `SchemaDiscovery` starts nothing when constructed. A `discover` call takes only a `PluginLocation` (entry name, kind, path, trust), never the entry's config, arguments, environment or secrets. The path must be absolute; there is no search of the caller's `PATH`. Discovery checks the checksum, or explicit development trust, and only then runs the executable. Probe stderr is logged when the probe fails and never put in an error. A Rust plugin can call `metadata::write_schema` before constructing its provider or loading settings, then exit.
 
