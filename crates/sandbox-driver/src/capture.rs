@@ -59,6 +59,7 @@ impl fmt::Debug for CapturedOutput {
         f.debug_struct("CapturedOutput")
             .field("retained_bytes", &self.bytes.len())
             .field("omitted_bytes", &self.omitted_bytes)
+            .field("head_bytes", &self.head_bytes)
             .finish()
     }
 }
