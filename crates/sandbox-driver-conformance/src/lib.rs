@@ -92,7 +92,7 @@ impl Conformance {
             peer: None,
             environment: environment.into(),
             commands,
-            bash:  false,
+            bash: false,
             search: false,
             timeout: Duration::from_secs(30),
         }
