@@ -210,13 +210,6 @@ impl Conformance {
             read(sandbox, path, range).await? == payload[1..4],
             "file range ignored",
         )?;
-        let entries = sandbox.files().list("conformance/nested", 0).await?;
-        require(
-            entries.iter().any(|entry| {
-                entry.path.ends_with("binary.dat") && entry.size == payload.len() as u64
-            }),
-            "file missing from list",
-        )?;
         // Depth counts levels below the listed directory, which is never an
         // entry itself: zero is its children, and each increment adds a level.
         sandbox
@@ -227,7 +220,11 @@ impl Conformance {
             )
             .await?;
         let nested = ("nested", sandbox_driver::FileKind::Directory, None);
-        let binary = ("nested/binary.dat", sandbox_driver::FileKind::File, Some(7));
+        let binary = (
+            "nested/binary.dat",
+            sandbox_driver::FileKind::File,
+            Some(payload.len() as u64),
+        );
         let deep = ("nested/deep", sandbox_driver::FileKind::Directory, None);
         let inner = (
             "nested/deep/inner.dat",
