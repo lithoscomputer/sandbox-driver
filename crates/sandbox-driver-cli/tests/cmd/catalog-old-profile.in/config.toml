@@ -1,2 +1,4 @@
+default-provider = "local"
+
 [providers.local]
 type = "host"

@@ -13,38 +13,6 @@ use super::{Captured, CapturedOutput, Error, ExecOutcome, Termination};
 /// How much of each stream [`CommandFailure::new`] keeps.
 const TAIL_BYTES: usize = 8 * 1024;
 
-/// The newest bytes of one stream of a command.
-#[derive(Clone, Default, Eq, PartialEq)]
-pub struct OutputTail {
-    pub bytes:         Vec<u8>,
-    /// Bytes the command wrote to this stream before `bytes`.
-    pub omitted_bytes: u64,
-}
-
-impl OutputTail {
-    fn of(output: &CapturedOutput) -> Self {
-        let (bytes, omitted_bytes) = output.newest(TAIL_BYTES);
-        Self {
-            bytes: bytes.to_vec(),
-            omitted_bytes,
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.bytes.is_empty() && self.omitted_bytes == 0
-    }
-}
-
-// Command output can carry credentials, as `ExecSpec::argv` can.
-impl fmt::Debug for OutputTail {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OutputTail")
-            .field("retained_bytes", &self.bytes.len())
-            .field("omitted_bytes", &self.omitted_bytes)
-            .finish()
-    }
-}
-
 /// A command that ran and left its caller without a result, kept with the
 /// end of what it wrote.
 ///
@@ -57,8 +25,11 @@ pub struct CommandFailure {
     /// What the command was for, such as `stat`; never the command itself.
     pub context:     String,
     pub outcome:     ExecOutcome,
-    pub stdout_tail: OutputTail,
-    pub stderr_tail: OutputTail,
+    /// The newest bytes of stdout; `omitted_bytes` counts what the command
+    /// wrote before them.
+    pub stdout_tail: CapturedOutput,
+    /// As `stdout_tail`, for stderr.
+    pub stderr_tail: CapturedOutput,
     /// How long the command ran, when whoever reported the failure measured
     /// it. [`Self::new`] always has it.
     pub duration:    Option<Duration>,
@@ -71,8 +42,8 @@ impl CommandFailure {
         Self {
             context:     context.into(),
             outcome:     captured.outcome.clone(),
-            stdout_tail: OutputTail::of(&captured.stdout),
-            stderr_tail: OutputTail::of(&captured.stderr),
+            stdout_tail: captured.stdout.newest(TAIL_BYTES),
+            stderr_tail: captured.stderr.newest(TAIL_BYTES),
             duration:    Some(captured.duration),
         }
     }
@@ -102,7 +73,7 @@ impl CommandFailure {
     pub fn display_for_log(&self) -> String {
         let mut rendered = self.to_string();
         for (stream, tail) in [("stderr", &self.stderr_tail), ("stdout", &self.stdout_tail)] {
-            if tail.is_empty() {
+            if tail.observed_bytes() == 0 {
                 continue;
             }
             let _ = write!(

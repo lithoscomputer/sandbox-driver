@@ -24,8 +24,8 @@ description = "Build the workspace"
 run = "cargo build --locked"
 
 [tasks."plugins:build"]
-description = "Build the provider executables used by CLI tests"
-run = "cargo build --locked --bins -p sandbox-driver-host -p sandbox-driver-docker -p sandbox-driver-daytona"
+description = "Build the provider and fixture plugin executables used by tests"
+run = "cargo build --locked --bins -p sandbox-driver-host -p sandbox-driver-docker -p sandbox-driver-daytona -p sandbox-driver-fixture-plugins"
 
 [tasks.fmt]
 description = "Format Rust with the pinned nightly formatter"

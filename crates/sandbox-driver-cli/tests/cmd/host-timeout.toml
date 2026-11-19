@@ -1,22 +1,9 @@
 bin.name = "lithos-sandbox"
-args = [
-  "--provider",
-  "host",
-  "--events",
-  "off",
-  "sandbox",
-  "run",
-  "--timeout-seconds",
-  "1",
-  "--",
-  "/bin/sh",
-  "-c",
-  "sleep 10",
-]
+args = ["run", "host", "--timeout", "1s", "--", "/bin/sh", "-c", "sleep 10"]
 status.code = 124
 stdout = ""
 stderr = """
-sandbox command timed out
+command timed out
 """
 
 [env]

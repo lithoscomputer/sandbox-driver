@@ -1,20 +1,9 @@
 bin.name = "lithos-sandbox"
-args = [
-  "--provider",
-  "host",
-  "--events",
-  "off",
-  "sandbox",
-  "run",
-  "--provider-config",
-  "{broken",
-  "--",
-  "/bin/true",
-]
+args = ["run", "host", "--provider-config", "{broken", "--", "/bin/true"]
 status.code = 1
 stdout = ""
 stderr = """
-error: parsing --provider-config as JSON
+error: parsing --provider-config as a JSON object
   caused by: key must be a string at line 1 column 2
 """
 

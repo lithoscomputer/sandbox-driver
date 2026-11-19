@@ -1,9 +1,9 @@
 bin.name = "lithos-sandbox"
-args = ["--provider", "host", "--output", "id", "provider", "health"]
+args = ["cp", "a.txt", "b.txt"]
 status.code = 1
 stdout = ""
 stderr = """
-error: --output id is not valid for provider health
+error: one side of cp must be SANDBOX:PATH, such as docker/1a2b:/tmp/file
 """
 
 [env]

@@ -1,168 +1,152 @@
-use std::io::Result as IoResult;
-use std::path::Path;
+use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use sandbox_driver::legacy;
-use sandbox_driver::legacy::{
-    Error, EventContext, ExecControls, ExecSpec, OutputSink, OutputStream, Sandbox,
-    SandboxProvider, Termination, WaitOptions,
+use sandbox_driver::{
+    Error, ExecControls, ExecSpec, MutationOutcome, OutputSink, OutputStream, Sandbox, Sandboxes,
+    Termination,
 };
-use tokio::io::{
-    AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, stderr as async_stderr,
-    stdin as async_stdin, stdout as async_stdout,
-};
+use tokio::process::Command as TokioCommand;
 use tokio::signal::ctrl_c;
 use tokio_util::sync::CancellationToken;
 
-use super::spec::{build_spec, parse_assignments};
-use super::{CANCELLED_EXIT, DRIVER_ERROR_EXIT, KILLED_EXIT, TIMEOUT_EXIT, is_host};
+use super::spec::{duration, parse_assignments};
+use super::{after_cleanup, create_sandbox};
 use crate::cli::{ExecOptions, RunArgs};
-use crate::output::write_stderr;
+use crate::output::{display_ref, write_stderr, write_stdout};
+use crate::stdin::local_stdin;
 
-pub(super) async fn execute_run(
-    args: &RunArgs,
-    provider: &dyn SandboxProvider,
-    events: Option<EventContext>,
-) -> Result<u8> {
-    if args.spec.spec.as_deref() == Some(Path::new("-")) && args.exec.stdin {
-        bail!("--spec - and --stdin cannot read from stdin in the same command");
-    }
-    if args.keep && is_host(provider.kind()) {
-        bail!(
-            "Host sandboxes cannot be reattached after this command exits; remove --keep or use a persistent provider"
-        );
-    }
+pub(super) const DRIVER_ERROR_EXIT: u8 = 125;
+const TIMEOUT_EXIT: u8 = 124;
+const TERMINATED_EXIT: u8 = 130;
+const KILLED_EXIT: u8 = 137;
 
-    let spec = build_spec(&args.spec, provider.kind()).await?;
-    let sandbox = provider.create(&spec, events).await?;
-    let operation = async {
-        legacy::activate(sandbox.as_ref(), &WaitOptions::default()).await?;
-        execute_command(sandbox.as_ref(), &args.exec, &args.command).await
+/// Creates a sandbox, runs one command, and destroys the sandbox, also
+/// when the command fails.
+pub(super) async fn run(catalog: &Sandboxes, args: &RunArgs) -> Result<u8> {
+    if args.create.spec.as_deref() == Some("-".as_ref()) && args.exec.stdin {
+        bail!("--spec - and --stdin cannot both read stdin");
     }
-    .await;
+    // Every option is checked before anything is created: a typo must not
+    // cost a sandbox.
+    let spec = exec_spec(&args.exec, &args.command)?;
+    let sandbox = create_sandbox(catalog, &args.create, args.keep.then_some("--keep")).await?;
+    let reference = sandbox.reference();
+    let outcome = execute(sandbox.as_ref(), spec, args.exec.stdin).await;
 
     if args.keep {
-        write_stderr(format!("sandbox {} preserved\n", sandbox.id()).as_bytes()).await?;
-        return operation;
+        write_stderr(format!("kept sandbox {}\n", display_ref(&reference)).as_bytes()).await?;
+        return outcome;
     }
-
-    let cleanup = sandbox.delete().await.context("deleting run sandbox");
-    match (operation, cleanup) {
-        (Ok(exit_code), Ok(())) => Ok(exit_code),
-        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
-        (Err(operation_error), Ok(())) => Err(operation_error),
-        (Err(operation_error), Err(cleanup_error)) => Err(operation_error.context(format!(
-            "the command also failed to clean up its sandbox: {cleanup_error:#}"
-        ))),
-    }
+    drop(sandbox);
+    let cleanup = catalog
+        .destroy(&reference)
+        .await
+        .with_context(|| format!("destroying sandbox {}", display_ref(&reference)));
+    after_cleanup(outcome, cleanup, "the sandbox also could not be destroyed")
 }
 
-pub(super) async fn execute_command(
-    sandbox: &dyn Sandbox,
-    options: &ExecOptions,
-    command: &[String],
-) -> Result<u8> {
-    // clap guarantees at least one word; it is the program.
-    let (program, args) = command
-        .split_first()
-        .context("a command to execute is required")?;
-    let mut spec = ExecSpec::new(program).args(args);
-    if let Some(working_dir) = &options.working_dir {
-        spec.working_dir = Some(working_dir.clone());
-    }
+/// The command and its exec options as an `ExecSpec`.
+pub(super) fn exec_spec(options: &ExecOptions, command: &[String]) -> Result<ExecSpec> {
+    let mut spec = ExecSpec::argv(command);
     spec.env = parse_assignments(&options.exec_env, "exec-env")?;
-    if options.no_timeout {
-        spec.timeout = None;
-    } else if let Some(seconds) = options.timeout_seconds {
-        spec.timeout = Some(Duration::from_secs(seconds));
+    spec.working_directory.clone_from(&options.workdir);
+    if let Some(timeout) = &options.timeout {
+        spec.timeout_ms = Some(duration("--timeout", timeout, "30s or 5m")?);
     }
-    if options.stdin {
-        if !sandbox.capabilities().exec.stdin {
-            bail!(
-                "provider does not support exec.stdin for sandbox {}",
-                sandbox.id()
-            );
-        }
-        let mut bytes = Vec::new();
-        async_stdin()
-            .read_to_end(&mut bytes)
-            .await
-            .context("reading command stdin")?;
-        spec.stdin = Some(bytes);
-    }
+    Ok(spec)
+}
 
-    // Ctrl-C is the caller's own ladder: the first sends TERM, a second
-    // sends KILL. There is no automatic escalation.
-    let stops = sandbox
-        .capabilities()
-        .exec
-        .stop
-        .then(|| (CancellationToken::new(), CancellationToken::new()));
+/// Runs `spec`, streaming its output to this process's stdout and stderr,
+/// and local stdin to it when `stdin` is set. Returns the exit code the CLI
+/// should exit with.
+pub(super) async fn execute(sandbox: &dyn Sandbox, spec: ExecSpec, stdin: bool) -> Result<u8> {
+    // Ctrl-C is the caller's own ladder: the first requests TERM, a second
+    // KILL. There is no automatic escalation.
+    let (term, kill) = (CancellationToken::new(), CancellationToken::new());
     let controls = ExecControls {
-        term: stops.as_ref().map(|(term, _)| term.clone()),
-        kill: stops.as_ref().map(|(_, kill)| kill.clone()),
-        sink: Some(command_output_sink()),
-        retained_output_limit: Some(0),
-        ..ExecControls::default()
+        stdin:  stdin.then(|| Box::pin(local_stdin()) as _),
+        sink:   Some(output_sink()),
+        term:   Some(term.clone()),
+        kill:   Some(kill.clone()),
+        resize: None,
     };
-    let execution = sandbox.exec().run_streaming(&spec, controls);
+    let execution = sandbox.exec(spec, controls);
     tokio::pin!(execution);
-    let streaming = if let Some((term, kill)) = stops {
-        tokio::select! {
-            result = &mut execution => result?,
-            signal = ctrl_c() => {
-                signal.context("listening for Ctrl-C")?;
-                term.cancel();
-                tokio::select! {
-                    result = &mut execution => result?,
-                    signal = ctrl_c() => {
-                        signal.context("listening for Ctrl-C")?;
-                        kill.cancel();
-                        execution.await?
-                    }
+    let outcome = tokio::select! {
+        result = &mut execution => result?,
+        signal = ctrl_c() => {
+            signal.context("listening for Ctrl-C")?;
+            term.cancel();
+            tokio::select! {
+                result = &mut execution => result?,
+                signal = ctrl_c() => {
+                    signal.context("listening for Ctrl-C")?;
+                    kill.cancel();
+                    execution.await?
                 }
             }
         }
-    } else {
-        execution.await?
     };
 
-    termination_exit_code(streaming.result.termination, streaming.result.exit_code).await
-}
-
-fn command_output_sink() -> OutputSink {
-    Arc::new(|stream, bytes| {
-        Box::pin(async move {
-            let result = match stream {
-                OutputStream::Stdout => write_and_flush(async_stdout(), &bytes).await,
-                OutputStream::Stderr => write_and_flush(async_stderr(), &bytes).await,
-            };
-            result.map_err(|error| Error::io("writing command output", error))
-        })
+    Ok(match outcome.termination {
+        Termination::Exited => exit_byte(outcome.exit_code),
+        Termination::TimedOut => {
+            write_stderr(b"command timed out\n").await?;
+            TIMEOUT_EXIT
+        }
+        Termination::Terminated => TERMINATED_EXIT,
+        Termination::Killed => KILLED_EXIT,
+        Termination::Lost => {
+            write_stderr(b"the command's outcome is unknown; it may still be running\n").await?;
+            DRIVER_ERROR_EXIT
+        }
     })
 }
 
-async fn write_and_flush<W>(mut writer: W, bytes: &[u8]) -> IoResult<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    writer.write_all(bytes).await?;
-    writer.flush().await
+/// Opens the provider's interactive shell. Providers that offer one report
+/// a local command, such as `docker exec -it`, that this process runs.
+pub(super) async fn shell(sandbox: &dyn Sandbox) -> Result<u8> {
+    let unsupported = || {
+        anyhow::anyhow!(
+            "this sandbox's provider offers no shell command; use `lithos-sandbox exec {} -- sh -c ...`",
+            display_ref(&sandbox.reference())
+        )
+    };
+    let endpoints = sandbox.endpoints().ok_or_else(unsupported)?;
+    let command = match endpoints.shell_command().await {
+        Ok(command) => command,
+        Err(Error::Unsupported { .. }) => return Err(unsupported()),
+        Err(error) => return Err(error.into()),
+    };
+    let status = TokioCommand::new("sh")
+        .args(["-c", &command])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await
+        .context("running the provider's shell command")?;
+    Ok(exit_byte(status.code()))
 }
 
-async fn termination_exit_code(termination: Termination, exit_code: Option<i32>) -> Result<u8> {
-    match termination {
-        Termination::Exited => Ok(exit_code
-            .and_then(|code| u8::try_from(code).ok())
-            .unwrap_or(DRIVER_ERROR_EXIT)),
-        Termination::TimedOut => {
-            write_stderr(b"sandbox command timed out\n").await?;
-            Ok(TIMEOUT_EXIT)
-        }
-        Termination::Cancelled => Ok(CANCELLED_EXIT),
-        Termination::Killed => Ok(KILLED_EXIT),
-        _ => Ok(DRIVER_ERROR_EXIT),
-    }
+/// A command's exit code as this process can report it.
+fn exit_byte(code: Option<i32>) -> u8 {
+    code.and_then(|code| u8::try_from(code).ok())
+        .unwrap_or(DRIVER_ERROR_EXIT)
+}
+
+fn output_sink() -> OutputSink {
+    Arc::new(|stream, bytes| {
+        Box::pin(async move {
+            let result = match stream {
+                OutputStream::Stderr => write_stderr(&bytes).await,
+                OutputStream::Stdout | OutputStream::Terminal => write_stdout(&bytes).await,
+            };
+            result.map_err(|error| Error::Transport {
+                message: format!("writing command output: {error:#}"),
+                outcome: MutationOutcome::Unknown,
+            })
+        })
+    })
 }

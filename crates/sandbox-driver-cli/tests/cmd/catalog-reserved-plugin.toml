@@ -1,0 +1,16 @@
+bin.name = "lithos-sandbox"
+args = ["--config", "config.toml", "provider", "health", "local"]
+status.code = 1
+stdout = ""
+stderr = """
+error: invalid provider entry local at plugin: host, docker and daytona are built-in providers, not plugins; a plugin must use another kind
+"""
+
+[env]
+inherit = false
+
+[env.add]
+NO_COLOR = "1"
+PATH = "/usr/bin:/bin"
+RUST_LOG = "off"
+XDG_CONFIG_HOME = "tests/cmd/no-config"

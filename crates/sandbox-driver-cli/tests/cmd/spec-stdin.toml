@@ -1,19 +1,6 @@
 bin.name = "lithos-sandbox"
-args = [
-  "--provider",
-  "host",
-  "--events",
-  "off",
-  "sandbox",
-  "run",
-  "--spec",
-  "-",
-  "--",
-  "/bin/sh",
-  "-c",
-  "printf '%s\\n' \"$SPEC_ENV\"",
-]
-stdin = '{"source":"host_directory","env":{"SPEC_ENV":"from-spec"}}'
+args = ["run", "host", "--spec", "-", "--", "/bin/sh", "-c", "printf '%s\\n' \"$SPEC_ENV\""]
+stdin = "{\"source\":\"host_directory\",\"env\":{\"SPEC_ENV\":\"from-spec\"}}"
 status = "success"
 stdout = """
 from-spec

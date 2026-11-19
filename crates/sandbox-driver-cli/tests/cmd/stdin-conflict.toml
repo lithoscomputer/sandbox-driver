@@ -1,19 +1,9 @@
 bin.name = "lithos-sandbox"
-args = [
-  "--provider",
-  "host",
-  "sandbox",
-  "run",
-  "--spec",
-  "-",
-  "--stdin",
-  "--",
-  "/bin/true",
-]
+args = ["run", "host", "--spec", "-", "--stdin", "--", "/bin/true"]
 status.code = 1
 stdout = ""
 stderr = """
-error: --spec - and --stdin cannot read from stdin in the same command
+error: --spec - and --stdin cannot both read stdin
 """
 
 [env]
