@@ -1,16 +1,5 @@
 bin.name = "lithos-sandbox"
-args = [
-  "--provider",
-  "host",
-  "--events",
-  "off",
-  "sandbox",
-  "run",
-  "--exec-env",
-  "BROKEN",
-  "--",
-  "/bin/true",
-]
+args = ["run", "host", "--exec-env", "BROKEN", "--", "/bin/true"]
 status.code = 1
 stdout = ""
 stderr = """

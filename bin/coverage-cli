@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Instrument the CLI and the separate provider processes it launches.
+# Instrument the CLI, its linked providers, and the fixture plugin it launches.
 set -euo pipefail
 
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target/llvm-cov-target}"
@@ -8,10 +8,7 @@ trap 'rm -f -- "$coverage_env"' EXIT HUP INT TERM
 cargo llvm-cov clean --workspace
 cargo llvm-cov show-env --sh > "$coverage_env"
 source "$coverage_env"
-cargo build --locked --bins \
-  -p sandbox-driver-host \
-  -p sandbox-driver-docker \
-  -p sandbox-driver-daytona
+cargo build --locked --bins -p sandbox-driver-cli -p sandbox-driver-fixture-plugins
 # Live providers are required here, so include the ignored Daytona workflow.
 cargo nextest run --locked -p sandbox-driver-cli --run-ignored all \
   --test trycmd --test live --test plugins

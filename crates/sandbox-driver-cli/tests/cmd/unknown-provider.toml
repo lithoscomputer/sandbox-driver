@@ -1,10 +1,10 @@
 bin.name = "lithos-sandbox"
-args = ["--provider", "unknown", "provider", "health"]
+args = ["provider", "health", "unknown"]
 status.code = 1
 stdout = ""
 stderr = """
-error: connecting provider profile "unknown"
-  caused by: unknown provider "unknown"; use host, docker, daytona, or a configured profile
+error: provider entry unknown is not configured
+hint: `lithos-sandbox providers` lists them
 """
 
 [env]
