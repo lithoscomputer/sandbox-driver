@@ -1,0 +1,22 @@
+bin.name = "lithos-sandbox"
+args = ["--config", "config.toml", "providers"]
+status.code = 1
+stdout = ""
+stderr = """
+error: parsing catalog config.toml
+  caused by: TOML parse error at line 1, column 1
+  |
+1 | default-provider = "local"
+  | ^^^^^^^^^^^^^^^^
+unknown field `default-provider`, expected `providers` or `environments`
+
+"""
+
+[env]
+inherit = false
+
+[env.add]
+NO_COLOR = "1"
+PATH = "/usr/bin:/bin"
+RUST_LOG = "off"
+XDG_CONFIG_HOME = "tests/cmd/no-config"

@@ -1,17 +1,5 @@
 bin.name = "lithos-sandbox"
-args = [
-  "--provider",
-  "host",
-  "--events",
-  "off",
-  "sandbox",
-  "run",
-  "--workspace",
-  ".",
-  "--",
-  "/bin/echo",
-  "hello from trycmd",
-]
+args = ["run", "host", "--workspace", ".", "--", "/bin/echo", "hello from trycmd"]
 status = "success"
 stdout = """
 hello from trycmd

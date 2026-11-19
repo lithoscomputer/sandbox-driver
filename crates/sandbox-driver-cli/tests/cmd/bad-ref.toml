@@ -1,0 +1,16 @@
+bin.name = "lithos-sandbox"
+args = ["status", "not-a-ref"]
+status.code = 1
+stdout = ""
+stderr = """
+error: "not-a-ref" is not a sandbox ref; expected <provider>/<id>, as `create` prints
+"""
+
+[env]
+inherit = false
+
+[env.add]
+NO_COLOR = "1"
+PATH = "/usr/bin:/bin"
+RUST_LOG = "off"
+XDG_CONFIG_HOME = "tests/cmd/no-config"

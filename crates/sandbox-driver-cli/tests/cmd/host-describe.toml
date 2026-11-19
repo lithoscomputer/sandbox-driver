@@ -1,0 +1,27 @@
+bin.name = "lithos-sandbox"
+args = ["provider", "describe", "host"]
+status = "success"
+stdout = """
+provider: host
+plugin: host 0.1.0
+access: owner_process
+capabilities: {"container_fields":[],"containers":false,"endpoints":[],"image_credentials":false,"services":false,"timers":[]}
+durability: process
+isolation: none
+locality: {"host_address":"127.0.0.1","mounts_host_paths":true}
+namespace: {"id":"host:[..]","scope":"machine"}
+network: provider_default
+ports: {"exposable":"any"}
+resources: none
+sources: host_directory
+"""
+stderr = ""
+
+[env]
+inherit = false
+
+[env.add]
+NO_COLOR = "1"
+PATH = "/usr/bin:/bin"
+RUST_LOG = "off"
+XDG_CONFIG_HOME = "tests/cmd/no-config"
