@@ -1,0 +1,4 @@
+[providers.local]
+plugin = "docker"
+path = "/opt/sandbox-driver-docker"
+dev = true

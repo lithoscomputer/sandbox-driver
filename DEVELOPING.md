@@ -21,7 +21,7 @@ mise run setup
 | Command | Purpose |
 | --- | --- |
 | `mise run dev` | Build the CLI and all provider executables |
-| `mise run plugins:build` | Build provider executables for CLI tests |
+| `mise run plugins:build` | Build the provider and fixture plugin executables used by tests |
 | `mise run fmt` | Format Rust code |
 | `mise run fmt:check` | Check formatting without changing files |
 | `mise run lint` | Run Clippy with warnings denied |
@@ -31,18 +31,18 @@ mise run setup
 | `mise run check:nightly` | Run the extended verification gate |
 
 Run `mise run check` before opening a pull request. The test tasks build
-provider executables before CLI tests, including targeted `mise run test:cli`.
+the fixture plugins before CLI tests, including targeted `mise run test:cli`.
 
 For local CLI use after `mise run dev`:
 
 ```sh
-export SANDBOX_DRIVER_PLUGIN_DEV=1
-target/debug/lithos-sandbox --provider host provider health
+target/debug/lithos-sandbox provider health docker
+target/debug/lithos-sandbox run docker -- uname -a
 ```
 
-The CLI finds providers beside its own executable, then on `PATH`. Installed
-providers require a checksum pin or explicit development mode. See
-[the CLI guide](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/cli.md#provider-executables).
+Host, Docker and Daytona are linked into the CLI; other providers are
+plugin entries in the catalog. See
+[the CLI guide](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/cli.md).
 
 ## Rust policy
 

@@ -1,0 +1,20 @@
+[providers.local]
+plugin = "host"
+
+[providers.remote]
+plugin = "example"
+path = "/opt/lithos-sandbox-example"
+dev = true
+
+[environments.scratch]
+provider = "local"
+
+[environments.scratch.spec]
+source = "host_directory"
+env = { FROM_CATALOG = "catalog" }
+
+[environments.elsewhere]
+provider = "remote"
+
+[environments.elsewhere.spec]
+source = { image = "alpine:3" }
