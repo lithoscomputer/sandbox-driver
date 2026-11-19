@@ -455,7 +455,7 @@ impl Sandbox for HostSandbox {
             },
             exit_code:   result.result.exit_code,
             signal:      result.result.signal,
-            output_loss: result.output_loss,
+            output_loss: result.delivery_loss(),
         })
     }
     fn files(&self) -> &dyn Files {

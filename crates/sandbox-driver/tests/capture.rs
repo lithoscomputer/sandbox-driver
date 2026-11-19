@@ -1,14 +1,13 @@
 #![cfg(unix)]
 
-use std::os::unix::fs::symlink;
-use std::process::{Command, Output};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, process};
 
 use sandbox_driver::{
     DEFAULT_CAPTURE_BYTES, Error, ExecControls, ExecSpec, MutationOutcome, OutputSink,
-    OutputStream, Sandbox, Sandboxes, Termination, run_captured, run_captured_with, run_shell,
+    OutputStream, Sandbox, Sandboxes, Termination, run_captured, run_captured_with,
 };
 use sandbox_driver_testing::{FakeExec, FakeProvider};
 use tokio::time;
@@ -31,6 +30,14 @@ async fn scripted(argv: Vec<String>, response: FakeExec) -> (Sandboxes, Box<dyn 
 
 fn build() -> Vec<String> {
     vec!["build".to_owned()]
+}
+
+/// Controls that pass every chunk on to `sink`.
+fn forwarding(sink: OutputSink) -> ExecControls {
+    ExecControls {
+        sink: Some(sink),
+        ..ExecControls::default()
+    }
 }
 
 /// Returns the future unchanged; compiling proves a spawned task or an
@@ -110,10 +117,7 @@ async fn the_callers_sink_sees_every_chunk_even_when_nothing_is_kept() {
     let captured = run_captured_with(
         sandbox.as_ref(),
         ExecSpec::argv(build()),
-        ExecControls {
-            sink: Some(sink),
-            ..ExecControls::default()
-        },
+        forwarding(sink),
         0,
     )
     .await
@@ -145,10 +149,7 @@ async fn the_duration_covers_the_whole_exec_including_the_callers_sink() {
     let captured = run_captured_with(
         sandbox.as_ref(),
         ExecSpec::argv(build()),
-        ExecControls {
-            sink: Some(sink),
-            ..ExecControls::default()
-        },
+        forwarding(sink),
         DEFAULT_CAPTURE_BYTES,
     )
     .await
@@ -174,10 +175,7 @@ async fn a_failing_caller_sink_fails_the_run() {
     let result = run_captured_with(
         sandbox.as_ref(),
         ExecSpec::argv(build()),
-        ExecControls {
-            sink: Some(sink),
-            ..ExecControls::default()
-        },
+        forwarding(sink),
         DEFAULT_CAPTURE_BYTES,
     )
     .await;
@@ -207,9 +205,8 @@ async fn the_callers_stop_token_reaches_the_command_and_its_output_is_kept() {
         sandbox.as_ref(),
         ExecSpec::argv(build()),
         ExecControls {
-            sink: Some(sink),
             term: Some(term),
-            ..ExecControls::default()
+            ..forwarding(sink)
         },
         DEFAULT_CAPTURE_BYTES,
     )
@@ -235,65 +232,33 @@ async fn terminal_output_is_captured_as_stdout() {
     assert!(captured.stderr.bytes.is_empty());
 }
 
-#[tokio::test]
-async fn run_shell_runs_the_script_through_the_shell_spec() {
-    let script = "mkdir -p \"$1\" && echo made";
-    let spec = ExecSpec::shell(script);
-    assert_eq!(spec.argv.first().map(String::as_str), Some("sh"));
-    assert_eq!(spec.argv.last().map(String::as_str), Some(script));
-    spec.validate().expect("a shell spec is a valid exec");
-    let (_catalog, sandbox) = scripted(spec.argv, FakeExec {
-        stdout: b"made\n".to_vec(),
-        ..FakeExec::default()
-    })
-    .await;
-    let captured = spawnable(run_shell(sandbox.as_ref(), script))
-        .await
-        .expect("run");
-    assert_eq!(captured.stdout.bytes, b"made\n");
-    assert!(captured.success());
-}
-
-/// Runs a spec's argv the way a provider does, with no shell in between, in
-/// an environment of exactly `env`.
-fn run_argv(spec: &ExecSpec, env: &[(&str, &str)]) -> Output {
-    let (program, args) = spec.argv.split_first().expect("argv");
-    Command::new(program)
-        .args(args)
-        .env_clear()
-        .envs(env.iter().copied())
-        .output()
-        .expect("the test machine provides sh")
-}
-
 #[test]
-fn a_shell_spec_prefers_bash_falls_back_to_sh_and_reads_no_startup_file() {
+fn a_bash_spec_passes_the_exit_status_through_and_reads_no_startup_file() {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let scratch = env::temp_dir().join(format!("shell-spec-{}-{nanos}", process::id()));
+    let scratch = env::temp_dir().join(format!("bash-spec-{}-{nanos}", process::id()));
     fs::create_dir(&scratch).expect("scratch directory");
     // Bash sources the file `BASH_ENV` names before a `-c` script.
     let startup = scratch.join("startup.sh");
     fs::write(&startup, "echo sourced\n").expect("startup file");
-    let startup = startup.to_string_lossy();
-    let path = env::var("PATH").expect("PATH");
 
-    // `$0` is the name the script's own shell was started under.
-    let spec = ExecSpec::shell("printf '%s' \"$0\"; exit 7");
-    let with_bash = run_argv(&spec, &[("PATH", &path), ("BASH_ENV", &startup)]);
-    assert_eq!(String::from_utf8_lossy(&with_bash.stdout), "bash");
-    assert_eq!(with_bash.status.code(), Some(7));
-
-    // A `PATH` that holds `sh` and nothing else: a workload without Bash.
-    let only_sh = scratch.join("bin");
-    fs::create_dir(&only_sh).expect("bin directory");
-    symlink("/bin/sh", only_sh.join("sh")).expect("sh");
-    let only_sh = only_sh.to_string_lossy();
-    let without_bash = run_argv(&spec, &[("PATH", &only_sh), ("BASH_ENV", &startup)]);
-    assert_eq!(String::from_utf8_lossy(&without_bash.stdout), "sh");
-    assert_eq!(without_bash.status.code(), Some(7));
+    let spec = ExecSpec::bash("printf ran; exit 7");
+    spec.validate().expect("a bash spec is a valid exec");
+    // The argv run the way a provider does, with no shell in between: the
+    // spec's env laid over a workload that names a startup file.
+    let (program, args) = spec.argv.split_first().expect("argv");
+    let output = Command::new(program)
+        .args(args)
+        .env_clear()
+        .env("PATH", env::var("PATH").expect("PATH"))
+        .env("BASH_ENV", &startup)
+        .envs(&spec.env)
+        .output()
+        .expect("the test machine provides bash");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "ran");
+    assert_eq!(output.status.code(), Some(7));
 
     fs::remove_dir_all(&scratch).expect("cleanup");
 }

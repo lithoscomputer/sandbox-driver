@@ -16,29 +16,4 @@ pub use git::DerivedGit;
 pub use search::DerivedSearch;
 pub use service::DerivedServices;
 
-/// Quotes a string for safe interpolation into Bash source.
-pub(crate) fn shell_quote(value: &str) -> String {
-    let mut quoted = String::with_capacity(value.len() + 2);
-    quoted.push('\'');
-    for c in value.chars() {
-        if c == '\'' {
-            quoted.push_str("'\\''");
-        } else {
-            quoted.push(c);
-        }
-    }
-    quoted.push('\'');
-    quoted
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn quotes_single_quotes_safely() {
-        assert_eq!(shell_quote("plain"), "'plain'");
-        assert_eq!(shell_quote("it's"), r"'it'\''s'");
-        assert_eq!(shell_quote("a b;c$d"), "'a b;c$d'");
-    }
-}
+pub(crate) use crate::file_ops::shell_quote;

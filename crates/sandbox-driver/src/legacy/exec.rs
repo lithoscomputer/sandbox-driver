@@ -14,9 +14,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::legacy::capabilities::Capability;
-use crate::legacy::error::{Error, Result};
+use crate::legacy::error::{Error, ExecFailure, Result};
 use crate::legacy::sanitize::OutputSanitization;
 use crate::redact::EnvKeys;
+use crate::{ExecOutcome, OutputTail};
 pub use crate::{OutputLoss, StopLevel, stop_signal};
 
 /// The interpreter [`ExecSpec::bash`] names, resolved through `PATH`
@@ -488,6 +489,30 @@ pub enum Termination {
     Unknown,
 }
 
+impl From<Termination> for crate::Termination {
+    fn from(termination: Termination) -> Self {
+        match termination {
+            Termination::Exited => Self::Exited,
+            Termination::TimedOut => Self::TimedOut,
+            Termination::Cancelled => Self::Terminated,
+            Termination::Killed => Self::Killed,
+            Termination::Unknown => Self::Lost,
+        }
+    }
+}
+
+impl From<crate::Termination> for Termination {
+    fn from(termination: crate::Termination) -> Self {
+        match termination {
+            crate::Termination::Exited => Self::Exited,
+            crate::Termination::TimedOut => Self::TimedOut,
+            crate::Termination::Terminated => Self::Cancelled,
+            crate::Termination::Killed => Self::Killed,
+            crate::Termination::Lost => Self::Unknown,
+        }
+    }
+}
+
 /// Result of a buffered command run. Output is bytes: sandbox output is
 /// not guaranteed UTF-8.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -514,6 +539,35 @@ pub struct ExecResult {
 }
 
 impl ExecResult {
+    /// This result as the failure of the command `label` names, with all
+    /// of its output.
+    pub fn into_failure(self, label: impl Into<String>) -> ExecFailure {
+        let Self {
+            stdout,
+            stderr,
+            exit_code,
+            signal,
+            termination,
+            duration,
+        } = self;
+        let whole = |bytes| OutputTail {
+            bytes,
+            omitted_bytes: 0,
+        };
+        ExecFailure {
+            context:     label.into(),
+            outcome:     ExecOutcome {
+                termination: termination.into(),
+                exit_code,
+                signal,
+                output_loss: OutputLoss::default(),
+            },
+            stdout_tail: whole(stdout),
+            stderr_tail: whole(stderr),
+            duration:    Some(duration),
+        }
+    }
+
     pub fn new(termination: Termination, exit_code: Option<i32>, duration: Duration) -> Self {
         Self {
             stdout: Vec::new(),
@@ -636,6 +690,15 @@ impl ExecStreamingResult {
             });
         }
         Ok(self.result)
+    }
+
+    /// The loss a new-API outcome reports for this run: the transport's
+    /// counts, marked truncated when either capture is.
+    #[must_use]
+    pub fn delivery_loss(&self) -> OutputLoss {
+        let mut loss = self.output_loss;
+        loss.truncated |= self.stdout_capture.truncated || self.stderr_capture.truncated;
+        loss
     }
 
     /// Wraps a buffered result with the honesty flags at their degraded
@@ -981,6 +1044,20 @@ mod tests {
             matches!(&error, Error::Io { context, .. } if context == "writing"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn delivery_loss_is_truncated_when_either_capture_is() {
+        let mut result = ExecStreamingResult::new(ExecResult::new(
+            Termination::Exited,
+            Some(0),
+            Duration::ZERO,
+        ));
+        assert!(!result.delivery_loss().is_lossy());
+        result.stderr_capture.truncated = true;
+        let loss = result.delivery_loss();
+        assert!(loss.truncated && loss.is_lossy());
+        assert_eq!(loss.dropped_frames, 0);
     }
 
     #[test]

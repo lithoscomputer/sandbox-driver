@@ -36,7 +36,8 @@ mod wire_time;
 mod workload;
 
 pub use capture::{
-    Captured, CapturedOutput, DEFAULT_CAPTURE_BYTES, run_captured, run_captured_with, run_shell,
+    Captured, CapturedOutput, DEFAULT_CAPTURE_BYTES, IncompleteOutput, run_bash, run_captured,
+    run_captured_with,
 };
 pub use catalog::{
     CatalogDiagnostic, CatalogOptions, Found, ProviderFailure, ProviderHandle, Registry,
@@ -53,7 +54,7 @@ pub use execution::{
     ExecControls, ExecOutcome, ExecSpec, OutputLoss, OutputSink, OutputStream, StopLevel,
     TerminalSize, Termination, stop_signal,
 };
-pub use failure::{CommandError, CommandFailure, FAILURE_TAIL_BYTES, OutputTail};
+pub use failure::{CommandError, CommandFailure, OutputTail};
 pub use file_ops::{FileStat, create_dir_all, path_exists, remove_path, rename_path, stat_path};
 pub use git::{
     GitChange, GitCommit, GitDiffEntry, GitDiffOptions, GitError, GitFailure, GitFailureKind,

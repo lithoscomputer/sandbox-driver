@@ -225,11 +225,13 @@ impl fmt::Display for GitFailure {
             Termination::Lost => Some("ended with an unknown outcome"),
         };
         match (ended_early, command.outcome.exit_code) {
-            (Some(how), _) => write!(
-                f,
-                "{operation} {how} after {} ms",
-                command.duration.as_millis()
-            ),
+            (Some(how), _) => {
+                write!(f, "{operation} {how}")?;
+                match command.duration {
+                    Some(duration) => write!(f, " after {} ms", duration.as_millis()),
+                    None => Ok(()),
+                }
+            }
             (None, Some(code)) => write!(
                 f,
                 "{operation} failed: {} (exit code {code})",
@@ -287,26 +289,10 @@ impl GitError {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
-    use crate::{CapturedOutput, ExecOutcome, OutputLoss};
 
     fn ended(termination: Termination, exit_code: Option<i32>, stderr: &str) -> Captured {
-        Captured {
-            outcome:  ExecOutcome {
-                termination,
-                exit_code,
-                signal: None,
-                output_loss: OutputLoss::default(),
-            },
-            stdout:   CapturedOutput::default(),
-            stderr:   CapturedOutput {
-                bytes:         stderr.as_bytes().to_vec(),
-                omitted_bytes: 0,
-            },
-            duration: Duration::from_millis(1500),
-        }
+        Captured::ended(termination, exit_code, b"", stderr.as_bytes())
     }
 
     #[test]

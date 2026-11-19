@@ -1,7 +1,7 @@
 //! Reading a git repository inside a sandbox, derived over
 //! [`Sandbox::exec`]. These are library code, not a provider capability, so
-//! they work unchanged on every provider and plugin whose workload has a
-//! POSIX shell and `git`.
+//! they work unchanged on every provider and plugin whose workload has
+//! Bash and `git`.
 //!
 //! Every command runs hardened: no background maintenance, no repository
 //! hooks, no fsmonitor daemon, no external diff driver, no terminal prompt,
@@ -12,7 +12,7 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use super::file_ops::{quoted, shell_word};
+use super::file_ops::{quoted, shell_quote};
 use super::{Captured, CommandFailure, ExecSpec, Sandbox, run_captured};
 
 mod failure;
@@ -193,7 +193,7 @@ fn rename_flag(options: &GitDiffOptions) -> Option<String> {
 fn command(repo: &str, words: &[&str]) -> Result<String, super::Error> {
     let mut script = format!("{GIT} -C {}", quoted("repo", repo)?);
     for word in words {
-        let _ = write!(script, " {}", shell_word(word));
+        let _ = write!(script, " {}", shell_quote(word));
     }
     Ok(script)
 }
@@ -203,7 +203,7 @@ fn cat_file(repo: &str, blobs: &[String], mode: &str) -> Result<String, super::E
     let mut script = String::from("printf '%s\\n'");
     for blob in blobs {
         model::validate_object_name("blobs", blob)?;
-        let _ = write!(script, " {}", shell_word(blob));
+        let _ = write!(script, " {}", shell_quote(blob));
     }
     let _ = write!(script, " | {}", command(repo, &["cat-file", mode])?);
     Ok(script)
@@ -216,7 +216,7 @@ async fn run(
     script: String,
     timeout: Option<Duration>,
 ) -> Result<Captured, GitError> {
-    let mut spec = ExecSpec::shell(script);
+    let mut spec = ExecSpec::bash(script);
     spec.env
         .insert("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned());
     let timeout = timeout.unwrap_or(TIMEOUT).as_millis();

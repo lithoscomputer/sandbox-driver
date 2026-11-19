@@ -1,8 +1,7 @@
 //! File operations the [`Files`](super::Files) capability leaves out, derived
 //! over [`Sandbox::exec`]. They are library code, not a provider capability,
-//! so they work unchanged on every provider and plugin whose workload has a
-//! POSIX shell with `stat`, `mv`, `rm`, `rmdir` and `mkdir`: GNU, `BusyBox`
-//! or BSD.
+//! so they work unchanged on every provider and plugin whose workload has
+//! Bash with `stat`, `mv`, `rm`, `rmdir` and `mkdir`: GNU, `BusyBox` or BSD.
 //!
 //! A relative path resolves against the directory a command starts in, which
 //! is the sandbox's working directory.
@@ -50,7 +49,7 @@ pub async fn stat_path(sandbox: &dyn Sandbox, path: &str) -> Result<FileStat, Co
         missing = if_missing("p"),
     );
     let captured = run(sandbox, script).await?;
-    read_stat(path, &captured)
+    read_stat(path, captured)
 }
 
 /// Whether something is at `path`. A symbolic link is followed, so a link to
@@ -107,7 +106,7 @@ pub async fn rename_path(sandbox: &dyn Sandbox, from: &str, to: &str) -> Result<
         missing = if_missing("p"),
     );
     let captured = run(sandbox, script).await?;
-    read_rename(from, &captured)
+    read_rename(from, captured)
 }
 
 /// Creates the directory `path` and any missing parents. A directory that is
@@ -123,20 +122,30 @@ pub async fn create_dir_all(sandbox: &dyn Sandbox, path: &str) -> Result<(), Com
 }
 
 async fn run(sandbox: &dyn Sandbox, script: String) -> Result<Captured, Error> {
-    let mut spec = ExecSpec::shell(script);
+    let mut spec = ExecSpec::bash(script);
     spec.timeout_ms = Some(TIMEOUT_MS);
     run_captured(sandbox, spec).await
 }
 
-/// The non-empty, NUL-free `value` as one single-quoted shell word.
+/// `value`, once it is valid as one argument, quoted for Bash source.
 pub(super) fn quoted(field: &str, value: &str) -> Result<String, Error> {
     validate_name(field, value)?;
-    Ok(shell_word(value))
+    Ok(shell_quote(value))
 }
 
-/// `value` as one single-quoted shell word.
-pub(super) fn shell_word(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+/// Quotes a string for safe interpolation into Bash source.
+pub(crate) fn shell_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for c in value.chars() {
+        if c == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(c);
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 /// Shell that prints [`MISSING`] and stops when nothing is at `$variable`,
@@ -156,13 +165,16 @@ pub(super) fn succeeded(context: &str, captured: &Captured) -> Result<(), Comman
     }
 }
 
-/// The script's stdout as text without its final newline, once the command
-/// succeeded with nothing lost.
+/// The capture of a command that succeeded with nothing lost.
+fn complete(context: &str, captured: Captured) -> Result<Captured, CommandError> {
+    succeeded(context, &captured)?;
+    captured
+        .into_complete()
+        .map_err(|incomplete| unreadable(context, &incomplete.captured))
+}
+
+/// The script's stdout as text without its final newline.
 fn answer<'a>(context: &str, captured: &'a Captured) -> Result<&'a str, CommandError> {
-    succeeded(context, captured)?;
-    if !captured.is_complete() {
-        return Err(unreadable(context, captured));
-    }
     let text = str::from_utf8(&captured.stdout.bytes).map_err(|_| unreadable(context, captured))?;
     Ok(text.strip_suffix('\n').unwrap_or(text))
 }
@@ -178,7 +190,8 @@ fn not_found(path: &str) -> CommandError {
     })
 }
 
-fn read_stat(path: &str, captured: &Captured) -> Result<FileStat, CommandError> {
+fn read_stat(path: &str, captured: Captured) -> Result<FileStat, CommandError> {
+    let captured = &complete("stat", captured)?;
     let text = answer("stat", captured)?;
     if text == MISSING {
         return Err(not_found(path));
@@ -188,7 +201,7 @@ fn read_stat(path: &str, captured: &Captured) -> Result<FileStat, CommandError> 
         return Err(unreadable("stat", captured));
     };
     Ok(FileStat {
-        kind:           file_kind(kind),
+        kind:           parse_kind(kind),
         size:           size.parse().map_err(|_| unreadable("stat", captured))?,
         mode:           u32::from_str_radix(mode, 8).ok(),
         modified_at_ms: modified
@@ -198,18 +211,14 @@ fn read_stat(path: &str, captured: &Captured) -> Result<FileStat, CommandError> 
     })
 }
 
-/// GNU and `BusyBox` print `regular file` or `regular empty file`; BSD
-/// prints `Regular File`.
-fn file_kind(text: &str) -> FileKind {
-    let text = text.to_ascii_lowercase();
-    if text.starts_with("regular") {
-        FileKind::File
-    } else if text == "directory" {
-        FileKind::Directory
-    } else if text == "symbolic link" {
-        FileKind::Symlink
-    } else {
-        FileKind::Other
+/// The kind a `stat` type string names. GNU and `BusyBox` print `regular
+/// file` or `regular empty file`; BSD prints `Regular File`.
+pub(crate) fn parse_kind(text: &str) -> FileKind {
+    match text.to_ascii_lowercase().as_str() {
+        "regular file" | "regular empty file" => FileKind::File,
+        "directory" => FileKind::Directory,
+        "symbolic link" => FileKind::Symlink,
+        _ => FileKind::Other,
     }
 }
 
@@ -221,7 +230,8 @@ fn read_exists(captured: &Captured) -> Result<bool, CommandError> {
     }
 }
 
-fn read_rename(from: &str, captured: &Captured) -> Result<(), CommandError> {
+fn read_rename(from: &str, captured: Captured) -> Result<(), CommandError> {
+    let captured = &complete("rename", captured)?;
     match answer("rename", captured)? {
         "" => Ok(()),
         MISSING => Err(not_found(from)),
@@ -231,37 +241,28 @@ fn read_rename(from: &str, captured: &Captured) -> Result<(), CommandError> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
-    use crate::{CapturedOutput, ExecOutcome, OutputLoss};
 
     fn exited(exit_code: i32, stdout: &str) -> Captured {
         ended(Termination::Exited, Some(exit_code), stdout)
     }
 
     fn ended(termination: Termination, exit_code: Option<i32>, stdout: &str) -> Captured {
-        Captured {
-            outcome:  ExecOutcome {
-                termination,
-                exit_code,
-                signal: None,
-                output_loss: OutputLoss::default(),
-            },
-            stdout:   CapturedOutput {
-                bytes:         stdout.as_bytes().to_vec(),
-                omitted_bytes: 0,
-            },
-            stderr:   CapturedOutput::default(),
-            duration: Duration::ZERO,
-        }
+        Captured::ended(termination, exit_code, stdout.as_bytes(), b"")
+    }
+
+    #[test]
+    fn quotes_single_quotes_safely() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote("a b;c$d"), "'a b;c$d'");
     }
 
     #[test]
     fn stat_reads_what_gnu_and_bsd_print() {
         // GNU and BusyBox: `%F|%s|%a|%Y`.
         assert_eq!(
-            read_stat("f", &exited(0, "regular file|42|644|1700000000\n")),
+            read_stat("f", exited(0, "regular file|42|644|1700000000\n")),
             Ok(FileStat {
                 kind:           FileKind::File,
                 size:           42,
@@ -270,12 +271,12 @@ mod tests {
             })
         );
         assert_eq!(
-            read_stat("f", &exited(0, "regular empty file|0|4755|1\n")).map(|stat| stat.mode),
+            read_stat("f", exited(0, "regular empty file|0|4755|1\n")).map(|stat| stat.mode),
             Ok(Some(0o4755))
         );
         // BSD: `%HT|%z|%Mp%Lp|%m`.
         assert_eq!(
-            read_stat("d", &exited(0, "Directory|96|1777|1700000000\n")),
+            read_stat("d", exited(0, "Directory|96|1777|1700000000\n")),
             Ok(FileStat {
                 kind:           FileKind::Directory,
                 size:           96,
@@ -287,10 +288,11 @@ mod tests {
             ("symbolic link", FileKind::Symlink),
             ("Symbolic Link", FileKind::Symlink),
             ("fifo", FileKind::Other),
+            ("socket", FileKind::Other),
             ("Character Device", FileKind::Other),
         ] {
             assert_eq!(
-                read_stat("p", &exited(0, &format!("{text}|0|644|1\n"))).map(|stat| stat.kind),
+                read_stat("p", exited(0, &format!("{text}|0|644|1\n"))).map(|stat| stat.kind),
                 Ok(kind),
                 "{text}"
             );
@@ -300,14 +302,14 @@ mod tests {
     #[test]
     fn stat_tells_a_missing_path_from_a_failed_and_an_unreadable_command() {
         assert_eq!(
-            read_stat("gone/file", &exited(0, &format!("{MISSING}\n"))),
+            read_stat("gone/file", exited(0, &format!("{MISSING}\n"))),
             Err(CommandError::Sandbox(Error::NotFound {
                 resource: "file".into(),
                 id:       "gone/file".into(),
             }))
         );
         assert!(matches!(
-            read_stat("f", &exited(1, "")),
+            read_stat("f", exited(1, "")),
             Err(CommandError::Failed(failure)) if failure.context == "stat"
         ));
         // Too few fields, a size that is not a number, and output a provider
@@ -321,7 +323,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    read_stat("f", &captured),
+                    read_stat("f", captured.clone()),
                     Err(CommandError::UnexpectedOutput(_))
                 ),
                 "{captured:?}"
@@ -349,13 +351,13 @@ mod tests {
 
     #[test]
     fn rename_reports_a_missing_source_as_not_found() {
-        assert_eq!(read_rename("a", &exited(0, "")), Ok(()));
+        assert_eq!(read_rename("a", exited(0, "")), Ok(()));
         assert_eq!(
-            read_rename("a", &exited(0, &format!("{MISSING}\n"))),
+            read_rename("a", exited(0, &format!("{MISSING}\n"))),
             Err(not_found("a"))
         );
         assert!(matches!(
-            read_rename("a", &exited(1, "")),
+            read_rename("a", exited(1, "")),
             Err(CommandError::Failed(failure)) if failure.context == "rename"
         ));
     }

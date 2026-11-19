@@ -377,7 +377,7 @@ fn outcome(result: &ExecStreamingResult) -> ExecOutcome {
             .then_some(result.result.exit_code)
             .flatten(),
         signal: result.result.signal,
-        output_loss: result.output_loss,
+        output_loss: result.delivery_loss(),
     }
 }
 
