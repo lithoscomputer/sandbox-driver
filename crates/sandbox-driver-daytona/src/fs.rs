@@ -48,15 +48,14 @@ impl DaytonaFs {
     }
 }
 
-/// An entry's path below the listed directory `root`. The toolbox gives each
-/// entry its full path and, as `name`, only that path's last component, which
-/// would name an entry below the first level as a child of `root`.
-fn path_below(root: &str, name: String, full_path: Option<&str>) -> String {
+/// An entry's path below the listed directory `root`, taken from the full
+/// path the toolbox gives each entry. Its `name` is only the last component,
+/// which would name an entry below the first level as a child of `root`.
+fn path_below<'p>(root: &str, full_path: &'p str) -> Option<&'p str> {
     full_path
-        .and_then(|path| path.strip_prefix(root.trim_end_matches('/')))
+        .strip_prefix(root.trim_end_matches('/'))
         .and_then(|below| below.strip_prefix('/'))
         .filter(|below| !below.is_empty())
-        .map_or(name, str::to_owned)
 }
 
 fn parse_mode(mode: &str) -> Option<u32> {
@@ -266,7 +265,7 @@ impl Filesystem for DaytonaFs {
             .list_files_with_depth(&root, Some(depth))
             .await
             .map_err(|error| daytona_error("listing directory", error))?;
-        let mut entries: Vec<DirEntry> = files
+        let mut entries = files
             .into_iter()
             .map(|info| {
                 let kind = if info.is_dir {
@@ -274,14 +273,26 @@ impl Filesystem for DaytonaFs {
                 } else {
                     FileKind::File
                 };
-                let path = path_below(&root, info.name, info.path.as_deref());
+                let path = info
+                    .path
+                    .as_deref()
+                    .and_then(|path| path_below(&root, path))
+                    .ok_or_else(|| {
+                        Error::io(
+                            "listing directory",
+                            io::Error::other(format!(
+                                "the toolbox listed {:?} with no path below {root}",
+                                info.name
+                            )),
+                        )
+                    })?;
                 let mut entry = DirEntry::new(path, kind);
                 if kind == FileKind::File {
                     entry.size = u64::try_from(info.size).ok();
                 }
-                entry
+                Ok(entry)
             })
-            .collect();
+            .collect::<Result<Vec<DirEntry>>>()?;
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(entries)
     }
@@ -377,24 +388,18 @@ mod tests {
 
     #[test]
     fn a_listed_entry_is_named_by_its_path_below_the_listed_directory() {
-        let below = |root, name: &str, path| path_below(root, name.to_owned(), path);
-        // Two levels down, the toolbox's `name` is only the last component.
         assert_eq!(
-            below("/work/dir", "inner.dat", Some("/work/dir/nested/inner.dat")),
-            "nested/inner.dat"
+            path_below("/work/dir", "/work/dir/nested/inner.dat"),
+            Some("nested/inner.dat")
         );
-        assert_eq!(
-            below("/work/dir", "nested", Some("/work/dir/nested")),
-            "nested"
-        );
+        assert_eq!(path_below("/work/dir", "/work/dir/nested"), Some("nested"));
         // A caller's trailing slash and the filesystem root are still prefixes.
-        assert_eq!(below("/work/dir/", "a", Some("/work/dir/sub/a")), "sub/a");
-        assert_eq!(below("/", "hosts", Some("/etc/hosts")), "etc/hosts");
-        // Without a usable full path the name is all there is: none sent, one
-        // outside the directory, and a sibling that only shares a prefix.
-        assert_eq!(below("/work/dir", "a", None), "a");
-        assert_eq!(below("/work/dir", "a", Some("/elsewhere/a")), "a");
-        assert_eq!(below("/work/dir", "a", Some("/work/directory/a")), "a");
+        assert_eq!(path_below("/work/dir/", "/work/dir/sub/a"), Some("sub/a"));
+        assert_eq!(path_below("/", "/etc/hosts"), Some("etc/hosts"));
+        // A path outside the directory, or a sibling that only shares a
+        // prefix, has no path below it.
+        assert_eq!(path_below("/work/dir", "/elsewhere/a"), None);
+        assert_eq!(path_below("/work/dir", "/work/directory/a"), None);
     }
 
     #[test]
