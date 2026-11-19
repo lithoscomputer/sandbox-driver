@@ -854,7 +854,7 @@ plugin → {"id":7,"result":{"result":{"exit_code":null,"termination":"killed",�
            "stdout_capture":{"observed_bytes":…,"retained_bytes":…,"omitted_bytes":…,
                              "truncated":false},
            "stderr_capture":{…},
-           "output_loss":{"dropped_frames":0,"dropped_bytes":0}}}
+           "output_loss":{"dropped_frames":0,"dropped_bytes":0,"truncated":false}}}
 ```
 
 Rules:
@@ -903,7 +903,7 @@ Rules:
   (default `false`) means bytes were lost *beyond* that accounting — the
   provider abandoned an unfinished drain — so the counts undercount the
   real output.
-- **Loss.** `output_loss` (additive; both fields default to `0`) counts
+- **Loss.** `output_loss` (additive; the counts default to `0`) counts
   output the plugin's own transport lost before it reached the channel:
   `dropped_frames` records it could not read and `dropped_bytes` the
   encoded bytes they held. A plugin that reports a loss must also set
@@ -911,6 +911,10 @@ Rules:
   only the capture flags still learns the output is incomplete. A loss
   never fails the request; the result carries the command's exit status
   and the count. Daytona's encoded output decoder is the producer today.
+  `output_loss.truncated` (additive; defaults to `false`) serves the
+  newer exec outcome, which has no capture flags. On this exchange the
+  capture flags carry truncation: a plugin may leave it `false`, and a
+  host must not rely on it.
 - **Backpressure and isolation.** The channel's socket is the
   backpressure: a plugin that cannot write must stall the producing
   process, never drop output. Because every exec has its own channel, a

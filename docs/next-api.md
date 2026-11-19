@@ -193,7 +193,30 @@ Rules every method obeys:
 
 ### Exec
 
-`ExecSpec` is argv (no shell), env, working directory, timeout, and `tty`. `ExecControls` is a streamed stdin, an output sink, and two cancellation levels: `term` then `kill`. `ExecOutcome` reports `termination` (`exited`, `timed_out`, `terminated`, `killed`, `lost`), `exit_code`, `signal`, and output-loss counts. With `tty: true` the sink receives one stream and the controls gain `resize`. Dropping the future requests cancellation; it does not confirm that the command has stopped. The library owns bounded cleanup after the drop. `lost` means the execution outcome is unknown, not that the command or sandbox is known to be gone. Only a confirmed termination outcome or a successful sandbox `stop` establishes that the affected execution has ended.
+`ExecSpec` is argv (no shell), env, working directory, timeout, and `tty`. `ExecControls` is a streamed stdin, an output sink, and two cancellation levels: `term` then `kill`. `ExecOutcome` reports `termination` (`exited`, `timed_out`, `terminated`, `killed`, `lost`), `exit_code`, `signal`, and `output_loss`: counts of output the provider's transport dropped, and `truncated` when the provider stopped reading a stream of a command that exited on its own. A stopped or timed-out command always leaves output unread, which its `termination` reports. With `tty: true` the sink receives one stream and the controls gain `resize`. Dropping the future requests cancellation; it does not confirm that the command has stopped. The library owns bounded cleanup after the drop. `lost` means the execution outcome is unknown, not that the command or sandbox is known to be gone. Only a confirmed termination outcome or a successful sandbox `stop` establishes that the affected execution has ended.
+
+The library adds whole-command helpers over `exec`. They are functions, not a capability, so they work on every provider and plugin with no wire support:
+
+```rust
+/// Runs to completion and keeps up to 16 MiB of each stream.
+pub async fn run_captured(sandbox: &dyn Sandbox, spec: ExecSpec) -> Result<Captured, Error>;
+/// The same with the caller's controls (stdin, stop tokens, a sink that also sees every chunk) and limit.
+pub async fn run_captured_with(
+    sandbox: &dyn Sandbox, spec: ExecSpec, controls: ExecControls, limit: usize,
+) -> Result<Captured, Error>;
+/// `run_captured` of `ExecSpec::bash(script)`.
+pub async fn run_bash(sandbox: &dyn Sandbox, script: &str) -> Result<Captured, Error>;
+
+pub struct Captured { pub outcome: ExecOutcome, pub stdout: CapturedOutput, pub stderr: CapturedOutput, pub duration: Duration }
+pub struct CapturedOutput { pub bytes: Vec<u8>, pub omitted_bytes: u64 }
+impl Captured { pub fn into_complete(self) -> Result<Captured, IncompleteOutput>; }
+```
+
+A command that exits nonzero is a `Captured`, not an error; `success()` is true only for an exit with code zero. Output beyond the limit is still read, so the command never blocks, and is counted in `omitted_bytes`: the first half of the limit is kept from the start of the stream and the rest from its end. `is_complete()` is true only when the command exited on its own, nothing was omitted, and the provider reported no output loss; a command that was stopped, timed out, or lost is never complete. `into_complete()` turns that into an `IncompleteOutput` error that still holds the capture; call it before parsing output, so a short read is an error and not a wrong answer. `duration` is how long the caller waited for the command, measured by the library around the exec. `Captured`, `CapturedOutput`, and `IncompleteOutput` are `#[non_exhaustive]`: callers read their fields but do not build them, and a pattern that destructures one ends with `..`, so the library can add fields.
+
+`ExecSpec::bash(script)` is the one place a shell is implied. It is `bash -c <script>` with a blank `BASH_ENV`, so the script runs in a non-login shell that sources no startup file. The workload must provide `bash` on its `PATH`; no other shell is tried.
+
+Host, Docker and Daytona keep `BASH_ENV` blank for that argv, and for the same one written by hand: when an argv's first two words are exactly `bash` and `-c`, the command runs with `BASH_ENV` set to the empty string, whatever `env` says, so no startup file runs ahead of the script. Any other spelling, such as `/bin/bash -c` or `bash script.sh`, keeps the value you set.
 
 ### Files and ports
 
