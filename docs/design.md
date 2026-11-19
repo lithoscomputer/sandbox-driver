@@ -11,8 +11,7 @@
 > Still in the tree but being removed: the old provider API in the hidden
 > `sandbox_driver::legacy` module, protocol version 2, the Host, Docker and
 > Daytona provider executables, and the `sandbox-driver-docker-config` and
-> `sandbox-driver-daytona-config` crates. The `lithos-sandbox` CLI still uses
-> them; see [CLI](#cli). If you need them, pin tag
+> `sandbox-driver-daytona-config` crates. If you need them, pin tag
 > [`v2`](https://github.com/lithoscomputer/sandbox-driver/tree/v2).
 
 One interface to any sandbox. Clients name an environment; providers own the sandboxes; the library owns everything in between.
@@ -524,7 +523,21 @@ The fake lives in `sandbox-driver-testing`, which consumers add as a dev-depende
 
 ## CLI
 
-`lithos-sandbox` has not been ported to this API yet. It runs Host, Docker and Daytona, and any other provider, as protocol version 2 plugin executables, which are being removed; the [CLI guide](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/cli.md) describes it as it is.
+`lithos-sandbox` is the command-line client of this API and uses the same catalog: provider entries and environments, read from one file. Host, Docker and Daytona are linked into it and run in its process; every other kind is a plugin, launched over protocol version 3 by the plugin loader. With no catalog file it has one entry and one environment of the same name for each built-in.
+
+```
+lithos-sandbox providers                     # provider entries from the catalog
+lithos-sandbox provider describe daytona
+lithos-sandbox provider health daytona
+lithos-sandbox environments
+lithos-sandbox create ci-linux --label job=1842
+lithos-sandbox exec <ref> -- make test
+lithos-sandbox cp <ref>:/workspace/out ./out
+lithos-sandbox find --label job=1842         # across every provider
+lithos-sandbox destroy <ref>
+```
+
+The [CLI guide](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/cli.md) describes every command, where the catalog file is found, and its defaults.
 
 ## Design rules
 
