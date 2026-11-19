@@ -191,17 +191,18 @@ impl HostExec {
                 .await
                 .map_err(|error| Error::io("recreating managed workspace", error))?;
         }
+        let mut command_env = effective_env(&self.base_env);
+        command_env.extend(env.clone());
         let configure = |command: &mut Command| {
             command.current_dir(self.resolve_dir(working_dir));
-            command.env_clear();
-            command.envs(effective_env(&self.base_env));
-            command.envs(env);
             command
                 .stdin(stdin)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
         };
-        self.groups.spawn(program, args, configure).await
+        self.groups
+            .spawn(program, args, &command_env, configure)
+            .await
     }
 }
 

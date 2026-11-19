@@ -5,7 +5,7 @@
 //! or a fence appears. After the workload exits, the idle sentinel watches
 //! the same conditions, so descendants cannot outlive the provider either.
 
-use std::ffi::OsString;
+use std::collections::BTreeMap;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, ExitStatus};
@@ -247,38 +247,29 @@ impl GroupState {
 /// them by this name.
 const ENV_CARRIER: &str = "SANDBOX_DRIVER_ENV_";
 
-/// The sentinel invocation that runs `program` with `args` and reports
-/// through `paths`, after `configure` has set its directory, environment,
-/// and pipes.
+/// The sentinel invocation that runs `program` with `args` in `env` and
+/// reports through `paths`, after `configure` has set its directory and
+/// pipes.
 ///
-/// The environment is the command's, but the sentinel is a shell that starts
-/// first, and a shell acts on what it finds there: Bash sources the file
-/// `BASH_ENV` names, applies `SHELLOPTS`, and defines exported functions over
-/// its own builtins. So the sentinel starts with nothing but numbered carrier
-/// variables, and `env -i` rebuilds the command's environment from them. The
-/// entries pass through the argument list of that `env` process until it
-/// replaces itself with the program.
+/// `env` is the command's whole environment, but the sentinel is a shell
+/// that starts first, and a shell acts on what it finds there: Bash sources
+/// the file `BASH_ENV` names, applies `SHELLOPTS`, and defines exported
+/// functions over its own builtins. So the sentinel starts with nothing but
+/// numbered carrier variables, and `env -i` rebuilds the command's
+/// environment from them. The entries pass through the argument list of that
+/// `env` process until it replaces itself with the program.
 fn sentinel_command(
     paths: &RecordPaths,
     program: &str,
     args: &[String],
+    env: &BTreeMap<String, String>,
     configure: impl FnOnce(&mut Command),
 ) -> Command {
     let mut command = Command::new(sentinel_shell());
     configure(&mut command);
-    let entries: Vec<OsString> = command
-        .as_std()
-        .get_envs()
-        .filter_map(|(name, value)| {
-            let mut entry = name.to_owned();
-            entry.push("=");
-            entry.push(value?);
-            Some(entry)
-        })
-        .collect();
     command.env_clear();
-    for (index, entry) in entries.iter().enumerate() {
-        command.env(format!("{ENV_CARRIER}{index}"), entry);
+    for (index, (name, value)) in env.iter().enumerate() {
+        command.env(format!("{ENV_CARRIER}{index}"), format!("{name}={value}"));
     }
     command
         .arg("-c")
@@ -288,7 +279,7 @@ fn sentinel_command(
         .arg(&paths.group)
         .arg(&paths.marker)
         .arg(process::id().to_string())
-        .arg(entries.len().to_string())
+        .arg(env.len().to_string())
         .arg(program)
         .args(args);
     command
@@ -325,6 +316,7 @@ impl ProcessGroups {
         self: &Arc<Self>,
         program: &str,
         args: &[String],
+        env: &BTreeMap<String, String>,
         configure: impl FnOnce(&mut Command),
     ) -> Result<HostChild> {
         // `env` reads a leading `NAME=value` word as one more variable, so it
@@ -343,7 +335,7 @@ impl ProcessGroups {
         }
         let generation = state.generation_or_create(&self.root).await?;
         let paths = generation.next_record_paths();
-        let mut command = sentinel_command(&paths, program, args, configure);
+        let mut command = sentinel_command(&paths, program, args, env, configure);
         command.process_group(0);
         command.kill_on_drop(false);
         let mut child = {
