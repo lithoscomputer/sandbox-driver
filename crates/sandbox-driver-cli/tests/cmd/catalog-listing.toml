@@ -1,0 +1,27 @@
+bin.name = "lithos-sandbox"
+args = ["--config", "config.toml", "--output", "json", "providers"]
+status = "success"
+stdout = """
+[
+  {
+    "name": "local",
+    "plugin": "host",
+    "path": null
+  },
+  {
+    "name": "remote",
+    "plugin": "example",
+    "path": "/opt/lithos-sandbox-example"
+  }
+]
+"""
+stderr = ""
+
+[env]
+inherit = false
+
+[env.add]
+NO_COLOR = "1"
+PATH = "/usr/bin:/bin"
+RUST_LOG = "off"
+XDG_CONFIG_HOME = "tests/cmd/no-config"

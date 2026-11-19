@@ -1,214 +1,282 @@
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::slice::from_ref;
-use std::sync::Arc;
 
-use anyhow::{Context as _, Result, bail};
-use async_trait::async_trait;
-use sandbox_driver::legacy::{
-    Capabilities, Capability, Event, EventBody, EventContext, EventObserver, HealthStatus,
-    ProviderHealth, SandboxStatus,
+use anyhow::{Context as _, Result};
+use sandbox_driver::{
+    Descriptor, Environment, EnvironmentName, Exposure, FileEntry, Found, Health, ProviderEntry,
+    ProviderName, SandboxRef, Source, Status,
 };
 use serde::Serialize;
+use serde_json::Value;
 use tokio::io::{AsyncWriteExt as _, stderr, stdout};
 
-use crate::cli::{EventFormat, OutputFormat};
+use crate::cli::OutputFormat;
 
-const OPTIONAL_CAPABILITIES: &[Capability] = &[
-    Capability::LifecyclePause,
-    Capability::LifecycleArchive,
-    Capability::LifecycleFork,
-    Capability::LifecycleResize,
-    Capability::LifecycleRecover,
-    Capability::LifecycleUndelete,
-    Capability::LifecycleRefreshActivity,
-    Capability::LifecycleTimers,
-    Capability::LifecycleLabels,
-    Capability::LifecycleUpdateNetwork,
-    Capability::LifecycleSnapshotSandbox,
-    Capability::ExecStdin,
-    Capability::ExecStop,
-    Capability::ExecStdioProcess,
-    Capability::FsUpload,
-    Capability::FsDownload,
-    Capability::FsPermissions,
-    Capability::Pty,
-    Capability::Logs,
-    Capability::PreviewUrls,
-    Capability::SignedPreviewUrls,
-    Capability::Ssh,
-    Capability::SshTtl,
-    Capability::SshRevoke,
-    Capability::ShellCommandAccess,
-    Capability::WebTerminalAccess,
-    Capability::VncAccess,
-    Capability::Snapshots,
-    Capability::SnapshotsContainerFromImage,
-    Capability::SnapshotsVmFromImage,
-    Capability::SnapshotsContainerFromDockerfile,
-    Capability::SnapshotsVmFromDockerfile,
-    Capability::SnapshotsFilesystem,
-    Capability::SnapshotsLiveProcessState,
-    Capability::SnapshotsActivation,
-    Capability::Search,
-    Capability::Git,
-    Capability::Services,
-    Capability::Volumes,
-];
-
-#[derive(Debug, Serialize)]
-pub(crate) struct ProviderListing<'a> {
-    pub name:          &'a str,
-    pub provider_type: &'a str,
-    pub kind:          &'a str,
-    pub selected:      bool,
+/// How a sandbox is named on the command line: `<entry>/<id>`.
+pub(crate) fn display_ref(reference: &SandboxRef) -> String {
+    format!("{}/{}", reference.provider, reference.id)
 }
 
-pub(crate) fn event_context(format: EventFormat) -> Option<EventContext> {
-    if format == EventFormat::Off {
-        return None;
+#[derive(Serialize)]
+struct ProviderRow<'a> {
+    name:   &'a ProviderName,
+    plugin: &'a str,
+    path:   Option<&'a str>,
+}
+
+pub(crate) async fn write_providers(
+    entries: &BTreeMap<ProviderName, ProviderEntry>,
+    format: OutputFormat,
+) -> Result<()> {
+    let rows: Vec<_> = entries
+        .iter()
+        .map(|(name, entry)| ProviderRow {
+            name,
+            plugin: entry.plugin.as_str(),
+            path: entry.path.as_deref(),
+        })
+        .collect();
+    match format {
+        OutputFormat::Json => write_json(&rows).await,
+        OutputFormat::Id => write_lines(rows.iter().map(|row| row.name.to_string())).await,
+        OutputFormat::Table => {
+            let mut rendered = String::from("NAME\tPLUGIN\tPATH\n");
+            for row in &rows {
+                let path = row.path.unwrap_or("built in");
+                let _ = writeln!(rendered, "{}\t{}\t{path}", row.name, row.plugin);
+            }
+            write_stdout(rendered.as_bytes()).await
+        }
     }
-    Some(EventContext::new(Arc::new(StderrEventObserver { format })))
 }
 
-pub(crate) async fn write_provider_list(
-    listings: &[ProviderListing<'_>],
+pub(crate) async fn write_environments(
+    environments: &[(EnvironmentName, Environment)],
     format: OutputFormat,
 ) -> Result<()> {
     match format {
-        OutputFormat::Json => write_json(listings).await,
+        OutputFormat::Json => {
+            let map: serde_json::Map<_, _> = environments
+                .iter()
+                .map(|(name, environment)| {
+                    serde_json::to_value(environment).map(|value| (name.to_string(), value))
+                })
+                .collect::<Result<_, _>>()
+                .context("serializing environments")?;
+            write_json(&map).await
+        }
+        OutputFormat::Id => {
+            write_lines(environments.iter().map(|(name, _)| name.to_string())).await
+        }
         OutputFormat::Table => {
-            let mut rendered = String::from("NAME\tTYPE\tKIND\tDEFAULT\n");
-            for listing in listings {
-                let default = if listing.selected { "yes" } else { "" };
+            let mut rendered = String::from("NAME\tPROVIDER\tSOURCE\n");
+            for (name, environment) in environments {
                 let _ = writeln!(
                     rendered,
-                    "{}\t{}\t{}\t{default}",
-                    listing.name, listing.provider_type, listing.kind
+                    "{name}\t{}\t{}",
+                    environment.provider,
+                    summarize_source(&environment.spec.source)
                 );
             }
             write_stdout(rendered.as_bytes()).await
         }
-        OutputFormat::Id => {
-            let mut rendered = String::new();
-            for listing in listings {
-                rendered.push_str(listing.name);
-                rendered.push('\n');
+    }
+}
+
+/// `image ubuntu:24.04`, `dockerfile`, `snapshot base` or `host_directory`.
+/// A Dockerfile's content is never printed.
+fn summarize_source(source: &Source) -> String {
+    match source {
+        Source::Image(image) => format!("image {image}"),
+        Source::Dockerfile(_) => "dockerfile".to_owned(),
+        Source::Snapshot(snapshot) => format!("snapshot {snapshot}"),
+        Source::HostDirectory => "host_directory".to_owned(),
+    }
+}
+
+pub(crate) async fn write_descriptor(
+    entry: &str,
+    descriptor: &Descriptor,
+    format: OutputFormat,
+) -> Result<()> {
+    match format {
+        OutputFormat::Json => write_json(descriptor).await,
+        OutputFormat::Id => write_line(descriptor.namespace.id.as_str()).await,
+        OutputFormat::Table => {
+            let mut rendered = format!(
+                "provider: {entry}\nplugin: {} {}\n",
+                descriptor.schemas.kind, descriptor.schemas.version
+            );
+            let Value::Object(fields) =
+                serde_json::to_value(descriptor).context("serializing descriptor")?
+            else {
+                unreachable!("a descriptor serializes as an object");
+            };
+            for (key, value) in fields.iter().filter(|(key, _)| *key != "schemas") {
+                let _ = writeln!(rendered, "{key}: {}", render_value(value));
             }
             write_stdout(rendered.as_bytes()).await
         }
     }
 }
 
-pub(crate) async fn write_health(
-    provider: &str,
-    health: &ProviderHealth,
-    format: OutputFormat,
-) -> Result<()> {
+pub(crate) async fn write_health(entry: &str, health: &Health, format: OutputFormat) -> Result<()> {
     match format {
         OutputFormat::Json => write_json(health).await,
-        OutputFormat::Table => {
-            let status = serialized_name(&health.status)?;
-            let mut rendered = format!("provider: {provider}\nstatus: {status}\n");
+        OutputFormat::Table | OutputFormat::Id => {
+            let status = if health.healthy { "ok" } else { "unhealthy" };
+            let mut rendered = format!("provider: {entry}\nstatus: {status}\n");
             if let Some(message) = &health.message {
                 let _ = writeln!(rendered, "message: {message}");
             }
-            if !health.missing_permissions.is_empty() {
-                let _ = writeln!(
-                    rendered,
-                    "missing permissions: {}",
-                    health.missing_permissions.join(", ")
-                );
-            }
             write_stdout(rendered.as_bytes()).await
         }
-        OutputFormat::Id => bail!("--output id is not valid for provider health"),
     }
 }
 
-pub(crate) async fn write_capabilities(
-    provider: &str,
-    capabilities: &Capabilities,
-    format: OutputFormat,
-) -> Result<()> {
+pub(crate) async fn write_status(status: &Status, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => write_json(capabilities).await,
+        OutputFormat::Json => write_json(status).await,
+        OutputFormat::Id => write_line(&display_ref(&status.reference)).await,
         OutputFormat::Table => {
-            let isolation = serialized_name(&capabilities.isolation)?;
-            let mut rendered = format!("provider: {provider}\nisolation: {isolation}\n");
-            rendered.push_str("optional capabilities:\n");
-            for capability in OPTIONAL_CAPABILITIES {
-                if capabilities.supports(*capability) {
-                    let _ = writeln!(rendered, "  {capability}");
+            let Value::Object(fields) =
+                serde_json::to_value(status).context("serializing status")?
+            else {
+                unreachable!("a status serializes as an object");
+            };
+            let mut rendered = format!("sandbox: {}\n", display_ref(&status.reference));
+            for (key, value) in &fields {
+                // An object with no fields set, or none at all, says nothing.
+                let empty = value.is_null()
+                    || value
+                        .as_object()
+                        .is_some_and(|map| map.values().all(Value::is_null));
+                if key != "reference" && !empty {
+                    let _ = writeln!(rendered, "{key}: {}", render_value(value));
                 }
             }
             write_stdout(rendered.as_bytes()).await
         }
-        OutputFormat::Id => bail!("--output id is not valid for provider capabilities"),
     }
 }
 
-pub(crate) async fn write_statuses(statuses: &[SandboxStatus], format: OutputFormat) -> Result<()> {
+pub(crate) async fn write_found(found: &Found, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => write_json(statuses).await,
+        OutputFormat::Json => write_json(&found.sandboxes).await?,
         OutputFormat::Id => {
-            let mut rendered = String::new();
-            for status in statuses {
-                rendered.push_str(status.id.as_str());
-                rendered.push('\n');
-            }
-            write_stdout(rendered.as_bytes()).await
+            write_lines(
+                found
+                    .sandboxes
+                    .iter()
+                    .map(|summary| display_ref(&summary.reference)),
+            )
+            .await?;
         }
         OutputFormat::Table => {
-            let mut rendered = String::from("ID\tNAME\tSTATE\tPROVIDER STATE\tREGION\n");
-            for status in statuses {
-                let state = serialized_name(&status.state)?;
+            let mut rendered = String::from("SANDBOX\tNAME\tSTATE\tLABELS\n");
+            for summary in &found.sandboxes {
+                let labels: Vec<_> = summary
+                    .labels
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect();
                 let _ = writeln!(
                     rendered,
-                    "{}\t{}\t{}\t{}\t{}",
-                    status.id,
-                    status.name.as_deref().unwrap_or(""),
-                    state,
-                    status.provider_state,
-                    status.region.as_deref().unwrap_or("")
+                    "{}\t{}\t{}\t{}",
+                    display_ref(&summary.reference),
+                    summary.name.as_deref().unwrap_or(""),
+                    render_value(&serde_json::to_value(summary.state)?),
+                    labels.join(",")
                 );
+            }
+            write_stdout(rendered.as_bytes()).await?;
+        }
+    }
+    // Skipped entries are reported, never read as having no sandboxes.
+    let mut warnings = String::new();
+    for failure in &found.failures {
+        let _ = writeln!(
+            warnings,
+            "warning: provider {} was not searched: {}",
+            failure.entry, failure.error
+        );
+    }
+    write_stderr(warnings.as_bytes()).await
+}
+
+pub(crate) async fn write_files(entries: &[FileEntry], format: OutputFormat) -> Result<()> {
+    match format {
+        OutputFormat::Json => write_json(entries).await,
+        OutputFormat::Id => write_lines(entries.iter().map(|entry| entry.path.clone())).await,
+        OutputFormat::Table => {
+            let mut rendered = String::from("KIND\tSIZE\tPATH\n");
+            for entry in entries {
+                let kind = render_value(&serde_json::to_value(entry.kind)?);
+                let _ = writeln!(rendered, "{kind}\t{}\t{}", entry.size, entry.path);
             }
             write_stdout(rendered.as_bytes()).await
         }
     }
 }
 
-pub(crate) async fn write_status(status: &SandboxStatus, format: OutputFormat) -> Result<()> {
+pub(crate) async fn write_exposure(exposure: &Exposure, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => write_json(status).await,
-        OutputFormat::Id => write_line(status.id.as_str()).await,
-        OutputFormat::Table => write_statuses(from_ref(status), format).await,
+        OutputFormat::Json => write_json(exposure).await,
+        OutputFormat::Id => write_line(&exposure.url).await,
+        OutputFormat::Table => {
+            let mut rendered = format!("url: {}\n", exposure.url);
+            for (name, value) in &exposure.headers {
+                let _ = writeln!(rendered, "header: {name}: {value}");
+            }
+            if let Some(expires) = exposure.expires_at_ms {
+                let _ = writeln!(rendered, "expires_at_ms: {expires}");
+            }
+            write_stdout(rendered.as_bytes()).await
+        }
     }
 }
 
+/// Reports a completed action on one sandbox, such as `stopped docker/1a2b`.
 pub(crate) async fn write_action(
-    provider: &str,
-    id: &str,
+    reference: &SandboxRef,
     action: &str,
     format: OutputFormat,
 ) -> Result<()> {
     match format {
         OutputFormat::Json => {
-            write_json(&serde_json::json!({
-                "provider": provider,
-                "sandbox_id": id,
-                "action": action,
-            }))
-            .await
+            write_json(&serde_json::json!({ "sandbox": reference, "action": action })).await
         }
-        OutputFormat::Id => write_line(id).await,
-        OutputFormat::Table => write_line(&format!("{action} {id}")).await,
+        OutputFormat::Id => write_line(&display_ref(reference)).await,
+        OutputFormat::Table => write_line(&format!("{action} {}", display_ref(reference))).await,
     }
 }
 
+/// One line per value: strings bare, lists joined, anything else as
+/// compact JSON.
+fn render_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(items) if items.is_empty() => "none".to_owned(),
+        Value::Array(items) => items
+            .iter()
+            .map(render_value)
+            .collect::<Vec<_>>()
+            .join(", "),
+        other => other.to_string(),
+    }
+}
+
+async fn write_lines(lines: impl Iterator<Item = String>) -> Result<()> {
+    let mut rendered = String::new();
+    for line in lines {
+        rendered.push_str(&line);
+        rendered.push('\n');
+    }
+    write_stdout(rendered.as_bytes()).await
+}
+
 pub(crate) async fn write_line(value: &str) -> Result<()> {
-    let mut rendered = value.as_bytes().to_vec();
-    rendered.push(b'\n');
-    write_stdout(&rendered).await
+    write_stdout(format!("{value}\n").as_bytes()).await
 }
 
 pub(crate) async fn write_stdout(bytes: &[u8]) -> Result<()> {
@@ -230,64 +298,4 @@ where
     let mut rendered = serde_json::to_vec_pretty(value).context("serializing JSON output")?;
     rendered.push(b'\n');
     write_stdout(&rendered).await
-}
-
-fn serialized_name<T>(value: &T) -> Result<String>
-where
-    T: Serialize,
-{
-    let value = serde_json::to_value(value).context("formatting value")?;
-    value
-        .as_str()
-        .map(ToOwned::to_owned)
-        .context("serialized value was not a string")
-}
-
-struct StderrEventObserver {
-    format: EventFormat,
-}
-
-#[async_trait]
-impl EventObserver for StderrEventObserver {
-    async fn observe(&self, event: Event) {
-        let rendered = match self.format {
-            EventFormat::Json => serde_json::to_vec(&event)
-                .map(|mut bytes| {
-                    bytes.push(b'\n');
-                    bytes
-                })
-                .context("serializing event"),
-            EventFormat::Human => Ok(render_human_event(&event).into_bytes()),
-            EventFormat::Off => Ok(Vec::new()),
-        };
-        match rendered {
-            Ok(bytes) if !bytes.is_empty() => {
-                if let Err(error) = write_stderr(&bytes).await {
-                    tracing::warn!(error = ?error, "event output failed");
-                }
-            }
-            Ok(_) => {}
-            Err(error) => tracing::warn!(error = ?error, "event rendering failed"),
-        }
-    }
-}
-
-fn render_human_event(event: &Event) -> String {
-    match &event.body {
-        EventBody::OperationProgress { progress, .. } => progress
-            .message
-            .as_ref()
-            .map_or_else(String::new, |message| {
-                format!("[{0}] {message}\n", event.provider)
-            }),
-        EventBody::Notice { message, .. } => format!("[{0}] {message}\n", event.provider),
-        _ => String::new(),
-    }
-}
-
-pub(crate) fn health_exit_code(health: &ProviderHealth) -> u8 {
-    match health.status {
-        HealthStatus::Ok | HealthStatus::Unknown => 0,
-        _ => 1,
-    }
 }

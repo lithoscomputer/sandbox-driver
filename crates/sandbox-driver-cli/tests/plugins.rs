@@ -1,4 +1,7 @@
-//! CLI provider selection and trust checks cross a real executable boundary.
+//! Third-party plugin entries cross a real executable boundary: the CLI's
+//! catalog verifies trust, launches the `test-host` fixture plugin over
+//! protocol version 3, and passes it exactly the configured environment.
+//! The fixture is built by `mise run plugins:build`.
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt as _;
@@ -12,140 +15,112 @@ use sandbox_driver_protocol::file_sha256;
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 #[tokio::test]
-async fn default_profile_requires_a_pin_or_explicit_development_mode() {
+async fn a_pinned_plugin_entry_runs_commands_through_the_plugin() {
     let fixture = Fixture::new();
-    let script = fixture.script(
-        "provider",
-        &format!(
-            "printf launched > {}\nexec {}\n",
-            shell_path(&fixture.root.join("launched")),
-            shell_path(&host_binary()),
-        ),
-    );
-    let mut command = fixture.command();
-    command.env("SANDBOX_DRIVER_HOST_PLUGIN", &script);
-    let unpinned = command.output().unwrap();
-    assert!(!unpinned.status.success());
-    assert!(stderr(&unpinned).contains("no pinned sha256"));
-    assert!(!fixture.root.join("launched").exists());
+    let digest = file_sha256(&fixture_plugin()).await.unwrap();
+    fixture.catalog(&fixture_plugin(), &format!("sha256 = '{digest}'"), "");
 
-    // Development mode never bypasses a configured checksum mismatch.
-    command.env("SANDBOX_DRIVER_PLUGIN_DEV", "1");
-    command.env("SANDBOX_DRIVER_HOST_SHA256", "deadbeef");
-    let mismatch = command.output().unwrap();
-    assert!(!mismatch.status.success());
-    assert!(stderr(&mismatch).contains("checksum mismatch"));
-    assert!(!fixture.root.join("launched").exists());
+    let describe = fixture.run(&["provider", "describe", "plugged"]);
+    assert_success(&describe);
+    assert!(
+        stdout(&describe).contains("plugin: test-host "),
+        "{}",
+        stdout(&describe)
+    );
 
-    command.env_remove("SANDBOX_DRIVER_PLUGIN_DEV");
-    command.env(
-        "SANDBOX_DRIVER_HOST_SHA256",
-        file_sha256(&script).await.unwrap(),
-    );
-    let pinned = command.output().unwrap();
-    assert!(pinned.status.success(), "{}", stderr(&pinned));
-    assert_eq!(
-        fs::read_to_string(fixture.root.join("launched")).unwrap(),
-        "launched"
-    );
-    assert!(String::from_utf8_lossy(&pinned.stdout).contains("status: ok"));
+    let run = fixture.run(&[
+        "run",
+        "scratch",
+        "--",
+        "sh",
+        "-c",
+        "echo through the plugin; exit 4",
+    ]);
+    assert_eq!(run.status.code(), Some(4), "{}", stderr(&run));
+    assert_eq!(stdout(&run), "through the plugin\n");
 }
 
 #[test]
-fn default_profile_honors_the_executable_override_and_scrubs_environment() {
+fn an_unpinned_or_mismatched_plugin_is_never_launched() {
+    let fixture = Fixture::new();
+    let marker = fixture.root.join("launched");
+    let script = fixture.script(&format!(
+        "printf launched > {}\nexec {} \"$@\"\n",
+        shell_path(&marker),
+        shell_path(&fixture_plugin()),
+    ));
+
+    fixture.catalog(&script, "", "");
+    let unpinned = fixture.run(&["provider", "health", "plugged"]);
+    assert!(!unpinned.status.success());
+    assert!(
+        stderr(&unpinned).contains("sha256"),
+        "{}",
+        stderr(&unpinned)
+    );
+    assert!(!marker.exists());
+
+    fixture.catalog(&script, &format!("sha256 = '{}'", "0".repeat(64)), "");
+    let mismatch = fixture.run(&["provider", "health", "plugged"]);
+    assert!(!mismatch.status.success());
+    assert!(
+        stderr(&mismatch).contains("checksum mismatch"),
+        "{}",
+        stderr(&mismatch)
+    );
+    assert!(!marker.exists());
+
+    // Development trust cannot sit beside a pin to bypass it.
+    fixture.catalog(
+        &script,
+        &format!("sha256 = '{}'\ndev = true", "0".repeat(64)),
+        "",
+    );
+    let both = fixture.run(&["provider", "health", "plugged"]);
+    assert!(!both.status.success());
+    assert!(!marker.exists());
+
+    fixture.catalog(&script, "dev = true", "");
+    assert_success(&fixture.run(&["provider", "health", "plugged"]));
+    assert!(marker.exists());
+}
+
+#[test]
+fn the_plugin_receives_only_inherited_conveniences_explicit_env_and_secrets() {
     let fixture = Fixture::new();
     let observed = fixture.root.join("environment");
-    let script = fixture.script(
-        "provider",
-        &format!(
-            "printf '%s:%s' \"$HOME\" \"${{UNRELATED_TOKEN-unset}}\" > {}\nexec {}\n",
-            shell_path(&observed),
-            shell_path(&host_binary()),
-        ),
+    // Discovery probes the plugin with a fixed minimal environment; the
+    // activation launch is the one that carries the secret.
+    let script = fixture.script(&format!(
+        "if [ -n \"${{PLUGIN_TOKEN-}}\" ]; then printf '%s:%s:%s:%s' \"$HOME\" \"${{UNRELATED_TOKEN-unset}}\" \"$EXPLICIT\" \"$PLUGIN_TOKEN\" > {}; fi\nexec {} \"$@\"\n",
+        shell_path(&observed),
+        shell_path(&fixture_plugin()),
+    ));
+    fixture.catalog(
+        &script,
+        "dev = true\nsecrets = ['PLUGIN_TOKEN']",
+        "[providers.plugged.env]\nEXPLICIT = 'explicit'\n",
     );
+
+    let missing = fixture.run(&["provider", "health", "plugged"]);
+    assert!(!missing.status.success());
+    assert!(
+        stderr(&missing).contains("requires secret PLUGIN_TOKEN"),
+        "{}",
+        stderr(&missing)
+    );
+
     let output = fixture
-        .command()
-        .env("SANDBOX_DRIVER_PLUGIN_DEV", "1")
-        .env("SANDBOX_DRIVER_HOST_PLUGIN", script)
+        .command(&["provider", "health", "plugged"])
         .env("HOME", &fixture.root)
         .env("UNRELATED_TOKEN", "must-not-reach-plugin")
+        .env("PLUGIN_TOKEN", "resolved-secret")
         .output()
         .unwrap();
-    assert!(output.status.success(), "{}", stderr(&output));
+    assert_success(&output);
     assert_eq!(
         fs::read_to_string(observed).unwrap(),
-        format!("{}:unset", fixture.root.display())
-    );
-}
-
-#[test]
-fn missing_override_fails_instead_of_using_an_embedded_provider() {
-    let fixture = Fixture::new();
-    let output = fixture
-        .command()
-        .env("SANDBOX_DRIVER_PLUGIN_DEV", "1")
-        .env("SANDBOX_DRIVER_HOST_PLUGIN", fixture.root.join("missing"))
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(stderr(&output).contains("missing"));
-}
-
-#[test]
-fn explicit_profile_keeps_its_own_trust_and_environment_configuration() {
-    let fixture = Fixture::new();
-    let config = fixture.root.join("config.toml");
-    let profile = format!(
-        "[providers.local]\ntype = 'plugin'\nkind = 'host'\npath = {}\ninherit-env = ['PATH', 'LLVM_PROFILE_FILE']\n[providers.local.env]\nRUST_LOG = 'off'\n",
-        toml::Value::String(host_binary().to_string_lossy().into_owned()),
-    );
-    fs::write(&config, &profile).unwrap();
-    let mut command = fixture.command();
-    command
-        .args(["--provider", "local", "--config"])
-        .arg(&config)
-        .env("SANDBOX_DRIVER_PLUGIN_DEV", "1");
-    let unpinned = command.output().unwrap();
-    assert!(!unpinned.status.success());
-    assert!(stderr(&unpinned).contains("no pinned sha256"));
-
-    fs::write(
-        &config,
-        profile.replace("type = 'plugin'", "type = 'plugin'\ndev = true"),
-    )
-    .unwrap();
-    let allowed = command.output().unwrap();
-    assert!(allowed.status.success(), "{}", stderr(&allowed));
-}
-
-#[test]
-fn daytona_profile_overrides_standard_environment_with_named_settings() {
-    let fixture = Fixture::new();
-    let observed = fixture.root.join("environment");
-    let script = fixture.script("daytona", &format!(
-        "printf '%s\\n' \"$DAYTONA_API_KEY\" \"${{DAYTONA_JWT_TOKEN-unset}}\" \"$DAYTONA_API_URL\" \"$DAYTONA_TARGET\" > {}\nexit 1\n",
-        shell_path(&observed),
-    ));
-    let config = fixture.root.join("config.toml");
-    fs::write(&config, "[providers.cloud]\ntype = 'daytona'\napi-key-env = 'TEST_CLOUD_KEY'\napi-url = 'https://example.invalid/api'\ntarget = 'test-region'\n").unwrap();
-    let output = fixture
-        .command()
-        .args(["--provider", "cloud", "--config"])
-        .arg(config)
-        .env("SANDBOX_DRIVER_PLUGIN_DEV", "1")
-        .env("SANDBOX_DRIVER_DAYTONA_PLUGIN", script)
-        .env("TEST_CLOUD_KEY", "configured-test-key")
-        .env("DAYTONA_API_KEY", "ambient-test-key")
-        .env("DAYTONA_JWT_TOKEN", "ambient-test-token")
-        .output()
-        .unwrap();
-    assert!(
-        !output.status.success(),
-        "the environment probe exits before the handshake"
-    );
-    assert_eq!(
-        fs::read_to_string(observed).unwrap(),
-        "configured-test-key\nambient-test-token\nhttps://example.invalid/api\ntest-region\n"
+        format!("{}:unset:explicit:resolved-secret", fixture.root.display())
     );
 }
 
@@ -161,22 +136,40 @@ impl Fixture {
         Self { root }
     }
 
-    fn command(&self) -> Command {
+    /// Writes a catalog with the plugin entry `plugged` at `path` and the
+    /// `scratch` environment on it.
+    fn catalog(&self, path: &Path, trust: &str, extra: &str) {
+        let path = toml::Value::String(path.to_string_lossy().into_owned());
+        fs::write(
+            self.root.join("config.toml"),
+            format!(
+                "[providers.plugged]\nplugin = 'test-host'\npath = {path}\n{trust}\n\n{extra}\n\
+                 [environments.scratch]\nprovider = 'plugged'\nspec = {{ source = 'host_directory' }}\n"
+            ),
+        )
+        .expect("write catalog");
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_lithos-sandbox"));
         command
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
-            .env("RUST_LOG", "off")
-            .env("XDG_CONFIG_HOME", &self.root)
-            .args(["provider", "health"]);
+            .arg("--config")
+            .arg(self.root.join("config.toml"))
+            .args(args);
         if let Some(profile_file) = env::var_os("LLVM_PROFILE_FILE") {
             command.env("LLVM_PROFILE_FILE", profile_file);
         }
         command
     }
 
-    fn script(&self, name: &str, body: &str) -> PathBuf {
-        let path = self.root.join(name);
+    fn run(&self, args: &[&str]) -> Output {
+        self.command(args).output().expect("lithos-sandbox starts")
+    }
+
+    fn script(&self, body: &str) -> PathBuf {
+        let path = self.root.join("plugin");
         fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}")).expect("write plugin script");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
             .expect("make plugin executable");
@@ -186,19 +179,34 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        fs::remove_dir_all(&self.root).expect("remove fixture directory");
+        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
-fn host_binary() -> PathBuf {
-    Path::new(env!("CARGO_BIN_EXE_lithos-sandbox"))
+/// The fixture plugin, built beside this CLI by `mise run plugins:build`.
+fn fixture_plugin() -> PathBuf {
+    let path = Path::new(env!("CARGO_BIN_EXE_lithos-sandbox"))
         .parent()
         .expect("Cargo binary has a parent directory")
-        .join("sandbox-driver-host")
+        .join("sandbox-driver-test-host");
+    assert!(
+        path.is_file(),
+        "{} is missing; run `mise run plugins:build`",
+        path.display()
+    );
+    path
 }
 
 fn shell_path(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+fn assert_success(output: &Output) {
+    assert!(output.status.success(), "{}", stderr(output));
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 fn stderr(output: &Output) -> String {

@@ -189,21 +189,18 @@ and [diagnostics](https://github.com/lithoscomputer/sandbox-driver/blob/main/doc
 
 ### Use it from the command line
 
-The CLI has not been ported to the `Sandboxes` API yet. Until it is, it runs
-every provider, including Host, Docker, and Daytona, as a protocol version 2
-plugin executable:
+The CLI drives the same environment catalog. Host, Docker, and Daytona are
+built in; any other provider is a configured plugin entry:
 
 ```sh
 cargo install --git https://github.com/lithoscomputer/sandbox-driver --locked sandbox-driver-cli
 lithos-sandbox --help
-lithos-sandbox provider list
+lithos-sandbox providers
+lithos-sandbox run docker -- uname -a
 ```
 
-Sandbox operations also need an installed provider executable and its checksum
-configuration. Docker needs a reachable daemon; Daytona needs API credentials.
+Docker needs a reachable daemon; Daytona needs API credentials.
 See the [CLI guide](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/cli.md).
-The [ported CLI](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/next-api.md#cli)
-will use the environment catalog; those commands are not available yet.
 
 ## Status and compatibility
 
