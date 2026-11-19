@@ -112,7 +112,7 @@ async fn host_passes_the_shared_contract() {
         long_running: ExecSpec::argv(["sh", "-c", "echo ready; exec sleep 600"]),
     })
     .with_peer(peer.clone())
-    .with_shell()
+    .with_bash()
     .with_ambient_variable("PATH")
     .run()
     .await;

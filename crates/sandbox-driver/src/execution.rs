@@ -14,14 +14,6 @@ use super::provider::ByteStream;
 use super::workload::{validate_argv, validate_env, validate_name};
 use crate::redact::EnvKeys;
 
-const SHELL: &str = "sh";
-
-/// Hands the script, its first argument, to Bash when there is one. `exec`
-/// replaces this launcher, so the script's own exit status is the command's.
-const SHELL_LAUNCHER: &str = r#"unset BASH_ENV
-if command -v bash >/dev/null 2>&1; then exec bash -c "$1"; fi
-exec sh -c "$1""#;
-
 /// An argv executed in the requested workload, never in its outer runner.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,22 +40,18 @@ impl ExecSpec {
         }
     }
 
-    /// Runs `script` as a shell command: under Bash when the workload has
-    /// `bash` on its `PATH`, and under POSIX `sh` otherwise. The workload must
-    /// provide `sh`. A script that may meet an image without Bash should keep
-    /// to POSIX syntax; one that needs Bash names it in `argv` instead.
+    /// Runs `script` as Bash source: `bash -c <script>`, with `bash` found on
+    /// the workload's `PATH`. A workload without Bash fails the command; no
+    /// other shell is tried.
     ///
-    /// The script's shell is not a login shell and sources no startup file:
-    /// `BASH_ENV` is unset before it starts, whether the image or the spec's
-    /// own `env` set it. The script receives no positional arguments.
-    pub fn shell(script: impl Into<String>) -> Self {
-        Self::argv([
-            SHELL.to_owned(),
-            "-c".to_owned(),
-            SHELL_LAUNCHER.to_owned(),
-            SHELL.to_owned(),
-            script.into(),
-        ])
+    /// The shell is not a login shell and sources no startup file: `env`
+    /// starts with a blank `BASH_ENV`, and the built-in providers keep it
+    /// blank for this argv whatever `env` says later. The script receives no
+    /// positional arguments.
+    pub fn bash(script: impl Into<String>) -> Self {
+        let mut spec = Self::argv(["bash".to_owned(), "-c".to_owned(), script.into()]);
+        spec.env.insert("BASH_ENV".to_owned(), String::new());
+        spec
     }
 
     pub fn validate(&self) -> Result<(), Error> {
@@ -187,7 +175,10 @@ pub struct ExecOutcome {
 /// counts what it threw away here. The bytes those records would have
 /// decoded to, and the stream they belonged to, are unknown, so a loss
 /// also sets `CaptureStats::truncated` on both streams. Every other
-/// provider reports zero.
+/// provider reports zero counts.
+///
+/// `truncated` is the loss no count describes: any provider can stop
+/// reading a stream before it ends.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 #[serde(default)]
@@ -196,11 +187,16 @@ pub struct OutputLoss {
     pub dropped_frames: u64,
     /// Encoded bytes those records held, their newline included.
     pub dropped_bytes:  u64,
+    /// The provider stopped reading output before a stream ended, as when a
+    /// process that outlived the command kept it open past the provider's
+    /// bound. How much is missing is unknown. Additive on the wire: an
+    /// older peer reports `false`.
+    pub truncated:      bool,
 }
 
 impl OutputLoss {
     /// Whether any output was lost.
     pub fn is_lossy(self) -> bool {
-        self.dropped_frames != 0 || self.dropped_bytes != 0
+        self.dropped_frames != 0 || self.dropped_bytes != 0 || self.truncated
     }
 }

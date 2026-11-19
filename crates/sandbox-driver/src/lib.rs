@@ -32,7 +32,8 @@ mod wire_time;
 mod workload;
 
 pub use capture::{
-    Captured, CapturedOutput, DEFAULT_CAPTURE_BYTES, run_captured, run_captured_with, run_shell,
+    Captured, CapturedOutput, DEFAULT_CAPTURE_BYTES, IncompleteOutput, run_bash, run_captured,
+    run_captured_with,
 };
 pub use catalog::{
     CatalogDiagnostic, CatalogOptions, Found, ProviderFailure, ProviderHandle, Registry,
