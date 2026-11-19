@@ -49,7 +49,7 @@ pub struct Conformance {
     peer:        Option<Sandboxes>,
     environment: String,
     commands:    Commands,
-    ambient:     Option<String>,
+    ambient:     bool,
     bash:        bool,
     pub timeout: Duration,
 }
@@ -57,8 +57,8 @@ pub struct Conformance {
 /// What a check does with its freshly created sandbox.
 enum Scenario<'a> {
     Identity,
-    /// Compares `env()` with what a command sees for this variable.
-    AmbientEnv(&'a str),
+    /// Compares `env()` with what a command sees for `PATH`.
+    AmbientEnv,
     Files,
     Exec,
     Bash,
@@ -79,8 +79,8 @@ impl Conformance {
             peer: None,
             environment: environment.into(),
             commands,
-            ambient: None,
-            bash:  false,
+            ambient: false,
+            bash: false,
             timeout: Duration::from_secs(30),
         }
     }
@@ -102,14 +102,13 @@ impl Conformance {
         self
     }
 
-    /// Names a variable the workload's image or host sets and the sandbox
-    /// spec does not, such as `PATH`, in a workload that provides `printenv`.
-    /// It adds a check that [`Sandbox::env`] reports the variable with the
-    /// value a command sees. A provider that reports only the spec's own
-    /// variables fails it.
+    /// Declares that the workload's image or host sets `PATH`, the sandbox
+    /// spec does not, and the workload provides `printenv`. It adds a check
+    /// that [`Sandbox::env`] reports `PATH` with the value a command sees. A
+    /// provider that reports only the spec's own variables fails it.
     #[must_use]
-    pub fn with_ambient_variable(mut self, name: impl Into<String>) -> Self {
-        self.ambient = Some(name.into());
+    pub fn with_ambient_env(mut self) -> Self {
+        self.ambient = true;
         self
     }
 
@@ -130,8 +129,8 @@ impl Conformance {
         if let Some(peer) = &self.peer {
             scenarios.push(("cross_instance_stop_fence", Scenario::Fence(peer)));
         }
-        if let Some(name) = &self.ambient {
-            scenarios.push(("ambient_env", Scenario::AmbientEnv(name)));
+        if self.ambient {
+            scenarios.push(("ambient_env", Scenario::AmbientEnv));
         }
         let mut results = Vec::new();
         for (name, scenario) in scenarios {
@@ -148,7 +147,7 @@ impl Conformance {
                 let sandbox = sandbox.as_ref();
                 match scenario {
                     Scenario::Identity => self.identity(sandbox).await,
-                    Scenario::AmbientEnv(name) => Self::ambient_env(sandbox, name).await,
+                    Scenario::AmbientEnv => Self::ambient_env(sandbox).await,
                     Scenario::Files => Self::files(sandbox).await,
                     Scenario::Exec => self.exec(sandbox).await,
                     Scenario::Bash => Self::bash(sandbox).await,
@@ -260,12 +259,12 @@ impl Conformance {
             "stop/start lost workspace",
         )
     }
-    async fn ambient_env(sandbox: &dyn Sandbox, name: &str) -> CheckOutcome {
-        let Some(reported) = sandbox.env().get(name) else {
-            return fail("env() lacks a variable the workload sets");
+    async fn ambient_env(sandbox: &dyn Sandbox) -> CheckOutcome {
+        let Some(reported) = sandbox.env().get("PATH") else {
+            return fail("env() lacks PATH, which the workload sets");
         };
         let seen =
-            sandbox_driver::run_captured(sandbox, ExecSpec::argv(["printenv", name])).await?;
+            sandbox_driver::run_captured(sandbox, ExecSpec::argv(["printenv", "PATH"])).await?;
         require(
             seen.success() && seen.is_complete(),
             "printenv did not report the variable",

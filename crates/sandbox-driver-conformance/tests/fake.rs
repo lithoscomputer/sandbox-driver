@@ -45,7 +45,7 @@ async fn a_provider_that_reports_only_the_spec_env_fails_the_ambient_check() {
     // The fake's `env()` is the spec's own, which is empty here: it has no
     // image or host to read variables from.
     let (conformance, catalogs) = suite().await;
-    let report = conformance.with_ambient_variable("PATH").run().await;
+    let report = conformance.with_ambient_env().run().await;
     let failed: Vec<&str> = report.failures().iter().map(|result| result.name).collect();
     assert_eq!(failed, ["ambient_env"], "{report}");
     shut_down(catalogs).await;
