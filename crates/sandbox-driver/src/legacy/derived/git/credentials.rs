@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 
 use super::DerivedGit;
 use super::command::{GIT, GIT_TIMEOUT, GitCommand};
-use crate::file_ops::shell_quote;
+use crate::legacy::derived::shell_quote;
 use crate::legacy::error::{Error, Result};
 use crate::legacy::git::GitCredentials;
 

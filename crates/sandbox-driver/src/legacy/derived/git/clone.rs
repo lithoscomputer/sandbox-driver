@@ -380,9 +380,9 @@ mod tests {
         assert_eq!(failure.operation(), "git clone");
         assert_eq!(failure.kind(), GitFailureKind::AuthRejected);
         let output = failure.output().expect("command output is attached");
-        assert_eq!(output.outcome.exit_code, Some(128));
+        assert_eq!(output.exit_code(), Some(128));
         assert!(
-            String::from_utf8_lossy(&output.stderr_tail.bytes).contains("Repository not found"),
+            String::from_utf8_lossy(output.stderr()).contains("Repository not found"),
             "raw stderr is reachable through the accessor"
         );
         assert!(

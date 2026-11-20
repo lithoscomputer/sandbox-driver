@@ -225,13 +225,11 @@ impl fmt::Display for GitFailure {
             Termination::Lost => Some("ended with an unknown outcome"),
         };
         match (ended_early, command.outcome.exit_code) {
-            (Some(how), _) => {
-                write!(f, "{operation} {how}")?;
-                match command.duration {
-                    Some(duration) => write!(f, " after {} ms", duration.as_millis()),
-                    None => Ok(()),
-                }
-            }
+            (Some(how), _) => write!(
+                f,
+                "{operation} {how} after {} ms",
+                command.duration.as_millis()
+            ),
             (None, Some(code)) => write!(
                 f,
                 "{operation} failed: {} (exit code {code})",

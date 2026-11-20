@@ -16,7 +16,6 @@ use tokio_util::sync::CancellationToken;
 use crate::legacy::capabilities::Capability;
 use crate::legacy::error::{Error, Result};
 use crate::redact::EnvKeys;
-use crate::{CapturedOutput, CommandFailure, ExecOutcome};
 pub use crate::{OutputLoss, StopLevel, stop_signal};
 
 /// The interpreter [`ExecSpec::bash`] names, resolved through `PATH`
@@ -476,30 +475,6 @@ pub enum Termination {
     Unknown,
 }
 
-impl From<Termination> for crate::Termination {
-    fn from(termination: Termination) -> Self {
-        match termination {
-            Termination::Exited => Self::Exited,
-            Termination::TimedOut => Self::TimedOut,
-            Termination::Cancelled => Self::Terminated,
-            Termination::Killed => Self::Killed,
-            Termination::Unknown => Self::Lost,
-        }
-    }
-}
-
-impl From<crate::Termination> for Termination {
-    fn from(termination: crate::Termination) -> Self {
-        match termination {
-            crate::Termination::Exited => Self::Exited,
-            crate::Termination::TimedOut => Self::TimedOut,
-            crate::Termination::Terminated => Self::Cancelled,
-            crate::Termination::Killed => Self::Killed,
-            crate::Termination::Lost => Self::Unknown,
-        }
-    }
-}
-
 /// Result of a buffered command run. Output is bytes: sandbox output is
 /// not guaranteed UTF-8.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -526,31 +501,6 @@ pub struct ExecResult {
 }
 
 impl ExecResult {
-    /// This result as the failure of the command `label` names, with all
-    /// of its output.
-    pub fn into_failure(self, label: impl Into<String>) -> CommandFailure {
-        let Self {
-            stdout,
-            stderr,
-            exit_code,
-            signal,
-            termination,
-            duration,
-        } = self;
-        CommandFailure {
-            context:     label.into(),
-            outcome:     ExecOutcome {
-                termination: termination.into(),
-                exit_code,
-                signal,
-                output_loss: OutputLoss::default(),
-            },
-            stdout_tail: CapturedOutput::whole(stdout),
-            stderr_tail: CapturedOutput::whole(stderr),
-            duration:    Some(duration),
-        }
-    }
-
     pub fn new(termination: Termination, exit_code: Option<i32>, duration: Duration) -> Self {
         Self {
             stdout: Vec::new(),
