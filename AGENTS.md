@@ -15,8 +15,8 @@ Authoritative documents:
 - `docs/design.md` — the Rust interface design: resource model,
   lifecycle actions, facets, capability discovery, and what stays out of
   this library.
-- `docs/protocol.md` — the normative plugin wire protocol (version 2),
-  written for implementers in any language. The compatibility tests in
+- `docs/protocol.md` — the normative plugin wire protocol (version 3 is
+  section 16), written for implementers in any language. The compatibility tests in
   `crates/sandbox-driver-protocol` verify its encodings and tolerance
   rules behaviorally (era-JSON decoding, unknown-value handling) — not
   full-shape pins, which are change-detector tests and unwanted.
@@ -28,6 +28,14 @@ The workspace is `crates/sandbox-driver` (core traits and types) plus
 `sandbox-driver-{conformance,host,docker,docker-config,daytona,daytona-config,protocol,cli}`.
 The Host, Docker, and Daytona packages each build a same-named executable.
 There are no separate `*-plugin` packages.
+
+## Migration to the new API
+
+`main` supports only the new API and protocol version 3. The old API
+(`sandbox_driver::legacy`) and protocol version 2 are unsupported on `main`
+and are being deleted; anyone who needs them pins tag `v2`. Do not preserve
+version 2 behavior or keep two versions of a protocol or interface alive.
+Delete old code as you replace it instead of carrying it over.
 
 ## Rust style
 

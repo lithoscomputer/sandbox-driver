@@ -27,6 +27,7 @@ mod identity;
 pub mod legacy;
 mod provider;
 mod redact;
+mod sanitize;
 mod schema;
 mod status;
 mod units;
@@ -65,6 +66,7 @@ pub use provider::{
     Provider, ProviderFactory, Sandbox, SandboxSummary, SecretResolver, SecretValues,
     SshAccessInfo, VncConnection, WorkloadAdmission,
 };
+pub use sanitize::{OutputSanitization, OutputSanitizer};
 pub use status::{SandboxState, ServiceAddress, Status};
 pub use units::{ParseUnitError, parse_duration_ms, parse_size_mib};
 pub use workload::{

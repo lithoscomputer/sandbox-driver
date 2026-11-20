@@ -369,7 +369,6 @@ const CHECKS: &[(&str, CheckFn)] = checks![
     exec::bash_helper_ignores_a_caller_bash_env,
     exec::exec_argv_is_literal,
     exec::exec_output_is_binary_safe,
-    exec::exec_output_sanitization_is_consistent,
     exec::exec_stdin_round_trips,
     exec_stop::exec_timeout_terminates,
     exec_stop::exec_term_terminates,
