@@ -128,13 +128,13 @@ async fn run(sandbox: &dyn Sandbox, script: String) -> Result<Captured, Error> {
 }
 
 /// `value`, once it is valid as one argument, quoted for Bash source.
-fn quoted(field: &str, value: &str) -> Result<String, Error> {
+pub(super) fn quoted(field: &str, value: &str) -> Result<String, Error> {
     validate_name(field, value)?;
     Ok(shell_quote(value))
 }
 
 /// Quotes a string for safe interpolation into Bash source.
-fn shell_quote(value: &str) -> String {
+pub(super) fn shell_quote(value: &str) -> String {
     let mut quoted = String::with_capacity(value.len() + 2);
     quoted.push('\'');
     for c in value.chars() {
@@ -157,7 +157,7 @@ fn if_missing(variable: &str) -> String {
     )
 }
 
-fn succeeded(context: &str, captured: &Captured) -> Result<(), CommandError> {
+pub(super) fn succeeded(context: &str, captured: &Captured) -> Result<(), CommandError> {
     if captured.success() {
         Ok(())
     } else {
@@ -179,7 +179,7 @@ fn answer<'a>(context: &str, captured: &'a Captured) -> Result<&'a str, CommandE
     Ok(text.strip_suffix('\n').unwrap_or(text))
 }
 
-fn unreadable(context: &str, captured: &Captured) -> CommandError {
+pub(super) fn unreadable(context: &str, captured: &Captured) -> CommandError {
     CommandError::UnexpectedOutput(Box::new(CommandFailure::new(context, captured)))
 }
 

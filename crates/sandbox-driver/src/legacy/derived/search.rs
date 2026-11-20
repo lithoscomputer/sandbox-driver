@@ -7,7 +7,8 @@ use tokio::sync::OnceCell;
 use crate::legacy::derived::shell_quote;
 use crate::legacy::error::{Error, ExecFailure, Result};
 use crate::legacy::exec::{Exec, ExecResult, ExecSpec, Termination};
-use crate::legacy::search::{GrepMatch, GrepOptions, Search, WalkOptions, WalkedFile};
+use crate::legacy::search::Search;
+use crate::search::{GrepMatch, GrepOptions, WalkOptions, WalkedFile};
 
 const GREP_TIMEOUT: Duration = Duration::from_secs(30);
 const WALK_TIMEOUT: Duration = Duration::from_secs(30);

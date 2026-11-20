@@ -252,6 +252,26 @@ pub struct FileStat { pub kind: FileKind, pub size: u64, pub mode: Option<u32>, 
 
 A relative path resolves against the sandbox's working directory. `stat_path` describes a symbolic link itself and `path_exists` follows it. A missing path is `Error::NotFound` from `stat_path` and from `rename_path` for its source. `remove_path` succeeds on a missing path, removes a link rather than what it names, and needs `recursive` for a directory that is not empty. `rename_path` moves as `mv` does and does not create the destination's parent. Each command has a 60-second budget.
 
+Search is derived the same way:
+
+```rust
+/// Lines matching a regular expression in a file, or in every file under a directory.
+pub async fn grep_files(
+    sandbox: &dyn Sandbox, pattern: &str, path: &str, options: &GrepOptions,
+) -> Result<Vec<GrepMatch>, CommandError>;
+/// Every regular file under `base`, as paths relative to it, in path order.
+pub async fn walk_files(sandbox: &dyn Sandbox, base: &str, options: &WalkOptions) -> Result<Vec<WalkedFile>, CommandError>;
+/// The walked paths that match a glob; `*` stops at a `/` and `**` crosses them.
+pub async fn glob_files(sandbox: &dyn Sandbox, pattern: &str, base: &str) -> Result<Vec<String>, CommandError>;
+
+pub struct GrepOptions { pub case_insensitive: bool, pub max_matches: Option<usize>, pub include: Option<String> }
+pub struct GrepMatch { pub path: String, pub line_number: u64, pub line: String }
+pub struct WalkOptions { pub max_depth: Option<usize>, pub exclude_dirs: Vec<String> }
+pub struct WalkedFile { pub path: String, pub size: Option<u64> }
+```
+
+`grep_files` runs ripgrep when the workload has `rg`, and GNU or BSD `grep -r` otherwise; BusyBox `grep` is not enough. The pattern is in that tool's default syntax, and ripgrep skips hidden and ignored files. No match is an empty result, and a search that could not run, such as one of a missing path, is `CommandError::Failed`. `max_matches` bounds the total and stops the search at the source. `walk_files` uses `find` (GNU, BSD or BusyBox) and reports sizes only with GNU `find`. A missing base is an empty walk, and so is a base that is a symbolic link or, for a relative base, is reached through one. Each command has a 30-second budget.
+
 `Ports` is `expose(port, Expose { signed, ttl }) -> Exposure { url, headers, expires_at }` and `release(port)`. Some providers hold a real local forward until `release`.
 
 ### Errors

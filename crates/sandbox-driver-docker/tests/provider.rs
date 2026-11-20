@@ -109,7 +109,8 @@ async fn docker_passes_the_shared_contract_suite() {
 }
 
 /// What the library derives over a Bash exec is checked on an image that
-/// has Bash.
+/// has Bash. Its GNU `grep` also serves the search, which `BusyBox` `grep`
+/// cannot.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a live Docker daemon"]
 #[expect(
@@ -125,6 +126,7 @@ async fn docker_passes_the_bash_checks_on_an_image_with_bash() {
         long_running: ExecSpec::argv(["sh", "-c", "echo ready; exec sleep 600"]),
     })
     .with_bash()
+    .with_search()
     .run()
     .await;
     eprintln!("{report}");

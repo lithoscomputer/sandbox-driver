@@ -10,9 +10,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sandbox_driver::{
-    AccessScope, CommandError, Error, ExecControls, ExecSpec, FileKind, FileRange, LabelFilter,
-    MutationOutcome, OutputSink, Sandbox, SandboxRef, SandboxState, Sandboxes, Termination,
-    create_dir_all, path_exists, remove_path, rename_path, run_bash, stat_path,
+    AccessScope, CommandError, Error, ExecControls, ExecSpec, FileKind, FileRange, GrepMatch,
+    GrepOptions, LabelFilter, MutationOutcome, OutputSink, Sandbox, SandboxRef, SandboxState,
+    Sandboxes, Termination, WalkOptions, create_dir_all, glob_files, grep_files, path_exists,
+    remove_path, rename_path, run_bash, stat_path, walk_files,
 };
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
@@ -51,6 +52,7 @@ pub struct Conformance {
     environment: String,
     commands:    Commands,
     bash:        bool,
+    search:      bool,
     pub timeout: Duration,
 }
 
@@ -61,6 +63,7 @@ enum Scenario<'a> {
     Exec,
     Bash,
     DerivedFiles,
+    DerivedSearch,
     /// Stops the sandbox through a handle attached from this catalog.
     Fence(&'a Sandboxes),
 }
@@ -90,6 +93,7 @@ impl Conformance {
             environment: environment.into(),
             commands,
             bash: false,
+            search: false,
             timeout: Duration::from_secs(30),
         }
     }
@@ -113,6 +117,16 @@ impl Conformance {
         self
     }
 
+    /// Declares that the environment's workload provides Bash with `find`,
+    /// `head`, `ln` and either ripgrep or GNU or BSD `grep`, which adds a
+    /// check of the search the library derives over exec. `BusyBox` `grep`
+    /// is not enough.
+    #[must_use]
+    pub fn with_search(mut self) -> Self {
+        self.search = true;
+        self
+    }
+
     /// Creates one sandbox per check, then attempts bounded cleanup even after
     /// a check fails or times out; a cleanup failure fails its check. Unknown
     /// create outcomes have no guessed ID; providers/applications must
@@ -127,6 +141,9 @@ impl Conformance {
         if self.bash {
             scenarios.push(("captured_bash", Scenario::Bash));
             scenarios.push(("derived_files", Scenario::DerivedFiles));
+        }
+        if self.search {
+            scenarios.push(("derived_search", Scenario::DerivedSearch));
         }
         if let Some(peer) = &self.peer {
             scenarios.push(("cross_instance_stop_fence", Scenario::Fence(peer)));
@@ -150,6 +167,7 @@ impl Conformance {
                     Scenario::Exec => self.exec(sandbox).await,
                     Scenario::Bash => Self::bash(sandbox).await,
                     Scenario::DerivedFiles => Self::derived_files(sandbox).await,
+                    Scenario::DerivedSearch => Self::derived_search(sandbox).await,
                     Scenario::Fence(catalog) => self.fence_with(sandbox, catalog).await,
                 }
             };
@@ -306,6 +324,164 @@ impl Conformance {
         require(
             captured.stderr.bytes == b"to stderr",
             "bash stderr differed",
+        )
+    }
+    async fn derived_search(sandbox: &dyn Sandbox) -> CheckOutcome {
+        let root = "conformance/search";
+        let main = "fn main() {}\nlet Needle = 1;\n";
+        for (path, content) in [
+            ("top.txt", "top\n"),
+            ("src/main.rs", main),
+            // A `:` in a file name must not be read as the line separator.
+            ("src/with:colon.txt", "a needle: here\n"),
+            ("node_modules/dep/index.js", "needle\n"),
+            // A file named like an excluded directory is not excluded.
+            ("docs/node_modules", "plain\n"),
+        ] {
+            sandbox
+                .files()
+                .put(
+                    &format!("{root}/{path}"),
+                    Box::pin(Cursor::new(content.as_bytes().to_vec())),
+                )
+                .await?;
+        }
+        let linked = run_bash(sandbox, "ln -s search conformance/linked").await?;
+        require(linked.success(), "the workload could not create a link")?;
+
+        let grep = async |pattern: &str, path: &str, options: &GrepOptions| {
+            let mut matches = grep_files(sandbox, pattern, path, options).await?;
+            matches.sort_by(|left, right| left.path.cmp(&right.path));
+            Ok::<_, CommandError>(matches)
+        };
+        let colon = GrepMatch::new(format!("{root}/src/with:colon.txt"), 1, "a needle: here");
+        let found = grep("needle", root, &GrepOptions::default()).await?;
+        let expected = [
+            GrepMatch::new(format!("{root}/node_modules/dep/index.js"), 1, "needle"),
+            colon.clone(),
+        ];
+        require(
+            found == expected,
+            &format!("grep of a directory returned {found:?}, expected {expected:?}"),
+        )?;
+        // Searching one file still names it.
+        let found = grep("needle", &colon.path, &GrepOptions::default()).await?;
+        require(
+            found == [colon],
+            &format!("grep of one file returned {found:?}"),
+        )?;
+        let mut options = GrepOptions::default();
+        options.case_insensitive = true;
+        options.include = Some("*.rs".to_owned());
+        let found = grep("needle", root, &options).await?;
+        require(
+            found
+                == [GrepMatch::new(
+                    format!("{root}/src/main.rs"),
+                    2,
+                    "let Needle = 1;",
+                )],
+            &format!("a case-insensitive grep of *.rs returned {found:?}"),
+        )?;
+        let mut options = GrepOptions::default();
+        options.case_insensitive = true;
+        options.max_matches = Some(2);
+        let found = grep("needle", root, &options).await?;
+        require(
+            found.len() == 2,
+            &format!("grep with max_matches 2 returned {found:?}"),
+        )?;
+        require(
+            grep("no-such-text", root, &GrepOptions::default())
+                .await?
+                .is_empty(),
+            "grep with no match was not empty",
+        )?;
+        // A search that could not run is not "no match".
+        for options in [GrepOptions::default(), options] {
+            require(
+                matches!(
+                    grep("needle", "conformance/absent", &options).await,
+                    Err(CommandError::Failed(_))
+                ),
+                "grep of a missing path did not fail",
+            )?;
+        }
+
+        let walk = async |base: &str, options: &WalkOptions| {
+            let files = walk_files(sandbox, base, options).await?;
+            // A size is reported or not as the workload's `find` allows,
+            // but a reported one is the file's.
+            let sized = files.iter().all(|file| match file.path.as_str() {
+                "src/main.rs" => file.size.is_none_or(|size| size == main.len() as u64),
+                _ => true,
+            });
+            let paths: Vec<String> = files.into_iter().map(|file| file.path).collect();
+            Ok::<_, CommandError>((paths, sized))
+        };
+        let (paths, sized) = walk(root, &WalkOptions::default()).await?;
+        let everything = [
+            "docs/node_modules",
+            "node_modules/dep/index.js",
+            "src/main.rs",
+            "src/with:colon.txt",
+            "top.txt",
+        ];
+        require(
+            paths == everything,
+            &format!("walk returned {paths:?}, expected {everything:?}"),
+        )?;
+        require(sized, "walk reported a wrong size")?;
+        let mut options = WalkOptions::default();
+        options.exclude_dirs = vec!["node_modules".to_owned()];
+        let (paths, _) = walk(root, &options).await?;
+        require(
+            paths
+                == [
+                    "docs/node_modules",
+                    "src/main.rs",
+                    "src/with:colon.txt",
+                    "top.txt",
+                ],
+            &format!("walk without node_modules returned {paths:?}"),
+        )?;
+        let mut options = WalkOptions::default();
+        options.max_depth = Some(1);
+        let (paths, _) = walk(root, &options).await?;
+        require(
+            paths == ["top.txt"],
+            &format!("walk at depth 1 returned {paths:?}"),
+        )?;
+        // A missing root is empty, and so is one reached through a link.
+        for base in [
+            "conformance/absent",
+            "conformance/linked",
+            "conformance/linked/src",
+        ] {
+            let (paths, _) = walk(base, &WalkOptions::default()).await?;
+            require(
+                paths.is_empty(),
+                &format!("walk of {base} returned {paths:?}"),
+            )?;
+        }
+
+        for (pattern, expected) in [
+            ("src/*.rs", vec!["src/main.rs"]),
+            ("*.txt", vec!["top.txt"]),
+            ("**/*.txt", vec!["src/with:colon.txt", "top.txt"]),
+        ] {
+            let paths = glob_files(sandbox, pattern, root).await?;
+            require(
+                paths == expected,
+                &format!("glob {pattern} returned {paths:?}, expected {expected:?}"),
+            )?;
+        }
+        require(
+            matches!(
+                glob_files(sandbox, "src/[", root).await,
+                Err(CommandError::Sandbox(Error::InvalidSpec { .. }))
+            ),
+            "an invalid glob was not InvalidSpec",
         )
     }
     async fn derived_files(sandbox: &dyn Sandbox) -> CheckOutcome {
