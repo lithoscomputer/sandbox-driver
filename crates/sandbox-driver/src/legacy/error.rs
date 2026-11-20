@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{fmt, io};
 
-pub use crate::CommandFailure as ExecFailure;
+use crate::CommandFailure;
 use crate::id::ProviderKind;
 use crate::legacy::capabilities::Capability;
 use crate::legacy::event::Action;
@@ -106,7 +106,7 @@ pub enum Error {
     /// A command inside the sandbox failed in a way the caller did not run
     /// it to observe (probe failures, derived-operation failures).
     #[error(transparent)]
-    Exec(Box<ExecFailure>),
+    Exec(Box<CommandFailure>),
 
     /// A git operation failed, classified by what the remote or the
     /// working tree said so callers decide about retries and reporting
@@ -238,8 +238,8 @@ impl AuthError {
 }
 
 // Boxed so that the error stays small on every `Result`.
-impl From<ExecFailure> for Error {
-    fn from(failure: ExecFailure) -> Self {
+impl From<CommandFailure> for Error {
+    fn from(failure: CommandFailure) -> Self {
         Self::Exec(Box::new(failure))
     }
 }
@@ -400,13 +400,13 @@ impl GitFailureKind {
 ///
 /// `Display` carries the operation and the class only; raw output stays
 /// behind [`GitFailure::output`] so the caller controls exposure and
-/// redaction, as with [`ExecFailure`].
+/// redaction, as with [`CommandFailure`].
 #[derive(Debug)]
 pub struct GitFailure {
     operation: String,
     kind:      GitFailureKind,
     // Boxed so the error enum stays small on every `Result`.
-    output:    Option<Box<ExecFailure>>,
+    output:    Option<Box<CommandFailure>>,
     provider:  Option<Box<ProviderError>>,
 }
 
@@ -455,7 +455,7 @@ impl GitFailure {
     /// read from its output. Exit codes 127 and 126 are the shell saying
     /// `git` itself could not be found or run, so they classify before
     /// the output is read.
-    pub fn from_command(operation: impl Into<String>, output: ExecFailure) -> Self {
+    pub fn from_command(operation: impl Into<String>, output: CommandFailure) -> Self {
         let kind = match output.outcome.exit_code {
             Some(126 | 127) => GitFailureKind::GitUnavailable,
             _ => GitFailureKind::from_output(&output.stderr_tail.bytes, &output.stdout_tail.bytes),
@@ -502,7 +502,7 @@ impl GitFailure {
 
     /// Attaches the command output a reconstructed failure was read from.
     #[must_use]
-    pub fn with_output(mut self, output: ExecFailure) -> Self {
+    pub fn with_output(mut self, output: CommandFailure) -> Self {
         self.output = Some(Box::new(output));
         self
     }
@@ -518,7 +518,7 @@ impl GitFailure {
 
     /// The failed command, with its raw output, when git ran inside the
     /// sandbox. Not included in `Display`.
-    pub fn output(&self) -> Option<&ExecFailure> {
+    pub fn output(&self) -> Option<&CommandFailure> {
         self.output.as_deref()
     }
 
@@ -645,7 +645,7 @@ pub(crate) fn exec_failure(
     exit_code: Option<i32>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
-) -> ExecFailure {
+) -> CommandFailure {
     let mut result = crate::legacy::exec::ExecResult::new(termination, exit_code, Duration::ZERO);
     result.stdout = stdout;
     result.stderr = stderr;

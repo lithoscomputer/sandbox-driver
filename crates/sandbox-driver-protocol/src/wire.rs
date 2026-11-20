@@ -12,10 +12,10 @@ use std::{error, fmt, io};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use sandbox_driver::legacy::{
-    Action, AuthError, Capability, Error, ErrorReport, ExecFailure, GitFailure, GitFailureKind,
-    ProviderError, ProviderKind, ResourceKind, SandboxState, Termination, TransportError,
+    Action, AuthError, Capability, Error, ErrorReport, GitFailure, GitFailureKind, ProviderError,
+    ProviderKind, ResourceKind, SandboxState, Termination, TransportError,
 };
-use sandbox_driver::{CapturedOutput, ExecOutcome, OutputLoss, legacy};
+use sandbox_driver::{CapturedOutput, CommandFailure, ExecOutcome, OutputLoss, legacy};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -260,10 +260,10 @@ struct GitDetail {
     provider:  Option<ProviderError>,
 }
 
-fn exec_detail(failure: &ExecFailure) -> ExecDetail {
+fn exec_detail(failure: &CommandFailure) -> ExecDetail {
     // This wire has no field for the signal, for output loss, or for bytes
     // left out of a tail. A failure the old API builds has none of them.
-    let ExecFailure {
+    let CommandFailure {
         context,
         outcome:
             ExecOutcome {
@@ -287,14 +287,14 @@ fn exec_detail(failure: &ExecFailure) -> ExecDetail {
     }
 }
 
-fn exec_failure(detail: ExecDetail) -> Option<ExecFailure> {
+fn exec_failure(detail: ExecDetail) -> Option<CommandFailure> {
     let (Ok(stdout), Ok(stderr)) = (
         decode_bytes(&detail.stdout_b64),
         decode_bytes(&detail.stderr_b64),
     ) else {
         return None;
     };
-    Some(ExecFailure {
+    Some(CommandFailure {
         context:     detail.label,
         outcome:     ExecOutcome {
             termination: detail.termination.into(),
