@@ -162,7 +162,7 @@ async fn config_and_spec_schemas_are_separate_and_rejections_precede_create() {
         .expect("spec schema rejects connection key");
     assert!(matches!(error, Error::InvalidSpec { .. }));
     assert!(!error.to_string().contains("secret-spec"));
-    assert_eq!(factory.creates.load(Ordering::SeqCst), 0);
+    assert_eq!(factory.admissions.lock().await.len(), 0);
     catalog
         .builder("test")
         .await
@@ -416,6 +416,77 @@ async fn closed_catalog_does_not_reactivate_even_through_clones_or_builders() {
 }
 
 #[tokio::test]
+async fn the_workload_credential_is_resolved_by_name_and_travels_beside_the_spec() {
+    // The fake pulls no image, so the admission is observed and then refused.
+    let refusal = Error::Unhealthy {
+        message: "observed".into(),
+    };
+    let factory = Arc::new(Factory {
+        capabilities: CapabilitySet {
+            image_credentials: true,
+            services: true,
+            ..CapabilitySet::default()
+        },
+        create_error: Some(refusal.clone()),
+        ..Factory::default()
+    });
+    let mut spec = SandboxSpec::new(Source::Image("registry.example/private:1".into()));
+    spec.credential = Some("workload-registry".into());
+    let mut service = ServiceSpec::new("registry.example/db:1");
+    service.credential = Some("service-registry".into());
+    spec.services.insert("db".into(), service);
+    let create = async |secrets: Secrets| {
+        Sandboxes::try_new(
+            [(name("entry"), entry())],
+            environments(),
+            &registry(&factory),
+            Arc::new(secrets),
+            options(),
+        )
+        .expect("catalog")
+        .builder("test")
+        .await
+        .expect("builder")
+        .spec(spec.clone())
+        .create()
+        .await
+        .err()
+    };
+
+    let only_the_service = Secrets {
+        values: BTreeMap::from([("service-registry".into(), "svc:secret".into())]),
+        ..Secrets::default()
+    };
+    assert!(matches!(
+        create(only_the_service).await,
+        Some(Error::MissingSecret { name, .. }) if name == "workload-registry"
+    ));
+    assert_eq!(factory.admissions.lock().await.len(), 0);
+
+    let both = Secrets {
+        values: BTreeMap::from([
+            ("workload-registry".into(), "user:secret".into()),
+            ("service-registry".into(), "svc:secret".into()),
+        ]),
+        ..Secrets::default()
+    };
+    assert_eq!(create(both).await, Some(refusal));
+    let admissions = factory.admissions.lock().await;
+    assert_eq!(admissions.len(), 1);
+    assert_eq!(
+        admissions[0].credentials.values(),
+        &BTreeMap::from([
+            ("service-registry".to_owned(), "svc:secret".to_owned()),
+            ("workload-registry".to_owned(), "user:secret".to_owned()),
+        ])
+    );
+    assert_eq!(
+        admissions[0].spec.credential.as_deref(),
+        Some("workload-registry")
+    );
+}
+
+#[tokio::test]
 async fn uncertain_create_is_not_replayed() {
     let factory = Arc::new(Factory {
         create_error: Some(Error::Transport {
@@ -437,7 +508,7 @@ async fn uncertain_create_is_not_replayed() {
             ..
         })
     ));
-    assert_eq!(factory.creates.load(Ordering::SeqCst), 1);
+    assert_eq!(factory.admissions.lock().await.len(), 1);
     assert_eq!(factory.activations.lock().await.len(), 1);
 }
 

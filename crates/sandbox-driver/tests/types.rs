@@ -322,6 +322,7 @@ fn portable_validation_rejects_unsafe_or_empty_requests() {
         json!({"source": {"image": "ubuntu:24.04"}, "services": {"DB": {"image": "redis"}, "db": {"image": "redis"}}}),
         json!({"source": {"image": "ubuntu:24.04"}, "name": ""}),
         json!({"source": {"image": "ubuntu:24.04"}, "user": ""}),
+        json!({"source": {"image": "ubuntu:24.04"}, "credential": ""}),
         json!({"source": {"image": "ubuntu:24.04"}, "env": {"": "value"}}),
         json!({"source": {"image": "ubuntu:24.04"}, "env": {"A=B": "value"}}),
         json!({"source": {"image": "ubuntu:24.04"}, "env": {"A\u{0}": "value"}}),

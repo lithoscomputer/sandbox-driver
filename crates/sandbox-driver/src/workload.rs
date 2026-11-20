@@ -283,6 +283,11 @@ pub struct SandboxSpec {
     pub workspace_ownership: Option<WorkspaceOwnership>,
     #[serde(default)]
     pub user:                Option<String>,
+    /// Names the secret holding the registry credential for the workload's
+    /// own image, as [`ServiceSpec::credential`] does for a service's. The
+    /// catalog resolves it at admission; the value is never part of the spec.
+    #[serde(default)]
+    pub credential:          Option<String>,
     #[serde(default)]
     pub services:            BTreeMap<String, ServiceSpec>,
     #[serde(default)]
@@ -304,6 +309,7 @@ impl SandboxSpec {
             working_directory: None,
             workspace_ownership: None,
             user: None,
+            credential: None,
             services: BTreeMap::new(),
             container: None,
             provider_config: BTreeMap::new(),
@@ -324,6 +330,7 @@ impl SandboxSpec {
             ("name", &self.name),
             ("user", &self.user),
             ("working_directory", &self.working_directory),
+            ("credential", &self.credential),
         ] {
             if value.as_deref() == Some("") {
                 return Err(Error::invalid_spec(path, "must not be empty"));
@@ -415,6 +422,7 @@ impl fmt::Debug for SandboxSpec {
             working_directory,
             workspace_ownership,
             user,
+            credential,
             services,
             container,
             provider_config: _,
@@ -430,6 +438,7 @@ impl fmt::Debug for SandboxSpec {
             .field("working_directory", working_directory)
             .field("workspace_ownership", workspace_ownership)
             .field("user", user)
+            .field("credential", credential)
             .field("services", services)
             .field("container", container)
             .field("provider_config", &"<redacted>")

@@ -99,9 +99,11 @@ unsupported dialects and must not fetch external references implicitly.
 Schema discovery and validation are not implemented by deserializing these DTOs.
 
 Secret references never contain credential values. Entry secrets are resolved
-at entry activation through the application's resolver. Service `credential`
-names use that same explicitly supplied credential store, resolved by the driver
-at workload admission. Runtime secrets must not appear in descriptors, saved
+at entry activation through the application's resolver. The workload's own
+`credential` name and each service's use that same explicitly supplied
+credential store, resolved by the driver at workload admission. A workload
+`credential` is refused as `Unsupported` unless the descriptor sets
+`capabilities.image_credentials`. Runtime secrets must not appear in descriptors, saved
 specs, or errors. Provider config, explicit environment, and arguments may
 contain sensitive values; their `Debug` output is redacted.
 

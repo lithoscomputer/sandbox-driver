@@ -743,9 +743,15 @@ impl SandboxBuilder {
             .provider
             .resolve_secrets(
                 self.spec
-                    .services
-                    .values()
-                    .filter_map(|service| service.credential.clone())
+                    .credential
+                    .iter()
+                    .chain(
+                        self.spec
+                            .services
+                            .values()
+                            .filter_map(|service| service.credential.as_ref()),
+                    )
+                    .cloned()
                     .collect::<Vec<_>>(),
             )
             .await?;

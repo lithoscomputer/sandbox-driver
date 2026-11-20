@@ -5,7 +5,7 @@ stdout = """
 provider: host
 plugin: host 0.1.0
 access: owner_process
-capabilities: {"container_fields":[],"containers":false,"endpoints":[],"services":false,"timers":[]}
+capabilities: {"container_fields":[],"containers":false,"endpoints":[],"image_credentials":false,"services":false,"timers":[]}
 durability: process
 isolation: none
 locality: {"host_address":"127.0.0.1","mounts_host_paths":true}

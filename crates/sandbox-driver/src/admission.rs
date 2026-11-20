@@ -26,6 +26,10 @@ impl SandboxSpec {
             require(capabilities.timers.contains(&capability), field)?;
         }
         require(
+            self.credential.is_none() || capabilities.image_credentials,
+            "credential",
+        )?;
+        require(
             self.services.is_empty() || capabilities.services,
             "services",
         )?;

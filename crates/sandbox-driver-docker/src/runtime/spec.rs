@@ -99,6 +99,11 @@ pub(crate) fn plan(
     if spec.workspace_ownership.is_some() {
         return Err(unsupported("workspace_ownership"));
     }
+    // Refused by name until Docker pulls the workload image with it; this
+    // plan does not consult the descriptor, so nothing else would refuse it.
+    if spec.credential.is_some() {
+        return Err(unsupported("credential"));
+    }
     // Refused by name until Docker honours the portable field; until then
     // `provider_config.platform` is how a caller chooses a platform here.
     if spec
@@ -481,6 +486,9 @@ mod tests {
         assert_eq!(refused(spec), Some(unsupported("network")));
         let spec = SandboxSpec::new(Source::Dockerfile("FROM alpine".to_owned()));
         assert_eq!(refused(spec), Some(unsupported("source")));
+        let mut spec = image();
+        spec.credential = Some("registry".to_owned());
+        assert_eq!(refused(spec), Some(unsupported("credential")));
         let mut spec = image();
         spec.container = Some(ContainerSpec {
             platform: Some("linux/amd64".to_owned()),
