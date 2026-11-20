@@ -5,7 +5,7 @@ use std::fmt::Display;
 use std::time::Duration;
 use std::{fmt, io};
 
-use crate::file_ops::shell_quote;
+use crate::legacy::derived::shell_quote;
 use crate::legacy::error::{Error, GitFailure};
 use crate::legacy::exec::{ExecResult, ExecSpec};
 

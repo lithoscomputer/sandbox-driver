@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use crate::file_ops::shell_quote;
 use crate::id::ServiceId;
+use crate::legacy::derived::shell_quote;
 use crate::legacy::error::{Error, Result};
 use crate::legacy::exec::{Exec, ExecResult, ExecSpec};
 use crate::legacy::service::{ListeningPort, ServiceSpec, ServiceStatus, Services};

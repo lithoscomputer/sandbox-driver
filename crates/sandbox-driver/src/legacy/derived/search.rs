@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use globset::GlobBuilder;
 use tokio::sync::OnceCell;
 
-use crate::file_ops::shell_quote;
+use crate::legacy::derived::shell_quote;
 use crate::legacy::error::{Error, Result};
 use crate::legacy::exec::{Exec, ExecResult, ExecSpec, Termination};
 use crate::legacy::search::{GrepMatch, GrepOptions, Search, WalkOptions, WalkedFile};
