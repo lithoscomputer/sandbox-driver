@@ -26,6 +26,10 @@ impl SandboxSpec {
             require(capabilities.timers.contains(&capability), field)?;
         }
         require(
+            self.host_workspace.is_none() || descriptor.locality.mounts_host_paths,
+            "host_workspace",
+        )?;
+        require(
             self.credential.is_none() || capabilities.image_credentials,
             "credential",
         )?;

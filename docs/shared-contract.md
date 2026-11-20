@@ -287,6 +287,8 @@ a run record can display history but is not a live sandbox handle. Shared access
 would require a separately designed coordinator and conformance evidence.
 
 A designated workspace remains caller-owned and is never removed by destroy.
+The same holds for a `host_workspace`, the host directory a container provider
+with `locality.mounts_host_paths` mounts at the workload's `working_directory`.
 A managed workspace is provider-owned and removed on confirmed destroy.
 Designated path defaults to designated ownership; no path defaults to a managed
 temporary directory. Explicit managed ownership transfers deletion rights.

@@ -281,6 +281,14 @@ pub struct SandboxSpec {
     pub working_directory:   Option<String>,
     #[serde(default)]
     pub workspace_ownership: Option<WorkspaceOwnership>,
+    /// A directory on the provider's host, mounted read-write at
+    /// `working_directory` as the workload's workspace. Only a provider
+    /// whose descriptor reports `locality.mounts_host_paths` can take it.
+    /// The directory stays the caller's: destroy never removes it.
+    /// A `host_directory` source already runs in a host directory and names
+    /// it in `working_directory` instead.
+    #[serde(default)]
+    pub host_workspace:      Option<String>,
     #[serde(default)]
     pub user:                Option<String>,
     /// Names the secret holding the registry credential for the workload's
@@ -308,6 +316,7 @@ impl SandboxSpec {
             env: BTreeMap::new(),
             working_directory: None,
             workspace_ownership: None,
+            host_workspace: None,
             user: None,
             credential: None,
             services: BTreeMap::new(),
@@ -350,6 +359,21 @@ impl SandboxSpec {
                 "working_directory",
                 "designated workspace requires a path",
             ));
+        }
+        if let Some(host_workspace) = &self.host_workspace {
+            validate_name("host_workspace", host_workspace)?;
+            if self.source == Source::HostDirectory {
+                return Err(Error::invalid_spec(
+                    "host_workspace",
+                    "a host_directory source names its directory in working_directory",
+                ));
+            }
+            if self.working_directory.is_none() {
+                return Err(Error::invalid_spec(
+                    "working_directory",
+                    "host_workspace requires the path it is mounted at",
+                ));
+            }
         }
         self.network.validate()?;
         if let Some(container) = &self.container {
@@ -421,6 +445,7 @@ impl fmt::Debug for SandboxSpec {
             env,
             working_directory,
             workspace_ownership,
+            host_workspace,
             user,
             credential,
             services,
@@ -437,6 +462,7 @@ impl fmt::Debug for SandboxSpec {
             .field("env_keys", &EnvKeys(env))
             .field("working_directory", working_directory)
             .field("workspace_ownership", workspace_ownership)
+            .field("host_workspace", host_workspace)
             .field("user", user)
             .field("credential", credential)
             .field("services", services)

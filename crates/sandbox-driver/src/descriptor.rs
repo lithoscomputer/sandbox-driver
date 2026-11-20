@@ -104,6 +104,8 @@ pub struct Locality {
     /// Address reachable from the workload, if any; never an outer-runner
     /// target.
     pub host_address:      Option<String>,
+    /// Whether a directory on this machine can be mounted into a workload.
+    /// It gates `SandboxSpec::host_workspace`.
     #[serde(default)]
     pub mounts_host_paths: bool,
 }

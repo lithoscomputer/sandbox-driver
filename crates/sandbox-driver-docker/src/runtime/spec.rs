@@ -104,6 +104,11 @@ pub(crate) fn plan(
     if spec.credential.is_some() {
         return Err(unsupported("credential"));
     }
+    // Refused by name until Docker mounts it. A local daemon's descriptor
+    // already reports `mounts_host_paths`, for `provider_config.binds`.
+    if spec.host_workspace.is_some() {
+        return Err(unsupported("host_workspace"));
+    }
     // Refused by name until Docker honours the portable field; until then
     // `provider_config.platform` is how a caller chooses a platform here.
     if spec
@@ -489,6 +494,10 @@ mod tests {
         let mut spec = image();
         spec.credential = Some("registry".to_owned());
         assert_eq!(refused(spec), Some(unsupported("credential")));
+        let mut spec = image();
+        spec.host_workspace = Some("/srv/checkout".to_owned());
+        spec.working_directory = Some("/workspace".to_owned());
+        assert_eq!(refused(spec), Some(unsupported("host_workspace")));
         let mut spec = image();
         spec.container = Some(ContainerSpec {
             platform: Some("linux/amd64".to_owned()),
