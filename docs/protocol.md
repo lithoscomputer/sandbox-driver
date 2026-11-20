@@ -1129,8 +1129,8 @@ Version 3 carries [the shared contract](shared-contract.md) between a host and
 a configured third-party plugin. The built-in providers (Host, Docker and
 Daytona) are never served over it: their kinds are reserved, and a plugin uses
 another kind. The framing, envelope, data channels and transport budgets of
-sections 2 and 3 are unchanged. Version 2 stays available on both sides until
-its consumers migrate, and a version 3 host never falls back to it.
+sections 2 and 3 are unchanged. Version 2 is unsupported on `main` and is being
+deleted (pin tag `v2` for it), and a version 3 host never falls back to it.
 
 **Host side.** `v3::PluginLoader` is the `ProviderFactory` an
 application passes to `Registry::plugins`. `discover` is section 15.
