@@ -15,5 +15,3 @@ pub use fs::DerivedFs;
 pub use git::DerivedGit;
 pub use search::DerivedSearch;
 pub use service::DerivedServices;
-
-pub(crate) use crate::file_ops::shell_quote;

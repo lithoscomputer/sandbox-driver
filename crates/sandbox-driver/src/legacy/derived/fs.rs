@@ -5,8 +5,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use async_trait::async_trait;
 use tokio::fs as tokio_fs;
 
-use crate::file_ops::parse_kind;
-use crate::legacy::derived::shell_quote;
+use crate::file_ops::{parse_kind, shell_quote};
 use crate::legacy::error::{Error, Result};
 use crate::legacy::exec::{Exec, ExecResult, ExecSpec};
 use crate::legacy::fs::{DirEntry, FileKind, FileMetadata, Filesystem};
