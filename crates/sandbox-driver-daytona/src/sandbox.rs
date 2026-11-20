@@ -10,10 +10,10 @@ use async_trait::async_trait;
 use daytona_api_client::models::UpdateSandboxNetworkSettings;
 use daytona_sdk::DaytonaError;
 use sandbox_driver::legacy::{
-    Action, Capabilities, Capability, Error, EventEmitter, EventSubject, Exec, ExecSpec,
-    Filesystem, ForkOptions, Git, LifecycleTimers, Logs, NetworkPolicy, OneShot, PlatformInfo,
-    PreviewUrls, Pty, Resources, Result, Sandbox, SandboxId, SandboxSnapshotOptions, SandboxState,
-    SandboxStatus, SnapshotId, SnapshotMode, SshAccess, Vnc, WebTerminal,
+    Action, Capabilities, Capability, Error, EventEmitter, EventSubject, Exec, ExecFailure,
+    ExecSpec, Filesystem, ForkOptions, Git, LifecycleTimers, Logs, NetworkPolicy, OneShot,
+    PlatformInfo, PreviewUrls, Pty, Resources, Result, Sandbox, SandboxId, SandboxSnapshotOptions,
+    SandboxState, SandboxStatus, SnapshotId, SnapshotMode, SshAccess, Vnc, WebTerminal,
 };
 use tokio::time;
 
@@ -473,7 +473,16 @@ impl Sandbox for DaytonaSandbox {
     async fn environment(&self) -> Result<BTreeMap<String, String>> {
         let result = self.exec().run(&ExecSpec::new("env").arg("-0")).await?;
         if !result.success() {
-            return Err(result.into_failure("reading sandbox environment").into());
+            return Err(Error::Exec(
+                ExecFailure::new(
+                    "reading sandbox environment",
+                    result.termination,
+                    result.exit_code,
+                    result.stdout,
+                    result.stderr,
+                )
+                .with_duration(result.duration),
+            ));
         }
         let output = String::from_utf8(result.stdout)
             .map_err(|error| Error::invalid_spec("environment", error.to_string()))?;

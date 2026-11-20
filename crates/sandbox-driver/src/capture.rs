@@ -37,15 +37,6 @@ impl CapturedOutput {
         (self.bytes.len() as u64).saturating_add(self.omitted_bytes)
     }
 
-    /// A stream kept whole: `bytes` is everything the command wrote to it.
-    pub fn whole(bytes: Vec<u8>) -> Self {
-        Self {
-            head_bytes: bytes.len(),
-            bytes,
-            omitted_bytes: 0,
-        }
-    }
-
     /// The last `max_bytes` the command wrote to this stream, or fewer when
     /// fewer were kept, with every byte it wrote before them counted as
     /// omitted.
@@ -106,6 +97,11 @@ impl Captured {
         stdout: &[u8],
         stderr: &[u8],
     ) -> Self {
+        let whole = |bytes: &[u8]| CapturedOutput {
+            bytes:         bytes.to_vec(),
+            omitted_bytes: 0,
+            head_bytes:    bytes.len(),
+        };
         Self {
             outcome:  ExecOutcome {
                 termination,
@@ -113,8 +109,8 @@ impl Captured {
                 signal: None,
                 output_loss: super::OutputLoss::default(),
             },
-            stdout:   CapturedOutput::whole(stdout.to_vec()),
-            stderr:   CapturedOutput::whole(stderr.to_vec()),
+            stdout:   whole(stdout),
+            stderr:   whole(stderr),
             duration: Duration::from_millis(1500),
         }
     }
