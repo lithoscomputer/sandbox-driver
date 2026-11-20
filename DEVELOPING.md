@@ -40,7 +40,7 @@ target/debug/lithos-sandbox provider health docker
 target/debug/lithos-sandbox run docker -- uname -a
 ```
 
-Host, Docker and Daytona are linked into the CLI; other providers are
+Host, Docker, Daytona and boxd are linked into the CLI; other providers are
 plugin entries in the catalog. See
 [the CLI guide](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/cli.md).
 
@@ -75,6 +75,15 @@ Review the draft before publishing it.
 The current Host and Docker conformance checks exercise both in-process and
 plugin access. Docker checks need a running daemon. Daytona's live suite
 needs `DAYTONA_API_KEY`.
+
+boxd's routine tests run the shared conformance suite against an in-process
+fake boxd that runs commands on the host. Its live suite, `mise run
+test:live:boxd`, needs `BOXD_API_KEY` and creates machines on that key's
+organization, each with a one-hour delete-after timer; set `BOXD_REGION` to
+run it in a region other than the organization's home. The boxd gRPC client
+is generated, not hand-written: `bin/boxd-api` fetches the API definition
+boxd publishes and regenerates `crates/sandbox-driver-boxd/src/runtime/api`,
+recording the source's SHA-256 in `api/SOURCE`.
 
 The hosted nested Docker gate also needs
 `SANDBOX_DRIVER_DAYTONA_DIND_SNAPSHOT`. Set it to a runner snapshot with

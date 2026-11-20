@@ -1,0 +1,16 @@
+[package]
+name = "boxd-api"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+description = "Generates sandbox-driver-boxd's client for the subset of the boxd API it calls"
+
+# Its own workspace: this tool runs only when the API is regenerated, so
+# its compiler dependencies never reach the provider's build.
+[workspace]
+
+[dependencies]
+prost-types = "0.14"
+protox = "0.10"
+tonic-prost-build = { version = "=0.14.5", default-features = false, features = ["transport"] }

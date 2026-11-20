@@ -20,15 +20,18 @@ futures-util = "0.3"
 globset = "0.4"
 http = "1"
 humantime = "2"
+hyper = { version = "1", default-features = false }
 jsonschema = { version = "=0.42.2", default-features = false }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "webpki-roots"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 nix = { version = "0.30", features = ["signal"] }
+prost = "0.14"
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false }
 reqwest-middleware = "0.5"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 sandbox-driver = { path = "crates/sandbox-driver" }
+sandbox-driver-boxd = { path = "crates/sandbox-driver-boxd" }
 sandbox-driver-daytona-config = { path = "crates/sandbox-driver-daytona-config" }
 sandbox-driver-docker = { path = "crates/sandbox-driver-docker" }
 sandbox-driver-conformance = { path = "crates/sandbox-driver-conformance" }
@@ -43,10 +46,14 @@ tar = "0.4"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "rt", "sync", "time"] }
 tokio-util = "0.7"
+# 0.14.6 and later need Rust 1.88, above this workspace's 1.85.
+tonic = { version = "=0.14.5", default-features = false }
+tonic-prost = "=0.14.5"
 toml = "=0.8.23"
 tracing = "0.1"
 tracing-subscriber = { version = "=0.3.20", features = ["env-filter"] }
 trycmd = "=1.2.1"
+webpki-roots = "1"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
