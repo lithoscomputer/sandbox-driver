@@ -27,7 +27,9 @@ use crate::registry;
 /// Bash sources this file at startup. Dropped from the inherited
 /// environment so a worker's startup file never runs inside a sandboxed
 /// `bash -c`; [`sandbox_driver::legacy::ExecSpec::bash`] blanks it per command.
-const BASH_ENV_VAR: &str = "BASH_ENV";
+/// A value in a command's own env reaches that command and no shell the
+/// driver runs around it.
+pub(crate) const BASH_ENV_VAR: &str = "BASH_ENV";
 
 /// How long the output pipes may stay silent after the process has ended
 /// before the drain gives up, so a backgrounded grandchild holding the
@@ -189,17 +191,18 @@ impl HostExec {
                 .await
                 .map_err(|error| Error::io("recreating managed workspace", error))?;
         }
+        let mut command_env = effective_env(&self.base_env);
+        command_env.extend(env.clone());
         let configure = |command: &mut Command| {
             command.current_dir(self.resolve_dir(working_dir));
-            command.env_clear();
-            command.envs(effective_env(&self.base_env));
-            command.envs(env);
             command
                 .stdin(stdin)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
         };
-        self.groups.spawn(program, args, configure).await
+        self.groups
+            .spawn(program, args, &command_env, configure)
+            .await
     }
 }
 
