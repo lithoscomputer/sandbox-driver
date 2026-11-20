@@ -15,7 +15,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::legacy::capabilities::Capability;
 use crate::legacy::error::{Error, Result};
-use crate::legacy::sanitize::OutputSanitization;
 use crate::redact::EnvKeys;
 pub use crate::{OutputLoss, StopLevel, stop_signal};
 
@@ -128,13 +127,13 @@ pub trait Exec: Send + Sync {
 pub struct ExecSpec {
     /// The executable, resolved through the command's `PATH` when it has
     /// no slash; see the trait-level contract.
-    pub program:             String,
+    pub program:     String,
     /// Arguments after the program, passed unchanged.
-    pub args:                Vec<String>,
+    pub args:        Vec<String>,
     /// `None` waits forever. [`ExecSpec::new`] starts at
     /// [`ExecSpec::DEFAULT_TIMEOUT`]; opt out with
     /// [`ExecSpec::no_timeout`].
-    pub timeout:             Option<Duration>,
+    pub timeout:     Option<Duration>,
     /// How long a stop waits after SIGTERM before SIGKILL. `None`, the
     /// default, keeps stops raw: the timeout and a failing sink kill
     /// outright and a caller's `term` is one signal. With a grace, the
@@ -142,16 +141,12 @@ pub struct ExecSpec {
     /// caller's `term`; the caller's `kill` stays immediate. A provider
     /// that cannot deliver a signal ends the command on the TERM.
     #[serde(default)]
-    pub stop_grace:          Option<Duration>,
-    pub working_dir:         Option<String>,
-    pub env:                 BTreeMap<String, String>,
+    pub stop_grace:  Option<Duration>,
+    pub working_dir: Option<String>,
+    pub env:         BTreeMap<String, String>,
     /// Written to the process then closed for EOF. A broken pipe while
     /// writing (the `head -1` case) is not an error.
-    pub stdin:               Option<Vec<u8>>,
-    /// Output policy for buffered results and streaming sink chunks. PTY
-    /// sessions and [`Exec::spawn_stdio`] remain raw.
-    #[serde(default)]
-    pub output_sanitization: OutputSanitization,
+    pub stdin:       Option<Vec<u8>>,
 }
 
 impl ExecSpec {
@@ -165,14 +160,13 @@ impl ExecSpec {
     /// [`ExecSpec::arg`] or [`ExecSpec::args`].
     pub fn new(program: impl Into<String>) -> Self {
         Self {
-            program:             program.into(),
-            args:                Vec::new(),
-            timeout:             Some(Self::DEFAULT_TIMEOUT),
-            stop_grace:          None,
-            working_dir:         None,
-            env:                 BTreeMap::new(),
-            stdin:               None,
-            output_sanitization: OutputSanitization::Raw,
+            program:     program.into(),
+            args:        Vec::new(),
+            timeout:     Some(Self::DEFAULT_TIMEOUT),
+            stop_grace:  None,
+            working_dir: None,
+            env:         BTreeMap::new(),
+            stdin:       None,
         }
     }
 
@@ -263,12 +257,6 @@ impl ExecSpec {
         self.stdin = Some(bytes);
         self
     }
-
-    #[must_use]
-    pub fn output_sanitization(mut self, policy: OutputSanitization) -> Self {
-        self.output_sanitization = policy;
-        self
-    }
 }
 
 impl fmt::Debug for ExecSpec {
@@ -281,7 +269,6 @@ impl fmt::Debug for ExecSpec {
             .field("working_dir", &self.working_dir)
             .field("env_keys", &EnvKeys(&self.env))
             .field("stdin_bytes", &self.stdin.as_ref().map(Vec::len))
-            .field("output_sanitization", &self.output_sanitization)
             .finish()
     }
 }
@@ -564,8 +551,7 @@ impl ExecResult {
     }
 }
 
-/// Retention accounting for one captured stream. Counts describe bytes after
-/// [`ExecSpec::output_sanitization`] has been applied.
+/// Retention accounting for one captured stream.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 #[serde(default)]

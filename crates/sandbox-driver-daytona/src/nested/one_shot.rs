@@ -296,9 +296,7 @@ impl Action {
                 }) as OutputSink
             });
             let transport_kill = CancellationToken::new();
-            let mut command =
-                DockerCli::command(words(["start", "--attach", &self.name])).no_timeout();
-            command.output_sanitization = self.spec.output_sanitization;
+            let command = DockerCli::command(words(["start", "--attach", &self.name])).no_timeout();
             let mut run = pin!(self.cli.exec.run_streaming(&command, ExecControls {
                 sink,
                 kill: Some(transport_kill.clone()),
