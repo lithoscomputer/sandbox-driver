@@ -206,7 +206,8 @@ network policy, and a console URL when the provider has one; an absent field
 was not reported, not zero.
 
 Container options explicitly cover init, privilege, capability additions/drops,
-DNS, extra hosts, and shared-memory MiB. `None` is unspecified, while
+DNS, extra hosts, shared-memory MiB, and the image platform (such as
+`linux/amd64`). `None` is unspecified, while
 `Some(false)` is an explicit request. Descriptor `container_fields` lists exactly
 which requests are supported, separately from `services` and one-shot
 `containers`. Unsupported requests return `Unsupported` naming the field,

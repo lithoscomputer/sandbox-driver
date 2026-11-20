@@ -408,6 +408,7 @@ impl DockerContractSandbox {
         result: ExecStreamingResult,
         admitted: Option<&str>,
     ) -> Result<ExecOutcome, ContractError> {
+        let output_loss = result.delivery_loss();
         let exec = result.result;
         let mut termination = match exec.termination {
             legacy::Termination::Exited => Termination::Exited,
@@ -432,7 +433,7 @@ impl DockerContractSandbox {
                 .then_some(exec.exit_code)
                 .flatten(),
             signal: exec.signal,
-            output_loss: result.output_loss,
+            output_loss,
         })
     }
 

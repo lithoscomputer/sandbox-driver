@@ -40,6 +40,20 @@ impl ExecSpec {
         }
     }
 
+    /// Runs `script` as Bash source: `bash -c <script>`, with `bash` found on
+    /// the workload's `PATH`. A workload without Bash fails the command; no
+    /// other shell is tried.
+    ///
+    /// The shell is not a login shell and sources no startup file: `env`
+    /// starts with a blank `BASH_ENV`, and the built-in providers keep it
+    /// blank for this argv whatever `env` says later. The script receives no
+    /// positional arguments.
+    pub fn bash(script: impl Into<String>) -> Self {
+        let mut spec = Self::argv(["bash".to_owned(), "-c".to_owned(), script.into()]);
+        spec.env.insert("BASH_ENV".to_owned(), String::new());
+        spec
+    }
+
     pub fn validate(&self) -> Result<(), Error> {
         validate_argv("argv", &self.argv)?;
         if let Some(path) = &self.working_directory {
@@ -161,7 +175,10 @@ pub struct ExecOutcome {
 /// counts what it threw away here. The bytes those records would have
 /// decoded to, and the stream they belonged to, are unknown, so a loss
 /// also sets `CaptureStats::truncated` on both streams. Every other
-/// provider reports zero.
+/// provider reports zero counts.
+///
+/// `truncated` is the loss no count describes: any provider can stop
+/// reading a stream before it ends.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 #[serde(default)]
@@ -170,11 +187,18 @@ pub struct OutputLoss {
     pub dropped_frames: u64,
     /// Encoded bytes those records held, their newline included.
     pub dropped_bytes:  u64,
+    /// The provider stopped reading output before a stream ended, as when a
+    /// process that outlived the command kept it open past the provider's
+    /// bound. How much is missing is unknown. Set only for a command that
+    /// exited on its own: one that was stopped or timed out always leaves
+    /// output unread, and its termination reports that. Additive on the
+    /// wire: an older peer reports `false`.
+    pub truncated:      bool,
 }
 
 impl OutputLoss {
     /// Whether any output was lost.
     pub fn is_lossy(self) -> bool {
-        self.dropped_frames != 0 || self.dropped_bytes != 0
+        self.dropped_frames != 0 || self.dropped_bytes != 0 || self.truncated
     }
 }

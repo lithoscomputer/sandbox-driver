@@ -332,6 +332,7 @@ fn portable_validation_rejects_unsafe_or_empty_requests() {
         json!({"source": {"image": "ubuntu:24.04"}, "container": {"capabilities_drop": [" "]}}),
         json!({"source": {"image": "ubuntu:24.04"}, "container": {"dns": [""]}}),
         json!({"source": {"image": "ubuntu:24.04"}, "container": {"extra_hosts": {"db": ""}}}),
+        json!({"source": {"image": "ubuntu:24.04"}, "container": {"platform": " "}}),
     ] {
         let spec: SandboxSpec = serde_json::from_value(value).expect("raw DTO");
         assert!(matches!(spec.validate(), Err(Error::InvalidSpec { .. })));

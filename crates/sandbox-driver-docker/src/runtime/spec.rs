@@ -104,6 +104,15 @@ pub(crate) fn plan(
     if spec.credential.is_some() {
         return Err(unsupported("credential"));
     }
+    // Refused by name until Docker honours the portable field; until then
+    // `provider_config.platform` is how a caller chooses a platform here.
+    if spec
+        .container
+        .as_ref()
+        .is_some_and(|container| container.platform.is_some())
+    {
+        return Err(unsupported("container.platform"));
+    }
     let network = match &spec.network {
         NetworkPolicy::ProviderDefault => legacy::NetworkPolicy::ProviderDefault,
         NetworkPolicy::AllowAll => legacy::NetworkPolicy::AllowAll,
@@ -365,6 +374,7 @@ mod tests {
             dns:               vec!["1.1.1.1".to_owned()],
             extra_hosts:       BTreeMap::from([("db".to_owned(), "10.0.0.2".to_owned())]),
             shm_size_mb:       NonZeroU64::new(64),
+            platform:          None,
         });
         spec.resources.cpu_cores = NonZeroU32::new(2);
         spec.resources.memory_mb = NonZeroU64::new(512);
@@ -479,6 +489,12 @@ mod tests {
         let mut spec = image();
         spec.credential = Some("registry".to_owned());
         assert_eq!(refused(spec), Some(unsupported("credential")));
+        let mut spec = image();
+        spec.container = Some(ContainerSpec {
+            platform: Some("linux/amd64".to_owned()),
+            ..ContainerSpec::default()
+        });
+        assert_eq!(refused(spec), Some(unsupported("container.platform")));
         let mut spec = image();
         spec.network = NetworkPolicy::Block;
         spec.services
