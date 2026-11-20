@@ -272,6 +272,23 @@ pub struct WalkedFile { pub path: String, pub size: Option<u64> }
 
 `grep_files` runs ripgrep when the workload has `rg`, and GNU or BSD `grep -r` otherwise; BusyBox `grep` is not enough. The pattern is in that tool's default syntax, and ripgrep skips hidden and ignored files. No match is an empty result, and a search that could not run, such as one of a missing path, is `CommandError::Failed`. `max_matches` bounds the total and stops the search at the source. `walk_files` uses `find` (GNU, BSD or BusyBox) and reports sizes only with GNU `find`. A missing base is an empty walk, and so is a base that is a symbolic link or, for a relative base, is reached through one. Each command has a 30-second budget.
 
+Reading a git repository is derived too, for a workload that has Bash and `git`:
+
+```rust
+pub async fn git_log(sandbox: &dyn Sandbox, repo: &str, options: &GitLogOptions) -> Result<Vec<GitCommit>, GitError>;
+pub async fn git_diff_entries(sandbox: &dyn Sandbox, repo: &str, options: &GitDiffOptions) -> Result<Vec<GitDiffEntry>, GitError>;
+pub async fn git_diff_numstat(sandbox: &dyn Sandbox, repo: &str, options: &GitDiffOptions) -> Result<Vec<GitNumstat>, GitError>;
+pub async fn git_diff_patch(sandbox: &dyn Sandbox, repo: &str, options: &GitDiffOptions) -> Result<String, GitError>;
+/// Sizes and contents by full object name, in request order; `None` for an object the repository lacks.
+pub async fn git_blob_sizes(sandbox: &dyn Sandbox, repo: &str, blobs: &[String]) -> Result<Vec<Option<u64>>, GitError>;
+pub async fn git_blobs(sandbox: &dyn Sandbox, repo: &str, blobs: &[String], max_bytes: u64) -> Result<Vec<Option<Vec<u8>>>, GitError>;
+
+pub enum GitError { Sandbox(Error), Failed(Box<GitFailure>), UnexpectedOutput(Box<CommandFailure>) }
+pub struct GitFailure { pub operation: String, pub kind: GitFailureKind, pub command: Option<CommandFailure> }
+```
+
+Every command runs hardened: no hooks, no background maintenance, no fsmonitor, no external diff driver, no terminal prompt and no fetch through a local path. A revision that begins with `-` and a blob that is not a full hex object name are `InvalidSpec` before anything runs. A git that ran and failed is `GitError::Failed` with a `GitFailureKind` read from its output: `ref_not_found`, `auth_rejected`, `remote_unavailable`, `access_denied`, `target_exists`, `git_unavailable` (the shell could not find or run `git`) or `unclassified`. `GitFailure`'s `Display` names the operation and the class only; `display_for_log` adds the output tails, which the caller redacts. `GitFailure::classified` builds the same failure for git that ran outside a sandbox, from `GitFailureKind::from_message`. A diff or log runs for 60 seconds unless its options say otherwise, and a result larger than one command's output keeps (16 MiB) is `UnexpectedOutput`, not a truncated answer.
+
 `Ports` is `expose(port, Expose { signed, ttl }) -> Exposure { url, headers, expires_at }` and `release(port)`. Some providers hold a real local forward until `release`.
 
 ### Errors

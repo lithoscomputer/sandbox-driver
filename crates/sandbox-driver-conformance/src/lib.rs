@@ -10,10 +10,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sandbox_driver::{
-    AccessScope, CommandError, Error, ExecControls, ExecSpec, FileKind, FileRange, GrepMatch,
-    GrepOptions, LabelFilter, MutationOutcome, OutputSink, Sandbox, SandboxRef, SandboxState,
-    Sandboxes, Termination, WalkOptions, create_dir_all, glob_files, grep_files, path_exists,
-    remove_path, rename_path, run_bash, stat_path, walk_files,
+    AccessScope, CommandError, CommandFailure, Error, ExecControls, ExecSpec, FileKind, FileRange,
+    GitChange, GitDiffOptions, GitError, GitFailureKind, GitLogOptions, GitRevisionRange,
+    GrepMatch, GrepOptions, LabelFilter, MutationOutcome, OutputSink, Sandbox, SandboxRef,
+    SandboxState, Sandboxes, Termination, WalkOptions, create_dir_all, git_blob_sizes, git_blobs,
+    git_diff_entries, git_diff_numstat, git_diff_patch, git_log, glob_files, grep_files,
+    path_exists, remove_path, rename_path, run_bash, stat_path, walk_files,
 };
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
@@ -27,6 +29,34 @@ pub mod legacy;
 mod report;
 
 pub use report::{CheckResult, Outcome, Report};
+
+/// Builds a repository of three commits and prints their names, oldest
+/// first. It reads no configuration but its own, so the result does not
+/// depend on the machine.
+const GIT_FIXTURE: &str = r"set -e
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+export GIT_AUTHOR_DATE=2026-01-02T03:04:05+02:00 GIT_COMMITTER_DATE=2026-01-02T03:04:05+02:00
+mkdir -p 'conformance/git repo'
+cd 'conformance/git repo'
+git init -q .
+git config user.name Ada
+git config user.email ada@example.com
+printf 'one\ntwo\n' > kept.txt
+printf 'same\ncontent\n' > 'old name.txt'
+printf 'gone\n' > removed.txt
+git add .
+git commit -q -m first
+git mv 'old name.txt' 'new name.txt'
+git rm -q removed.txt
+printf 'one\n2\nthree\n' > kept.txt
+printf '\000\001\002' > blob.bin
+git add .
+git commit -q -m 'second
+
+body'
+git commit -q --allow-empty -m third
+git rev-parse HEAD~2 HEAD~1 HEAD
+";
 
 /// Every check's sandbox carries this label; the awkward value proves it
 /// round-trips through inventory unchanged.
@@ -53,6 +83,7 @@ pub struct Conformance {
     commands:    Commands,
     bash:        bool,
     search:      bool,
+    git:         bool,
     pub timeout: Duration,
 }
 
@@ -64,6 +95,7 @@ enum Scenario<'a> {
     Bash,
     DerivedFiles,
     DerivedSearch,
+    DerivedGit,
     /// Stops the sandbox through a handle attached from this catalog.
     Fence(&'a Sandboxes),
 }
@@ -75,6 +107,18 @@ impl From<CommandError> for Verdict {
         Self::Failed(match error.failure() {
             Some(failure) => failure.display_for_log(),
             None => error.to_string(),
+        })
+    }
+}
+
+impl From<GitError> for Verdict {
+    fn from(error: GitError) -> Self {
+        // As for a command: the log form includes git's output.
+        Self::Failed(match &error {
+            GitError::Failed(failure) => failure.display_for_log(),
+            _ => error
+                .command()
+                .map_or_else(|| error.to_string(), CommandFailure::display_for_log),
         })
     }
 }
@@ -94,6 +138,7 @@ impl Conformance {
             commands,
             bash: false,
             search: false,
+            git: false,
             timeout: Duration::from_secs(30),
         }
     }
@@ -127,6 +172,15 @@ impl Conformance {
         self
     }
 
+    /// Declares that the environment's workload provides Bash and
+    /// `git`, which adds a check of the git reading the library derives
+    /// over exec.
+    #[must_use]
+    pub fn with_git(mut self) -> Self {
+        self.git = true;
+        self
+    }
+
     /// Creates one sandbox per check, then attempts bounded cleanup even after
     /// a check fails or times out; a cleanup failure fails its check. Unknown
     /// create outcomes have no guessed ID; providers/applications must
@@ -144,6 +198,9 @@ impl Conformance {
         }
         if self.search {
             scenarios.push(("derived_search", Scenario::DerivedSearch));
+        }
+        if self.git {
+            scenarios.push(("derived_git", Scenario::DerivedGit));
         }
         if let Some(peer) = &self.peer {
             scenarios.push(("cross_instance_stop_fence", Scenario::Fence(peer)));
@@ -168,6 +225,7 @@ impl Conformance {
                     Scenario::Bash => Self::bash(sandbox).await,
                     Scenario::DerivedFiles => Self::derived_files(sandbox).await,
                     Scenario::DerivedSearch => Self::derived_search(sandbox).await,
+                    Scenario::DerivedGit => Self::derived_git(sandbox).await,
                     Scenario::Fence(catalog) => self.fence_with(sandbox, catalog).await,
                 }
             };
@@ -324,6 +382,141 @@ impl Conformance {
         require(
             captured.stderr.bytes == b"to stderr",
             "bash stderr differed",
+        )
+    }
+    async fn derived_git(sandbox: &dyn Sandbox) -> CheckOutcome {
+        let repo = "conformance/git repo";
+        let built = run_bash(sandbox, GIT_FIXTURE).await?;
+        require(
+            built.success(),
+            &format!(
+                "the workload could not build a repository: {}",
+                String::from_utf8_lossy(&built.stderr.bytes)
+            ),
+        )?;
+        let revisions = String::from_utf8_lossy(&built.stdout.bytes);
+        let revisions: Vec<&str> = revisions.lines().collect();
+        let &[first, second, third] = revisions.as_slice() else {
+            return fail(format!("the fixture printed {revisions:?}"));
+        };
+
+        let range = || GitRevisionRange::new(first).to(third);
+        let to_head = GitLogOptions::new(GitRevisionRange::new(first));
+        let log = git_log(sandbox, repo, &to_head).await?;
+        let shas: Vec<&str> = log.iter().map(|commit| commit.sha.as_str()).collect();
+        require(
+            shas == [third, second],
+            &format!("log to HEAD returned {shas:?}"),
+        )?;
+        let commit = &log[1];
+        let when = "2026-01-02T03:04:05+02:00";
+        require(
+            commit.parents == [first]
+                && commit.message == "second\n\nbody"
+                && commit.author.name == "Ada"
+                && commit.author.email == "ada@example.com"
+                && commit.author.date == when
+                && commit.committer.date == when
+                && commit.tree.len() == first.len(),
+            &format!("log returned {commit:?}"),
+        )?;
+        // `--max-count` picks the newest commit before `--reverse` orders.
+        let one = GitLogOptions::new(range()).reverse().max_count(1);
+        let log = git_log(sandbox, repo, &one).await?;
+        let shas: Vec<&str> = log.iter().map(|commit| commit.sha.as_str()).collect();
+        require(shas == [third], &format!("a log of one returned {shas:?}"))?;
+
+        let options = GitDiffOptions::new(range()).find_renames(50);
+        let mut entries = git_diff_entries(sandbox, repo, &options).await?;
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        let changes: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.change, entry.old_path.as_deref()))
+            .collect();
+        let expected = [
+            ("blob.bin", GitChange::Added, None),
+            ("kept.txt", GitChange::Modified, None),
+            ("new name.txt", GitChange::Renamed, Some("old name.txt")),
+            ("removed.txt", GitChange::Deleted, None),
+        ];
+        require(
+            changes == expected,
+            &format!("diff entries were {changes:?}, expected {expected:?}"),
+        )?;
+        require(
+            entries[0].old_blob.is_none()
+                && entries[3].new_blob.is_none()
+                && entries[2].similarity == Some(100)
+                && entries[1].new_mode.as_deref() == Some("100644"),
+            &format!("diff entries carried the wrong sides: {entries:?}"),
+        )?;
+
+        let mut numstat = git_diff_numstat(sandbox, repo, &options).await?;
+        numstat.sort_by(|left, right| left.path.cmp(&right.path));
+        let counts: Vec<_> = numstat
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.additions, entry.deletions))
+            .collect();
+        let expected = [
+            ("blob.bin", None, None),
+            ("kept.txt", Some(2), Some(1)),
+            ("new name.txt", Some(0), Some(0)),
+            ("removed.txt", Some(0), Some(1)),
+        ];
+        require(
+            counts == expected,
+            &format!("numstat was {counts:?}, expected {expected:?}"),
+        )?;
+        let patch = git_diff_patch(sandbox, repo, &options).await?;
+        require(
+            patch.starts_with("diff --git ") && patch.contains("\n-two\n+2\n+three\n"),
+            &format!("the patch was {patch:?}"),
+        )?;
+
+        let (Some(binary), Some(text)) = (entries[0].new_blob.clone(), entries[1].new_blob.clone())
+        else {
+            return fail("diff entries named no new blobs");
+        };
+        let blobs = [text, "0123456789".repeat(4), binary];
+        let sizes = git_blob_sizes(sandbox, repo, &blobs).await?;
+        require(
+            sizes == [Some(12), None, Some(3)],
+            &format!("blob sizes were {sizes:?}"),
+        )?;
+        for (max_bytes, text) in [(12, Some(b"one\n2\nthree\n".to_vec())), (11, None)] {
+            let contents = git_blobs(sandbox, repo, &blobs, max_bytes).await?;
+            require(
+                contents == [text, None, Some(vec![0, 1, 2])],
+                &format!("blobs capped at {max_bytes} bytes were {contents:?}"),
+            )?;
+        }
+
+        // A failure says why, and a request git could misread never runs.
+        let unknown = GitDiffOptions::new(GitRevisionRange::new("no-such-revision"));
+        let failed = git_diff_entries(sandbox, repo, &unknown).await;
+        require(
+            failed.as_ref().is_err_and(|error| {
+                error.kind() == Some(GitFailureKind::RefNotFound) && error.command().is_some()
+            }),
+            &format!("a diff from an unknown revision returned {failed:?}"),
+        )?;
+        let failed = git_log(sandbox, "conformance/absent", &GitLogOptions::new(range())).await;
+        require(
+            failed
+                .as_ref()
+                .is_err_and(|error| error.kind() == Some(GitFailureKind::Unclassified)),
+            &format!("a log of a missing repository returned {failed:?}"),
+        )?;
+        let refused = GitDiffOptions::new(GitRevisionRange::new("--output=conformance/written"));
+        require(
+            matches!(
+                git_diff_patch(sandbox, repo, &refused).await,
+                Err(GitError::Sandbox(Error::InvalidSpec { .. }))
+            ) && matches!(
+                git_blobs(sandbox, repo, &["HEAD".to_owned()], 1).await,
+                Err(GitError::Sandbox(Error::InvalidSpec { .. }))
+            ),
+            "an option-shaped revision or a short object name was not InvalidSpec",
         )
     }
     async fn derived_search(sandbox: &dyn Sandbox) -> CheckOutcome {
