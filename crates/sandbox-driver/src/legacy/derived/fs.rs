@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use tokio::fs as tokio_fs;
 
 use crate::legacy::derived::shell_quote;
-use crate::legacy::error::{Error, Result};
+use crate::legacy::error::{Error, ExecFailure, Result};
 use crate::legacy::exec::{Exec, ExecResult, ExecSpec};
 use crate::legacy::fs::{DirEntry, FileKind, FileMetadata, Filesystem};
 
@@ -44,7 +44,16 @@ impl DerivedFs {
         if result.success() {
             return Ok(result);
         }
-        Err(result.into_failure(label).into())
+        Err(Error::Exec(
+            ExecFailure::new(
+                label,
+                result.termination,
+                result.exit_code,
+                result.stdout,
+                result.stderr,
+            )
+            .with_duration(result.duration),
+        ))
     }
 }
 

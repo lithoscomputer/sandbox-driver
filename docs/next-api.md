@@ -226,7 +226,7 @@ pub enum CommandError {
 }
 pub struct CommandFailure {
     pub context: String, pub outcome: ExecOutcome,
-    pub stdout_tail: CapturedOutput, pub stderr_tail: CapturedOutput, pub duration: Option<Duration>,
+    pub stdout_tail: CapturedOutput, pub stderr_tail: CapturedOutput, pub duration: Duration,
 }
 ```
 
