@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sandbox_driver::{
-    AccessScope, Error, ExecControls, ExecSpec, FileRange, LabelFilter, MutationOutcome,
-    OutputSink, Sandbox, SandboxRef, SandboxState, Sandboxes, Termination, run_bash,
+    AccessScope, CommandError, Error, ExecControls, ExecSpec, FileKind, FileRange, LabelFilter,
+    MutationOutcome, OutputSink, Sandbox, SandboxRef, SandboxState, Sandboxes, Termination,
+    create_dir_all, path_exists, remove_path, rename_path, run_bash, stat_path,
 };
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
@@ -59,8 +60,20 @@ enum Scenario<'a> {
     Files,
     Exec,
     Bash,
+    DerivedFiles,
     /// Stops the sandbox through a handle attached from this catalog.
     Fence(&'a Sandboxes),
+}
+
+impl From<CommandError> for Verdict {
+    fn from(error: CommandError) -> Self {
+        // The log form includes the command's output; a conformance run
+        // holds no credentials.
+        Self::Failed(match error.failure() {
+            Some(failure) => failure.display_for_log(),
+            None => error.to_string(),
+        })
+    }
 }
 
 impl From<Error> for Verdict {
@@ -88,10 +101,12 @@ impl Conformance {
         self
     }
 
-    /// Declares that the environment's workload provides Bash, which adds a
-    /// check that the provider carries a Bash spec's argv intact, keeps
-    /// stdout and stderr apart, and reports the script's exit code. The exec
-    /// contract itself assumes no shell, so the check is opt-in.
+    /// Declares that the environment's workload provides Bash with `stat`,
+    /// `mv`, `rm`, `rmdir`, `mkdir` and `ln`. It adds a check that the
+    /// provider carries a Bash spec's argv intact, keeps stdout and stderr
+    /// apart, and reports the script's exit code, and a check of the file
+    /// operations the library derives over exec. The exec contract itself
+    /// assumes no shell, so the checks are opt-in.
     #[must_use]
     pub fn with_bash(mut self) -> Self {
         self.bash = true;
@@ -111,6 +126,7 @@ impl Conformance {
         ];
         if self.bash {
             scenarios.push(("captured_bash", Scenario::Bash));
+            scenarios.push(("derived_files", Scenario::DerivedFiles));
         }
         if let Some(peer) = &self.peer {
             scenarios.push(("cross_instance_stop_fence", Scenario::Fence(peer)));
@@ -133,6 +149,7 @@ impl Conformance {
                     Scenario::Files => Self::files(sandbox).await,
                     Scenario::Exec => self.exec(sandbox).await,
                     Scenario::Bash => Self::bash(sandbox).await,
+                    Scenario::DerivedFiles => Self::derived_files(sandbox).await,
                     Scenario::Fence(catalog) => self.fence_with(sandbox, catalog).await,
                 }
             };
@@ -291,6 +308,94 @@ impl Conformance {
             "bash stderr differed",
         )
     }
+    async fn derived_files(sandbox: &dyn Sandbox) -> CheckOutcome {
+        // A quote, a space, a leading dash and a substitution: each must
+        // reach the workload as part of one path.
+        let dir = "conformance/derived/it's -a $(dir)";
+        let file = format!("{dir}/data.bin");
+        let moved = format!("{dir}/moved.bin");
+        let link = format!("{dir}/link");
+
+        create_dir_all(sandbox, dir).await?;
+        create_dir_all(sandbox, dir).await?;
+        require(
+            stat_path(sandbox, dir).await?.kind == FileKind::Directory,
+            "a created directory was not a directory",
+        )?;
+        require(
+            !path_exists(sandbox, &file).await?,
+            "a file existed before it was written",
+        )?;
+        require(
+            is_not_found(&stat_path(sandbox, &file).await),
+            "stat of a missing path was not NotFound",
+        )?;
+
+        sandbox
+            .files()
+            .put(&file, Box::pin(Cursor::new(b"12345".to_vec())))
+            .await?;
+        let stat = stat_path(sandbox, &file).await?;
+        require(
+            stat.kind == FileKind::File && stat.size == 5,
+            "stat did not report a five-byte file",
+        )?;
+        // Which time a provider gives a file it writes is its own business;
+        // Docker's is the epoch.
+        require(
+            stat.mode.is_some() && stat.modified_at_ms.is_some(),
+            "stat did not report a mode and a modification time",
+        )?;
+
+        rename_path(sandbox, &file, &moved).await?;
+        require(
+            !path_exists(sandbox, &file).await? && path_exists(sandbox, &moved).await?,
+            "rename did not move the file",
+        )?;
+        require(
+            is_not_found(&rename_path(sandbox, &file, &moved).await),
+            "rename of a missing path was not NotFound",
+        )?;
+
+        // A link to a directory is described and removed as the link.
+        let linked = run_bash(
+            sandbox,
+            r#"cd "conformance/derived/it's -a \$(dir)" && ln -s . link"#,
+        )
+        .await?;
+        require(linked.success(), "the workload could not create a link")?;
+        require(
+            stat_path(sandbox, &link).await?.kind == FileKind::Symlink,
+            "stat followed a symbolic link",
+        )?;
+        remove_path(sandbox, &link, false).await?;
+        require(
+            !path_exists(sandbox, &link).await? && path_exists(sandbox, &moved).await?,
+            "removing a link did not remove only the link",
+        )?;
+
+        require(
+            matches!(
+                remove_path(sandbox, dir, false).await,
+                Err(CommandError::Failed(_))
+            ),
+            "a directory with a file in it was removed without recursive",
+        )?;
+        remove_path(sandbox, &moved, false).await?;
+        remove_path(sandbox, &moved, false).await?;
+        remove_path(sandbox, dir, false).await?;
+        require(
+            !path_exists(sandbox, dir).await?,
+            "an empty directory was not removed",
+        )?;
+
+        create_dir_all(sandbox, &format!("{dir}/a/b")).await?;
+        remove_path(sandbox, "conformance/derived", true).await?;
+        require(
+            !path_exists(sandbox, "conformance/derived").await?,
+            "a recursive remove left the directory",
+        )
+    }
     async fn fence_with(&self, sandbox: &dyn Sandbox, catalog: &Sandboxes) -> CheckOutcome {
         let reference = sandbox.reference();
         let attached = match catalog.attach(&reference).await {
@@ -361,6 +466,9 @@ async fn read(
         .await
         .map_err(|error| format!("reading {path} failed: {error}"))?;
     Ok(bytes)
+}
+fn is_not_found<T>(result: &Result<T, CommandError>) -> bool {
+    matches!(result, Err(CommandError::Sandbox(Error::NotFound { .. })))
 }
 fn require(condition: bool, message: &str) -> CheckOutcome {
     if condition { Ok(()) } else { fail(message) }

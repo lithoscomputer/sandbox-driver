@@ -16,6 +16,7 @@ mod descriptor;
 mod error;
 mod execution;
 mod failure;
+mod file_ops;
 mod id;
 mod identity;
 #[doc(hidden)]
@@ -53,6 +54,7 @@ pub use execution::{
     TerminalSize, Termination, stop_signal,
 };
 pub use failure::{CommandError, CommandFailure};
+pub use file_ops::{FileStat, create_dir_all, path_exists, remove_path, rename_path, stat_path};
 pub use id::{
     EnvironmentName, InvalidIdError, NamespaceId, ProviderKind, ProviderName, SandboxId,
     Sha256Digest, SnapshotId,
