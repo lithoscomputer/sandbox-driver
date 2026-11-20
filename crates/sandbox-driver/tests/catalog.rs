@@ -3,6 +3,7 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -348,6 +349,58 @@ async fn duplicate_and_foreign_inventory_results_have_explicit_failure_semantics
 }
 
 #[tokio::test]
+async fn an_entry_lists_its_own_sandboxes_without_starting_other_entries() {
+    let factory = Arc::new(Factory::default());
+    let catalog = catalog_with(
+        &factory,
+        [(name("entry"), entry()), (name("other"), entry())],
+        options(),
+    );
+    let mut created = Vec::new();
+    for job in ["a", "b", "a"] {
+        let sandbox = catalog
+            .builder("test")
+            .await
+            .expect("builder")
+            .label("job", job)
+            .create()
+            .await
+            .expect("create");
+        created.push(sandbox.reference());
+    }
+    let provider = catalog.provider("entry").expect("entry");
+    let listed = provider
+        .list(&LabelFilter::eq("job", "a"))
+        .await
+        .expect("list");
+    let references: Vec<_> = listed
+        .into_iter()
+        .map(|summary| summary.reference)
+        .collect();
+    assert_eq!(references, [created[0].clone(), created[2].clone()]);
+    assert_eq!(factory.activations.lock().await.len(), 1);
+
+    let mut foreign = SandboxSummary {
+        reference: created[1].clone(),
+        name:      None,
+        state:     SandboxState::Running,
+        labels:    BTreeMap::new(),
+    };
+    foreign.reference.namespace = NamespaceId::try_new("elsewhere").expect("namespace");
+    *factory.list_results.lock().await = Some(Ok(vec![foreign]));
+    assert!(matches!(
+        provider.list(&LabelFilter::default()).await,
+        Err(Error::Transport { .. })
+    ));
+
+    catalog.shutdown().await.expect("shutdown");
+    assert!(matches!(
+        provider.list(&LabelFilter::default()).await,
+        Err(Error::Stale { .. })
+    ));
+}
+
+#[tokio::test]
 async fn closed_catalog_does_not_reactivate_even_through_clones_or_builders() {
     let factory = Arc::new(Factory::default());
     let catalog = catalog(&factory);
@@ -666,4 +719,62 @@ async fn explicit_plugin_trust_never_falls_back_to_a_same_kind_builtin() {
         Err(Error::Unavailable { .. })
     ));
     assert_eq!(factory.discovery.load(Ordering::SeqCst), 0);
+}
+
+/// Returns the future unchanged; compiling proves a spawned task or an
+/// `async_trait` method can await it.
+fn spawnable<F: Future + Send>(future: F) -> F {
+    future
+}
+
+#[tokio::test]
+async fn catalog_futures_can_cross_a_spawn_boundary() {
+    let factory = Arc::new(Factory::default());
+    let catalog = catalog(&factory);
+    let provider = catalog.provider("entry").expect("entry");
+    let filter = LabelFilter::default();
+    let spec = SandboxSpec::new(Source::Image("workload".into()));
+    let sandbox = spawnable(
+        spawnable(catalog.builder("test"))
+            .await
+            .expect("builder")
+            .create(),
+    )
+    .await
+    .expect("create");
+    let reference = sandbox.reference();
+    spawnable(catalog.diagnostics()).await.expect("diagnostics");
+    spawnable(catalog.environments())
+        .await
+        .expect("environments");
+    spawnable(catalog.environment("test"))
+        .await
+        .expect("environment");
+    spawnable(provider.describe()).await.expect("describe");
+    spawnable(provider.health()).await.expect("health");
+    spawnable(provider.validate_spec(&spec))
+        .await
+        .expect("validate");
+    spawnable(provider.list(&filter)).await.expect("list");
+    spawnable(catalog.attach(&reference)).await.expect("attach");
+    spawnable(catalog.destroy(&reference))
+        .await
+        .expect("destroy");
+    let found = tokio::spawn({
+        let catalog = catalog.clone();
+        async move { catalog.find(LabelFilter::default()).await }
+    })
+    .await
+    .expect("join")
+    .expect("find");
+    assert!(found.sandboxes.is_empty());
+    let missing = spawnable(Sandboxes::from_config_file(
+        Path::new("/nonexistent/catalog.toml"),
+        &registry(&factory),
+        Arc::new(Secrets::default()),
+        options(),
+    ))
+    .await;
+    assert!(matches!(missing, Err(Error::Unavailable { .. })));
+    spawnable(catalog.shutdown()).await.expect("shutdown");
 }

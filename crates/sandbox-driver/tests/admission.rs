@@ -43,6 +43,10 @@ fn unsupported_requests_are_refused_even_when_false_or_zero() {
             "host_workspace",
             json!({"host_workspace":"/srv/checkout", "working_directory":"/workspace"}),
         ),
+        (
+            "container.platform",
+            json!({"container":{"platform":"linux/amd64"}}),
+        ),
         ("timers.auto_stop_ms", json!({"timers":{"auto_stop_ms":0}})),
         (
             "timers.auto_archive_ms",
@@ -97,14 +101,15 @@ fn the_provider_default_network_needs_no_advertisement() {
 fn advertised_requests_pass_but_invalid_requests_do_not() {
     let mut descriptor = descriptor();
     descriptor.capabilities = serde_json::from_value(json!({
-        "container_fields":["init"], "image_credentials":true, "timers":["auto_stop"]
+        "container_fields":["init", "platform"], "image_credentials":true, "timers":["auto_stop"]
     }))
     .expect("caps");
     descriptor.locality.mounts_host_paths = true;
     let mut spec: SandboxSpec = serde_json::from_value(json!({
         "source":{"image":"test"}, "credential":"registry",
         "host_workspace":"/srv/checkout", "working_directory":"/workspace",
-        "container":{"init":false}, "timers":{"auto_stop_ms":0}
+        "container":{"init":false, "platform":"linux/arm64"},
+        "timers":{"auto_stop_ms":0}
     }))
     .expect("spec");
     spec.validate_for(&descriptor).expect("supported");

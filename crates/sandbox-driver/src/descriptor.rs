@@ -178,6 +178,7 @@ pub enum ContainerField {
     Dns,
     ExtraHosts,
     ShmSizeMb,
+    Platform,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]

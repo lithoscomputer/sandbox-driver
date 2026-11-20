@@ -356,12 +356,19 @@ impl Sandboxes {
     /// separate identities.
     pub async fn find(&self, filter: LabelFilter) -> Result<Found, Error> {
         self.catalog.ensure_open()?;
-        let mut results = stream::iter(self.catalog.entries.values())
+        let timeout = self.catalog.find_timeout;
+        // Each lookup owns its handle and filter and is built before the
+        // stream runs. A closure borrowing them inside `buffer_unordered`
+        // makes this future not `Send` (rust-lang/rust#102211).
+        let lookups: Vec<_> = self
+            .catalog
+            .entries
+            .values()
             .map(|entry| {
                 let handle = self.bind(entry);
-                let filter = &filter;
+                let filter = filter.clone();
                 async move {
-                    let result = time::timeout(self.catalog.find_timeout, handle.list(filter))
+                    let result = time::timeout(timeout, handle.list(&filter))
                         .await
                         .unwrap_or_else(|_| {
                             Err(unavailable(
@@ -372,6 +379,8 @@ impl Sandboxes {
                     (handle.entry.name.clone(), result)
                 }
             })
+            .collect();
+        let mut results = stream::iter(lookups)
             .buffer_unordered(self.catalog.find_concurrency.get())
             .collect::<Vec<_>>()
             .await;
@@ -580,7 +589,13 @@ impl ProviderHandle {
     pub async fn health(&self) -> Result<Health, Error> {
         self.active().await?.runtime.health().await
     }
-    async fn list(&self, filter: &LabelFilter) -> Result<Vec<SandboxSummary>, Error> {
+    /// This entry's sandboxes whose labels match `filter`, sorted by id. It
+    /// runs the checks [`Sandboxes::find`] runs for each entry: every
+    /// reference must name this entry and its current namespace, equal
+    /// repeated references collapse, and conflicting duplicates fail the
+    /// whole list. No deadline is applied here; `find` bounds each entry by
+    /// [`CatalogOptions::find_timeout`].
+    pub async fn list(&self, filter: &LabelFilter) -> Result<Vec<SandboxSummary>, Error> {
         let (active, descriptor) = self.ready().await?;
         let matches = active.runtime.list(filter).await?;
         let mut unique = BTreeMap::new();
