@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::{self, Instant};
 
 use crate::legacy::error::{Error, GitFailureKind};
+use crate::legacy::exec::Termination;
 use crate::legacy::git::GitCredentials;
 
 /// How long after its mint a credential is presumed to still be replicating
@@ -200,7 +201,7 @@ pub fn retry_reason(error: &Error, credentials: Option<&GitCredentials>) -> Opti
         Error::Git(failure) => {
             if failure
                 .output()
-                .is_some_and(|output| output.outcome.termination != crate::Termination::Exited)
+                .is_some_and(|output| output.termination() != Termination::Exited)
             {
                 return None;
             }
@@ -359,13 +360,12 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::legacy::error::{GitFailure, exec_failure};
-    use crate::legacy::exec::Termination;
+    use crate::legacy::error::{ExecFailure, GitFailure};
 
     fn git_failure(stderr: &str) -> Error {
         Error::Git(GitFailure::from_command(
             "git push",
-            exec_failure(
+            ExecFailure::new(
                 "git push",
                 Termination::Exited,
                 Some(128),
@@ -426,7 +426,7 @@ mod tests {
         );
         let timed_out = Error::Git(GitFailure::from_command(
             "git push",
-            exec_failure(
+            ExecFailure::new(
                 "git push",
                 Termination::TimedOut,
                 None,

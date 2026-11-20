@@ -30,9 +30,8 @@ pub struct CommandFailure {
     pub stdout_tail: CapturedOutput,
     /// As `stdout_tail`, for stderr.
     pub stderr_tail: CapturedOutput,
-    /// How long the command ran, when whoever reported the failure measured
-    /// it. [`Self::new`] always has it.
-    pub duration:    Option<Duration>,
+    /// How long the command ran.
+    pub duration:    Duration,
 }
 
 impl CommandFailure {
@@ -44,7 +43,7 @@ impl CommandFailure {
             outcome:     captured.outcome.clone(),
             stdout_tail: captured.stdout.newest(TAIL_BYTES),
             stderr_tail: captured.stderr.newest(TAIL_BYTES),
-            duration:    Some(captured.duration),
+            duration:    captured.duration,
         }
     }
 
@@ -99,9 +98,7 @@ impl fmt::Display for CommandFailure {
             (Termination::Killed, _) => f.write_str("was killed")?,
             (Termination::Lost, _) => f.write_str("ended with an unknown outcome")?,
         }
-        if let Some(duration) = self.duration {
-            write!(f, " after {} ms", duration.as_millis())?;
-        }
+        write!(f, " after {} ms", self.duration.as_millis())?;
         if let Some(hint) = self.hint() {
             write!(f, " — hint: {hint}")?;
         }

@@ -4,10 +4,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{fmt, io};
 
-use crate::CommandFailure;
 use crate::id::ProviderKind;
 use crate::legacy::capabilities::Capability;
 use crate::legacy::event::Action;
+use crate::legacy::exec::Termination;
 use crate::legacy::state::SandboxState;
 
 /// Result alias for this crate's error surface.
@@ -106,7 +106,7 @@ pub enum Error {
     /// A command inside the sandbox failed in a way the caller did not run
     /// it to observe (probe failures, derived-operation failures).
     #[error(transparent)]
-    Exec(Box<CommandFailure>),
+    Exec(#[from] ExecFailure),
 
     /// A git operation failed, classified by what the remote or the
     /// working tree said so callers decide about retries and reporting
@@ -237,10 +237,107 @@ impl AuthError {
     }
 }
 
-// Boxed so that the error stays small on every `Result`.
-impl From<CommandFailure> for Error {
-    fn from(failure: CommandFailure) -> Self {
-        Self::Exec(Box::new(failure))
+/// A failed command execution, with bounded classified metadata in
+/// `Display` and raw output behind explicit accessors so callers control
+/// exposure. Secret redaction is the caller's responsibility.
+#[derive(Debug)]
+pub struct ExecFailure {
+    label:       String,
+    termination: Termination,
+    exit_code:   Option<i32>,
+    stdout:      Vec<u8>,
+    stderr:      Vec<u8>,
+    duration:    Option<Duration>,
+}
+
+impl fmt::Display for ExecFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "command {:?} failed ({:?}, exit code {:?})",
+            self.label, self.termination, self.exit_code
+        )?;
+        if let Some(duration) = self.duration {
+            write!(f, " after {} ms", duration.as_millis())?;
+        }
+        if let Some(hint) = self.hint() {
+            write!(f, " — hint: {hint}")?;
+        }
+        Ok(())
+    }
+}
+
+impl StdError for ExecFailure {}
+
+impl ExecFailure {
+    /// A bounded diagnosis matched from stderr — static text only, so
+    /// the redaction boundary holds: raw output never enters `Display`.
+    /// Only provider-agnostic classes live here; git operations carry
+    /// their classification in [`GitFailure`].
+    fn hint(&self) -> Option<&'static str> {
+        let stderr = String::from_utf8_lossy(&self.stderr).to_ascii_lowercase();
+        if stderr.contains("could not resolve host") || stderr.contains("network is unreachable") {
+            Some("network failure inside the sandbox — check DNS / egress")
+        } else if stderr.contains("not a git repository")
+            || stderr.contains("does not appear to be a git repository")
+        {
+            Some("no git repository at the working directory")
+        } else {
+            None
+        }
+    }
+
+    pub fn new(
+        label: impl Into<String>,
+        termination: Termination,
+        exit_code: Option<i32>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            termination,
+            exit_code,
+            stdout,
+            stderr,
+            duration: None,
+        }
+    }
+
+    /// How long the command ran before failing, when the reporter
+    /// observed it (fabro's exec errors carried this).
+    #[must_use]
+    pub fn with_duration(mut self, duration: Duration) -> Self {
+        self.duration = Some(duration);
+        self
+    }
+
+    pub fn duration(&self) -> Option<Duration> {
+        self.duration
+    }
+
+    /// The label the failure was reported under (e.g. `"bash probe"`).
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn termination(&self) -> Termination {
+        self.termination
+    }
+
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit_code
+    }
+
+    /// Raw captured stdout. Not included in `Display`; the caller decides
+    /// what is safe to expose.
+    pub fn stdout(&self) -> &[u8] {
+        &self.stdout
+    }
+
+    /// Raw captured stderr. Not included in `Display`.
+    pub fn stderr(&self) -> &[u8] {
+        &self.stderr
     }
 }
 
@@ -400,26 +497,26 @@ impl GitFailureKind {
 ///
 /// `Display` carries the operation and the class only; raw output stays
 /// behind [`GitFailure::output`] so the caller controls exposure and
-/// redaction, as with [`CommandFailure`].
+/// redaction, as with [`ExecFailure`].
 #[derive(Debug)]
 pub struct GitFailure {
     operation: String,
     kind:      GitFailureKind,
     // Boxed so the error enum stays small on every `Result`.
-    output:    Option<Box<CommandFailure>>,
+    output:    Option<Box<ExecFailure>>,
     provider:  Option<Box<ProviderError>>,
 }
 
 impl fmt::Display for GitFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let ended_early = self.output.as_ref().and_then(|output| {
-            let how = match output.outcome.termination {
-                crate::Termination::TimedOut => "timed out",
-                crate::Termination::Terminated => "was cancelled",
-                crate::Termination::Killed => "was killed",
-                crate::Termination::Exited | crate::Termination::Lost => return None,
+            let how = match output.termination() {
+                Termination::TimedOut => "timed out",
+                Termination::Cancelled => "was cancelled",
+                Termination::Killed => "was killed",
+                _ => return None,
             };
-            Some((how, output.duration))
+            Some((how, output.duration()))
         });
         match ended_early {
             Some((how, Some(duration))) => {
@@ -434,7 +531,7 @@ impl fmt::Display for GitFailure {
             None => {
                 write!(f, "{} failed: {}", self.operation, self.kind.describe())?;
                 if let Some(output) = &self.output {
-                    write!(f, " (exit code {:?})", output.outcome.exit_code)?;
+                    write!(f, " (exit code {:?})", output.exit_code())?;
                 }
                 Ok(())
             }
@@ -455,10 +552,10 @@ impl GitFailure {
     /// read from its output. Exit codes 127 and 126 are the shell saying
     /// `git` itself could not be found or run, so they classify before
     /// the output is read.
-    pub fn from_command(operation: impl Into<String>, output: CommandFailure) -> Self {
-        let kind = match output.outcome.exit_code {
+    pub fn from_command(operation: impl Into<String>, output: ExecFailure) -> Self {
+        let kind = match output.exit_code() {
             Some(126 | 127) => GitFailureKind::GitUnavailable,
-            _ => GitFailureKind::from_output(&output.stderr_tail.bytes, &output.stdout_tail.bytes),
+            _ => GitFailureKind::from_output(output.stderr(), output.stdout()),
         };
         Self {
             operation: operation.into(),
@@ -502,7 +599,7 @@ impl GitFailure {
 
     /// Attaches the command output a reconstructed failure was read from.
     #[must_use]
-    pub fn with_output(mut self, output: CommandFailure) -> Self {
+    pub fn with_output(mut self, output: ExecFailure) -> Self {
         self.output = Some(Box::new(output));
         self
     }
@@ -518,7 +615,7 @@ impl GitFailure {
 
     /// The failed command, with its raw output, when git ran inside the
     /// sandbox. Not included in `Display`.
-    pub fn output(&self) -> Option<&CommandFailure> {
+    pub fn output(&self) -> Option<&ExecFailure> {
         self.output.as_deref()
     }
 
@@ -637,25 +734,9 @@ impl TransportError {
     }
 }
 
-/// The one fixture for a failed command in the old API's tests.
-#[cfg(test)]
-pub(crate) fn exec_failure(
-    label: &str,
-    termination: crate::legacy::exec::Termination,
-    exit_code: Option<i32>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-) -> CommandFailure {
-    let mut result = crate::legacy::exec::ExecResult::new(termination, exit_code, Duration::ZERO);
-    result.stdout = stdout;
-    result.stderr = stderr;
-    result.into_failure(label)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::legacy::exec::Termination;
 
     #[test]
     fn unsupported_names_the_capability() {
@@ -731,7 +812,7 @@ mod tests {
         for (stderr, expected) in cases {
             let failure = GitFailure::from_command(
                 "git clone",
-                exec_failure(
+                ExecFailure::new(
                     "git clone",
                     Termination::Exited,
                     Some(128),
@@ -752,7 +833,7 @@ mod tests {
     fn git_failures_read_stdout_when_stderr_says_nothing() {
         let failure = GitFailure::from_command(
             "git push",
-            exec_failure(
+            ExecFailure::new(
                 "git push",
                 Termination::Exited,
                 Some(1),
@@ -771,7 +852,7 @@ mod tests {
         ] {
             let failure = GitFailure::from_command(
                 "git clone",
-                exec_failure(
+                ExecFailure::new(
                     "git clone",
                     Termination::Exited,
                     Some(code),
@@ -786,7 +867,7 @@ mod tests {
         // shell's own codes name a missing executable.
         let failure = GitFailure::from_command(
             "git push",
-            exec_failure(
+            ExecFailure::new(
                 "git push",
                 Termination::Exited,
                 Some(128),
@@ -831,5 +912,37 @@ mod tests {
             failure.source().is_some(),
             "the provider failure stays in the chain"
         );
+    }
+
+    #[test]
+    fn exec_failure_display_omits_raw_output() {
+        let failure = ExecFailure::new(
+            "bash probe",
+            Termination::Exited,
+            Some(1),
+            b"secret stdout".to_vec(),
+            b"secret stderr".to_vec(),
+        );
+        let rendered = failure.to_string();
+        assert!(
+            !rendered.contains("secret"),
+            "raw output must stay behind accessors: {rendered}"
+        );
+        assert_eq!(failure.stdout(), b"secret stdout");
+    }
+
+    #[test]
+    fn exec_failure_display_carries_a_static_hint_only() {
+        let failure = ExecFailure::new(
+            "git clone",
+            Termination::Exited,
+            Some(128),
+            Vec::new(),
+            b"fatal: could not resolve host: github.com/secret-org".to_vec(),
+        );
+        let rendered = failure.to_string();
+        assert!(rendered.contains("hint: network failure"), "{rendered}");
+        // The hint is classification, never quoted stderr.
+        assert!(!rendered.contains("secret-org"), "{rendered}");
     }
 }

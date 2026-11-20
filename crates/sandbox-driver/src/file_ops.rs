@@ -134,7 +134,7 @@ pub(super) fn quoted(field: &str, value: &str) -> Result<String, Error> {
 }
 
 /// Quotes a string for safe interpolation into Bash source.
-pub(crate) fn shell_quote(value: &str) -> String {
+pub(super) fn shell_quote(value: &str) -> String {
     let mut quoted = String::with_capacity(value.len() + 2);
     quoted.push('\'');
     for c in value.chars() {
@@ -213,7 +213,7 @@ fn read_stat(path: &str, captured: Captured) -> Result<FileStat, CommandError> {
 
 /// The kind a `stat` type string names. GNU and `BusyBox` print `regular
 /// file` or `regular empty file`; BSD prints `Regular File`.
-pub(crate) fn parse_kind(text: &str) -> FileKind {
+fn parse_kind(text: &str) -> FileKind {
     match text.to_ascii_lowercase().as_str() {
         "regular file" | "regular empty file" => FileKind::File,
         "directory" => FileKind::Directory,
