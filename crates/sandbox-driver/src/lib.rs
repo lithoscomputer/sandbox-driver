@@ -28,6 +28,7 @@ mod identity;
 pub mod legacy;
 mod provider;
 mod redact;
+mod sanitize;
 mod schema;
 mod search;
 mod status;
@@ -72,6 +73,7 @@ pub use provider::{
     Provider, ProviderFactory, Sandbox, SandboxSummary, SecretResolver, SecretValues,
     SshAccessInfo, VncConnection, WorkloadAdmission,
 };
+pub use sanitize::{OutputSanitization, OutputSanitizer};
 pub use search::{
     GrepMatch, GrepOptions, WalkOptions, WalkedFile, glob_files, grep_files, walk_files,
 };

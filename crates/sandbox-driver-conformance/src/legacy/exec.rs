@@ -1,11 +1,9 @@
 //! Buffered exec: exit codes, environment, literal argv, binary-safe
-//! output, sanitization, and stdin.
+//! output, and stdin.
 
-use std::time::Duration;
+use sandbox_driver::legacy::{Capability, ExecSpec, Termination};
 
-use sandbox_driver::legacy::{Capability, ExecControls, ExecSpec, OutputSanitization, Termination};
-
-use crate::check::{COMMAND_TIMEOUT, CheckOutcome, PASS, RecordedOutput, fail, run_ok};
+use crate::check::{COMMAND_TIMEOUT, CheckOutcome, PASS, fail, run_ok};
 use crate::legacy::{Conformance, Provision};
 
 /// A relative exec `working_dir` resolves against the sandbox working
@@ -183,72 +181,6 @@ pub(super) async fn exec_output_is_binary_safe(ctx: &Conformance) -> CheckOutcom
             .map_err(|error| format!("exec failed: {error}"))?;
         if result.stdout != expected {
             return fail(format!("binary output mangled: {:?}", result.stdout));
-        }
-        PASS
-    })
-    .await
-}
-
-pub(super) async fn exec_output_sanitization_is_consistent(ctx: &Conformance) -> CheckOutcome {
-    ctx.with_ready(|sandbox| async move {
-        let command = "printf '\\033[31mred\\033[0m\\007\\001\\n'";
-
-        let raw = sandbox
-            .exec()
-            .run(&ExecSpec::bash(command))
-            .await
-            .map_err(|error| format!("raw exec failed: {error}"))?;
-        if raw.stdout != b"\x1b[31mred\x1b[0m\x07\x01\n" {
-            return fail(format!("raw output changed: {:?}", raw.stdout));
-        }
-
-        let ansi = sandbox
-            .exec()
-            .run(&ExecSpec::bash(command).output_sanitization(OutputSanitization::StripAnsi))
-            .await
-            .map_err(|error| format!("StripAnsi exec failed: {error}"))?;
-        if ansi.stdout != b"red\x07\x01\n" {
-            return fail(format!(
-                "StripAnsi returned wrong output: {:?}",
-                ansi.stdout
-            ));
-        }
-
-        let recorded = RecordedOutput::new();
-        let controls = ExecControls {
-            sink: Some(recorded.sink(Duration::ZERO)),
-            ..ExecControls::buffered()
-        };
-        let spec =
-            ExecSpec::bash("printf '\\033'; sleep 0.05; printf '[31mred\\033[0m\\007\\001\\n'")
-                .output_sanitization(OutputSanitization::StripAll)
-                .timeout(COMMAND_TIMEOUT);
-        let all = sandbox
-            .exec()
-            .run_streaming(&spec, controls)
-            .await
-            .map_err(|error| format!("StripAll streaming exec failed: {error}"))?;
-        if !all.result.success() {
-            return fail(format!(
-                "StripAll streaming command failed: {}",
-                all.result.stderr_lossy()
-            ));
-        }
-        if all.result.stdout != b"red\n" {
-            return fail(format!(
-                "StripAll returned wrong output: {:?}",
-                all.result.stdout
-            ));
-        }
-        let streamed = recorded.bytes();
-        if streamed != b"red\n" {
-            return fail(format!("StripAll sink saw wrong output: {streamed:?}"));
-        }
-        if all.stdout_capture.observed_bytes != b"red\n".len() {
-            return fail(format!(
-                "capture stats counted pre-sanitization bytes: {:?}",
-                all.stdout_capture
-            ));
         }
         PASS
     })

@@ -66,7 +66,6 @@ impl Job {
         args.extend(spec.args.iter().cloned());
         let mut command = DockerCli::command(args).no_timeout();
         command.stdin.clone_from(&spec.stdin);
-        command.output_sanitization = spec.output_sanitization;
         command
     }
 

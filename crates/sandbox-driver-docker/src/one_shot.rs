@@ -417,11 +417,14 @@ impl OneShot for DockerOneShot {
         let image = match self.prepare_image_or_stop(spec, &controls, started).await? {
             Ok(image) => image,
             Err(termination) => {
-                return Ok(StreamOutput::new(
-                    spec.output_sanitization,
-                    controls.retained_output_limit,
-                )
-                .into_result(termination, None, started.elapsed(), false));
+                return Ok(
+                    StreamOutput::new(controls.retained_output_limit).into_result(
+                        termination,
+                        None,
+                        started.elapsed(),
+                        false,
+                    ),
+                );
             }
         };
         // Releasing the fence can fail after the one-shot started; remove it
@@ -465,8 +468,7 @@ impl OneShot for DockerOneShot {
             }
         };
         let container = created.expect("successful admission created a one-shot container");
-        let mut captured =
-            StreamOutput::new(spec.output_sanitization, controls.retained_output_limit);
+        let mut captured = StreamOutput::new(controls.retained_output_limit);
         let outcome = match drain_with_stops(
             &mut captured,
             output,

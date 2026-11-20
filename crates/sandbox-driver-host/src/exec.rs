@@ -11,9 +11,8 @@ use std::{env, future, io};
 use async_trait::async_trait;
 use sandbox_driver::legacy::{
     Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputCaptureBuffer,
-    OutputSanitizer, OutputSink, OutputStream, Result, SpawnSpec, StderrTail, StdioProcess,
-    StdioProcessHandle, Termination, feed_stdin, finish_stdin_writer, run_with_stop_grace,
-    stop_signal,
+    OutputSink, OutputStream, Result, SpawnSpec, StderrTail, StdioProcess, StdioProcessHandle,
+    Termination, feed_stdin, finish_stdin_writer, run_with_stop_grace, stop_signal,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{ChildStderr, ChildStdout, Command};
@@ -213,41 +212,30 @@ enum PumpError {
 /// One output stream's pump: reads the pipe to EOF and delivers each chunk
 /// to the capture buffer and the sink.
 struct OutputPump<'a> {
-    stream:    OutputStream,
-    sanitizer: OutputSanitizer,
-    capture:   &'a mut OutputCaptureBuffer,
-    sink:      Option<&'a OutputSink>,
+    stream:   OutputStream,
+    capture:  &'a mut OutputCaptureBuffer,
+    sink:     Option<&'a OutputSink>,
     /// Counts the chunks read, so the post-exit drain can tell a silent
     /// pipe from a slow consumer.
-    progress:  &'a AtomicU64,
+    progress: &'a AtomicU64,
 }
 
 impl OutputPump<'_> {
-    /// Captures one sanitized chunk and hands it to the sink; the sink
-    /// only sees chunks with bytes in them.
-    async fn deliver(&mut self, chunk: Vec<u8>) -> Result<(), PumpError> {
-        self.capture.push(&chunk);
-        match self.sink {
-            Some(sink) if !chunk.is_empty() => {
-                sink(self.stream, chunk).await.map_err(|_| PumpError::Sink)
-            }
-            _ => Ok(()),
-        }
-    }
-
-    async fn run(mut self, mut reader: impl AsyncRead + Unpin) -> Result<(), PumpError> {
+    async fn run(self, mut reader: impl AsyncRead + Unpin) -> Result<(), PumpError> {
         let mut buffer = [0u8; 8192];
         loop {
             match reader.read(&mut buffer).await {
-                Ok(0) => {
-                    let chunk = self.sanitizer.finish();
-                    return self.deliver(chunk).await;
-                }
+                Ok(0) => return Ok(()),
                 Err(error) => return Err(PumpError::Read(error)),
                 Ok(read) => {
                     self.progress.fetch_add(1, Ordering::Relaxed);
-                    let chunk = self.sanitizer.push(&buffer[..read]);
-                    self.deliver(chunk).await?;
+                    let chunk = &buffer[..read];
+                    self.capture.push(chunk);
+                    if let Some(sink) = self.sink {
+                        sink(self.stream, chunk.to_vec())
+                            .await
+                            .map_err(|_| PumpError::Sink)?;
+                    }
                 }
             }
         }
@@ -404,7 +392,6 @@ impl HostExec {
                 tokio::try_join!(
                     OutputPump {
                         stream: OutputStream::Stdout,
-                        sanitizer: OutputSanitizer::new(spec.output_sanitization),
                         capture: &mut stdout_capture,
                         sink,
                         progress: &progress,
@@ -412,7 +399,6 @@ impl HostExec {
                     .run(stdout),
                     OutputPump {
                         stream: OutputStream::Stderr,
-                        sanitizer: OutputSanitizer::new(spec.output_sanitization),
                         capture: &mut stderr_capture,
                         sink,
                         progress: &progress,

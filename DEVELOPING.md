@@ -103,6 +103,7 @@ update the CLI installation and examples, and recheck provider packaging and
 protocol-version claims. Examples that need a daemon or credentials must use
 `rust,no_run` so they still compile as doctests.
 
-The existing [provider API](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/design.md)
-and [version 2 protocol](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/protocol.md)
-remain the references for current consumers during migration.
+`main` does not support the old [provider API](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/design.md)
+(`sandbox_driver::legacy`) or protocol version 2. They are being deleted as the
+migration goes, and nothing on `main` promises they keep working. Consumers that
+need them pin tag [`v2`](https://github.com/lithoscomputer/sandbox-driver/tree/v2).
