@@ -9,8 +9,8 @@ use daytona_sdk::{DaytonaError, FileSystemService, ProcessService, SessionComman
 use sandbox_driver::legacy;
 use sandbox_driver::legacy::{
     Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, IncompleteOperation,
-    OutputCaptureBuffer, OutputSanitizer, OutputSink, OutputStream, Result, SpawnSpec,
-    StdioProcess, StopLevel, Termination, run_with_stop_grace,
+    OutputCaptureBuffer, OutputSink, OutputStream, Result, SpawnSpec, StdioProcess, StopLevel,
+    Termination, run_with_stop_grace,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -375,8 +375,7 @@ impl DaytonaTransport {
             Some(response) => (
                 Termination::Exited,
                 Some(response.exit_code.unwrap_or(0)),
-                spec.output_sanitization
-                    .sanitize(response.result.as_bytes()),
+                response.result.into_bytes(),
             ),
         };
 
@@ -504,7 +503,6 @@ impl SessionRun {
             stdin: InputPump::default(),
             stream: StreamTask::default(),
             output: Arc::new(Mutex::new(SessionOutput::new(
-                spec,
                 controls,
                 sink_failed.clone(),
             ))),
@@ -623,8 +621,7 @@ struct Settled {
 }
 
 impl Settled {
-    /// Appends what the stream missed, flushes the sanitizers, and
-    /// assembles the result.
+    /// Appends what the stream missed and assembles the result.
     async fn into_result(self, started: Instant) -> ExecStreamingResult {
         let mut output = self.output.lock().await;
         // The stream and the final fetch overlap arbitrarily; append
@@ -634,7 +631,7 @@ impl Settled {
             logs_separated = logs.streams_separated;
             output.append_final_logs(logs).await;
         }
-        let [stdout, stderr] = output.finish().await;
+        let [stdout, stderr] = output.finish();
         let (stdout_bytes, stdout_stats) = stdout.into_parts();
         let (stderr_bytes, stderr_stats) = stderr.into_parts();
 
@@ -752,16 +749,14 @@ struct Side {
     /// The provider's raw bytes, for matching the final log fetch
     /// against what the stream delivered. Deduplication needs its own
     /// minimum overlap window, whatever the caller retains.
-    raw_seen:  OutputCaptureBuffer,
-    /// Sanitized bytes at the caller's retention limit.
-    seen:      OutputCaptureBuffer,
-    sanitizer: OutputSanitizer,
+    raw_seen: OutputCaptureBuffer,
+    /// The same bytes at the caller's retention limit.
+    seen:     OutputCaptureBuffer,
 }
 
 /// Everything the session's output passes through, both streams, owned
 /// once. The stream task delivers live chunks; after the run settles,
-/// the final log fetch appends what the stream missed and the
-/// sanitizers flush.
+/// the final log fetch appends what the stream missed.
 struct SessionOutput {
     sides:       [Side; 2],
     saw_live:    bool,
@@ -770,12 +765,11 @@ struct SessionOutput {
 }
 
 impl SessionOutput {
-    fn new(spec: &ExecSpec, controls: &ExecControls, sink_failed: CancellationToken) -> Self {
+    fn new(controls: &ExecControls, sink_failed: CancellationToken) -> Self {
         Self {
             sides: [OutputStream::Stdout, OutputStream::Stderr].map(|_| Side {
-                raw_seen:  dedup_capture(controls.retained_output_limit),
-                seen:      OutputCaptureBuffer::new(controls.retained_output_limit),
-                sanitizer: OutputSanitizer::new(spec.output_sanitization),
+                raw_seen: dedup_capture(controls.retained_output_limit),
+                seen:     OutputCaptureBuffer::new(controls.retained_output_limit),
             }),
             saw_live: false,
             sink: controls.sink.clone(),
@@ -798,11 +792,7 @@ impl SessionOutput {
         self.saw_live = true;
         let side = &mut self.sides[stream as usize];
         side.raw_seen.push(&bytes);
-        let bytes = side.sanitizer.push(&bytes);
         side.seen.push(&bytes);
-        if bytes.is_empty() {
-            return Ok(());
-        }
         if let Some(sink) = &self.sink {
             if sink(stream, bytes).await.is_err() {
                 self.sink_failed.cancel();
@@ -822,20 +812,13 @@ impl SessionOutput {
             let side = &mut self.sides[stream as usize];
             let missing = missing_suffix(&mut side.raw_seen, bytes);
             side.raw_seen.push(&missing);
-            let sanitized = side.sanitizer.push(&missing);
-            side.seen.push(&sanitized);
-            self.emit(stream, sanitized).await;
+            side.seen.push(&missing);
+            self.emit(stream, missing).await;
         }
     }
 
-    /// Flushes the sanitizers and takes both captures.
-    async fn finish(&mut self) -> [OutputCaptureBuffer; 2] {
-        for stream in [OutputStream::Stdout, OutputStream::Stderr] {
-            let side = &mut self.sides[stream as usize];
-            let final_bytes = side.sanitizer.finish();
-            side.seen.push(&final_bytes);
-            self.emit(stream, final_bytes).await;
-        }
+    /// Takes both captures.
+    fn finish(&mut self) -> [OutputCaptureBuffer; 2] {
         [OutputStream::Stdout, OutputStream::Stderr].map(|stream| {
             mem::replace(
                 &mut self.sides[stream as usize].seen,

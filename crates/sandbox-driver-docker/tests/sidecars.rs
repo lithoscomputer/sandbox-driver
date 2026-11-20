@@ -80,12 +80,20 @@ async fn restarted_services_are_healthy_before_work_resumes() {
     let Ok(provider) = DockerProvider::connect().await else {
         return;
     };
+    // Keep the listener open across requests: a shell loop around one-shot
+    // nc leaves the port closed between the health probe and the client.
+    let server = r#"sleep 1; exec nc -lk -p 8080 -e sh -c '
+        while IFS= read -r line; do
+            [ "$line" = "$(printf "\r")" ] && break
+        done
+        printf "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nready\n"
+    '"#;
     let spec = spec_with_sidecar(
         "restart",
         &serde_json::json!({
             "name": "web",
             "image": SIDECAR_IMAGE,
-            "entrypoint": ["sh", "-c", "sleep 1; while true; do printf 'HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nready\n' | nc -l -p 8080; done"],
+            "entrypoint": ["sh", "-c", server],
             "health": {"cmd": "wget -q -O- http://127.0.0.1:8080/ready", "interval_ms": 200, "retries": 100},
         }),
     );

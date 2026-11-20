@@ -1,6 +1,6 @@
 //! Preserve exact exec bytes through Daytona's text-only command output.
 //! Bash emits bounded, ASCII-only records before bytes reach the toolbox.
-//! Decoding happens before sanitization, delivery, and retention accounting.
+//! Decoding happens before delivery and retention accounting.
 //!
 //! The toolbox is lossy under a fast run of small writes: a record arrives
 //! without its leading tag, two records arrive glued together, or the
@@ -16,8 +16,8 @@ use std::result::Result as StdResult;
 use std::sync::Arc;
 
 use sandbox_driver::legacy::{
-    Exec, ExecControls, ExecSpec, ExecStreamingResult, OutputCaptureBuffer, OutputLoss,
-    OutputSanitization, OutputSanitizer, OutputSink, OutputStream, Result,
+    Exec, ExecControls, ExecSpec, ExecStreamingResult, OutputCaptureBuffer, OutputLoss, OutputSink,
+    OutputStream, Result,
 };
 use tokio::sync::Mutex;
 
@@ -198,22 +198,17 @@ struct FramedOutput {
     /// to and including it belong to the same loss.
     discarding: bool,
     loss:       OutputLoss,
-    streams:    [(OutputSanitizer, OutputCaptureBuffer); 2],
+    streams:    [OutputCaptureBuffer; 2],
     sink:       Option<OutputSink>,
 }
 
 impl FramedOutput {
-    fn new(policy: OutputSanitization, controls: &ExecControls) -> Self {
+    fn new(controls: &ExecControls) -> Self {
         Self {
             pending:    Vec::new(),
             discarding: false,
             loss:       OutputLoss::default(),
-            streams:    [0, 1].map(|_| {
-                (
-                    OutputSanitizer::new(policy),
-                    OutputCaptureBuffer::new(controls.retained_output_limit),
-                )
-            }),
+            streams:    [0, 1].map(|_| OutputCaptureBuffer::new(controls.retained_output_limit)),
             sink:       controls.sink.clone(),
         }
     }
@@ -233,12 +228,10 @@ impl FramedOutput {
     }
 
     async fn emit(&mut self, stream: OutputStream, raw: &[u8]) -> Result<()> {
-        let (sanitizer, capture) = &mut self.streams[stream as usize];
-        let bytes = sanitizer.push(raw);
-        capture.push(&bytes);
-        if !bytes.is_empty() {
+        self.streams[stream as usize].push(raw);
+        if !raw.is_empty() {
             if let Some(sink) = &self.sink {
-                sink(stream, bytes).await?;
+                sink(stream, raw.to_vec()).await?;
             }
         }
         Ok(())
@@ -298,30 +291,20 @@ impl FramedOutput {
         Ok(())
     }
 
-    async fn finish(&mut self, mut result: ExecStreamingResult) -> Result<ExecStreamingResult> {
+    fn finish(&mut self, mut result: ExecStreamingResult) -> ExecStreamingResult {
         if !self.pending.is_empty() {
             let bytes = self.pending.len();
             self.pending.clear();
             self.discard(UNTERMINATED_FRAME, bytes);
         }
-        for stream in [OutputStream::Stdout, OutputStream::Stderr] {
-            let (sanitizer, capture) = &mut self.streams[stream as usize];
-            let final_bytes = sanitizer.finish();
-            capture.push(&final_bytes);
-            if !final_bytes.is_empty() {
-                if let Some(sink) = &self.sink {
-                    sink(stream, final_bytes).await?;
-                }
-            }
-        }
-        result.result.stdout = self.streams[OutputStream::Stdout as usize].1.to_bytes();
-        result.result.stderr = self.streams[OutputStream::Stderr as usize].1.to_bytes();
+        result.result.stdout = self.streams[OutputStream::Stdout as usize].to_bytes();
+        result.result.stderr = self.streams[OutputStream::Stderr as usize].to_bytes();
         // A discarded record's stream is unknown, so a loss truncates both.
         let truncated = result.stdout_capture.truncated
             || result.stderr_capture.truncated
             || self.loss.is_lossy();
-        result.stdout_capture = self.streams[OutputStream::Stdout as usize].1.stats();
-        result.stderr_capture = self.streams[OutputStream::Stderr as usize].1.stats();
+        result.stdout_capture = self.streams[OutputStream::Stdout as usize].stats();
+        result.stderr_capture = self.streams[OutputStream::Stderr as usize].stats();
         result.stdout_capture.truncated |= truncated;
         result.stderr_capture.truncated |= truncated;
         result.output_loss = self.loss;
@@ -333,7 +316,7 @@ impl FramedOutput {
                 "output decoding lost frames; the captures are marked truncated"
             );
         }
-        Ok(result)
+        result
     }
 }
 
@@ -343,10 +326,7 @@ pub(super) async fn run(
     spec: &ExecSpec,
     controls: ExecControls,
 ) -> Result<ExecStreamingResult> {
-    let output = Arc::new(Mutex::new(FramedOutput::new(
-        spec.output_sanitization,
-        &controls,
-    )));
+    let output = Arc::new(Mutex::new(FramedOutput::new(&controls)));
     let encoded = encoded_spec(spec);
     let streaming = controls.stdin.is_some()
         || controls.sink.is_some()
@@ -382,7 +362,7 @@ pub(super) async fn run(
             .await?;
         result
     };
-    output.lock().await.finish(result).await
+    Ok(output.lock().await.finish(result))
 }
 
 #[cfg(test)]
@@ -474,21 +454,18 @@ sys.exit(7)
         .expect("command joined");
         assert_eq!(output.status.code(), Some(7), "{:?}", output.stderr);
         assert!(output.stderr.is_empty(), "stderr must also be encoded");
-        let mut framed = FramedOutput::new(OutputSanitization::Raw, &ExecControls::buffered());
+        let mut framed = FramedOutput::new(&ExecControls::buffered());
         for fragment in output.stdout.chunks(79) {
             framed
                 .push(OutputStream::Stdout, fragment)
                 .await
                 .expect("fragment decoded");
         }
-        let result = framed
-            .finish(ExecStreamingResult::new(ExecResult::new(
-                Termination::Exited,
-                output.status.code(),
-                Duration::ZERO,
-            )))
-            .await
-            .expect("capture completed");
+        let result = framed.finish(ExecStreamingResult::new(ExecResult::new(
+            Termination::Exited,
+            output.status.code(),
+            Duration::ZERO,
+        )));
         let stdout: Vec<u8> = (0..=255).cycle().take(2048).chain([0, 0, b'x']).collect();
         let stderr: Vec<u8> = (0..=255)
             .rev()
@@ -532,7 +509,7 @@ sys.exit(7)
                 })
             }
         });
-        let mut framed = FramedOutput::new(OutputSanitization::Raw, &ExecControls {
+        let mut framed = FramedOutput::new(&ExecControls {
             sink: Some(sink),
             retained_output_limit: Some(2),
             ..ExecControls::buffered()
@@ -552,7 +529,7 @@ sys.exit(7)
         // decoder. Deliberate transport omission is not decoded truncation.
         native.stdout_capture.observed_bytes = output.stdout.len();
         native.stdout_capture.omitted_bytes = output.stdout.len();
-        let result = framed.finish(native).await.expect("capture completed");
+        let result = framed.finish(native);
         assert_eq!(*observed.lock().await, [vec![0, 255, 128, 10, 65], vec![
             254, 0, 66
         ]]);
@@ -589,40 +566,34 @@ sys.exit(7)
         .await
         .expect("command joined");
         assert!(output.status.success());
-        let mut framed = FramedOutput::new(OutputSanitization::Raw, &ExecControls::buffered());
+        let mut framed = FramedOutput::new(&ExecControls::buffered());
         framed
             .push(OutputStream::Stdout, &output.stdout)
             .await
             .expect("output decoded");
-        let result = framed
-            .finish(ExecStreamingResult::new(ExecResult::new(
-                Termination::Exited,
-                output.status.code(),
-                Duration::ZERO,
-            )))
-            .await
-            .expect("capture completed");
+        let result = framed.finish(ExecStreamingResult::new(ExecResult::new(
+            Termination::Exited,
+            output.status.code(),
+            Duration::ZERO,
+        )));
         assert_eq!(result.result.stdout, spec.stdin.expect("fixed input"));
     }
 
     /// Feeds a scripted encoded stream to a fresh decoder, `chunk` bytes
     /// per push, and finishes it as a clean exit.
     async fn decode(stream: &[u8], chunk: usize) -> ExecStreamingResult {
-        let mut framed = FramedOutput::new(OutputSanitization::Raw, &ExecControls::buffered());
+        let mut framed = FramedOutput::new(&ExecControls::buffered());
         for fragment in stream.chunks(chunk) {
             framed
                 .push(OutputStream::Stdout, fragment)
                 .await
                 .expect("a torn stream never fails the exec");
         }
-        framed
-            .finish(ExecStreamingResult::new(ExecResult::new(
-                Termination::Exited,
-                Some(0),
-                Duration::ZERO,
-            )))
-            .await
-            .expect("capture completed")
+        framed.finish(ExecStreamingResult::new(ExecResult::new(
+            Termination::Exited,
+            Some(0),
+            Duration::ZERO,
+        )))
     }
 
     fn assert_loss(result: &ExecStreamingResult, frames: u64, bytes: u64) {
