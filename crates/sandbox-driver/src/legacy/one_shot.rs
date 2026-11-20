@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use crate::legacy::error::Result;
 use crate::legacy::exec::{ExecControls, ExecStreamingResult};
 use crate::redact::EnvKeys;
-use crate::sanitize::OutputSanitization;
 
 /// Ephemeral containers run beside a sandbox, in its world.
 ///
@@ -66,25 +65,23 @@ pub enum OneShotImage {
 #[derive(Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct OneShotSpec {
-    pub image:               OneShotImage,
+    pub image:       OneShotImage,
     /// Override the image's entrypoint: one executable, arguments go in
     /// `args`.
     #[serde(default)]
-    pub entrypoint:          Option<String>,
+    pub entrypoint:  Option<String>,
     /// Arguments to the entrypoint.
     #[serde(default)]
-    pub args:                Vec<String>,
+    pub args:        Vec<String>,
     #[serde(default)]
-    pub env:                 BTreeMap<String, String>,
+    pub env:         BTreeMap<String, String>,
     /// The working directory inside the container, absolute. `None` is the
     /// sandbox's working directory, where the shared workspace is mounted.
     #[serde(default)]
-    pub working_dir:         Option<String>,
+    pub working_dir: Option<String>,
     /// `None` waits forever; the provider kills at the deadline otherwise.
     #[serde(default)]
-    pub timeout:             Option<Duration>,
-    #[serde(default)]
-    pub output_sanitization: OutputSanitization,
+    pub timeout:     Option<Duration>,
 }
 
 impl OneShotSpec {
@@ -102,7 +99,6 @@ impl OneShotSpec {
             env: BTreeMap::new(),
             working_dir: None,
             timeout: None,
-            output_sanitization: OutputSanitization::Raw,
         }
     }
 
@@ -150,7 +146,6 @@ impl fmt::Debug for OneShotSpec {
             .field("env_keys", &EnvKeys(&self.env))
             .field("working_dir", &self.working_dir)
             .field("timeout", &self.timeout)
-            .field("output_sanitization", &self.output_sanitization)
             .finish()
     }
 }

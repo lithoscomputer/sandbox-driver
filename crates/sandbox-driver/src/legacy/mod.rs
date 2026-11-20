@@ -130,4 +130,3 @@ pub use state::{SandboxState, SandboxStatus};
 pub use wait::{WaitOptions, wait_for_stable_state, wait_for_state};
 
 pub use crate::id::{InvalidIdError, ProviderKind, SandboxId, ServiceId, SnapshotId, VolumeId};
-pub use crate::sanitize::{OutputSanitization, OutputSanitizer};

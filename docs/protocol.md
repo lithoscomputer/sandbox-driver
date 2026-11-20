@@ -584,7 +584,7 @@ on `PATH` to serve them.
 The exec spec DTO:
 
 ```json
-{"program":"echo","args":["hi"],"timeout_ms":30000,"stop_grace_ms":5000,"working_dir":null,"env":{},"output_sanitization":"strip_ansi"}
+{"program":"echo","args":["hi"],"timeout_ms":30000,"stop_grace_ms":5000,"working_dir":null,"env":{}}
 ```
 
 `args` may be omitted and means `[]`. `stop_grace_ms` is optional and
@@ -597,11 +597,6 @@ the field ignores it and keeps raw stops. Standard input is not in the spec:
 a request whose `stdin` is true feeds the command from the channel's
 `stdin` frames (§9), and a plugin whose provider takes only fixed stdin
 collects those frames to their `eof` first.
-
-`output_sanitization` is optional. Its values are `raw`, `strip_ansi`,
-and `strip_all`; omission means `raw`. A plugin applies this policy to
-buffered output and streaming notifications before capture accounting.
-PTY and bidirectional stdio traffic always remains raw.
 
 | method | params | result |
 | --- | --- | --- |
@@ -936,7 +931,7 @@ retention, and result are those of `exec/stream`, without stdin. The spec:
 ```json
 {"image":{"registry":{"reference":"alpine:3.20"}},
  "entrypoint":"sh","args":["-c","echo hi"],"env":{},
- "working_dir":null,"timeout":{"secs":60,"nanos":0},"output_sanitization":"raw"}
+ "working_dir":null,"timeout":{"secs":60,"nanos":0}}
 ```
 
 `image` is `{"registry":{"reference":…}}` or, gated on `one_shot.build`,
