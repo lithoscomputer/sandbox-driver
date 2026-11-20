@@ -98,6 +98,7 @@ async fn docker_passes_the_shared_contract_suite() {
         long_running: ExecSpec::argv(["sh", "-c", "echo ready; exec sleep 600"]),
     })
     .with_peer(peer.clone())
+    .with_ambient_env()
     .run()
     .await;
     eprintln!("{report}");

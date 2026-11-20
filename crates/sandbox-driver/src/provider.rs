@@ -161,6 +161,11 @@ pub struct SandboxSummary {
 pub trait Sandbox: Send + Sync {
     fn reference(&self) -> SandboxRef;
     fn working_directory(&self) -> &Path;
+    /// The environment a command starts from, before its own
+    /// [`ExecSpec::env`] is laid over it: every variable the workload's image
+    /// or host sets, with the sandbox spec's `env` on top. It is the
+    /// workload's environment, not that of a runner or helper around it, and
+    /// it is read when the handle is created or attached.
     fn env(&self) -> &BTreeMap<String, String>;
     async fn status(&self) -> Result<Status, Error>;
     /// Uses the frozen admission, rechecks readiness, and refuses while an old

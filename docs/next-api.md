@@ -160,7 +160,7 @@ pub struct Found {
 pub trait Sandbox: Send + Sync {
     fn reference(&self) -> SandboxRef;
     fn working_directory(&self) -> &Path;
-    fn env(&self) -> &BTreeMap<String, String>;      // the sandbox's ambient variables
+    fn env(&self) -> &BTreeMap<String, String>;      // what a command starts from: image or host variables, then the spec's env
     async fn status(&self) -> Result<Status, Error>;
     async fn start(&self) -> Result<(), Error>;      // also brings a paused sandbox back
     async fn stop(&self) -> Result<(), Error>;
@@ -465,7 +465,7 @@ Connection loss, a plugin crash, or `Error::Stale` does not establish whether an
 
 - `source` is exactly one of `{"image": …}`, `{"dockerfile": …}` (the file's text), `{"snapshot": …}` (a provider-known id) or the bare string `"host_directory"`. Your descriptor's `sources` lists which you accept. A host directory has no image: the directory is `working_directory`, and `workspace_ownership` says whether it is `designated` (caller-owned, never removed by destroy; the default when a path is given) or `managed` (provider-owned, removed on confirmed destroy; a temporary directory when no path is given). Ownership is only valid with a host directory source.
 
-`source` describes the workload the caller wants to execute. Sandbox `exec`, `working_directory`, ambient `env`, and file operations refer to that workload and its workspace, not an outer runner or helper container. A one-shot container uses its own requested image but shares the workload's workspace, network, and service reachability. Any outer runner, nested Docker setup, helper image, or backend-specific job recipe is the provider's responsibility; the caller supplies the same workload spec regardless of provider.
+`source` describes the workload the caller wants to execute. Sandbox `exec`, `working_directory`, ambient `env`, and file operations refer to that workload and its workspace, not an outer runner or helper container. A one-shot container uses its own requested image but shares the workload's workspace, network, and service reachability. Any outer runner, nested Docker setup, helper image, or backend-specific job recipe is the provider's responsibility; the caller supplies the same workload spec regardless of provider. The `env` you return from `create` and `attach` is everything a command in the workload starts from: the variables its image or host sets, with the spec's `env` over them. Returning only the spec's `env` hides `PATH` and the rest from callers that plan commands from it.
 
 - `resources` are whole cores and MiB. Round up if your backend allocates in coarser units and report the result in `status`. A non-zero `gpus` you cannot provide is `unsupported`, never dropped.
 - `network.mode` is `provider_default`, `allow_all`, `block`, `cidr_allow_list` or `domain_allow_list`; your descriptor's `network` lists which you honour. A mode you do not list is `unsupported`, except `provider_default`, which every provider honours whether listed or not, so a spec without `network` is accepted everywhere. The two allow-list modes carry their entries under one `allow` key, and an `allow` on any other mode is rejected at decode rather than dropped.
