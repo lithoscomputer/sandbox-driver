@@ -102,12 +102,25 @@ impl SchemaDiscovery {
     /// On Unix its working directory is `/` and it runs in its own process
     /// group, which is killed when the probe ends, fails or is cancelled.
     pub async fn discover(&self, location: &PluginLocation) -> Result<DiscoveredPlugin, Error> {
-        time::timeout(self.limits.timeout, self.discover_inner(location))
-            .await
-            .map_err(|_| unavailable(&location.entry, "metadata discovery timed out"))?
+        let mut phase = "resolving executable";
+        time::timeout(
+            self.limits.timeout,
+            self.discover_inner(location, &mut phase),
+        )
+        .await
+        .map_err(|_| {
+            unavailable(
+                &location.entry,
+                &format!("metadata discovery timed out while {phase}"),
+            )
+        })?
     }
 
-    async fn discover_inner(&self, location: &PluginLocation) -> Result<DiscoveredPlugin, Error> {
+    async fn discover_inner(
+        &self,
+        location: &PluginLocation,
+        phase: &mut &'static str,
+    ) -> Result<DiscoveredPlugin, Error> {
         let entry = &location.entry;
         let trust = location.trust.as_ref().ok_or_else(|| {
             invalid_config(
@@ -117,6 +130,7 @@ impl SchemaDiscovery {
             )
         })?;
         let path = resolve(location).await?;
+        *phase = "hashing executable";
         let digest = executable_digest(entry, &path).await?;
         if let PluginTrust::Sha256 { digest: expected } = trust {
             if expected != &digest {
@@ -131,18 +145,22 @@ impl SchemaDiscovery {
             }
         }
         let cell = self.cell(&digest);
+        *phase = "waiting for shared metadata probe";
         let schemas = cell
             .get_or_try_init(|| async {
                 let schemas = {
+                    *phase = "waiting for metadata probe capacity";
                     let _permit = self
                         .probes
                         .acquire()
                         .await
                         .expect("the probe semaphore is never closed");
+                    *phase = "running metadata probe";
                     probe(entry, &path, &self.limits).await?
                 };
                 // A replacement during the probe must not be cached under
                 // the digest that was trusted.
+                *phase = "verifying executable after metadata probe";
                 if executable_digest(entry, &path).await? != digest {
                     return Err(invalid_config(
                         entry,
