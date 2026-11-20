@@ -14,10 +14,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::legacy::capabilities::Capability;
-use crate::legacy::error::{Error, ExecFailure, Result};
+use crate::legacy::error::{Error, Result};
 use crate::legacy::sanitize::OutputSanitization;
 use crate::redact::EnvKeys;
-use crate::{CapturedOutput, ExecOutcome};
+use crate::{CapturedOutput, CommandFailure, ExecOutcome};
 pub use crate::{OutputLoss, StopLevel, stop_signal};
 
 /// The interpreter [`ExecSpec::bash`] names, resolved through `PATH`
@@ -541,7 +541,7 @@ pub struct ExecResult {
 impl ExecResult {
     /// This result as the failure of the command `label` names, with all
     /// of its output.
-    pub fn into_failure(self, label: impl Into<String>) -> ExecFailure {
+    pub fn into_failure(self, label: impl Into<String>) -> CommandFailure {
         let Self {
             stdout,
             stderr,
@@ -550,7 +550,7 @@ impl ExecResult {
             termination,
             duration,
         } = self;
-        ExecFailure {
+        CommandFailure {
             context:     label.into(),
             outcome:     ExecOutcome {
                 termination: termination.into(),
