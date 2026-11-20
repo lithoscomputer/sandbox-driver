@@ -88,9 +88,8 @@ pub struct Captured {
 
 #[cfg(test)]
 impl Captured {
-    /// The one fixture for this crate's tests: a command that ended as
-    /// `termination` after 1500 ms and wrote `stdout` and `stderr`, all of
-    /// it kept.
+    /// A finished command for tests: it ended as `termination` after 1500 ms
+    /// and wrote `stdout` and `stderr`, all of it kept.
     pub(crate) fn ended(
         termination: Termination,
         exit_code: Option<i32>,
