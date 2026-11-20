@@ -145,6 +145,8 @@ impl SandboxBuilder {
 impl ProviderHandle {
     pub async fn describe(&self) -> Result<Descriptor, Error>;
     pub async fn health(&self) -> Result<Health, Error>;
+    /// One entry's inventory, with the checks `find` runs per entry and no deadline.
+    pub async fn list(&self, filter: &LabelFilter) -> Result<Vec<SandboxSummary>, Error>;
 }
 
 /// What `find` returns: every match it could reach, and the providers it could not.
@@ -193,7 +195,7 @@ Rules every method obeys:
 
 ### Exec
 
-`ExecSpec` is argv (no shell), env, working directory, timeout, and `tty`. `ExecControls` is a streamed stdin, an output sink, and two cancellation levels: `term` then `kill`. `ExecOutcome` reports `termination` (`exited`, `timed_out`, `terminated`, `killed`, `lost`), `exit_code`, `signal`, and `output_loss`: counts of output the provider's transport dropped, and `truncated` when the provider stopped reading a stream of a command that exited on its own. A stopped or timed-out command always leaves output unread, which its `termination` reports. With `tty: true` the sink receives one stream and the controls gain `resize`. Dropping the future requests cancellation; it does not confirm that the command has stopped. The library owns bounded cleanup after the drop. `lost` means the execution outcome is unknown, not that the command or sandbox is known to be gone. Only a confirmed termination outcome or a successful sandbox `stop` establishes that the affected execution has ended.
+`ExecSpec` is argv (no shell), env, working directory, timeout, and `tty`. `ExecControls` is a streamed stdin, an output sink, and two cancellation levels: `term` then `kill`. `ExecOutcome` reports `termination` (`exited`, `timed_out`, `terminated`, `killed`, `lost`), `exit_code`, `signal`, and `output_loss`: counts of output the provider's transport dropped, and `truncated` when the provider stopped reading a stream of a command that exited on its own. A stopped or timed-out command always leaves output unread, which its `termination` reports. With `tty: true` the sink receives one stream and the controls gain `resize`. Dropping the future requests cancellation; it does not confirm that the command has stopped. The library owns bounded cleanup after the drop. `lost` means the execution outcome is unknown, not that the command or sandbox is known to be gone. Only a confirmed termination outcome or a successful sandbox `stop` establishes that the affected execution has ended. Output reaches the sink as the command wrote it. A client that shows it to a person or a model cleans it with the library's `OutputSanitization` (`raw`, `strip_ansi` for terminal escape sequences, `strip_all` for those and stray control characters), over a whole buffer or chunk by chunk with an `OutputSanitizer` per stream. It is a function over bytes, not an `ExecSpec` field, so nothing about it crosses the wire.
 
 The library adds whole-command helpers over `exec`. They are functions, not a capability, so they work on every provider and plugin with no wire support:
 
@@ -519,7 +521,7 @@ Connection loss, a plugin crash, or `Error::Stale` does not establish whether an
 - `labels` and `env` are string maps and round-trip exactly (labels) or reach every process in the sandbox (env).
 - `working_directory` and `user` are what commands run as and where; return the working directory you actually used in the create result.
 - `services` is a workload beside the sandbox: named containers with an image, env, published ports, a registry credential name, and a readiness check executed inside the service container. The provider waits for readiness before `create` or `start` returns success. Every readiness check states its whole budget: `interval_ms`, a per-attempt `timeout_ms`, `retries` and an overall `deadline_ms`, all required and non-zero, so the bound is explicit rather than inferred; a timeout longer than the deadline, or an interval that leaves no room for a second attempt, is `invalid_spec`. Each service must be reachable from the sandbox workload and its one-shot containers; `status.services` reports the host and port used from that workload, because on Docker that is a network alias and in a pod it is localhost. Services follow the sandbox lifecycle and participate in its stop fence. Declare `services` in your capabilities or refuse a non-empty `services` with `unsupported`.
-- `container` is the typed subset of container options a job can ask for: `init`, `privileged`, `capabilities_add`, `capabilities_drop`, `dns`, `extra_hosts`, `shm_size_mb`. Honour what you can; refuse the rest with `unsupported` naming the field.
+- `container` is the typed subset of container options a job can ask for: `init`, `privileged`, `capabilities_add`, `capabilities_drop`, `dns`, `extra_hosts`, `shm_size_mb`, `platform` (the image platform to pull and run, such as `linux/amd64`). Honour what you can; refuse the rest with `unsupported` naming the field.
 - `provider_config` is yours, for the few settings with no provider-neutral meaning. Describe it with a `spec_schema` in your descriptor and the library validates overrides against it; otherwise it is passed through unread.
 
 ### The descriptor
