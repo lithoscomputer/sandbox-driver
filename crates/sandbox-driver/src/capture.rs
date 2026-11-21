@@ -26,12 +26,36 @@ pub struct CapturedOutput {
     /// Bytes dropped between the first and the newest to stay within the
     /// limit.
     pub omitted_bytes: u64,
+    /// How many of `bytes` are the stream's first ones. The omitted bytes
+    /// fall after them, and the stream's newest bytes are the rest.
+    pub head_bytes:    usize,
 }
 
 impl CapturedOutput {
     /// Bytes the command wrote to this stream, kept or not.
     pub fn observed_bytes(&self) -> u64 {
         (self.bytes.len() as u64).saturating_add(self.omitted_bytes)
+    }
+
+    /// The last `max_bytes` the command wrote to this stream, or fewer when
+    /// fewer were kept, with every byte it wrote before them counted as
+    /// omitted.
+    pub(crate) fn newest(&self, max_bytes: usize) -> Self {
+        if self.omitted_bytes == 0 && self.bytes.len() <= max_bytes {
+            return self.clone();
+        }
+        // With a gap, the first bytes are not contiguous with the newest.
+        let newest = if self.omitted_bytes == 0 {
+            &self.bytes[..]
+        } else {
+            &self.bytes[self.head_bytes.min(self.bytes.len())..]
+        };
+        let newest = &newest[newest.len().saturating_sub(max_bytes)..];
+        Self {
+            bytes:         newest.to_vec(),
+            omitted_bytes: self.observed_bytes().saturating_sub(newest.len() as u64),
+            head_bytes:    0,
+        }
     }
 }
 
@@ -41,6 +65,7 @@ impl fmt::Debug for CapturedOutput {
         f.debug_struct("CapturedOutput")
             .field("retained_bytes", &self.bytes.len())
             .field("omitted_bytes", &self.omitted_bytes)
+            .field("head_bytes", &self.head_bytes)
             .finish()
     }
 }
@@ -59,6 +84,35 @@ pub struct Captured {
     /// provider. It includes the provider's own setup and the time the
     /// caller's sink took.
     pub duration: Duration,
+}
+
+#[cfg(test)]
+impl Captured {
+    /// A finished command for tests: it ended as `termination` after 1500 ms
+    /// and wrote `stdout` and `stderr`, all of it kept.
+    pub(crate) fn ended(
+        termination: Termination,
+        exit_code: Option<i32>,
+        stdout: &[u8],
+        stderr: &[u8],
+    ) -> Self {
+        let whole = |bytes: &[u8]| CapturedOutput {
+            bytes:         bytes.to_vec(),
+            omitted_bytes: 0,
+            head_bytes:    bytes.len(),
+        };
+        Self {
+            outcome:  ExecOutcome {
+                termination,
+                exit_code,
+                signal: None,
+                output_loss: super::OutputLoss::default(),
+            },
+            stdout:   whole(stdout),
+            stderr:   whole(stderr),
+            duration: Duration::from_millis(1500),
+        }
+    }
 }
 
 impl Captured {
@@ -277,6 +331,7 @@ impl Retained {
 
     fn take(&mut self) -> CapturedOutput {
         let mut bytes = mem::take(&mut self.head);
+        let head_bytes = bytes.len();
         // Taking the tail frees its buffer even while a provider keeps the
         // sink alive.
         let tail = mem::take(&mut self.tail);
@@ -287,6 +342,7 @@ impl Retained {
         CapturedOutput {
             bytes,
             omitted_bytes: mem::take(&mut self.omitted),
+            head_bytes,
         }
     }
 }
@@ -309,6 +365,7 @@ mod tests {
         let output = retain(5, &[b"01", b"234"]);
         assert_eq!(output.bytes, b"01234");
         assert_eq!(output.omitted_bytes, 0);
+        assert_eq!(output.head_bytes, 2);
     }
 
     #[test]
@@ -322,8 +379,27 @@ mod tests {
             let output = retain(5, chunks);
             assert_eq!(output.bytes, b"01789", "{chunks:?}");
             assert_eq!(output.omitted_bytes, 5, "{chunks:?}");
+            assert_eq!(output.head_bytes, 2, "{chunks:?}");
             assert_eq!(output.observed_bytes(), 10, "{chunks:?}");
         }
+    }
+
+    #[test]
+    fn the_newest_bytes_never_reach_back_across_the_gap() {
+        // Whole stream: the newest bytes are a plain suffix.
+        let newest = |output: &CapturedOutput, max_bytes| {
+            let tail = output.newest(max_bytes);
+            (tail.bytes, tail.omitted_bytes)
+        };
+        let whole = retain(10, &[b"0123456789"]);
+        assert_eq!(newest(&whole, 3), (b"789".to_vec(), 7));
+        assert_eq!(newest(&whole, 99), (b"0123456789".to_vec(), 0));
+        // Limit 5 keeps "01" and "789" around a gap of five bytes. Asking for
+        // more than the three after the gap must not return "1789".
+        let gapped = retain(5, &[b"0123456789"]);
+        assert_eq!(newest(&gapped, 4), (b"789".to_vec(), 7));
+        assert_eq!(newest(&gapped, 2), (b"89".to_vec(), 8));
+        assert_eq!(newest(&gapped, 0), (Vec::new(), 10));
     }
 
     #[test]
@@ -334,17 +410,10 @@ mod tests {
     }
 
     fn captured(stdout: CapturedOutput, output_loss: OutputLoss) -> Captured {
-        Captured {
-            outcome: ExecOutcome {
-                termination: Termination::Exited,
-                exit_code: Some(0),
-                signal: None,
-                output_loss,
-            },
-            stdout,
-            stderr: CapturedOutput::default(),
-            duration: Duration::ZERO,
-        }
+        let mut captured = Captured::ended(Termination::Exited, Some(0), b"", b"");
+        captured.stdout = stdout;
+        captured.outcome.output_loss = output_loss;
+        captured
     }
 
     #[test]

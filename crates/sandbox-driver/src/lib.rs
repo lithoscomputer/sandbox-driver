@@ -15,6 +15,7 @@ mod config;
 mod descriptor;
 mod error;
 mod execution;
+mod failure;
 mod id;
 mod identity;
 #[doc(hidden)]
@@ -51,6 +52,7 @@ pub use execution::{
     ExecControls, ExecOutcome, ExecSpec, OutputLoss, OutputSink, OutputStream, StopLevel,
     TerminalSize, Termination, stop_signal,
 };
+pub use failure::{CommandError, CommandFailure};
 pub use id::{
     EnvironmentName, InvalidIdError, NamespaceId, ProviderKind, ProviderName, SandboxId,
     Sha256Digest, SnapshotId,

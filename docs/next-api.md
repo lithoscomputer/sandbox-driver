@@ -210,11 +210,27 @@ pub async fn run_captured_with(
 pub async fn run_bash(sandbox: &dyn Sandbox, script: &str) -> Result<Captured, Error>;
 
 pub struct Captured { pub outcome: ExecOutcome, pub stdout: CapturedOutput, pub stderr: CapturedOutput, pub duration: Duration }
-pub struct CapturedOutput { pub bytes: Vec<u8>, pub omitted_bytes: u64 }
+pub struct CapturedOutput { pub bytes: Vec<u8>, pub omitted_bytes: u64, pub head_bytes: usize }
 impl Captured { pub fn into_complete(self) -> Result<Captured, IncompleteOutput>; }
 ```
 
-A command that exits nonzero is a `Captured`, not an error; `success()` is true only for an exit with code zero. Output beyond the limit is still read, so the command never blocks, and is counted in `omitted_bytes`: the first half of the limit is kept from the start of the stream and the rest from its end. `is_complete()` is true only when the command exited on its own, nothing was omitted, and the provider reported no output loss; a command that was stopped, timed out, or lost is never complete. `into_complete()` turns that into an `IncompleteOutput` error that still holds the capture; call it before parsing output, so a short read is an error and not a wrong answer. `duration` is how long the caller waited for the command, measured by the library around the exec. `Captured`, `CapturedOutput`, and `IncompleteOutput` are `#[non_exhaustive]`: callers read their fields but do not build them, and a pattern that destructures one ends with `..`, so the library can add fields.
+A command that exits nonzero is a `Captured`, not an error; `success()` is true only for an exit with code zero. Output beyond the limit is still read, so the command never blocks, and is counted in `omitted_bytes`: the first half of the limit is kept from the start of the stream and the rest from its end, and `head_bytes` says how many of `bytes` came from the start. `is_complete()` is true only when the command exited on its own, nothing was omitted, and the provider reported no output loss; a command that was stopped, timed out, or lost is never complete. `into_complete()` turns that into an `IncompleteOutput` error that still holds the capture; call it before parsing output, so a short read is an error and not a wrong answer. `duration` is how long the caller waited for the command, measured by the library around the exec. `Captured`, `CapturedOutput`, and `IncompleteOutput` are `#[non_exhaustive]`: callers read their fields but do not build them, and a pattern that destructures one ends with `..`, so the library can add fields.
+
+The library's own helpers that run commands fail with `CommandError`, because a failed command is an outcome, not an `Error`, and `Error` carries no command output:
+
+```rust
+pub enum CommandError {
+    Sandbox(Error),                         // the exec was refused or lost; the command may not have run
+    Failed(Box<CommandFailure>),            // the command ran and did not succeed
+    UnexpectedOutput(Box<CommandFailure>),  // it exited with zero, but its output was incomplete or unreadable
+}
+pub struct CommandFailure {
+    pub context: String, pub outcome: ExecOutcome,
+    pub stdout_tail: CapturedOutput, pub stderr_tail: CapturedOutput, pub duration: Duration,
+}
+```
+
+`CommandFailure::new(context, &captured)` builds one from any `Captured`, keeping the last 8 KiB of each stream; a tail's `omitted_bytes` counts everything the command wrote before it. `context` says what the command was for, such as `stat`, never the command itself. `Display` gives the context, how the command ended and a fixed hint for a failure its stderr identifies (no network, no git repository), and never includes output; `display_for_log()` adds the tails, which can carry credentials, so redact its result before it leaves the process.
 
 `ExecSpec::bash(script)` is the one place a shell is implied. It is `bash -c <script>` with a blank `BASH_ENV`, so the script runs in a non-login shell that sources no startup file. The workload must provide `bash` on its `PATH`; no other shell is tried.
 
