@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use bollard::Docker;
 use bollard::container::{Config, CreateContainerOptions, StartContainerOptions};
+use bollard::errors::Error as DockerApiError;
 use bollard::models::{
     ContainerInspectResponse, EndpointSettings, HostConfig, Mount, MountTypeEnum,
 };
@@ -21,7 +22,7 @@ use tokio::time;
 use crate::config::{DockerProviderConfig, RegistryAuth};
 use crate::container::{inspect_container, remove_container_forced};
 use crate::daemon::{POSIX_SH, docker_error, docker_kind, is_conflict, shell_quote};
-use crate::inspect::map_state;
+use crate::inspect::{is_primary, map_state};
 use crate::sidecars::Service;
 use crate::{
     CALLER_LABELS_LABEL, DEFAULT_WORKING_DIRECTORY, MANAGED_LABEL, RUNTIME_DIRECTORY,
@@ -299,6 +300,31 @@ fn validate_supported_creation_fields(spec: &SandboxSpec) -> Result<()> {
     Ok(())
 }
 
+/// The refusal of a name already in use. When a sandbox holds the name,
+/// such as one a crashed create left behind, the error carries its ID so a
+/// caller can attach to it; any other holder is the caller's spec at fault.
+async fn name_taken(docker: &Docker, name: &str, conflict: DockerApiError) -> Error {
+    let holder = inspect_container(docker, name)
+        .await
+        .ok()
+        .filter(|holder| {
+            holder.name.as_deref() == Some(format!("/{name}").as_str())
+                && holder
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.labels.as_ref())
+                    .is_some_and(is_primary)
+        })
+        .and_then(|holder| holder.id);
+    let Some(id) = holder else {
+        return Error::invalid_spec("name", "a container with this name already exists");
+    };
+    let mut error = ProviderError::with_source(docker_kind(), "creating container", conflict);
+    error.code = Some("already_exists".to_owned());
+    error.detail = Some(serde_json::json!({ "name": name, "id": id }));
+    Error::Provider(error)
+}
+
 /// A container `create` made and has not yet handed to a sandbox handle.
 /// Every step after creation either finishes or abandons it, so a new
 /// early return cannot leak the container.
@@ -309,19 +335,23 @@ pub(crate) struct CreatedContainer {
 }
 
 impl CreatedContainer {
-    /// Creates the planned container. A name already in use is the
-    /// caller's spec at fault, not the daemon.
+    /// Creates the planned container. A name already in use is reported
+    /// by [`name_taken`], not as a daemon failure.
     pub(crate) async fn create(docker: &Docker, plan: &ContainerPlan) -> Result<Self> {
-        let created = docker
+        let created = match docker
             .create_container(plan.options.clone(), plan.config.clone())
             .await
-            .map_err(|error| {
-                if is_conflict(&error) && plan.named {
-                    Error::invalid_spec("name", "a container with this name already exists")
-                } else {
-                    docker_error("creating container", error)
-                }
-            })?;
+        {
+            Ok(created) => created,
+            Err(error) => {
+                return Err(match &plan.options {
+                    Some(options) if is_conflict(&error) && plan.named => {
+                        name_taken(docker, &options.name, error).await
+                    }
+                    _ => docker_error("creating container", error),
+                });
+            }
+        };
         Ok(Self {
             docker:          docker.clone(),
             id:              created.id,

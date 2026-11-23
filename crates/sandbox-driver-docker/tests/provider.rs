@@ -4,18 +4,21 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+use std::process;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bollard::Docker;
-use bollard::container::{ListContainersOptions, RemoveContainerOptions};
+use bollard::container::{
+    Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
+};
 use bollard::models::ContainerInspectResponse;
 use bollard::network::ListNetworksOptions;
 use sandbox_driver::{
     AccessScope, CatalogOptions, Durability, Environment, EnvironmentName, Error, ExecControls,
     ExecSpec, LabelFilter, OneShotImage, OneShotSpec, OutputSink, ProviderEntry, ProviderKind,
-    ProviderName, ReadinessCheck, Registry, SandboxSpec, SandboxState, Sandboxes, SecretResolver,
-    ServiceSpec, Source, StaticEnvironments, Termination,
+    ProviderName, ReadinessCheck, Registry, SandboxId, SandboxSpec, SandboxState, Sandboxes,
+    SecretResolver, ServiceSpec, Source, StaticEnvironments, Termination,
 };
 use sandbox_driver_conformance::{Commands, Conformance};
 use sandbox_driver_docker::DockerFactory;
@@ -263,6 +266,82 @@ async fn labels_round_trip_and_a_stopped_sandbox_refuses_exec() {
     }
     .await;
     catalog.destroy(&reference).await.expect("destroy");
+}
+
+/// A sandbox a crashed create left behind still holds its name: creating
+/// the name again reports that sandbox's ID, so the client can attach to it.
+/// A container that is not a sandbox holding the name stays a spec refusal.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a live Docker daemon"]
+async fn a_taken_name_reports_the_sandbox_holding_it() {
+    let name = format!("already-exists-{}", process::id());
+    let mut spec = workload();
+    spec.name = Some(name.clone());
+    let catalog = catalog(BTreeMap::from([("named", spec)]));
+    let create = || async {
+        catalog
+            .builder("named")
+            .await
+            .expect("builder")
+            .create()
+            .await
+    };
+    let sandbox = create().await.expect("create");
+    let reference = sandbox.reference();
+    let again = create().await.err();
+    let recovered = match &again {
+        Some(Error::AlreadyExists { id, .. }) => {
+            let mut recovered = reference.clone();
+            recovered.id = SandboxId::try_new(id.as_str()).expect("id");
+            Some(
+                catalog
+                    .attach(&recovered)
+                    .await
+                    .expect("attach")
+                    .reference(),
+            )
+        }
+        _ => None,
+    };
+    catalog.destroy(&reference).await.expect("destroy");
+    assert_eq!(
+        again,
+        Some(Error::AlreadyExists {
+            name: name.clone(),
+            id:   reference.id.to_string(),
+        })
+    );
+    assert_eq!(recovered, Some(reference), "the reported ID attaches");
+
+    let docker = daemon();
+    docker
+        .create_container(
+            Some(CreateContainerOptions {
+                name:     name.clone(),
+                platform: None,
+            }),
+            Config {
+                image: Some(IMAGE.to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create a plain container");
+    let refused = create().await.err();
+    docker
+        .remove_container(
+            &name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("remove the plain container");
+    assert!(
+        matches!(&refused, Some(Error::InvalidSpec { path, .. }) if path == "name"),
+        "{refused:?}"
+    );
 }
 
 /// The contract has no resume: `start` brings back a container paused out

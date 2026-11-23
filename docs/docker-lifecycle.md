@@ -193,7 +193,9 @@ shell-command endpoint. No timers are enforced, so any timer request is
   instead of reporting `not_found`.
 - **Errors:** a daemon 404 maps to `not_found` only when the primary is gone;
   a missing image or service is `unhealthy`, so callers do not treat the
-  sandbox as removed.
+  sandbox as removed. Creating a name a sandbox already holds, such as one a
+  crashed create left behind, is `already_exists` with that sandbox's ID; a
+  name held by a container that is not a sandbox is `invalid_spec`.
 - **Reconciliation:** sidecars and their network carry
   `sh.sandbox-driver.sandbox=<full sandbox ID>`. Destroying a sandbox whose
   primary is already gone removes them by that label before reporting success.
