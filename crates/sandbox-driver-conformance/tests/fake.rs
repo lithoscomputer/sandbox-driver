@@ -10,6 +10,13 @@ async fn new_contract_fake_passes_common_suite() {
         ..FakeExec::default()
     })
     .await;
+    // The suite compares `env()` with the `PATH` a command sees.
+    fake.image_env("PATH", "/usr/bin").await;
+    fake.script(["printenv", "PATH"], FakeExec {
+        stdout: b"/usr/bin\n".to_vec(),
+        ..FakeExec::default()
+    })
+    .await;
     fake.script(["long"], FakeExec {
         stdout: b"ready\n".to_vec(),
         wait_for_stop: true,

@@ -56,6 +56,8 @@ pub struct Conformance {
 /// What a check does with its freshly created sandbox.
 enum Scenario<'a> {
     Identity,
+    /// Compares `env()` with what a command sees for `PATH`.
+    AmbientEnv,
     Files,
     Exec,
     Bash,
@@ -70,6 +72,9 @@ impl From<Error> for Verdict {
 }
 
 impl Conformance {
+    /// The environment's workload must provide `printenv` and take `PATH`
+    /// from its image or host, not from its spec: the suite checks that
+    /// [`Sandbox::env`] reports the `PATH` a command sees.
     pub fn new(catalog: Sandboxes, environment: impl Into<String>, commands: Commands) -> Self {
         Self {
             catalog,
@@ -105,6 +110,7 @@ impl Conformance {
     pub async fn run(&self) -> Report {
         let mut scenarios = vec![
             ("identity_and_inventory", Scenario::Identity),
+            ("ambient_env", Scenario::AmbientEnv),
             ("binary_files", Scenario::Files),
             ("streamed_exec", Scenario::Exec),
             ("cross_handle_stop_fence", Scenario::Fence(&self.catalog)),
@@ -130,6 +136,7 @@ impl Conformance {
                 let sandbox = sandbox.as_ref();
                 match scenario {
                     Scenario::Identity => self.identity(sandbox).await,
+                    Scenario::AmbientEnv => Self::ambient_env(sandbox).await,
                     Scenario::Files => Self::files(sandbox).await,
                     Scenario::Exec => self.exec(sandbox).await,
                     Scenario::Bash => Self::bash(sandbox).await,
@@ -239,6 +246,21 @@ impl Conformance {
         require(
             read(sandbox, path, None).await? == payload,
             "stop/start lost workspace",
+        )
+    }
+    async fn ambient_env(sandbox: &dyn Sandbox) -> CheckOutcome {
+        let Some(reported) = sandbox.env().get("PATH") else {
+            return fail("env() lacks PATH, which the workload sets");
+        };
+        let seen =
+            sandbox_driver::run_captured(sandbox, ExecSpec::argv(["printenv", "PATH"])).await?;
+        require(
+            seen.success() && seen.is_complete(),
+            "printenv did not report the variable",
+        )?;
+        require(
+            seen.stdout.bytes == format!("{reported}\n").as_bytes(),
+            "env() and a command disagree on the variable's value",
         )
     }
     async fn exec(&self, sandbox: &dyn Sandbox) -> CheckOutcome {

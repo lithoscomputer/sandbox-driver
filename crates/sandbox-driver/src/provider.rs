@@ -161,6 +161,16 @@ pub struct SandboxSummary {
 pub trait Sandbox: Send + Sync {
     fn reference(&self) -> SandboxRef;
     fn working_directory(&self) -> &Path;
+    /// The environment a command starts from, before its own
+    /// [`ExecSpec::env`] is laid over it: every variable the workload's image
+    /// or host sets, with the sandbox spec's `env` on top. It is the
+    /// workload's environment, not that of a runner or helper around it.
+    ///
+    /// It is read once, when the handle is created or attached. A provider
+    /// that can only read a running workload, as Daytona does, returns the
+    /// spec's `env` alone from a handle attached while the sandbox is
+    /// stopped, and the whole environment once [`Sandbox::start`] succeeds on
+    /// that handle.
     fn env(&self) -> &BTreeMap<String, String>;
     async fn status(&self) -> Result<Status, Error>;
     /// Uses the frozen admission, rechecks readiness, and refuses while an old

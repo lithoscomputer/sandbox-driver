@@ -18,11 +18,12 @@ use sandbox_driver::{
     Sandbox, SandboxRef, SandboxSummary, SourceKind, TimerCapability, WorkloadAdmission, legacy,
 };
 use serde::Deserialize;
+use tokio::sync::oneshot;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 use super::error::{classify, from_sdk, refused};
-use super::handle::{Workload, contract_state, public_labels};
+use super::handle::{Workload, contract_state, probe_env, public_labels};
 use super::spec::{self, DEFAULT_RUNNER_IMAGE};
 use super::{DaytonaFactory, runner};
 use crate::labels::{MANAGED_LABEL, RECIPE_LABEL};
@@ -129,9 +130,14 @@ impl DaytonaRuntime {
         }
     }
 
-    fn workload(&self, handle: Arc<DaytonaSandbox>, env: BTreeMap<String, String>) -> Workload {
+    fn workload(
+        &self,
+        handle: Arc<DaytonaSandbox>,
+        spec_env: BTreeMap<String, String>,
+        env: Option<BTreeMap<String, String>>,
+    ) -> Workload {
         let reference = self.reference(handle_id(&handle));
-        Workload::new(reference, handle, env, self.closed.clone())
+        Workload::new(reference, handle, spec_env, env, self.closed.clone())
     }
 
     /// The sandbox `id` when it exists and this contract created it.
@@ -300,12 +306,23 @@ impl Provider for DaytonaRuntime {
         spec.validate_for(&self.descriptor)?;
         let plan = spec::plan(&spec, &self.runner_image)?;
         let auth = runner::service_auth(&spec.services, &credentials)?;
-        let provision = plan.nested.map(|nested| -> Provision {
-            Box::new(move |handle| runner::provision(handle, nested, auth).boxed())
+        // The environment is read inside the legacy create, so a workload
+        // that cannot report it is deleted like any other failed create.
+        let (report, mut env) = oneshot::channel();
+        let provision: Provision = Box::new(move |handle| {
+            async move {
+                if let Some(nested) = plan.nested {
+                    runner::provision(Arc::clone(&handle), nested, auth).await?;
+                }
+                // The receiver outlives the create.
+                let _ = report.send(probe_env(&handle).await?);
+                Ok(())
+            }
+            .boxed()
         });
         let created = self
             .provider
-            .create_with(&plan.legacy, None, &plan.labels, provision)
+            .create_with(&plan.legacy, None, &plan.labels, Some(provision))
             .await;
         let handle = match created {
             Ok(handle) => handle,
@@ -319,7 +336,11 @@ impl Provider for DaytonaRuntime {
             nested = handle.runs_in_container(),
             "daytona workload created"
         );
-        Ok(Box::new(self.workload(handle, spec.env)))
+        Ok(Box::new(self.workload(
+            handle,
+            spec.env,
+            env.try_recv().ok(),
+        )))
     }
 
     async fn attach(&self, id: &SandboxId) -> Result<Box<dyn Sandbox>, Error> {
@@ -331,7 +352,8 @@ impl Provider for DaytonaRuntime {
                 resource: "sandbox".to_owned(),
                 id:       id.to_string(),
             })?;
-        let env = spec::workload_env(&sdk.labels, &sdk.env);
+        let spec_env = spec::workload_env(&sdk.labels, &sdk.env);
+        let running = map_state(sdk.state) == LegacyState::Running;
         let handle = DaytonaSandbox::build(
             &self.provider.client,
             self.provider.capabilities(),
@@ -340,7 +362,12 @@ impl Provider for DaytonaRuntime {
         )
         .await
         .map_err(|error| classify("attaching sandbox", error))?;
-        Ok(Box::new(self.workload(handle, env)))
+        let workload = self.workload(handle, spec_env, None);
+        // Nothing runs in a stopped sandbox; `start` on this handle reads it.
+        if running {
+            workload.read_env().await?;
+        }
+        Ok(Box::new(workload))
     }
 
     async fn list(&self, filter: &LabelFilter) -> Result<Vec<SandboxSummary>, Error> {
@@ -461,6 +488,10 @@ mod tests {
         })
         .to_string()
     }
+
+    /// The toolbox's answer to `env -0` as the output encoder frames it: the
+    /// image's `PATH`, the sandbox's own `CI` and the provider's `BASH_ENV`.
+    const WORKLOAD_ENV: &str = r#"{"exitCode":0,"result":"OBASH_ENV=\nO$'\\0'\nOCI=1\nO$'\\0'\nOPATH=/usr/bin:/bin\nO$'\\0'\n"}"#;
 
     /// Direct workload `sb-1`, started, last changed at `updated_at`.
     fn started(updated_at: &str) -> String {
@@ -661,6 +692,9 @@ mod tests {
                                 started(ADMITTED)
                             },
                         ),
+                        ("POST", "/toolbox/sb-1/process/execute") => {
+                            Reply::Json(200, WORKLOAD_ENV.to_owned())
+                        }
                         ("POST", "/toolbox/sb-1/process/session") => {
                             Reply::Json(201, "{}".to_owned())
                         }
@@ -703,6 +737,7 @@ mod tests {
     /// that keeps the stream open must still be able to end the command.
     #[tokio::test]
     async fn a_nested_command_waiting_on_open_stdin_can_be_killed() {
+        let attached = AtomicBool::new(false);
         let fake = FakeDaytona::start(|address| {
             Arc::new(move |method, target| match (method, target) {
                 ("GET", target) if target.ends_with("/api-keys/current") => {
@@ -722,7 +757,11 @@ mod tests {
                         }),
                     ))
                     .expect("sandbox json");
-                    record["state"] = "started".into();
+                    // Stopped at attach, which then reads nothing from the
+                    // workload, and started since.
+                    if attached.swap(true, Ordering::SeqCst) {
+                        record["state"] = "started".into();
+                    }
                     Reply::Json(200, record.to_string())
                 }
                 _ => Reply::Json(404, "{}".to_owned()),
@@ -776,6 +815,9 @@ mod tests {
                 ("GET", target) if target.starts_with("/sandbox/sb-1?") => {
                     Reply::Json(200, started("2026-11-10T19:22:08.169Z"))
                 }
+                ("POST", "/toolbox/sb-1/process/execute") => {
+                    Reply::Json(200, WORKLOAD_ENV.to_owned())
+                }
                 _ => Reply::Json(200, "{}".to_owned()),
             })
         })
@@ -784,6 +826,7 @@ mod tests {
             .attach(&reference("sb-1"))
             .await
             .expect("attach");
+        let attached = fake.requests().len();
         let limit = legacy::DEFAULT_BUFFER_BYTES as u64;
         let refused = sandbox
             .files()
@@ -794,11 +837,63 @@ mod tests {
             "{refused:?}"
         );
         assert!(
-            fake.requests()
+            fake.requests()[attached..]
                 .iter()
                 .all(|request| !request.contains("toolbox/")),
             "{:?}",
             fake.requests()
         );
+    }
+
+    /// `env()` is what a command starts from, which only a running workload
+    /// can report: a handle attached while the sandbox is stopped has the
+    /// spec's own variables until `start` succeeds on it.
+    #[tokio::test]
+    async fn the_environment_is_read_from_the_running_workload() {
+        let running = Arc::new(AtomicBool::new(false));
+        let fake = FakeDaytona::start({
+            let running = Arc::clone(&running);
+            move |address| {
+                Arc::new(move |method, target| match (method, target) {
+                    ("GET", target) if target.ends_with("/api-keys/current") => {
+                        Reply::Json(200, CURRENT_KEY.to_owned())
+                    }
+                    ("GET", target) if target.starts_with("/sandbox/sb-1/toolbox-proxy-url") => {
+                        Reply::Json(200, toolbox_url(&address))
+                    }
+                    ("POST", "/sandbox/sb-1/start") => {
+                        running.store(true, Ordering::SeqCst);
+                        Reply::Json(200, started("2026-11-10T19:22:18.690Z"))
+                    }
+                    ("GET", target) if target.starts_with("/sandbox/sb-1") => Reply::Json(
+                        200,
+                        if running.load(Ordering::SeqCst) {
+                            started("2026-11-10T19:22:18.690Z")
+                        } else {
+                            direct("stopped", "2026-11-10T19:22:08.169Z")
+                        },
+                    ),
+                    ("POST", "/toolbox/sb-1/process/execute") => {
+                        Reply::Json(200, WORKLOAD_ENV.to_owned())
+                    }
+                    _ => Reply::Json(404, "{}".to_owned()),
+                })
+            }
+        })
+        .await;
+        let sandboxes = catalog(&fake, Some("test-key"));
+        let spec_env = BTreeMap::from([("CI".to_owned(), "1".to_owned())]);
+        let workload_env = BTreeMap::from([
+            ("CI".to_owned(), "1".to_owned()),
+            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+        ]);
+
+        let stopped = sandboxes.attach(&reference("sb-1")).await.expect("attach");
+        assert_eq!(stopped.env(), &spec_env);
+        stopped.start().await.expect("start");
+        assert_eq!(stopped.env(), &workload_env);
+
+        let attached = sandboxes.attach(&reference("sb-1")).await.expect("attach");
+        assert_eq!(attached.env(), &workload_env);
     }
 }
