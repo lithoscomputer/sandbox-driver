@@ -114,7 +114,6 @@ async fn docker_over_protocol_3_matches_the_built_in() {
         long_running: ExecSpec::argv(["sh", "-c", "echo ready; exec sleep 600"]),
     })
     .with_peer(peer.clone())
-    .with_ambient_env()
     .run()
     .await;
     eprintln!("{report}");

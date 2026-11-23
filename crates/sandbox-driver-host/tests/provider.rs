@@ -113,7 +113,6 @@ async fn host_passes_the_shared_contract() {
     })
     .with_peer(peer.clone())
     .with_bash()
-    .with_ambient_env()
     .run()
     .await;
     eprintln!("{report}");

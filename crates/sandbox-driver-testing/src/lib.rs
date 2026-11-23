@@ -59,6 +59,7 @@ struct FakeState {
     records:    Mutex<BTreeMap<SandboxId, Arc<Record>>>,
     calls:      Mutex<Vec<FakeCall>>,
     scripts:    Mutex<BTreeMap<Vec<String>, FakeExec>>,
+    image_env:  Mutex<BTreeMap<String, String>>,
 }
 struct Runtime {
     fake:   FakeProvider,
@@ -68,6 +69,7 @@ struct Runtime {
 struct Record {
     reference: SandboxRef,
     spec:      SandboxSpec,
+    env:       BTreeMap<String, String>,
     directory: PathBuf,
     state:     Mutex<RunningState>,
     fence:     RwLock<()>,
@@ -117,6 +119,7 @@ impl FakeProvider {
                 records:    Mutex::new(BTreeMap::new()),
                 calls:      Mutex::new(Vec::new()),
                 scripts:    Mutex::new(BTreeMap::new()),
+                image_env:  Mutex::new(BTreeMap::new()),
             }),
         }
     }
@@ -130,6 +133,15 @@ impl FakeProvider {
             .lock()
             .await
             .insert(argv.into_iter().map(Into::into).collect(), response);
+    }
+    /// Sets a variable the fake workload's image provides. Sandboxes created
+    /// afterwards report it from `env()`, under their spec's own variables.
+    pub async fn image_env(&self, name: impl Into<String>, value: impl Into<String>) {
+        self.inner
+            .image_env
+            .lock()
+            .await
+            .insert(name.into(), value.into());
     }
     pub async fn calls(&self) -> Vec<FakeCall> {
         self.inner.calls.lock().await.clone()
@@ -285,6 +297,8 @@ impl Provider for Runtime {
                 .as_deref()
                 .unwrap_or("/workspace"),
         );
+        let mut env = self.fake.inner.image_env.lock().await.clone();
+        env.extend(admission.spec.env.clone());
         let record = Arc::new(Record {
             reference: SandboxRef {
                 provider:  self.entry.clone(),
@@ -292,6 +306,7 @@ impl Provider for Runtime {
                 id:        id.clone(),
             },
             spec: admission.spec,
+            env,
             directory,
             state: Mutex::new(RunningState {
                 state: SandboxState::Running,
@@ -407,7 +422,7 @@ impl Sandbox for Handle {
         &self.record.directory
     }
     fn env(&self) -> &BTreeMap<String, String> {
-        &self.record.spec.env
+        &self.record.env
     }
     async fn status(&self) -> Result<Status, Error> {
         ensure_open(&self.closed)?;

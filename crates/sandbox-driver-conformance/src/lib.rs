@@ -49,7 +49,6 @@ pub struct Conformance {
     peer:        Option<Sandboxes>,
     environment: String,
     commands:    Commands,
-    ambient:     bool,
     bash:        bool,
     pub timeout: Duration,
 }
@@ -73,13 +72,15 @@ impl From<Error> for Verdict {
 }
 
 impl Conformance {
+    /// The environment's workload must provide `printenv` and take `PATH`
+    /// from its image or host, not from its spec: the suite checks that
+    /// [`Sandbox::env`] reports the `PATH` a command sees.
     pub fn new(catalog: Sandboxes, environment: impl Into<String>, commands: Commands) -> Self {
         Self {
             catalog,
             peer: None,
             environment: environment.into(),
             commands,
-            ambient: false,
             bash: false,
             timeout: Duration::from_secs(30),
         }
@@ -102,16 +103,6 @@ impl Conformance {
         self
     }
 
-    /// Declares that the workload's image or host sets `PATH`, the sandbox
-    /// spec does not, and the workload provides `printenv`. It adds a check
-    /// that [`Sandbox::env`] reports `PATH` with the value a command sees. A
-    /// provider that reports only the spec's own variables fails it.
-    #[must_use]
-    pub fn with_ambient_env(mut self) -> Self {
-        self.ambient = true;
-        self
-    }
-
     /// Creates one sandbox per check, then attempts bounded cleanup even after
     /// a check fails or times out; a cleanup failure fails its check. Unknown
     /// create outcomes have no guessed ID; providers/applications must
@@ -119,6 +110,7 @@ impl Conformance {
     pub async fn run(&self) -> Report {
         let mut scenarios = vec![
             ("identity_and_inventory", Scenario::Identity),
+            ("ambient_env", Scenario::AmbientEnv),
             ("binary_files", Scenario::Files),
             ("streamed_exec", Scenario::Exec),
             ("cross_handle_stop_fence", Scenario::Fence(&self.catalog)),
@@ -128,9 +120,6 @@ impl Conformance {
         }
         if let Some(peer) = &self.peer {
             scenarios.push(("cross_instance_stop_fence", Scenario::Fence(peer)));
-        }
-        if self.ambient {
-            scenarios.push(("ambient_env", Scenario::AmbientEnv));
         }
         let mut results = Vec::new();
         for (name, scenario) in scenarios {
