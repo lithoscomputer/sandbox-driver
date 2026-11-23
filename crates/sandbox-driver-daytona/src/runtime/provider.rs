@@ -44,7 +44,7 @@ struct EntryConfig {
     target:       Option<String>,
     runner_image: Option<String>,
     user_agent:   Option<String>,
-    proxy:        Option<String>,
+    direct:       bool,
 }
 
 pub(super) struct DaytonaRuntime {
@@ -89,24 +89,15 @@ impl DaytonaRuntime {
                 message: "a JWT credential needs an explicit organization".to_owned(),
             });
         }
-        // Without `proxy` the SDK builds its own client, which takes the
-        // system proxy settings.
+        // Otherwise the SDK builds its own client, which takes the system
+        // proxy settings.
         let http_client = config
-            .proxy
-            .as_deref()
-            .map(|proxy| {
-                let builder = reqwest::Client::builder();
-                if proxy == "none" {
-                    builder.no_proxy().build()
-                } else {
-                    reqwest::Proxy::all(proxy).and_then(|proxy| builder.proxy(proxy).build())
-                }
-            })
+            .direct
+            .then(|| reqwest::Client::builder().no_proxy().build())
             .transpose()
-            .map_err(|error| Error::InvalidConfig {
-                entry:   name.clone(),
-                path:    "proxy".to_owned(),
-                message: error.to_string(),
+            .map_err(|error| Error::Transport {
+                message: format!("building a direct Daytona client: {error}"),
+                outcome: MutationOutcome::NotStarted,
             })?;
         let sdk_config = DaytonaConfig {
             api_key,
@@ -697,37 +688,6 @@ mod tests {
                 fake.requests()
             );
         }
-    }
-
-    /// An entry's proxy carries every request to Daytona.
-    #[tokio::test]
-    async fn an_entrys_proxy_carries_its_daytona_requests() {
-        let proxy = FakeDaytona::start(|_| {
-            Arc::new(|_, target: &str| {
-                if target.ends_with("/api-keys/current") {
-                    Reply::Json(200, CURRENT_KEY.to_owned())
-                } else {
-                    Reply::Json(404, r#"{"message":"not found"}"#.to_owned())
-                }
-            })
-        })
-        .await;
-        let sandboxes = entry_catalog(
-            &serde_json::json!({"api_url": "http://daytona.invalid/api", "proxy": proxy.url()}),
-            Some("test-key"),
-        );
-
-        let descriptor = sandboxes
-            .provider("cloud")
-            .unwrap()
-            .describe()
-            .await
-            .unwrap();
-
-        assert_eq!(descriptor.namespace.id.as_str(), "daytona:org-42");
-        assert_eq!(proxy.requests(), [
-            "GET http://daytona.invalid/api/api-keys/current"
-        ]);
     }
 
     /// Daytona can stop and restart a sandbox in about a second and then

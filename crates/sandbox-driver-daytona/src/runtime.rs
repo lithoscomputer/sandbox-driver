@@ -29,10 +29,9 @@ use self::provider::DaytonaRuntime;
 ///
 /// The entry's `config` takes `api_url`, `organization`, `target` (the
 /// Daytona region) and `runner_image`, all optional. An application names
-/// itself to Daytona with `user_agent`, and chooses how its requests reach
-/// Daytona with `proxy`: `none` connects directly, any other value is the
-/// proxy's URL, and without it the system proxy settings (`HTTPS_PROXY`,
-/// `NO_PROXY`, ...) apply. The entry names the
+/// itself to Daytona with `user_agent`. Requests take the system proxy
+/// settings (`HTTPS_PROXY`, `NO_PROXY`, ...) unless `direct` is `true`.
+/// The entry names the
 /// credential under `secrets`: `DAYTONA_API_KEY`, or `DAYTONA_JWT_TOKEN`
 /// together with `organization`. Nothing else is read from the process
 /// environment. The namespace is `daytona:<organization>`, where an API
@@ -122,7 +121,7 @@ fn config_schema() -> serde_json::Value {
             "target": text("Daytona region for new sandboxes and snapshots"),
             "runner_image": text("Docker-capable runner image for workloads with services or container options"),
             "user_agent": text("User-Agent on every Daytona request; sandbox-driver's own when omitted"),
-            "proxy": text("`none` to reach Daytona directly, or a proxy URL; the system proxy settings when omitted"),
+            "direct": {"type": "boolean", "description": "Reach Daytona directly, ignoring the system proxy settings"},
         }
     })
 }
