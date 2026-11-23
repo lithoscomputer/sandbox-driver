@@ -15,6 +15,7 @@ mod config;
 mod descriptor;
 mod error;
 mod execution;
+mod failure;
 mod id;
 mod identity;
 #[doc(hidden)]
@@ -25,6 +26,7 @@ mod identity;
 pub mod legacy;
 mod provider;
 mod redact;
+mod sanitize;
 mod schema;
 mod status;
 mod units;
@@ -50,6 +52,7 @@ pub use execution::{
     ExecControls, ExecOutcome, ExecSpec, OutputLoss, OutputSink, OutputStream, StopLevel,
     TerminalSize, Termination, stop_signal,
 };
+pub use failure::{CommandError, CommandFailure};
 pub use id::{
     EnvironmentName, InvalidIdError, NamespaceId, ProviderKind, ProviderName, SandboxId,
     Sha256Digest, SnapshotId,
@@ -61,6 +64,7 @@ pub use provider::{
     Provider, ProviderFactory, Sandbox, SandboxSummary, SecretResolver, SecretValues,
     SshAccessInfo, VncConnection, WorkloadAdmission,
 };
+pub use sanitize::{OutputSanitization, OutputSanitizer};
 pub use status::{SandboxState, ServiceAddress, Status};
 pub use units::{ParseUnitError, parse_duration_ms, parse_size_mib};
 pub use workload::{

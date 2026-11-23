@@ -145,6 +145,8 @@ impl SandboxBuilder {
 impl ProviderHandle {
     pub async fn describe(&self) -> Result<Descriptor, Error>;
     pub async fn health(&self) -> Result<Health, Error>;
+    /// One entry's inventory, with the checks `find` runs per entry and no deadline.
+    pub async fn list(&self, filter: &LabelFilter) -> Result<Vec<SandboxSummary>, Error>;
 }
 
 /// What `find` returns: every match it could reach, and the providers it could not.
@@ -193,7 +195,7 @@ Rules every method obeys:
 
 ### Exec
 
-`ExecSpec` is argv (no shell), env, working directory, timeout, and `tty`. `ExecControls` is a streamed stdin, an output sink, and two cancellation levels: `term` then `kill`. `ExecOutcome` reports `termination` (`exited`, `timed_out`, `terminated`, `killed`, `lost`), `exit_code`, `signal`, and `output_loss`: counts of output the provider's transport dropped, and `truncated` when the provider stopped reading a stream of a command that exited on its own. A stopped or timed-out command always leaves output unread, which its `termination` reports. With `tty: true` the sink receives one stream and the controls gain `resize`. Dropping the future requests cancellation; it does not confirm that the command has stopped. The library owns bounded cleanup after the drop. `lost` means the execution outcome is unknown, not that the command or sandbox is known to be gone. Only a confirmed termination outcome or a successful sandbox `stop` establishes that the affected execution has ended.
+`ExecSpec` is argv (no shell), env, working directory, timeout, and `tty`. `ExecControls` is a streamed stdin, an output sink, and two cancellation levels: `term` then `kill`. `ExecOutcome` reports `termination` (`exited`, `timed_out`, `terminated`, `killed`, `lost`), `exit_code`, `signal`, and `output_loss`: counts of output the provider's transport dropped, and `truncated` when the provider stopped reading a stream of a command that exited on its own. A stopped or timed-out command always leaves output unread, which its `termination` reports. With `tty: true` the sink receives one stream and the controls gain `resize`. Dropping the future requests cancellation; it does not confirm that the command has stopped. The library owns bounded cleanup after the drop. `lost` means the execution outcome is unknown, not that the command or sandbox is known to be gone. Only a confirmed termination outcome or a successful sandbox `stop` establishes that the affected execution has ended. Output reaches the sink as the command wrote it. A client that shows it to a person or a model cleans it with the library's `OutputSanitization` (`raw`, `strip_ansi` for terminal escape sequences, `strip_all` for those and stray control characters), over a whole buffer or chunk by chunk with an `OutputSanitizer` per stream. It is a function over bytes, not an `ExecSpec` field, so nothing about it crosses the wire.
 
 The library adds whole-command helpers over `exec`. They are functions, not a capability, so they work on every provider and plugin with no wire support:
 
@@ -208,11 +210,27 @@ pub async fn run_captured_with(
 pub async fn run_bash(sandbox: &dyn Sandbox, script: &str) -> Result<Captured, Error>;
 
 pub struct Captured { pub outcome: ExecOutcome, pub stdout: CapturedOutput, pub stderr: CapturedOutput, pub duration: Duration }
-pub struct CapturedOutput { pub bytes: Vec<u8>, pub omitted_bytes: u64 }
+pub struct CapturedOutput { pub bytes: Vec<u8>, pub omitted_bytes: u64, pub head_bytes: usize }
 impl Captured { pub fn into_complete(self) -> Result<Captured, IncompleteOutput>; }
 ```
 
-A command that exits nonzero is a `Captured`, not an error; `success()` is true only for an exit with code zero. Output beyond the limit is still read, so the command never blocks, and is counted in `omitted_bytes`: the first half of the limit is kept from the start of the stream and the rest from its end. `is_complete()` is true only when the command exited on its own, nothing was omitted, and the provider reported no output loss; a command that was stopped, timed out, or lost is never complete. `into_complete()` turns that into an `IncompleteOutput` error that still holds the capture; call it before parsing output, so a short read is an error and not a wrong answer. `duration` is how long the caller waited for the command, measured by the library around the exec. `Captured`, `CapturedOutput`, and `IncompleteOutput` are `#[non_exhaustive]`: callers read their fields but do not build them, and a pattern that destructures one ends with `..`, so the library can add fields.
+A command that exits nonzero is a `Captured`, not an error; `success()` is true only for an exit with code zero. Output beyond the limit is still read, so the command never blocks, and is counted in `omitted_bytes`: the first half of the limit is kept from the start of the stream and the rest from its end, and `head_bytes` says how many of `bytes` came from the start. `is_complete()` is true only when the command exited on its own, nothing was omitted, and the provider reported no output loss; a command that was stopped, timed out, or lost is never complete. `into_complete()` turns that into an `IncompleteOutput` error that still holds the capture; call it before parsing output, so a short read is an error and not a wrong answer. `duration` is how long the caller waited for the command, measured by the library around the exec. `Captured`, `CapturedOutput`, and `IncompleteOutput` are `#[non_exhaustive]`: callers read their fields but do not build them, and a pattern that destructures one ends with `..`, so the library can add fields.
+
+The library's own helpers that run commands fail with `CommandError`, because a failed command is an outcome, not an `Error`, and `Error` carries no command output:
+
+```rust
+pub enum CommandError {
+    Sandbox(Error),                         // the exec was refused or lost; the command may not have run
+    Failed(Box<CommandFailure>),            // the command ran and did not succeed
+    UnexpectedOutput(Box<CommandFailure>),  // it exited with zero, but its output was incomplete or unreadable
+}
+pub struct CommandFailure {
+    pub context: String, pub outcome: ExecOutcome,
+    pub stdout_tail: CapturedOutput, pub stderr_tail: CapturedOutput, pub duration: Duration,
+}
+```
+
+`CommandFailure::new(context, &captured)` builds one from any `Captured`, keeping the last 8 KiB of each stream; a tail's `omitted_bytes` counts everything the command wrote before it. `context` says what the command was for, such as `stat`, never the command itself. `Display` gives the context, how the command ended and a fixed hint for a failure its stderr identifies (no network, no git repository), and never includes output; `display_for_log()` adds the tails, which can carry credentials, so redact its result before it leaves the process.
 
 `ExecSpec::bash(script)` is the one place a shell is implied. It is `bash -c <script>` with a blank `BASH_ENV`, so the script runs in a non-login shell that sources no startup file. The workload must provide `bash` on its `PATH`; no other shell is tried.
 
@@ -471,7 +489,7 @@ Connection loss, a plugin crash, or `Error::Stale` does not establish whether an
 - `labels` and `env` are string maps and round-trip exactly (labels) or reach every process in the sandbox (env).
 - `working_directory` and `user` are what commands run as and where; return the working directory you actually used in the create result.
 - `services` is a workload beside the sandbox: named containers with an image, env, published ports, a registry credential name, and a readiness check executed inside the service container. The provider waits for readiness before `create` or `start` returns success. Every readiness check states its whole budget: `interval_ms`, a per-attempt `timeout_ms`, `retries` and an overall `deadline_ms`, all required and non-zero, so the bound is explicit rather than inferred; a timeout longer than the deadline, or an interval that leaves no room for a second attempt, is `invalid_spec`. Each service must be reachable from the sandbox workload and its one-shot containers; `status.services` reports the host and port used from that workload, because on Docker that is a network alias and in a pod it is localhost. Services follow the sandbox lifecycle and participate in its stop fence. Declare `services` in your capabilities or refuse a non-empty `services` with `unsupported`.
-- `container` is the typed subset of container options a job can ask for: `init`, `privileged`, `capabilities_add`, `capabilities_drop`, `dns`, `extra_hosts`, `shm_size_mb`. Honour what you can; refuse the rest with `unsupported` naming the field.
+- `container` is the typed subset of container options a job can ask for: `init`, `privileged`, `capabilities_add`, `capabilities_drop`, `dns`, `extra_hosts`, `shm_size_mb`, `platform` (the image platform to pull and run, such as `linux/amd64`). Honour what you can; refuse the rest with `unsupported` naming the field.
 - `provider_config` is yours, for the few settings with no provider-neutral meaning. Describe it with a `spec_schema` in your descriptor and the library validates overrides against it; otherwise it is passed through unread.
 
 ### The descriptor

@@ -1,12 +1,20 @@
+//! Terminal control sequences stripped from command output.
+//!
+//! A provider delivers command output as the command wrote it. A client that
+//! shows that output to a person or a model chooses an [`OutputSanitization`]
+//! and applies it itself: to a whole buffer with
+//! [`OutputSanitization::sanitize`], or chunk by chunk with an
+//! [`OutputSanitizer`]. The policy is not part of
+//! [`ExecSpec`](crate::ExecSpec), because it changes what the client shows,
+//! not what the workload ran.
+
 use serde::{Deserialize, Serialize};
 
-/// Policy for command output returned by [`crate::legacy::Exec::run`] and
-/// [`crate::legacy::Exec::run_streaming`].
+/// How to clean command output before it is shown.
 ///
 /// Non-raw policies are lossy and are intended for textual output. Use
-/// [`OutputSanitization::Raw`] when output can contain arbitrary binary data.
-/// PTY sessions and long-lived bidirectional stdio processes always remain
-/// raw.
+/// [`OutputSanitization::Raw`] when output can contain arbitrary binary data,
+/// or when it goes to a terminal that interprets the sequences itself.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -332,6 +340,33 @@ mod tests {
         let mut sanitizer = OutputSanitizer::new(OutputSanitization::StripAnsi);
         assert_eq!(sanitizer.push(b"text\x1b]unfinished"), b"text");
         assert!(sanitizer.finish().is_empty());
+    }
+
+    #[test]
+    fn a_split_at_any_byte_matches_one_shot() {
+        // CSI, OSC ended by ST, a UTF-8 encoded C1 CSI, a DCS ended by a
+        // UTF-8 encoded ST, and two- and four-byte characters.
+        let bytes =
+            "a\u{1b}[1;31mb\u{1b}]0;title\u{1b}\\c\u{9b}0md\u{1b}Pq\u{9c}é؛🦀\u{1}\n".as_bytes();
+        for policy in [OutputSanitization::StripAnsi, OutputSanitization::StripAll] {
+            let expected = policy.sanitize(bytes);
+            for split in 0..=bytes.len() {
+                let (head, tail) = bytes.split_at(split);
+                let mut sanitizer = OutputSanitizer::new(policy);
+                let mut actual = sanitizer.push(head);
+                actual.extend(sanitizer.push(tail));
+                actual.extend(sanitizer.finish());
+                assert_eq!(actual, expected, "{policy:?} split at byte {split}");
+            }
+        }
+        assert_eq!(
+            OutputSanitization::StripAll.sanitize(bytes),
+            "abcdé؛🦀\n".as_bytes()
+        );
+        assert_eq!(
+            OutputSanitization::StripAnsi.sanitize(bytes),
+            "abcdé؛🦀\u{1}\n".as_bytes()
+        );
     }
 
     #[test]

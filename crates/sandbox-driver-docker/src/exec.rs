@@ -346,8 +346,7 @@ impl DockerExec {
         // A command without stdin gets the attached input closed at once.
         let stdin_task = stdin_reader.map(|reader| tokio::spawn(feed_stdin(input, reader)));
 
-        let mut captured =
-            StreamOutput::new(spec.output_sanitization, controls.retained_output_limit);
+        let mut captured = StreamOutput::new(controls.retained_output_limit);
         let outcome = drain_with_stops(
             &mut captured,
             output,

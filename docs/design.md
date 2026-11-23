@@ -332,7 +332,7 @@ The normative contract, and the load-bearing invariant of the whole system:
 
 This replaced fabro's rule that every command is Bash source. That rule made the primary consumer quote `exec 'prog' 'arg'…` into a script only for the provider to wrap it in a shell again, forced a per-image "which shell" setting on Docker, and made `attach` run a probe exec. An argv contract has none of that.
 
-`ExecSpec` is a plain owned serializable value — program, args, timeout, working dir, env vars, optional stdin bytes (write-then-EOF), and output sanitization — and is exactly what crosses the JSON-RPC boundary. `OutputSanitization` has three policies: `Raw` preserves every byte and is the default; `StripAnsi` removes ANSI terminal escape sequences but preserves standalone control characters; `StripAll` also removes standalone C0/C1 control characters except tab, line feed, and carriage return. Providers apply the policy before output reaches the sink, retained result, or capture statistics. Stateful filtering prevents an escape sequence from leaking when it spans streaming chunks. The policies apply only to `run` and `run_streaming`; PTY sessions and long-lived bidirectional stdio remain raw. Non-raw policies are lossy and callers must use `Raw` for binary output.
+`ExecSpec` is a plain owned serializable value — program, args, timeout, working dir, env vars, and optional stdin bytes (write-then-EOF) — and is exactly what crosses the JSON-RPC boundary.
 
 A relative working dir resolves against the sandbox working directory on every provider — a conformance case pins it. Process-local control objects travel separately in `ExecControls`: the `term` and `kill` stop tokens, the async output sink, and the retention cap (head+tail with `omitted_bytes` accounting — fabro's `OutputCaptureBuffer` moves here). On the wire, controls map to negotiated IDs — a host-generated `execId` routes `exec/output` notifications and `exec/stop` — never to serialized fields, and buffered `run` carries no streaming controls at all.
 
@@ -350,7 +350,7 @@ accounting facts.
 **Daytona's encoded exec is lossy, and says so.** The toolbox carries command
 output as text, so a Bash wrapper encodes every chunk of stdout and stderr as
 a bounded ASCII record (`printf '%s%q\n'` with a stream tag, under 512 bytes)
-and the provider decodes the records before sanitization, delivery, and
+and the provider decodes the records before delivery and
 retention accounting. Under a fast run of small writes the toolbox tears that
 stream: a record arrives without its tag, two arrive glued, or the output ends
 inside one. The decoder never fails the exec for it. It discards the
@@ -569,7 +569,7 @@ variant and its rendered remote source chain at the process boundary.
 - Git credentials and push machinery: `refresh_push_credentials`, `push_token_source`, `git_push_ref` (lease/retry engine), `setup_git` intents, `resume_setup_commands`, `origin_url`.
 - Clone orchestration: clone-source decisions, repo layout (`/repos/<owner>/<repo>` + symlink), pinned revisions, clone depth, clone events.
 - Content-addressed snapshot naming (HMAC of manifest).
-- Secret redaction policy: output sanitization is portable through `ExecSpec`, but provider-independent secret detection and redaction remain the caller's responsibility.
+- Secret redaction policy: provider-independent secret detection and redaction remain the caller's responsibility.
 - Fabro's run lifecycle: `initialize`-then-probe sequencing, cleanup scope guards, `--preserve-sandbox`, reconnect. These consume the crate's core + wait helper.
 
 Each of these is implementable over `Exec`/`Git`/core — the fabro survey confirmed both remote providers already implement them via exec today.

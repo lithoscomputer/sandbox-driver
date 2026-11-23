@@ -574,6 +574,9 @@ pub struct ContainerSpec {
     pub dns:               Vec<String>,
     pub extra_hosts:       BTreeMap<String, String>,
     pub shm_size_mb:       Option<NonZeroU64>,
+    /// The image platform to pull and run, such as `linux/amd64`. None is
+    /// the platform the provider's backend chooses.
+    pub platform:          Option<String>,
 }
 
 impl ContainerSpec {
@@ -589,6 +592,7 @@ impl ContainerSpec {
             dns,
             extra_hosts,
             shm_size_mb,
+            platform,
         } = self;
         set_fields([
             (init.is_some(), ContainerField::Init, "container.init"),
@@ -618,6 +622,11 @@ impl ContainerSpec {
                 ContainerField::ShmSizeMb,
                 "container.shm_size_mb",
             ),
+            (
+                platform.is_some(),
+                ContainerField::Platform,
+                "container.platform",
+            ),
         ])
     }
 
@@ -643,6 +652,16 @@ impl ContainerSpec {
             return Err(Error::invalid_spec(
                 format!("{path}.extra_hosts"),
                 "hosts and addresses must not be empty",
+            ));
+        }
+        if self
+            .platform
+            .as_deref()
+            .is_some_and(|platform| platform.trim().is_empty())
+        {
+            return Err(Error::invalid_spec(
+                format!("{path}.platform"),
+                "must not be empty",
             ));
         }
         Ok(())

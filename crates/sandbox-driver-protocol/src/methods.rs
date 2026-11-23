@@ -15,10 +15,10 @@ use sandbox_driver::legacy;
 use sandbox_driver::legacy::{
     Capabilities, CaptureStats, CorrelationId, DirEntry, Error, Event, ExecResult, ExecSpec,
     FileMetadata, ForkOptions, GitCloneOptions, LifecycleTimers, LogSource, NetworkPolicy,
-    OneShotSpec, OutputLoss, OutputSanitization, PlatformInfo, ProviderKind, PtyOptions, PtySize,
-    Resources, SandboxFilter, SandboxId, SandboxKind, SandboxSnapshotOptions, SandboxSource,
-    SandboxSpec, SandboxStatus, SnapshotId, SnapshotMode, SnapshotSource, SnapshotSpec, SpawnSpec,
-    StopLevel, Termination, VncConnection, VolumeMount,
+    OneShotSpec, OutputLoss, PlatformInfo, ProviderKind, PtyOptions, PtySize, Resources,
+    SandboxFilter, SandboxId, SandboxKind, SandboxSnapshotOptions, SandboxSource, SandboxSpec,
+    SandboxStatus, SnapshotId, SnapshotMode, SnapshotSource, SnapshotSpec, SpawnSpec, StopLevel,
+    Termination, VncConnection, VolumeMount,
 };
 use serde::{Deserialize, Serialize};
 
@@ -466,33 +466,30 @@ pub struct UpdateNetworkParams {
 /// as `Stdin` frames on the exec's data channel.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExecSpecDto {
-    pub program:             String,
+    pub program:       String,
     #[serde(default)]
-    pub args:                Vec<String>,
-    pub timeout_ms:          Option<u64>,
+    pub args:          Vec<String>,
+    pub timeout_ms:    Option<u64>,
     /// Additive: absent from and ignored by peers built before it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stop_grace_ms:       Option<u64>,
-    pub working_dir:         Option<String>,
-    pub env:                 BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "output_sanitization_is_raw")]
-    pub output_sanitization: OutputSanitization,
+    pub stop_grace_ms: Option<u64>,
+    pub working_dir:   Option<String>,
+    pub env:           BTreeMap<String, String>,
 }
 
 impl ExecSpecDto {
     pub fn from_spec(spec: &ExecSpec) -> Self {
         Self {
-            program:             spec.program.clone(),
-            args:                spec.args.clone(),
-            timeout_ms:          spec
+            program:       spec.program.clone(),
+            args:          spec.args.clone(),
+            timeout_ms:    spec
                 .timeout
                 .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
-            stop_grace_ms:       spec
+            stop_grace_ms: spec
                 .stop_grace
                 .map(|grace| u64::try_from(grace.as_millis()).unwrap_or(u64::MAX)),
-            working_dir:         spec.working_dir.clone(),
-            env:                 spec.env.clone(),
-            output_sanitization: spec.output_sanitization,
+            working_dir:   spec.working_dir.clone(),
+            env:           spec.env.clone(),
         }
     }
 
@@ -508,18 +505,8 @@ impl ExecSpecDto {
         for (key, value) in self.env {
             spec = spec.env_var(key, value);
         }
-        spec.output_sanitization(self.output_sanitization)
+        spec
     }
-}
-
-// serde's `skip_serializing_if` callback receives a reference even for a
-// one-byte Copy enum.
-#[allow(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "serde skip_serializing_if requires a reference callback"
-)]
-fn output_sanitization_is_raw(value: &OutputSanitization) -> bool {
-    *value == OutputSanitization::Raw
 }
 
 /// The metadata of a finished exec. Its bytes went over the channel: the

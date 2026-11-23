@@ -1,5 +1,5 @@
-//! Output of a Docker exec or one-shot container: captured and sanitized
-//! while it streams to the caller, and drained under the stop race every
+//! Output of a Docker exec or one-shot container: captured while it
+//! streams to the caller, and drained under the stop race every
 //! Docker command shares with the other providers.
 
 use std::pin::pin;
@@ -11,8 +11,8 @@ use bollard::errors::Error as DockerApiError;
 use futures_util::{Stream, StreamExt};
 use sandbox_driver::legacy;
 use sandbox_driver::legacy::{
-    ExecControls, ExecResult, ExecStreamingResult, OutputCaptureBuffer, OutputSanitization,
-    OutputSanitizer, OutputSink, OutputStream, Result, StopLevel, Termination,
+    ExecControls, ExecResult, ExecStreamingResult, OutputCaptureBuffer, OutputSink, OutputStream,
+    Result, StopLevel, Termination,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -65,23 +65,18 @@ where
     })
 }
 
-/// Captures and sanitizes Docker output while forwarding it to the caller.
+/// Captures Docker output while forwarding it to the caller.
 /// Its drain future must be polled alongside stop handling: a blocked sink
 /// must not prevent a command from being killed.
 pub(crate) struct StreamOutput {
-    streams: [(OutputStream, OutputSanitizer, OutputCaptureBuffer); 2],
+    streams: [(OutputStream, OutputCaptureBuffer); 2],
 }
 
 impl StreamOutput {
-    pub(crate) fn new(policy: OutputSanitization, limit: Option<usize>) -> Self {
+    pub(crate) fn new(limit: Option<usize>) -> Self {
         Self {
-            streams: [OutputStream::Stdout, OutputStream::Stderr].map(|stream| {
-                (
-                    stream,
-                    OutputSanitizer::new(policy),
-                    OutputCaptureBuffer::new(limit),
-                )
-            }),
+            streams: [OutputStream::Stdout, OutputStream::Stderr]
+                .map(|stream| (stream, OutputCaptureBuffer::new(limit))),
         }
     }
 
@@ -97,15 +92,9 @@ impl StreamOutput {
                 LogOutput::StdErr { message } => (1, message),
                 LogOutput::StdIn { .. } => continue,
             };
-            let (stream, sanitizer, capture) = &mut self.streams[index];
-            let bytes = sanitizer.push(&bytes);
+            let (stream, capture) = &mut self.streams[index];
             capture.push(&bytes);
-            Self::emit(sink, *stream, bytes, sink_failed).await;
-        }
-        for (stream, sanitizer, capture) in &mut self.streams {
-            let bytes = sanitizer.finish();
-            capture.push(&bytes);
-            Self::emit(sink, *stream, bytes, sink_failed).await;
+            Self::emit(sink, *stream, bytes.into(), sink_failed).await;
         }
         Ok(())
     }
@@ -132,7 +121,7 @@ impl StreamOutput {
         duration: Duration,
         truncated: bool,
     ) -> ExecStreamingResult {
-        let [(_, _, stdout), (_, _, stderr)] = self.streams;
+        let [(_, stdout), (_, stderr)] = self.streams;
         let (stdout, mut stdout_stats) = stdout.into_parts();
         let (stderr, mut stderr_stats) = stderr.into_parts();
         stdout_stats.truncated = truncated;
