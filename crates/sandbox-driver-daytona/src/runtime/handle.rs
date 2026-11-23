@@ -387,6 +387,7 @@ fn legacy_spec(spec: &ExecSpec) -> LegacySpec {
         Some(ms) => legacy.timeout(Duration::from_millis(ms)),
         None => legacy.no_timeout(),
     };
+    legacy.stop_grace = spec.stop_grace_ms.map(Duration::from_millis);
     if let Some(dir) = &spec.working_directory {
         legacy = legacy.working_dir(dir);
     }

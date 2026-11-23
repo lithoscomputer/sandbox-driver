@@ -161,6 +161,7 @@ async fn the_plugin_passes_the_shared_contract_through_the_loader() {
     let peer = plugin_catalog().await;
     let report = Conformance::new(catalog.clone(), "scratch", commands())
         .with_peer(peer.clone())
+        .with_bash()
         .run()
         .await;
     eprintln!("{report}");

@@ -25,6 +25,14 @@ pub struct ExecSpec {
     pub working_directory: Option<String>,
     #[serde(default)]
     pub timeout_ms:        Option<u64>,
+    /// Stops the command gracefully: the timeout and [`ExecControls::term`]
+    /// send SIGTERM to the command's process group, and SIGKILL follows
+    /// once this many milliseconds pass with the command still running.
+    /// A command the timeout stopped reports [`Termination::TimedOut`]
+    /// whichever signal ended it. Without it the timeout kills at once and
+    /// `term` is one SIGTERM.
+    #[serde(default)]
+    pub stop_grace_ms:     Option<u64>,
     #[serde(default)]
     pub tty:               bool,
 }
@@ -36,6 +44,7 @@ impl ExecSpec {
             env:               BTreeMap::new(),
             working_directory: None,
             timeout_ms:        None,
+            stop_grace_ms:     None,
             tty:               false,
         }
     }
@@ -70,6 +79,7 @@ impl fmt::Debug for ExecSpec {
             env,
             working_directory,
             timeout_ms,
+            stop_grace_ms,
             tty,
         } = self;
         f.debug_struct("ExecSpec")
@@ -77,6 +87,7 @@ impl fmt::Debug for ExecSpec {
             .field("env_keys", &EnvKeys(env))
             .field("working_directory", working_directory)
             .field("timeout_ms", timeout_ms)
+            .field("stop_grace_ms", stop_grace_ms)
             .field("tty", tty)
             .finish()
     }
