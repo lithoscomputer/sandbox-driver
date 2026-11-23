@@ -8,8 +8,8 @@
 > every provider as a protocol version 2 plugin, as the
 > [CLI guide](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/cli.md) describes.
 > The older provider API ([design](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/design.md)),
-> protocol version 2, and the provider executables are still in the tree but are
-> being removed; if you need them, pin tag
+> and protocol version 2 are still in the tree but are being removed; the
+> provider executables are gone. If you need any of them, pin tag
 > [`v2`](https://github.com/lithoscomputer/sandbox-driver/tree/v2).
 > The [shared contract](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/shared-contract.md)
 > is the implementation handoff. The
@@ -265,9 +265,7 @@ config  = { api_url = "https://app.daytona.io/api", organization = "org_…" }
 secrets = ["DAYTONA_API_KEY"]     # read from the environment, never stored here
 
 [providers.local]
-plugin = "host"                   # not built in: a plugin installed on this machine, durability: process
-path   = "~/.local/share/sandbox-driver/plugins/host/sandbox-driver-host"
-sha256 = "3c1e…"
+plugin = "host"                   # built in: directories on this machine, durability: process
 
 [providers.lima]
 plugin = "lima"                   # not built in: resolved from the plugin directory, see "Using a third-party plugin"

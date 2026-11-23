@@ -5,7 +5,7 @@ itself, as a consumer or plugin author reads it, is [docs/next-api.md](next-api.
 this document states the required behavior behind those shapes and the
 migration rules. It defines common data and required behavior for the next API. It does **not** claim the
 existing providers implement that behavior yet. The older traits, errors and
-specs (now under `sandbox_driver::legacy`), provider libraries, executables, and [protocol v2](protocol.md)
+specs (now under `sandbox_driver::legacy`), provider libraries, and [protocol v2](protocol.md)
 remain supported during migration. The additive façade, registration boundary,
 scripted fake and common conformance checks now consume these declarations.
 No new transport or consumer cutover is introduced by core.

@@ -1,10 +1,7 @@
 //! Daytona cloud sandbox provider.
 //!
-//! A supported library for in-process embedding, and the implementation
-//! behind the same-named plugin executable. An application either links
-//! this crate and constructs the provider directly, or launches the
-//! executable and reaches it through `sandbox-driver-protocol`. Both
-//! present the same trait family.
+//! A supported library for in-process embedding: an application links
+//! this crate and constructs the provider directly.
 //!
 //! VM-backed sandboxes (`Isolation::Vm`) through the Daytona control
 //! plane and per-sandbox toolbox daemon, with snapshots and volumes as

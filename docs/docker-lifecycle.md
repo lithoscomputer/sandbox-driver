@@ -116,11 +116,10 @@ Run the Docker verification path against a real daemon:
 mise run test:docker
 ```
 
-This builds the provider executables, runs failure injection and concurrent
-in-process/wire conformance, explicitly enables the live fence tests, and runs
-the `lithos-sandbox` CLI workflow with live Docker required. The CLI links the
-Docker provider in; the process-boundary fence test starts two independent
-driver executables against the same sandbox. An
+This runs failure injection and concurrent in-process/wire conformance,
+explicitly enables the live fence tests, and runs the `lithos-sandbox` CLI
+workflow with live Docker required. The CLI links the Docker provider in; the
+fence tests connect two independent providers to the same sandbox. An
 unreachable daemon fails this task instead of silently skipping live coverage.
 
 To run only the real-daemon fence tests:

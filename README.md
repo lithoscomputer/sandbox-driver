@@ -34,9 +34,9 @@ built-ins, and protocol version 3 loads third-party plugins. See the
 [API specification](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/next-api.md).
 
 The older provider API ([design](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/design.md)),
-protocol version 2, and the Host, Docker, and Daytona provider executables are
-still in the tree but are unsupported on `main` and being removed. If you need
-them, pin tag
+and protocol version 2 are still in the tree but are unsupported on `main` and
+being removed. The Host, Docker, and Daytona provider executables are gone. If
+you need any of them, pin tag
 [`v2`](https://github.com/lithoscomputer/sandbox-driver/tree/v2).
 
 Part of [Lithos](#part-of-lithos), a family of Rust building blocks for AI tools.

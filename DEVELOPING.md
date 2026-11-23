@@ -1,8 +1,8 @@
 # Developing
 
-The workspace builds the provider libraries, their plugin executables, and
-the `lithos-sandbox` CLI. Applications link the bundled provider libraries
-in-process or use the providers through JSON-RPC. Petri and fabro are the
+The workspace builds the provider libraries and the `lithos-sandbox` CLI.
+Applications link the bundled provider libraries in-process; other providers
+are plugins loaded over JSON-RPC. Petri and fabro are the
 primary consumers.
 
 ## Setup
@@ -20,8 +20,8 @@ mise run setup
 
 | Command | Purpose |
 | --- | --- |
-| `mise run dev` | Build the CLI and all provider executables |
-| `mise run plugins:build` | Build the provider and fixture plugin executables used by tests |
+| `mise run dev` | Build the workspace, including the CLI |
+| `mise run plugins:build` | Build the fixture plugin executables used by tests |
 | `mise run fmt` | Format Rust code |
 | `mise run fmt:check` | Check formatting without changing files |
 | `mise run lint` | Run Clippy with warnings denied |
@@ -64,16 +64,15 @@ each night. Both workflows test these native platforms:
 
 ## Releases
 
-Pushing a `v*` tag builds the three plugin executables (`sandbox-driver-host`,
-`sandbox-driver-docker`, `sandbox-driver-daytona`) for all three platforms,
-one archive and SHA-256 checksum each, plus a checksum of each bare executable
-for hosts that pin plugins. The workflow creates a draft GitHub release.
+Pushing a `v*` tag builds the `lithos-sandbox` CLI for all three platforms,
+one archive and SHA-256 checksum each. The workflow creates a draft GitHub
+release.
 Review the draft before publishing it.
 
 ## Provider verification
 
-The current Host and Docker conformance checks exercise both in-process and
-plugin access. Docker checks need a running daemon. Daytona's live suite
+The Host conformance checks run in-process; the Docker checks run both
+in-process and over the wire. Docker checks need a running daemon. Daytona's live suite
 needs `DAYTONA_API_KEY`.
 
 The hosted nested Docker gate also needs
