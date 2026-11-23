@@ -12,7 +12,7 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use super::file_ops::{quoted, shell_quote};
+use super::search::{quoted, shell_quote};
 use super::{Captured, CommandFailure, ExecSpec, Sandbox, run_captured};
 
 mod failure;

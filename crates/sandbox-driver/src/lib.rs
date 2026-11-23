@@ -16,7 +16,6 @@ mod descriptor;
 mod error;
 mod execution;
 mod failure;
-mod file_ops;
 mod git;
 mod id;
 mod identity;
@@ -56,7 +55,6 @@ pub use execution::{
     TerminalSize, Termination, stop_signal,
 };
 pub use failure::{CommandError, CommandFailure};
-pub use file_ops::{FileStat, create_dir_all, path_exists, remove_path, rename_path, stat_path};
 pub use git::{
     GitChange, GitCommit, GitDiffEntry, GitDiffOptions, GitError, GitFailure, GitFailureKind,
     GitIdentity, GitLogOptions, GitNumstat, GitRevisionRange, git_blob_sizes, git_blobs,

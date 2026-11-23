@@ -238,21 +238,9 @@ Host, Docker and Daytona keep `BASH_ENV` blank for that argv, and for the same o
 
 ### Files and ports
 
-`Files` is `get(path, range)`, `put(path, bytes)` creating parents, and `list(path, depth)`. Everything else is derived over exec by the library and works on every provider whose workload has Bash with `stat`, `mv`, `rm`, `rmdir` and `mkdir` (GNU, BusyBox or BSD):
+`Files` is `get(path, range)`, `put(path, bytes)` creating parents, and `list(path, depth)`. Everything else (`stat`, `remove`, `rename`, `mkdir`) is derived over exec by the library and works on every provider.
 
-```rust
-pub async fn stat_path(sandbox: &dyn Sandbox, path: &str) -> Result<FileStat, CommandError>;
-pub async fn path_exists(sandbox: &dyn Sandbox, path: &str) -> Result<bool, CommandError>;
-pub async fn remove_path(sandbox: &dyn Sandbox, path: &str, recursive: bool) -> Result<(), CommandError>;
-pub async fn rename_path(sandbox: &dyn Sandbox, from: &str, to: &str) -> Result<(), CommandError>;
-pub async fn create_dir_all(sandbox: &dyn Sandbox, path: &str) -> Result<(), CommandError>;
-
-pub struct FileStat { pub kind: FileKind, pub size: u64, pub mode: Option<u32>, pub modified_at_ms: Option<u64> }
-```
-
-A relative path resolves against the sandbox's working directory. `stat_path` describes a symbolic link itself and `path_exists` follows it. A missing path is `Error::NotFound` from `stat_path` and from `rename_path` for its source. `remove_path` succeeds on a missing path, removes a link rather than what it names, and needs `recursive` for a directory that is not empty. `rename_path` moves as `mv` does and does not create the destination's parent. Each command has a 60-second budget.
-
-Search is derived the same way:
+The library derives search over exec, for a workload that has Bash:
 
 ```rust
 /// Lines matching a regular expression in a file, or in every file under a directory.

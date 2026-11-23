@@ -12,7 +12,7 @@ use std::str;
 use globset::GlobBuilder;
 use serde::{Deserialize, Serialize};
 
-use super::file_ops::{quoted, shell_quote, succeeded, unreadable};
+use super::workload::validate_name;
 use super::{
     Captured, CommandError, CommandFailure, Error, ExecSpec, Sandbox, Termination, run_captured,
 };
@@ -169,6 +169,39 @@ async fn run(sandbox: &dyn Sandbox, script: String) -> Result<Captured, Error> {
     let mut spec = ExecSpec::bash(script);
     spec.timeout_ms = Some(TIMEOUT_MS);
     run_captured(sandbox, spec).await
+}
+
+/// `value`, once it is valid as one argument, quoted for Bash source.
+pub(super) fn quoted(field: &str, value: &str) -> Result<String, Error> {
+    validate_name(field, value)?;
+    Ok(shell_quote(value))
+}
+
+/// Quotes a string for safe interpolation into Bash source.
+pub(super) fn shell_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for c in value.chars() {
+        if c == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(c);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+fn succeeded(context: &str, captured: &Captured) -> Result<(), CommandError> {
+    if captured.success() {
+        Ok(())
+    } else {
+        Err(CommandFailure::new(context, captured).into())
+    }
+}
+
+fn unreadable(context: &str, captured: &Captured) -> CommandError {
+    CommandError::UnexpectedOutput(Box::new(CommandFailure::new(context, captured)))
 }
 
 /// `value` as one single-quoted shell word; unlike a path it may be empty.
@@ -429,5 +462,26 @@ mod tests {
             walk_script(".", &exclude),
             Err(Error::InvalidSpec { .. })
         ));
+    }
+
+    #[test]
+    fn quotes_single_quotes_safely() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote("a b;c$d"), "'a b;c$d'");
+    }
+
+    #[test]
+    fn a_path_is_one_shell_word_whatever_it_contains() {
+        assert_eq!(
+            quoted("path", "it's -a $(dir)").as_deref(),
+            Ok("'it'\\''s -a $(dir)'")
+        );
+        for path in ["", "a\0b"] {
+            assert!(
+                matches!(quoted("path", path), Err(Error::InvalidSpec { path, .. }) if path == "path"),
+                "{path:?}"
+            );
+        }
     }
 }
