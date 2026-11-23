@@ -47,7 +47,11 @@ const DEFAULT_SIGNED_TTL: Duration = Duration::from_secs(3600);
 pub(super) struct Workload {
     reference: SandboxRef,
     handle:    Arc<DaytonaSandbox>,
-    env:       BTreeMap<String, String>,
+    /// The sandbox spec's own variables: all that is known of a workload
+    /// that has not run since this handle was attached.
+    spec_env:  BTreeMap<String, String>,
+    /// What a command starts from, read from the running workload.
+    env:       OnceCell<BTreeMap<String, String>>,
     closed:    CancellationToken,
     /// Whether the direct workload provides Docker for one-shots.
     docker:    OnceCell<bool>,
@@ -57,13 +61,15 @@ impl Workload {
     pub(super) fn new(
         reference: SandboxRef,
         handle: Arc<DaytonaSandbox>,
-        env: BTreeMap<String, String>,
+        spec_env: BTreeMap<String, String>,
+        env: Option<BTreeMap<String, String>>,
         closed: CancellationToken,
     ) -> Self {
         Self {
             reference,
             handle,
-            env,
+            spec_env,
+            env: OnceCell::new_with(env),
             closed,
             docker: OnceCell::new(),
         }
@@ -71,6 +77,15 @@ impl Workload {
 
     fn ensure_open(&self) -> Result<(), Error> {
         super::ensure_open(&self.closed)
+    }
+
+    /// Reads the running workload's environment, unless this handle has it.
+    pub(super) async fn read_env(&self) -> Result<(), Error> {
+        self.env
+            .get_or_try_init(|| probe_env(&self.handle))
+            .await
+            .map_err(|error| classify("reading the workload environment", error))?;
+        Ok(())
     }
 
     /// Whether the workload runs as a container inside the provider's
@@ -381,6 +396,15 @@ fn outcome(result: &ExecStreamingResult) -> ExecOutcome {
     }
 }
 
+/// What a command in the running workload starts from: its image's variables
+/// with the sandbox spec's over them, as the workload itself reports them.
+/// `BASH_ENV` is the provider's own blank, not the workload's.
+pub(super) async fn probe_env(handle: &DaytonaSandbox) -> legacy::Result<BTreeMap<String, String>> {
+    let mut env = LegacySandbox::environment(handle).await?;
+    env.remove(legacy::BASH_ENV_VAR);
+    Ok(env)
+}
+
 fn legacy_spec(spec: &ExecSpec) -> LegacySpec {
     let mut legacy = LegacySpec::new(&spec.argv[0]).args(spec.argv[1..].iter().cloned());
     legacy = match spec.timeout_ms {
@@ -453,7 +477,7 @@ impl Sandbox for Workload {
     }
 
     fn env(&self) -> &BTreeMap<String, String> {
-        &self.env
+        self.env.get().unwrap_or(&self.spec_env)
     }
 
     async fn status(&self) -> Result<Status, Error> {
@@ -515,7 +539,8 @@ impl Sandbox for Workload {
         if self.nested() {
             runner::restart_services(&self.handle).await?;
         }
-        Ok(())
+        // A handle attached while the sandbox was stopped could not read it.
+        self.read_env().await
     }
 
     #[tracing::instrument(skip_all, fields(sandbox_id = %self.reference.id), err)]
