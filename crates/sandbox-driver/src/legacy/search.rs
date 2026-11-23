@@ -1,9 +1,9 @@
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 
 use crate::legacy::derived::DerivedSearch;
 use crate::legacy::error::Result;
 use crate::legacy::exec::Exec;
+use crate::search::{GrepMatch, GrepOptions, WalkOptions, WalkedFile};
 
 /// Content and file-tree search inside a sandbox.
 ///
@@ -83,62 +83,5 @@ impl Search for SearchFacet<'_> {
 
     async fn walk(&self, base: &str, options: &WalkOptions) -> Result<Vec<WalkedFile>> {
         self.implementation().walk(base, options).await
-    }
-}
-
-/// Options for [`Search::grep`].
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct GrepOptions {
-    pub case_insensitive: bool,
-    pub max_matches:      Option<usize>,
-    /// Glob the searched files must match.
-    pub include:          Option<String>,
-}
-
-/// One content match.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct GrepMatch {
-    pub path:        String,
-    pub line_number: u64,
-    pub line:        String,
-}
-
-impl GrepMatch {
-    pub fn new(path: impl Into<String>, line_number: u64, line: impl Into<String>) -> Self {
-        Self {
-            path: path.into(),
-            line_number,
-            line: line.into(),
-        }
-    }
-}
-
-/// Options for [`Search::walk`].
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct WalkOptions {
-    pub max_depth:    Option<usize>,
-    /// Directory names pruned from the walk (e.g. `.git`, `node_modules`).
-    pub exclude_dirs: Vec<String>,
-}
-
-/// One file from [`Search::walk`].
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct WalkedFile {
-    /// Path relative to the walk base.
-    pub path: String,
-    /// `None` when the transport cannot report sizes (BSD find fallback).
-    pub size: Option<u64>,
-}
-
-impl WalkedFile {
-    pub fn new(path: impl Into<String>, size: Option<u64>) -> Self {
-        Self {
-            path: path.into(),
-            size,
-        }
     }
 }

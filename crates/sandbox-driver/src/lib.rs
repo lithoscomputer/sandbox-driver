@@ -28,6 +28,7 @@ mod provider;
 mod redact;
 mod sanitize;
 mod schema;
+mod search;
 mod status;
 mod units;
 mod wire_time;
@@ -65,6 +66,9 @@ pub use provider::{
     SshAccessInfo, VncConnection, WorkloadAdmission,
 };
 pub use sanitize::{OutputSanitization, OutputSanitizer};
+pub use search::{
+    GrepMatch, GrepOptions, WalkOptions, WalkedFile, glob_files, grep_files, walk_files,
+};
 pub use status::{SandboxState, ServiceAddress, Status};
 pub use units::{ParseUnitError, parse_duration_ms, parse_size_mib};
 pub use workload::{

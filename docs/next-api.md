@@ -240,6 +240,26 @@ Host, Docker and Daytona keep `BASH_ENV` blank for that argv, and for the same o
 
 `Files` is `get(path, range)`, `put(path, bytes)` creating parents, and `list(path, depth)`. Everything else (`stat`, `remove`, `rename`, `mkdir`) is derived over exec by the library and works on every provider.
 
+The library derives search over exec, for a workload that has Bash:
+
+```rust
+/// Lines matching a regular expression in a file, or in every file under a directory.
+pub async fn grep_files(
+    sandbox: &dyn Sandbox, pattern: &str, path: &str, options: &GrepOptions,
+) -> Result<Vec<GrepMatch>, CommandError>;
+/// Every regular file under `base`, as paths relative to it, in path order.
+pub async fn walk_files(sandbox: &dyn Sandbox, base: &str, options: &WalkOptions) -> Result<Vec<WalkedFile>, CommandError>;
+/// The walked paths that match a glob; `*` stops at a `/` and `**` crosses them.
+pub async fn glob_files(sandbox: &dyn Sandbox, pattern: &str, base: &str) -> Result<Vec<String>, CommandError>;
+
+pub struct GrepOptions { pub case_insensitive: bool, pub max_matches: Option<usize>, pub include: Option<String> }
+pub struct GrepMatch { pub path: String, pub line_number: u64, pub line: String }
+pub struct WalkOptions { pub max_depth: Option<usize>, pub exclude_dirs: Vec<String> }
+pub struct WalkedFile { pub path: String, pub size: Option<u64> }
+```
+
+`grep_files` runs ripgrep when the workload has `rg`, and GNU or BSD `grep -r` otherwise; BusyBox `grep` is not enough. The pattern is in that tool's default syntax, and ripgrep skips hidden and ignored files. No match is an empty result, and a search that could not run, such as one of a missing path, is `CommandError::Failed`. `max_matches` bounds the total and stops the search at the source. `walk_files` uses `find` (GNU, BSD or BusyBox) and reports sizes only with GNU `find`. A missing base is an empty walk, and so is a base that is a symbolic link or, for a relative base, is reached through one. Each command has a 30-second budget.
+
 `Ports` is `expose(port, Expose { signed, ttl }) -> Exposure { url, headers, expires_at }` and `release(port)`. Some providers hold a real local forward until `release`.
 
 ### Errors
