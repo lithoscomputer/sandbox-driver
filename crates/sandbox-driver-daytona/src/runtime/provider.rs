@@ -148,9 +148,9 @@ impl DaytonaRuntime {
         if map_state(sdk.state) == LegacyState::Deleted {
             return Ok(None);
         }
-        // A sandbox without the contract's recipe label was made by someone
-        // else, or by the legacy provider; it exists, so it is not absent.
-        if !sdk.labels.contains_key(RECIPE_LABEL) {
+        // A sandbox this provider does not manage was made by someone else;
+        // it exists, so it is not absent.
+        if !manages(&sdk.labels) {
             return Err(Error::NotOwned { id: id.to_string() });
         }
         Ok(Some(sdk))
@@ -170,6 +170,18 @@ impl DaytonaRuntime {
             _ => error,
         }
     }
+}
+
+/// Whether this provider manages the sandbox with these labels: it created
+/// it, or the old API did.
+fn manages(labels: &HashMap<String, String>) -> bool {
+    labels.contains_key(RECIPE_LABEL)
+        // Old API grace period: the old Daytona provider (tag `v2`) marked
+        // its sandboxes with only the managed label. They stay reachable for
+        // 30 days after Fabro and Petri move to this API, so runs started
+        // before the move can finish and be cleaned up. When the period
+        // ends, delete this line and the test `old_api_sandboxes_stay_reachable`.
+        || labels.get(MANAGED_LABEL).is_some_and(|value| value == "true")
 }
 
 fn handle_id(handle: &DaytonaSandbox) -> SandboxId {
@@ -356,7 +368,7 @@ impl Provider for DaytonaRuntime {
             .map_err(|error| from_sdk("listing sandboxes", &error))?;
         items
             .into_iter()
-            .filter(|item| item.labels.contains_key(RECIPE_LABEL))
+            .filter(|item| manages(&item.labels))
             .map(|item| {
                 let id = SandboxId::try_new(&item.id).map_err(|_| Error::Transport {
                     message: "Daytona listed an unusable sandbox id".to_owned(),
@@ -533,10 +545,7 @@ mod tests {
                 "job": "1842",
             }),
         );
-        let legacy = sandbox(
-            "sb-legacy",
-            &serde_json::json!({"sh.sandbox-driver.managed": "true"}),
-        );
+        let foreign = sandbox("sb-foreign", &serde_json::json!({"job": "1842"}));
         let fake = FakeDaytona::start(move |_| {
             Arc::new(move |method, target| match (method, target) {
                 ("GET", target) if target.ends_with("/api-keys/current") => {
@@ -545,8 +554,8 @@ mod tests {
                 ("GET", target) if target.contains("/sandbox/sb-ours?") => {
                     Reply::Json(200, ours.clone())
                 }
-                ("GET", target) if target.contains("/sandbox/sb-legacy?") => {
-                    Reply::Json(200, legacy.clone())
+                ("GET", target) if target.contains("/sandbox/sb-foreign?") => {
+                    Reply::Json(200, foreign.clone())
                 }
                 _ => Reply::Json(404, r#"{"message":"not found"}"#.to_owned()),
             })
@@ -571,9 +580,9 @@ mod tests {
         assert_eq!(descriptor.namespace.id.as_str(), "daytona:org-42");
         assert_eq!(descriptor.access, AccessScope::Shared);
 
-        // A sandbox the contract did not create exists, so it is not absent.
+        // A sandbox this provider does not manage exists, so it is not absent.
         assert!(matches!(
-            sandboxes.attach(&reference("sb-legacy")).await,
+            sandboxes.attach(&reference("sb-foreign")).await,
             Err(Error::NotOwned { .. })
         ));
         assert!(matches!(
@@ -622,6 +631,75 @@ mod tests {
             "{:?}",
             fake.requests()
         );
+    }
+
+    /// A sandbox the old API created for a run is found by the run's label,
+    /// attached with its stored directory and environment, and destroyed.
+    #[tokio::test]
+    async fn old_api_sandboxes_stay_reachable() {
+        // As the old provider stored a nested-container sandbox: no recipe.
+        let old = sandbox(
+            "sb-old",
+            &serde_json::json!({
+                "sh.sandbox-driver.managed": "true",
+                "sh.sandbox-driver.working-directory": "/workspace",
+                "sh.sandbox-driver.docker-target": "container",
+                "petri.run": "run-7",
+            }),
+        );
+        let deleted = Arc::new(AtomicBool::new(false));
+        let fake = FakeDaytona::start({
+            let deleted = Arc::clone(&deleted);
+            move |_| {
+                Arc::new(move |method, target| match (method, target) {
+                    ("GET", target) if target.ends_with("/api-keys/current") => {
+                        Reply::Json(200, CURRENT_KEY.to_owned())
+                    }
+                    ("GET", target) if target.starts_with("/sandbox?") => {
+                        Reply::Json(200, format!(r#"{{"items":[{old}],"nextCursor":null}}"#))
+                    }
+                    ("GET", target)
+                        if target.starts_with("/sandbox/sb-old?")
+                            && !deleted.load(Ordering::SeqCst) =>
+                    {
+                        Reply::Json(200, old.clone())
+                    }
+                    ("DELETE", target) if target.starts_with("/sandbox/sb-old") => {
+                        deleted.store(true, Ordering::SeqCst);
+                        Reply::Json(200, old.clone())
+                    }
+                    _ => Reply::Json(404, r#"{"message":"not found"}"#.to_owned()),
+                })
+            }
+        })
+        .await;
+        let sandboxes = catalog(&fake, Some("test-key"));
+        let cloud = sandboxes.provider("cloud").unwrap();
+
+        let listed = cloud
+            .list(&LabelFilter::eq("petri.run", "run-7"))
+            .await
+            .unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|summary| (&summary.reference, &summary.labels))
+                .collect::<Vec<_>>(),
+            [(
+                &reference("sb-old"),
+                &BTreeMap::from([("petri.run".to_owned(), "run-7".to_owned())])
+            )]
+        );
+
+        let attached = sandboxes.attach(&reference("sb-old")).await.unwrap();
+        assert_eq!(attached.working_directory(), Path::new("/workspace"));
+        assert_eq!(
+            attached.env(),
+            &BTreeMap::from([("CI".to_owned(), "1".to_owned())])
+        );
+
+        sandboxes.destroy(&reference("sb-old")).await.unwrap();
+        assert!(deleted.load(Ordering::SeqCst), "{:?}", fake.requests());
     }
 
     /// Daytona can stop and restart a sandbox in about a second and then
