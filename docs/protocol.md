@@ -1154,6 +1154,9 @@ schemas.
 contract's own types. `exec`, `files.get` and `files.put` are data-channel
 operations: exec stdin and output, and file bytes, travel in frames, and a
 transfer that ends without its `Eof` fails rather than looking short.
+An `exec` whose spec has `tty` carries the caller's terminal `size`, so the
+command starts at it; `exec.resize` sends each later size, and output arrives
+in `stdout` frames that the host delivers as the terminal stream.
 `exec.stop`, `exec.resize`, `stop`, `destroy`, `health` and `ports.release` are
 reserved, so they are answered while the plugin's ordinary capacity is full.
 Dropping an exec future kills its execution. Errors keep their contract

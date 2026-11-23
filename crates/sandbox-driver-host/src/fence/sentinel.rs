@@ -4,6 +4,12 @@
 //! work. Its in-group watcher ends active work when the owning provider dies
 //! or a fence appears. After the workload exits, the idle sentinel watches
 //! the same conditions, so descendants cannot outlive the provider either.
+//!
+//! A command run on a terminal has a sentinel that leads a new session with
+//! the terminal as its controlling terminal, so the pinned id is also the
+//! session id. An interactive shell there moves itself and its jobs into
+//! process groups of their own; the fence reaches them as members of the
+//! session (see [`super::observation::Members`]).
 
 use std::collections::BTreeMap;
 use std::os::unix::process::ExitStatusExt;
@@ -14,8 +20,9 @@ use std::time::Duration;
 use std::{fs as sync_fs, io, mem, slice};
 
 use nix::errno::Errno;
-use nix::sys::signal::{Signal, killpg};
+use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::Pid;
+use sandbox_driver::TerminalSize;
 use sandbox_driver::legacy::{Error, ExecResult, ProviderError, Result, Termination};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::runtime::Handle;
@@ -23,9 +30,10 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::spawn_blocking;
 use tokio::{fs, time};
 
-use super::observation::{group_is_live, live_groups};
+use super::observation::{group_is_live, live_groups, members};
 use crate::exec::BASH_ENV_VAR;
 use crate::host_kind;
+use crate::terminal::Terminal;
 
 const POLL: Duration = Duration::from_millis(25);
 const DRAIN: Duration = Duration::from_secs(5);
@@ -50,15 +58,24 @@ fn sentinel_shell() -> &'static str {
     })
 }
 
+/// The workload starts in a subshell that restores SIGINT and SIGQUIT, which
+/// a shell ignores for a background command, so the interrupt character
+/// reaches a command on a terminal (`/bin/sh` fallbacks such as dash keep
+/// them ignored). The sentinel then ignores the signals a terminal sends its
+/// foreground group, which it shares with a command that does not use job
+/// control, and closes its own copies of the workload's input, so a
+/// terminal reports its end once the workload's processes have closed it.
 const SENTINEL_SCRIPT: &str = r#"
 sf="$1"; gf="$2"; fence="$3"; owner="$4"; startup_set="$5"; startup="$6"; shift 6
 printf '%s\n' "$$" > "$gf.tmp" && /bin/mv "$gf.tmp" "$gf" || exit 125
 if [ -e "$fence" ]; then exit 0; fi
 exec 3<&0
-if [ "$startup_set" = 1 ]; then BASH_ENV="$startup" "$@" <&3 & else "$@" <&3 & fi
+( trap - INT QUIT
+  if [ "$startup_set" = 1 ]; then export BASH_ENV="$startup"; fi
+  exec "$@" ) <&3 &
 w=$!
-trap '' TERM
-exec >/dev/null 2>&1
+trap '' TERM HUP INT QUIT TSTP
+exec </dev/null >/dev/null 2>&1 3<&-
 ( while kill -0 "$w" 2>/dev/null; do
     if [ -e "$fence" ]; then kill -KILL -- "-$$" 2>/dev/null || kill -KILL "-$$"; fi
     kill -0 "$owner" 2>/dev/null || kill -KILL -- "-$$" 2>/dev/null || kill -KILL "-$$"
@@ -111,6 +128,16 @@ impl PinnedGroup {
         })
     }
 
+    /// Signals one member of the group's session that sits in a process
+    /// group of its own, while the session id is pinned. The pid was
+    /// observed live in the session an instant before.
+    fn signal_member(&self, pid: i32, signal: Signal) {
+        let pin = self.pin.lock().unwrap_or_else(PoisonError::into_inner);
+        if matches!(*pin, Pin::Held(_)) {
+            let _ = kill(Pid::from_raw(pid), signal);
+        }
+    }
+
     fn is_pinned(&self) -> bool {
         matches!(
             *self.pin.lock().unwrap_or_else(PoisonError::into_inner),
@@ -155,9 +182,19 @@ async fn kill_owned_groups(groups: &[Arc<PinnedGroup>]) -> io::Result<()> {
             .iter()
             .filter_map(|group| Some((group.pgid, group.signal(Signal::SIGKILL)?)))
             .collect();
+        let pinned = groups.to_vec();
         let live = spawn_blocking(move || {
             let pgids: Vec<_> = signals.iter().map(|(pgid, _)| *pgid).collect();
-            let live_groups = live_groups(&pgids);
+            let members = members(&pgids);
+            // A terminal's shell and its jobs sit in groups of their own
+            // inside the sentinel's session, out of reach of the group
+            // signal above.
+            for (session, pid) in members.by_session {
+                if let Some(group) = pinned.iter().find(|group| group.pgid == session) {
+                    group.signal_member(pid, Signal::SIGKILL);
+                }
+            }
+            let live_groups = members.live;
             let mut live = false;
             for (pgid, signalled) in signals {
                 if live_groups.contains(&pgid) {
@@ -308,6 +345,44 @@ impl ProcessGroups {
         env: &BTreeMap<String, String>,
         configure: impl FnOnce(&mut Command),
     ) -> Result<HostChild> {
+        let (child, ()) = self
+            .spawn_in(program, args, env, false, configure, |command| {
+                command.process_group(0);
+                Ok(())
+            })
+            .await?;
+        Ok(child)
+    }
+
+    /// Spawns the command on a new terminal of `size`, its sentinel leading
+    /// a session the terminal controls. The child has no pipes: its input
+    /// and output are the returned terminal.
+    pub(crate) async fn spawn_terminal(
+        self: &Arc<Self>,
+        program: &str,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+        size: TerminalSize,
+        configure: impl FnOnce(&mut Command),
+    ) -> Result<(HostChild, Terminal)> {
+        self.spawn_in(program, args, env, true, configure, |command| {
+            Terminal::lead(command, size)
+        })
+        .await
+    }
+
+    /// Spawns a sentinel for `program`. `attach` places it (in a process
+    /// group of its own, or a session on a terminal) inside the spawn lock,
+    /// so a descriptor it opens is not inherited by a concurrent spawn.
+    async fn spawn_in<T>(
+        self: &Arc<Self>,
+        program: &str,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+        terminal: bool,
+        configure: impl FnOnce(&mut Command),
+        attach: impl FnOnce(&mut Command) -> io::Result<T>,
+    ) -> Result<(HostChild, T)> {
         let mut state = self.state.lock().await;
         if !state.accepting_work {
             return Err(
@@ -317,14 +392,17 @@ impl ProcessGroups {
         let generation = state.generation_or_create(&self.root).await?;
         let paths = generation.next_record_paths();
         let mut command = sentinel_command(&paths, program, args, env, configure);
-        command.process_group(0);
         command.kill_on_drop(false);
-        let mut child = {
+        let (mut child, attached) = {
             #[cfg(target_os = "macos")]
             let _spawn = SPAWN_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-            command.spawn()
-        }
-        .map_err(|e| Error::io("spawning host sentinel", e))?;
+            let attached =
+                attach(&mut command).map_err(|e| Error::io("opening host terminal", e))?;
+            let child = command
+                .spawn()
+                .map_err(|e| Error::io("spawning host sentinel", e))?;
+            (child, attached)
+        };
         let pgid = child
             .id()
             .and_then(|id| i32::try_from(id).ok())
@@ -337,14 +415,18 @@ impl ProcessGroups {
             pin: Mutex::new(Pin::Held(child)),
         });
         generation.groups.push(group.clone());
-        Ok(HostChild {
-            stdin,
-            stdout,
-            stderr,
-            group,
-            _groups: self.clone(),
-            status_file: paths.status,
-        })
+        Ok((
+            HostChild {
+                stdin,
+                stdout,
+                stderr,
+                group,
+                _groups: self.clone(),
+                status_file: paths.status,
+                terminal,
+            },
+            attached,
+        ))
     }
 
     pub(crate) async fn stop(&self) -> Result<()> {
@@ -555,6 +637,9 @@ pub(crate) struct HostChild {
     // A standalone stdio process can outlive the HostExec that spawned it.
     _groups:           Arc<ProcessGroups>,
     status_file:       PathBuf,
+    /// Whether the command runs on a terminal, its sentinel leading the
+    /// session.
+    terminal:          bool,
 }
 
 impl HostChild {
@@ -562,8 +647,27 @@ impl HostChild {
     /// [`sandbox_driver::legacy::ExecControls::term`] path. Whether the command
     /// ends is the command's business; the caller escalates to `kill` if
     /// it must.
+    ///
+    /// On a terminal, `term` hangs the command up first, as closing the
+    /// terminal would: an interactive shell ignores SIGTERM but ends on
+    /// SIGHUP, and hangs up its jobs. Both signals reach every process group
+    /// of the session; the sentinel ignores them.
     pub(crate) fn term(&self) {
+        if !self.terminal {
+            let _ = self.group.signal(Signal::SIGTERM);
+            return;
+        }
+        let _ = self.group.signal(Signal::SIGHUP);
         let _ = self.group.signal(Signal::SIGTERM);
+        let group = Arc::clone(&self.group);
+        // Best effort, like the group signals: the scan for the session's
+        // other groups runs off the runtime and nothing waits on it.
+        drop(spawn_blocking(move || {
+            for (_, pid) in members(&[group.pgid]).by_session {
+                group.signal_member(pid, Signal::SIGHUP);
+                group.signal_member(pid, Signal::SIGTERM);
+            }
+        }));
     }
 
     /// SIGKILLs the process group and waits for the group to settle: the

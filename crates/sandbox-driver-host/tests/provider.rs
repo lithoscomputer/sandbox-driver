@@ -19,7 +19,7 @@ use sandbox_driver::{
 use sandbox_driver_conformance::{Commands, Conformance};
 use sandbox_driver_host::HostFactory;
 use serde_json::json;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 use tokio::time;
 
 struct NoSecrets;
@@ -113,6 +113,7 @@ async fn host_passes_the_shared_contract() {
     })
     .with_peer(peer.clone())
     .with_bash()
+    .with_terminal()
     .run()
     .await;
     eprintln!("{report}");
@@ -155,9 +156,6 @@ async fn host_advertises_an_owner_process_provider_and_refuses_what_it_cannot_do
     refused(builder().await.spec(spec).create().await, "services");
 
     let sandbox = builder().await.create().await.expect("host sandbox");
-    let mut tty = ExecSpec::argv(["true"]);
-    tty.tty = true;
-    refused(sandbox.exec(tty, ExecControls::default()).await, "exec.tty");
     refused(
         sandbox
             .ports()
@@ -170,6 +168,61 @@ async fn host_advertises_an_owner_process_provider_and_refuses_what_it_cannot_do
     );
     assert!(sandbox.endpoints().is_none());
     assert!(sandbox.containers().is_none());
+    catalog
+        .destroy(&sandbox.reference())
+        .await
+        .expect("destroy");
+    catalog.shutdown().await.expect("shutdown");
+}
+
+/// The process group a live process is in.
+fn group_of(pid: u32) -> u32 {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).expect("stat");
+    let (_, rest) = stat.rsplit_once(") ").expect("stat fields");
+    rest.split_whitespace()
+        .nth(2)
+        .and_then(|group| group.parse().ok())
+        .expect("process group")
+}
+
+/// An interactive shell on a terminal moves itself and each of its jobs
+/// into a process group of its own. Stopping the sandbox still ends them,
+/// even when they ignore the terminal's hangup.
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_ends_a_terminal_shell_and_its_jobs() {
+    let catalog = scratch();
+    let sandbox = catalog
+        .builder("scratch")
+        .await
+        .expect("builder")
+        .create()
+        .await
+        .expect("host sandbox");
+    let workspace = sandbox.working_directory().to_owned();
+    let mut spec = ExecSpec::argv(["bash", "--norc", "--noprofile", "-i"]);
+    spec.tty = true;
+    let (mut input, stdin) = duplex(1024);
+    input
+        .write_all(b"trap '' HUP; sleep 600 & echo $! > job.pid; echo $$ > shell.pid\n")
+        .await
+        .expect("shell input");
+    let shell = sandbox.exec(spec, ExecControls {
+        stdin: Some(Box::pin(stdin)),
+        ..ExecControls::default()
+    });
+    let stopping = async {
+        let job = read_pid(&workspace.join("job.pid")).await;
+        let shell = read_pid(&workspace.join("shell.pid")).await;
+        assert_eq!(group_of(job), job, "the job leads its own group");
+        assert_eq!(group_of(shell), shell, "the shell leads its own group");
+        sandbox.stop().await.expect("stop");
+        (job, shell)
+    };
+    let (outcome, (job, shell)) = tokio::join!(shell, stopping);
+    assert_eq!(outcome.expect("shell").termination, Termination::Killed);
+    assert!(!alive(job), "the job outlived stop");
+    assert!(!alive(shell), "the shell outlived stop");
+    drop(input);
     catalog
         .destroy(&sandbox.reference())
         .await

@@ -479,14 +479,20 @@ async fn exec(
         sink,
         term,
         kill,
-        resize,
+        mut resize,
     } = controls;
+    // The wire has one output frame kind for stdout and a terminal.
+    let tty = spec.tty;
     let params = ExecParams {
         sandbox,
         exec: exec_id.clone(),
         spec,
         stdin: stdin.is_some(),
         channel,
+        size: resize
+            .as_mut()
+            .filter(|_| tty)
+            .map(|resize| *resize.borrow_and_update()),
     };
     // Dropping this future before the plugin answers requests a kill; the
     // cleanup is owned by the connection and bounded by its deadline.
@@ -536,6 +542,7 @@ async fn exec(
             let mut pumped = Pumped { sink_error: None };
             while let Some((kind, payload)) = reader.read().await? {
                 let stream = match kind {
+                    FrameKind::Stdout if tty => OutputStream::Terminal,
                     FrameKind::Stdout => OutputStream::Stdout,
                     FrameKind::Stderr => OutputStream::Stderr,
                     FrameKind::Eof => break,

@@ -57,6 +57,8 @@ mod fence;
 mod fs;
 mod registry;
 mod runtime;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod terminal;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -122,6 +124,67 @@ impl HostProvider {
 
     pub fn new() -> Self {
         Self::temporary(&registry::fresh_id())
+    }
+
+    /// [`SandboxProvider::create`], returning the Host handle itself.
+    pub(crate) async fn create_sandbox(
+        &self,
+        spec: &SandboxSpec,
+        events: Option<EventContext>,
+    ) -> Result<Arc<HostSandbox>> {
+        spec.validate()?;
+        validate_supported_creation_fields(spec)?;
+
+        let emitter = EventEmitter::new(self.kind.clone(), events);
+        let plan = WorkspacePlan::from_spec(spec);
+        // A designated directory is its own identity: the id is derived from
+        // the path, so a later process attaches to it without a record. A
+        // path that does not resolve keeps a fresh id here and fails inside
+        // the create operation below, where the failure is reported through
+        // the events.
+        let id = plan
+            .designated_directory()
+            .await
+            .as_deref()
+            .and_then(directory_id)
+            .unwrap_or_else(|| {
+                SandboxId::try_new(format!("host-{}", registry::fresh_id()))
+                    .expect("generated id is valid")
+            });
+        if let Some(existing) = self.registry.lock().await.get(&id) {
+            return Ok(Arc::clone(existing));
+        }
+        let subject = EventSubject::Sandbox {
+            id:   Some(id.clone()),
+            name: spec.name.clone(),
+        };
+        let handle_emitter = emitter.clone();
+        emitter
+            .run(subject, Action::Create, |reporter| async move {
+                reporter
+                    .progress(Progress::new(ProgressCode::SANDBOX_PROVISION))
+                    .await;
+                registry::private_directory(&self.root).await?;
+                let root = tokio_fs::canonicalize(&self.root)
+                    .await
+                    .map_err(|e| Error::io("resolving host registry", e))?;
+                let (workspace, ownership) = plan.realize(&root, &id).await?;
+                let record = Record {
+                    version: 1,
+                    id: id.clone(),
+                    name: spec.name.clone(),
+                    workspace,
+                    ownership,
+                    env: spec.env.clone(),
+                    labels: spec.labels.clone(),
+                    state: SandboxState::Running,
+                    created_at: SystemTime::now(),
+                };
+                registry::write(&root, &record).await?;
+                let mut handles = self.registry.lock().await;
+                self.cache_handle(&mut handles, record, None, handle_emitter)
+            })
+            .await
     }
 
     /// A temporary provider whose registry is named by `generation`.
@@ -579,60 +642,7 @@ impl SandboxProvider for HostProvider {
         spec: &SandboxSpec,
         events: Option<EventContext>,
     ) -> Result<Arc<dyn Sandbox>> {
-        spec.validate()?;
-        validate_supported_creation_fields(spec)?;
-
-        let emitter = EventEmitter::new(self.kind.clone(), events);
-        let plan = WorkspacePlan::from_spec(spec);
-        // A designated directory is its own identity: the id is derived from
-        // the path, so a later process attaches to it without a record. A
-        // path that does not resolve keeps a fresh id here and fails inside
-        // the create operation below, where the failure is reported through
-        // the events.
-        let id = plan
-            .designated_directory()
-            .await
-            .as_deref()
-            .and_then(directory_id)
-            .unwrap_or_else(|| {
-                SandboxId::try_new(format!("host-{}", registry::fresh_id()))
-                    .expect("generated id is valid")
-            });
-        if let Some(existing) = self.registry.lock().await.get(&id) {
-            return Ok(Arc::clone(existing) as Arc<dyn Sandbox>);
-        }
-        let subject = EventSubject::Sandbox {
-            id:   Some(id.clone()),
-            name: spec.name.clone(),
-        };
-        let handle_emitter = emitter.clone();
-        emitter
-            .run(subject, Action::Create, |reporter| async move {
-                reporter
-                    .progress(Progress::new(ProgressCode::SANDBOX_PROVISION))
-                    .await;
-                registry::private_directory(&self.root).await?;
-                let root = tokio_fs::canonicalize(&self.root)
-                    .await
-                    .map_err(|e| Error::io("resolving host registry", e))?;
-                let (workspace, ownership) = plan.realize(&root, &id).await?;
-                let record = Record {
-                    version: 1,
-                    id: id.clone(),
-                    name: spec.name.clone(),
-                    workspace,
-                    ownership,
-                    env: spec.env.clone(),
-                    labels: spec.labels.clone(),
-                    state: SandboxState::Running,
-                    created_at: SystemTime::now(),
-                };
-                registry::write(&root, &record).await?;
-                let mut handles = self.registry.lock().await;
-                let sandbox = self.cache_handle(&mut handles, record, None, handle_emitter)?;
-                Ok(sandbox as Arc<dyn Sandbox>)
-            })
-            .await
+        Ok(self.create_sandbox(spec, events).await? as Arc<dyn Sandbox>)
     }
 
     #[tracing::instrument(

@@ -161,6 +161,7 @@ async fn the_plugin_passes_the_shared_contract_through_the_loader() {
     let peer = plugin_catalog().await;
     let report = Conformance::new(catalog.clone(), "scratch", commands())
         .with_peer(peer.clone())
+        .with_terminal()
         .run()
         .await;
     eprintln!("{report}");
@@ -204,9 +205,6 @@ async fn refusals_and_descriptor_facts_cross_the_process_boundary() {
     refused(builder().await.spec(spec).create().await, "services");
 
     let sandbox = builder().await.create().await.expect("sandbox");
-    let mut tty = ExecSpec::argv(["true"]);
-    tty.tty = true;
-    refused(sandbox.exec(tty, ExecControls::default()).await, "exec.tty");
     refused(
         sandbox
             .ports()

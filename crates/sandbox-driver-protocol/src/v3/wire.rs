@@ -110,6 +110,10 @@ pub(crate) struct ExecParams {
     /// Whether `stdin` frames follow; otherwise the command's input is empty.
     pub stdin:   bool,
     pub channel: ChannelRequest,
+    /// A terminal's starting size, for a `spec.tty` command whose caller
+    /// gave one; later sizes travel as `exec.resize`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size:    Option<TerminalSize>,
 }
 
 #[derive(Serialize, Deserialize)]

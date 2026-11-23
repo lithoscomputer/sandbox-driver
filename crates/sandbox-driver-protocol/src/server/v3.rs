@@ -339,12 +339,10 @@ async fn exec(
         spec,
         stdin,
         channel: request,
+        size,
     } = params;
     let sandbox = sandbox(served, &id).await?;
-    let (resize, resized) = watch::channel(TerminalSize {
-        rows:    24.try_into().expect("non-zero"),
-        columns: 80.try_into().expect("non-zero"),
-    });
+    let (resize, resized) = watch::channel(size.unwrap_or_default());
     // Registered before the channel opens, so a stop the host sends once it
     // sees the channel always finds this exec.
     let handle = ExecHandle {

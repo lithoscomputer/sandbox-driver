@@ -148,6 +148,17 @@ pub struct TerminalSize {
     pub columns: NonZeroU16,
 }
 
+impl Default for TerminalSize {
+    /// 24 rows of 80 columns, the size a terminal has before its first
+    /// resize.
+    fn default() -> Self {
+        Self {
+            rows:    NonZeroU16::new(24).expect("non-zero"),
+            columns: NonZeroU16::new(80).expect("non-zero"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Termination {
