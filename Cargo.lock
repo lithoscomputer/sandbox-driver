@@ -2311,6 +2311,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "nix",
+ "rustix",
  "sandbox-driver",
  "sandbox-driver-conformance",
  "sandbox-driver-protocol",

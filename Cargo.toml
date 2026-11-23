@@ -27,6 +27,7 @@ nix = { version = "0.30", features = ["signal"] }
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false }
 reqwest-middleware = "0.5"
+rustix = { version = "1.1", features = ["fs", "process", "pty", "stdio", "termios"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 sandbox-driver = { path = "crates/sandbox-driver" }
 sandbox-driver-daytona-config = { path = "crates/sandbox-driver-daytona-config" }

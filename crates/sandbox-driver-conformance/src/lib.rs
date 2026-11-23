@@ -4,17 +4,19 @@
 //! surface. Provider-specific workload targeting, optional services/containers,
 //! crash recovery and fault injection remain separate integration gates; a
 //! passing report does not certify those unexecuted scenarios.
-use std::future;
+use std::future::{self, Future};
 use std::io::Cursor;
+use std::pin::{Pin, pin};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sandbox_driver::{
-    AccessScope, Error, ExecControls, ExecSpec, FileRange, LabelFilter, MutationOutcome,
-    OutputSink, Sandbox, SandboxRef, SandboxState, Sandboxes, Termination, run_bash,
+    AccessScope, Error, ExecControls, ExecOutcome, ExecSpec, FileRange, LabelFilter,
+    MutationOutcome, OutputSink, OutputStream, Sandbox, SandboxRef, SandboxState, Sandboxes,
+    TerminalSize, Termination, run_bash,
 };
-use tokio::io::AsyncReadExt;
-use tokio::sync::mpsc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
+use tokio::sync::{mpsc, watch};
 use tokio::time;
 
 use crate::check::{CheckOutcome, Verdict, fail};
@@ -50,6 +52,7 @@ pub struct Conformance {
     environment: String,
     commands:    Commands,
     bash:        bool,
+    terminal:    bool,
     pub timeout: Duration,
 }
 
@@ -59,6 +62,7 @@ enum Scenario<'a> {
     Files,
     Exec,
     Bash,
+    Terminal,
     /// Stops the sandbox through a handle attached from this catalog.
     Fence(&'a Sandboxes),
 }
@@ -77,6 +81,7 @@ impl Conformance {
             environment: environment.into(),
             commands,
             bash: false,
+            terminal: false,
             timeout: Duration::from_secs(30),
         }
     }
@@ -98,6 +103,17 @@ impl Conformance {
         self
     }
 
+    /// Declares that the provider runs commands on a terminal
+    /// (`ExecSpec::tty`) and that the workload provides Bash and `stty`,
+    /// which adds a check that a command sees a terminal of the requested
+    /// size, follows a resize, reads its input from the terminal, writes one
+    /// terminal stream, and that the interrupt character stops it.
+    #[must_use]
+    pub fn with_terminal(mut self) -> Self {
+        self.terminal = true;
+        self
+    }
+
     /// Creates one sandbox per check, then attempts bounded cleanup even after
     /// a check fails or times out; a cleanup failure fails its check. Unknown
     /// create outcomes have no guessed ID; providers/applications must
@@ -111,6 +127,9 @@ impl Conformance {
         ];
         if self.bash {
             scenarios.push(("captured_bash", Scenario::Bash));
+        }
+        if self.terminal {
+            scenarios.push(("terminal_exec", Scenario::Terminal));
         }
         if let Some(peer) = &self.peer {
             scenarios.push(("cross_instance_stop_fence", Scenario::Fence(peer)));
@@ -133,6 +152,7 @@ impl Conformance {
                     Scenario::Files => Self::files(sandbox).await,
                     Scenario::Exec => self.exec(sandbox).await,
                     Scenario::Bash => Self::bash(sandbox).await,
+                    Scenario::Terminal => Self::terminal(sandbox).await,
                     Scenario::Fence(catalog) => self.fence_with(sandbox, catalog).await,
                 }
             };
@@ -291,6 +311,55 @@ impl Conformance {
             "bash stderr differed",
         )
     }
+    async fn terminal(sandbox: &dyn Sandbox) -> CheckOutcome {
+        // Reports the terminal's size, then again for each line it reads.
+        let script = r#"stty size; while read -r line && [ "$line" != done ]; do stty size; done; echo finished"#;
+        let (resize, resized) = watch::channel(terminal_size(30, 100));
+        let (mut terminal, exec) = Terminal::start(sandbox, script, Some(resized));
+        let mut exec = pin!(exec);
+        terminal.wait_for(exec.as_mut(), "30 100").await?;
+        resize.send_replace(terminal_size(40, 120));
+        // A resize and input travel separately; ask until the new size shows.
+        for _ in 0..40 {
+            terminal.write(b"\n").await?;
+            let shown = time::timeout(
+                Duration::from_millis(500),
+                terminal.wait_for(exec.as_mut(), "40 120"),
+            )
+            .await;
+            if let Ok(shown) = shown {
+                shown?;
+                break;
+            }
+        }
+        require(terminal.text().contains("40 120"), "resize not followed")?;
+        terminal.write(b"done\n").await?;
+        let outcome = terminal.finish(exec).await?;
+        require(
+            outcome.termination == Termination::Exited && outcome.exit_code == Some(0),
+            "terminal command did not exit successfully",
+        )?;
+        require(terminal.text().contains("finished"), "terminal output lost")?;
+        require(
+            terminal.one_stream,
+            "terminal output arrived on stdout or stderr",
+        )?;
+
+        let (mut terminal, exec) = Terminal::start(sandbox, "echo ready; exec sleep 30", None);
+        let mut exec = pin!(exec);
+        terminal.wait_for(exec.as_mut(), "ready").await?;
+        terminal.write(&[0x03]).await?;
+        let outcome = terminal.finish(exec).await?;
+        if outcome.termination == Termination::Exited
+            && (outcome.signal == Some(2) || outcome.exit_code == Some(130))
+        {
+            Ok(())
+        } else {
+            fail(format!(
+                "the interrupt character did not stop the command: {outcome:?}"
+            ))
+        }
+    }
     async fn fence_with(&self, sandbox: &dyn Sandbox, catalog: &Sandboxes) -> CheckOutcome {
         let reference = sandbox.reference();
         let attached = match catalog.attach(&reference).await {
@@ -364,4 +433,109 @@ async fn read(
 }
 fn require(condition: bool, message: &str) -> CheckOutcome {
     if condition { Ok(()) } else { fail(message) }
+}
+
+fn terminal_size(rows: u16, columns: u16) -> TerminalSize {
+    TerminalSize {
+        rows:    rows.try_into().expect("non-zero rows"),
+        columns: columns.try_into().expect("non-zero columns"),
+    }
+}
+
+/// A started command, which runs only while polled.
+type Running<'a> = Pin<Box<dyn Future<Output = Result<ExecOutcome, Error>> + Send + 'a>>;
+
+/// The caller's side of a command run on a terminal: its input, and the
+/// output seen so far.
+struct Terminal {
+    input:      DuplexStream,
+    output:     mpsc::UnboundedReceiver<(OutputStream, Vec<u8>)>,
+    seen:       Vec<u8>,
+    /// Whether every chunk arrived as the terminal stream.
+    one_stream: bool,
+}
+
+impl Terminal {
+    /// Starts a Bash script on a terminal. The command runs only while the
+    /// returned future is polled.
+    fn start<'a>(
+        sandbox: &'a dyn Sandbox,
+        script: &str,
+        resize: Option<watch::Receiver<TerminalSize>>,
+    ) -> (Self, Running<'a>) {
+        let mut spec = ExecSpec::bash(script);
+        spec.tty = true;
+        spec.timeout_ms = Some(20_000);
+        let (input, stdin) = duplex(1024);
+        let (chunks, output) = mpsc::unbounded_channel();
+        let sink: OutputSink = Arc::new(move |stream, bytes| {
+            let _ = chunks.send((stream, bytes));
+            Box::pin(future::ready(Ok(())))
+        });
+        let exec = sandbox.exec(spec, ExecControls {
+            stdin: Some(Box::pin(stdin)),
+            sink: Some(sink),
+            resize,
+            ..ExecControls::default()
+        });
+        (
+            Self {
+                input,
+                output,
+                seen: Vec::new(),
+                one_stream: true,
+            },
+            exec,
+        )
+    }
+
+    fn record(&mut self, (stream, bytes): (OutputStream, Vec<u8>)) {
+        self.one_stream &= stream == OutputStream::Terminal;
+        self.seen.extend(bytes);
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.seen).into_owned()
+    }
+
+    async fn write(&mut self, bytes: &[u8]) -> CheckOutcome {
+        self.input
+            .write_all(bytes)
+            .await
+            .map_err(|error| Verdict::Failed(format!("terminal input failed: {error}")))
+    }
+
+    /// Runs the command until its output shows `wanted`.
+    async fn wait_for(
+        &mut self,
+        mut exec: Pin<&mut impl Future<Output = Result<ExecOutcome, Error>>>,
+        wanted: &str,
+    ) -> CheckOutcome {
+        while !self.text().contains(wanted) {
+            tokio::select! {
+                outcome = exec.as_mut() => {
+                    return fail(format!("the command ended before it wrote {wanted:?}: {outcome:?}"));
+                }
+                Some(chunk) = self.output.recv() => self.record(chunk),
+            }
+        }
+        Ok(())
+    }
+
+    /// Runs the command to its end and collects the rest of its output.
+    async fn finish(
+        &mut self,
+        mut exec: Pin<&mut impl Future<Output = Result<ExecOutcome, Error>>>,
+    ) -> Result<ExecOutcome, Verdict> {
+        let outcome = loop {
+            tokio::select! {
+                outcome = exec.as_mut() => break outcome?,
+                Some(chunk) = self.output.recv() => self.record(chunk),
+            }
+        };
+        while let Ok(chunk) = self.output.try_recv() {
+            self.record(chunk);
+        }
+        Ok(outcome)
+    }
 }

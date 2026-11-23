@@ -9,10 +9,13 @@ use std::time::{Duration, Instant};
 use std::{env, future, io};
 
 use async_trait::async_trait;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use sandbox_driver::TerminalSize;
 use sandbox_driver::legacy::{
     Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, OutputCaptureBuffer,
-    OutputSink, OutputStream, Result, SpawnSpec, StderrTail, StdioProcess, StdioProcessHandle,
-    Termination, feed_stdin, finish_stdin_writer, run_with_stop_grace, stop_signal,
+    OutputSink, OutputStream, Result, SpawnSpec, StderrTail, StdinReader, StdioProcess,
+    StdioProcessHandle, Termination, feed_stdin, finish_stdin_writer, run_with_stop_grace,
+    stop_signal,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{ChildStderr, ChildStdout, Command};
@@ -22,6 +25,8 @@ use tokio::{fs, time};
 
 use crate::fence::{HostChild, ProcessGroups, exec_result};
 use crate::registry;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::terminal::Terminal;
 
 /// Bash sources this file at startup. Dropped from the inherited
 /// environment so a worker's startup file never runs inside a sandboxed
@@ -175,6 +180,29 @@ impl HostExec {
         }
     }
 
+    async fn prepare_workspace(&self) -> Result<()> {
+        if self.recreate_missing_workspace {
+            fs::create_dir_all(&self.working_dir)
+                .await
+                .map_err(|error| Error::io("recreating managed workspace", error))?;
+        }
+        Ok(())
+    }
+
+    /// Sets the command's directory and its environment: the effective
+    /// environment overlaid with `env`.
+    fn place(
+        &self,
+        command: &mut Command,
+        working_dir: Option<&str>,
+        env: &BTreeMap<String, String>,
+    ) {
+        command.current_dir(self.resolve_dir(working_dir));
+        command.env_clear();
+        command.envs(effective_env(&self.base_env));
+        command.envs(env);
+    }
+
     async fn spawn_command(
         &self,
         program: &str,
@@ -183,16 +211,9 @@ impl HostExec {
         env: &BTreeMap<String, String>,
         stdin: Stdio,
     ) -> Result<HostChild> {
-        if self.recreate_missing_workspace {
-            fs::create_dir_all(&self.working_dir)
-                .await
-                .map_err(|error| Error::io("recreating managed workspace", error))?;
-        }
+        self.prepare_workspace().await?;
         let configure = |command: &mut Command| {
-            command.current_dir(self.resolve_dir(working_dir));
-            command.env_clear();
-            command.envs(effective_env(&self.base_env));
-            command.envs(env);
+            self.place(command, working_dir, env);
             command
                 .stdin(stdin)
                 .stdout(Stdio::piped())
@@ -200,6 +221,42 @@ impl HostExec {
         };
         self.groups.spawn(program, args, configure).await
     }
+}
+
+/// How a command's input and output are connected.
+enum Io {
+    Pipes,
+    /// A terminal, sized from the receiver's latest value, or the default
+    /// size without one.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Terminal(Option<watch::Receiver<TerminalSize>>),
+}
+
+/// Where a spawned command's output is read.
+enum Output {
+    Pipes {
+        stdout: ChildStdout,
+        stderr: ChildStderr,
+    },
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Terminal {
+        terminal: Terminal,
+        resize:   Option<watch::Receiver<TerminalSize>>,
+    },
+}
+
+/// Applies each new size to the terminal for as long as it is polled.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn follow_resizes(terminal: &Terminal, resize: Option<watch::Receiver<TerminalSize>>) {
+    if let Some(mut resize) = resize {
+        while resize.changed().await.is_ok() {
+            let size = *resize.borrow_and_update();
+            if let Err(error) = terminal.resize(size) {
+                tracing::debug!(provider_kind = "host", error = %error, "terminal resize failed");
+            }
+        }
+    }
+    future::pending::<()>().await;
 }
 
 enum PumpError {
@@ -243,12 +300,11 @@ impl OutputPump<'_> {
 }
 
 /// A spawned command with its pipes taken: the child to race, the stdin
-/// writer task when the spec has input, and the output pipes to pump.
+/// writer task when the spec has input, and the output to pump.
 struct Wired {
     child:      HostChild,
     stdin_task: Option<JoinHandle<Result<()>>>,
-    stdout:     ChildStdout,
-    stderr:     ChildStderr,
+    output:     Output,
 }
 
 /// Where the exec race stands.
@@ -351,7 +407,7 @@ impl Exec for HostExec {
         controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
         run_with_stop_grace(spec, controls, |spec, controls| async move {
-            self.run_signals(&spec, controls).await
+            self.run_signals(&spec, controls, Io::Pipes).await
         })
         .await
     }
@@ -362,20 +418,38 @@ impl Exec for HostExec {
 }
 
 impl HostExec {
+    /// Runs the command on a new terminal, which is its input, output and
+    /// controlling terminal. Its output reaches the sink and the result as
+    /// stdout, and each size `resize` sends is applied while it runs. The
+    /// end of the input leaves the terminal open.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[expect(
+        clippy::large_futures,
+        reason = "the exec future owns bounded stream and process state for its operation span"
+    )]
+    pub(crate) async fn run_terminal(
+        &self,
+        spec: &ExecSpec,
+        controls: ExecControls,
+        resize: Option<watch::Receiver<TerminalSize>>,
+    ) -> Result<ExecStreamingResult> {
+        self.run_signals(spec, controls, Io::Terminal(resize)).await
+    }
+
     /// Runs the command under raw stop signals; the trait method wraps
     /// this in the spec's stop grace.
     async fn run_signals(
         &self,
         spec: &ExecSpec,
         controls: ExecControls,
+        io: Io,
     ) -> Result<ExecStreamingResult> {
         let started = Instant::now();
         let Wired {
             mut child,
             stdin_task,
-            stdout,
-            stderr,
-        } = self.spawn_and_wire(spec, &controls).await?;
+            output,
+        } = self.spawn_and_wire(spec, &controls, io).await?;
         let mut stdout_capture = OutputCaptureBuffer::new(controls.retained_output_limit);
         let mut stderr_capture = OutputCaptureBuffer::new(controls.retained_output_limit);
         let sink = controls.sink.as_ref();
@@ -389,22 +463,33 @@ impl HostExec {
             pump_outcome,
         } = {
             let mut pumps = pin!(async {
-                tokio::try_join!(
-                    OutputPump {
-                        stream: OutputStream::Stdout,
-                        capture: &mut stdout_capture,
-                        sink,
-                        progress: &progress,
+                let stdout_pump = OutputPump {
+                    stream: OutputStream::Stdout,
+                    capture: &mut stdout_capture,
+                    sink,
+                    progress: &progress,
+                };
+                match output {
+                    Output::Pipes { stdout, stderr } => {
+                        tokio::try_join!(
+                            stdout_pump.run(stdout),
+                            OutputPump {
+                                stream: OutputStream::Stderr,
+                                capture: &mut stderr_capture,
+                                sink,
+                                progress: &progress,
+                            }
+                            .run(stderr),
+                        )?;
                     }
-                    .run(stdout),
-                    OutputPump {
-                        stream: OutputStream::Stderr,
-                        capture: &mut stderr_capture,
-                        sink,
-                        progress: &progress,
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    Output::Terminal { terminal, resize } => {
+                        tokio::select! {
+                            pumped = stdout_pump.run(terminal.clone()) => pumped?,
+                            () = follow_resizes(&terminal, resize) => {}
+                        }
                     }
-                    .run(stderr),
-                )?;
+                }
                 Ok::<(), PumpError>(())
             });
             self.race(
@@ -436,10 +521,53 @@ impl HostExec {
         ))
     }
 
-    /// Spawns the command and takes its pipes: stdin goes to a writer task
-    /// when the spec has input, stdout and stderr to the caller's pumps.
-    async fn spawn_and_wire(&self, spec: &ExecSpec, controls: &ExecControls) -> Result<Wired> {
+    /// Spawns the command and wires it: stdin goes to a writer task when
+    /// the spec has input, the output to the caller's pumps.
+    async fn spawn_and_wire(
+        &self,
+        spec: &ExecSpec,
+        controls: &ExecControls,
+        io: Io,
+    ) -> Result<Wired> {
         let stdin_reader = controls.stdin_reader(spec);
+        match io {
+            Io::Pipes => self.spawn_with_pipes(spec, stdin_reader).await,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Io::Terminal(resize) => self.spawn_on_terminal(spec, stdin_reader, resize).await,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn spawn_on_terminal(
+        &self,
+        spec: &ExecSpec,
+        stdin_reader: Option<StdinReader>,
+        resize: Option<watch::Receiver<TerminalSize>>,
+    ) -> Result<Wired> {
+        let size = resize
+            .as_ref()
+            .map_or_else(TerminalSize::default, |resize| *resize.borrow());
+        self.prepare_workspace().await?;
+        let (child, terminal) = self
+            .groups
+            .spawn_terminal(&spec.program, &spec.args, size, |command| {
+                self.place(command, spec.working_dir.as_deref(), &spec.launch_env());
+            })
+            .await?;
+        let stdin_task =
+            stdin_reader.map(|reader| tokio::spawn(feed_stdin(terminal.clone(), reader)));
+        Ok(Wired {
+            child,
+            stdin_task,
+            output: Output::Terminal { terminal, resize },
+        })
+    }
+
+    async fn spawn_with_pipes(
+        &self,
+        spec: &ExecSpec,
+        stdin_reader: Option<StdinReader>,
+    ) -> Result<Wired> {
         let mut child = self
             .spawn_command(
                 &spec.program,
@@ -466,8 +594,7 @@ impl HostExec {
         Ok(Wired {
             child,
             stdin_task,
-            stdout,
-            stderr,
+            output: Output::Pipes { stdout, stderr },
         })
     }
 

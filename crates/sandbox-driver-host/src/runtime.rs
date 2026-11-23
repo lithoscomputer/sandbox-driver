@@ -15,7 +15,7 @@ use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 use nix::unistd::gethostname;
 use sandbox_driver::legacy::{
-    FileKind, Isolation, OutputStream, SandboxId, SandboxProvider, SandboxSource, StdinSource,
+    FileKind, Isolation, OutputStream, Sandbox as _, SandboxId, SandboxSource, StdinSource,
     WorkspaceOwnership,
 };
 use sandbox_driver::{
@@ -63,6 +63,9 @@ pub fn schemas() -> ProviderSchemas {
 ///
 /// Host runs commands as local processes in a directory. It implements no
 /// optional capability and refuses every workload field it cannot honour.
+/// On Linux and macOS a `tty` command runs on a pseudo-terminal it leads a
+/// session on; a kill or `stop` ends every process of that session, including
+/// the jobs an interactive shell moves into process groups of their own.
 pub struct HostFactory;
 
 #[async_trait]
@@ -101,7 +104,7 @@ fn descriptor() -> Descriptor {
 
 /// A sandbox this instance created and still owns.
 struct Owned {
-    legacy:     Arc<dyn legacy::Sandbox>,
+    legacy:     Arc<crate::HostSandbox>,
     workspace:  PathBuf,
     designated: bool,
     name:       Option<String>,
@@ -267,7 +270,7 @@ impl Provider for HostRuntime {
         let designated = designated.is_some();
         let sandbox = self
             .provider
-            .create(&legacy, None)
+            .create_sandbox(&legacy, None)
             .await
             .map_err(contract_error)?;
         let env = sandbox.environment().await.map_err(contract_error)?;
@@ -399,7 +402,9 @@ impl Sandbox for HostSandbox {
     }
     async fn exec(&self, spec: ExecSpec, controls: ExecControls) -> Result<ExecOutcome, Error> {
         spec.validate()?;
-        if spec.tty {
+        let tty = spec.tty;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        if tty {
             return Err(unsupported("exec.tty"));
         }
         let mut argv = spec.argv.into_iter();
@@ -411,6 +416,8 @@ impl Sandbox for HostSandbox {
         let sink = controls.sink.map(|sink| {
             let sink: legacy::OutputSink = Arc::new(move |stream, chunk| {
                 let stream = match stream {
+                    // A terminal's one stream arrives as stdout.
+                    _ if tty => ContractStream::Terminal,
                     OutputStream::Stdout => ContractStream::Stdout,
                     OutputStream::Stderr => ContractStream::Stderr,
                 };
@@ -423,20 +430,31 @@ impl Sandbox for HostSandbox {
             });
             sink
         });
+        let legacy_controls = legacy::ExecControls {
+            term: controls.term,
+            kill: controls.kill,
+            stdin: controls.stdin.map(StdinSource::new),
+            sink,
+            retained_output_limit: None,
+        };
         let fences = self.owned.fences.load(Ordering::SeqCst);
-        let result = self
-            .owned
-            .legacy
-            .exec()
-            .run_streaming(&legacy, legacy::ExecControls {
-                term: controls.term,
-                kill: controls.kill,
-                stdin: controls.stdin.map(StdinSource::new),
-                sink,
-                retained_output_limit: None,
-            })
-            .await
-            .map_err(contract_error)?;
+        let run = async {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if tty {
+                return Box::pin(self.owned.legacy.exec.run_terminal(
+                    &legacy,
+                    legacy_controls,
+                    controls.resize,
+                ))
+                .await;
+            }
+            self.owned
+                .legacy
+                .exec()
+                .run_streaming(&legacy, legacy_controls)
+                .await
+        };
+        let result = run.await.map_err(contract_error)?;
         Ok(ExecOutcome {
             termination: match result.result.termination {
                 // A process with no exit code died by a signal; one sent by
