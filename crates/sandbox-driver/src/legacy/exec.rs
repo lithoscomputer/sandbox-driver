@@ -15,7 +15,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::legacy::capabilities::Capability;
 use crate::legacy::error::{Error, Result};
-use crate::legacy::sanitize::OutputSanitization;
 use crate::redact::EnvKeys;
 pub use crate::{OutputLoss, StopLevel, stop_signal};
 
@@ -128,13 +127,13 @@ pub trait Exec: Send + Sync {
 pub struct ExecSpec {
     /// The executable, resolved through the command's `PATH` when it has
     /// no slash; see the trait-level contract.
-    pub program:             String,
+    pub program:     String,
     /// Arguments after the program, passed unchanged.
-    pub args:                Vec<String>,
+    pub args:        Vec<String>,
     /// `None` waits forever. [`ExecSpec::new`] starts at
     /// [`ExecSpec::DEFAULT_TIMEOUT`]; opt out with
     /// [`ExecSpec::no_timeout`].
-    pub timeout:             Option<Duration>,
+    pub timeout:     Option<Duration>,
     /// How long a stop waits after SIGTERM before SIGKILL. `None`, the
     /// default, keeps stops raw: the timeout and a failing sink kill
     /// outright and a caller's `term` is one signal. With a grace, the
@@ -142,16 +141,12 @@ pub struct ExecSpec {
     /// caller's `term`; the caller's `kill` stays immediate. A provider
     /// that cannot deliver a signal ends the command on the TERM.
     #[serde(default)]
-    pub stop_grace:          Option<Duration>,
-    pub working_dir:         Option<String>,
-    pub env:                 BTreeMap<String, String>,
+    pub stop_grace:  Option<Duration>,
+    pub working_dir: Option<String>,
+    pub env:         BTreeMap<String, String>,
     /// Written to the process then closed for EOF. A broken pipe while
     /// writing (the `head -1` case) is not an error.
-    pub stdin:               Option<Vec<u8>>,
-    /// Output policy for buffered results and streaming sink chunks. PTY
-    /// sessions and [`Exec::spawn_stdio`] remain raw.
-    #[serde(default)]
-    pub output_sanitization: OutputSanitization,
+    pub stdin:       Option<Vec<u8>>,
 }
 
 impl ExecSpec {
@@ -165,14 +160,13 @@ impl ExecSpec {
     /// [`ExecSpec::arg`] or [`ExecSpec::args`].
     pub fn new(program: impl Into<String>) -> Self {
         Self {
-            program:             program.into(),
-            args:                Vec::new(),
-            timeout:             Some(Self::DEFAULT_TIMEOUT),
-            stop_grace:          None,
-            working_dir:         None,
-            env:                 BTreeMap::new(),
-            stdin:               None,
-            output_sanitization: OutputSanitization::Raw,
+            program:     program.into(),
+            args:        Vec::new(),
+            timeout:     Some(Self::DEFAULT_TIMEOUT),
+            stop_grace:  None,
+            working_dir: None,
+            env:         BTreeMap::new(),
+            stdin:       None,
         }
     }
 
@@ -263,12 +257,6 @@ impl ExecSpec {
         self.stdin = Some(bytes);
         self
     }
-
-    #[must_use]
-    pub fn output_sanitization(mut self, policy: OutputSanitization) -> Self {
-        self.output_sanitization = policy;
-        self
-    }
 }
 
 impl fmt::Debug for ExecSpec {
@@ -281,7 +269,6 @@ impl fmt::Debug for ExecSpec {
             .field("working_dir", &self.working_dir)
             .field("env_keys", &EnvKeys(&self.env))
             .field("stdin_bytes", &self.stdin.as_ref().map(Vec::len))
-            .field("output_sanitization", &self.output_sanitization)
             .finish()
     }
 }
@@ -564,8 +551,7 @@ impl ExecResult {
     }
 }
 
-/// Retention accounting for one captured stream. Counts describe bytes after
-/// [`ExecSpec::output_sanitization`] has been applied.
+/// Retention accounting for one captured stream.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 #[serde(default)]
@@ -636,6 +622,21 @@ impl ExecStreamingResult {
             });
         }
         Ok(self.result)
+    }
+
+    /// The loss a new-API outcome reports for this run: the transport's
+    /// counts, marked truncated when a command that exited on its own left
+    /// either capture truncated. A command that was stopped or timed out
+    /// always leaves output unread; its termination says so, and marking
+    /// it truncated as well would make every stop look like a lossy
+    /// provider.
+    #[must_use]
+    pub fn delivery_loss(&self) -> OutputLoss {
+        let mut loss = self.output_loss;
+        if self.result.termination == Termination::Exited {
+            loss.truncated |= self.stdout_capture.truncated || self.stderr_capture.truncated;
+        }
+        loss
     }
 
     /// Wraps a buffered result with the honesty flags at their degraded
@@ -981,6 +982,31 @@ mod tests {
             matches!(&error, Error::Io { context, .. } if context == "writing"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn delivery_loss_is_truncated_when_an_exited_command_left_either_capture_truncated() {
+        let mut result = ExecStreamingResult::new(ExecResult::new(
+            Termination::Exited,
+            Some(0),
+            Duration::ZERO,
+        ));
+        assert!(!result.delivery_loss().is_lossy());
+        result.stderr_capture.truncated = true;
+        let loss = result.delivery_loss();
+        assert!(loss.truncated && loss.is_lossy());
+        assert_eq!(loss.dropped_frames, 0);
+    }
+
+    #[test]
+    fn delivery_loss_leaves_a_stopped_command_to_its_termination() {
+        for termination in [Termination::TimedOut, Termination::Killed] {
+            let mut result =
+                ExecStreamingResult::new(ExecResult::new(termination, None, Duration::ZERO));
+            result.stdout_capture.truncated = true;
+            result.stderr_capture.truncated = true;
+            assert!(!result.delivery_loss().is_lossy(), "{termination:?}");
+        }
     }
 
     #[test]

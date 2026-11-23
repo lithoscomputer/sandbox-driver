@@ -4,15 +4,21 @@
 use std::fmt::Debug;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::Duration;
 use std::{env, fs};
 
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
-use sandbox_driver::{Error, PluginLocation, PluginTrust, ProviderName, ProviderSchemas};
+use sandbox_driver::{
+    Error, MutationOutcome, PluginLocation, PluginTrust, ProviderName, ProviderSchemas,
+};
 use sandbox_driver_protocol::file_sha256;
 use sandbox_driver_protocol::metadata::{DiscoveryLimits, SchemaDiscovery, write_schema};
 use serde_json::json;
+use tokio::runtime::Builder;
+use tokio::sync::oneshot;
+use tokio::task::spawn_blocking;
 use tokio::time;
 
 struct Fixture {
@@ -246,6 +252,48 @@ async fn assert_dead(pid: i32) {
     .expect("probe is killed and reaped");
 }
 
+#[test]
+fn timeout_identifies_executable_resolution_before_a_probe_starts() {
+    // Hold the only blocking worker so canonicalization cannot finish. This
+    // deterministically separates a lookup timeout from a slow plugin.
+    let runtime = Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let fixture = Fixture::new(&format!("echo probe >> calls\n{}", emit()));
+        let cache = SchemaDiscovery::try_new(DiscoveryLimits {
+            timeout: Duration::from_millis(100),
+            ..DiscoveryLimits::default()
+        })
+        .expect("limits");
+        let (release, held) = mpsc::channel::<()>();
+        let (started, ready) = oneshot::channel();
+        let worker = spawn_blocking(move || {
+            started.send(()).expect("worker started");
+            let _ = held.recv();
+        });
+        ready.await.expect("worker holds capacity");
+        let result = cache.discover(&fixture.entry()).await;
+        drop(release);
+        worker.await.expect("worker released");
+        let error = result.expect_err("lookup timed out");
+        assert!(
+            matches!(
+                error,
+                Error::Unavailable { ref message, outcome: MutationOutcome::NotStarted }
+                    if message.contains("timed out while resolving executable")
+            ),
+            "{error:?}"
+        );
+        assert!(
+            !fixture.root.join("calls").exists(),
+            "no probe was launched"
+        );
+    });
+}
+
 #[tokio::test]
 async fn timeout_and_caller_cancellation_kill_the_metadata_child() {
     let fixture = Fixture::new(&format!("{}\necho $$ > pid; exec /bin/sleep 30", emit()));
@@ -254,7 +302,15 @@ async fn timeout_and_caller_cancellation_kill_the_metadata_child() {
         ..DiscoveryLimits::default()
     })
     .expect("limits");
-    cache.discover(&fixture.entry()).await.expect_err("timeout");
+    let error = cache.discover(&fixture.entry()).await.expect_err("timeout");
+    assert!(
+        matches!(
+            error,
+            Error::Unavailable { ref message, outcome: MutationOutcome::NotStarted }
+                if message.contains("timed out while running metadata probe")
+        ),
+        "{error:?}"
+    );
     let pid = fixture.pid();
     assert_dead(pid).await;
     fs::remove_file(fixture.root.join("pid")).expect("remove pid");

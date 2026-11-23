@@ -584,7 +584,7 @@ on `PATH` to serve them.
 The exec spec DTO:
 
 ```json
-{"program":"echo","args":["hi"],"timeout_ms":30000,"stop_grace_ms":5000,"working_dir":null,"env":{},"output_sanitization":"strip_ansi"}
+{"program":"echo","args":["hi"],"timeout_ms":30000,"stop_grace_ms":5000,"working_dir":null,"env":{}}
 ```
 
 `args` may be omitted and means `[]`. `stop_grace_ms` is optional and
@@ -597,11 +597,6 @@ the field ignores it and keeps raw stops. Standard input is not in the spec:
 a request whose `stdin` is true feeds the command from the channel's
 `stdin` frames (§9), and a plugin whose provider takes only fixed stdin
 collects those frames to their `eof` first.
-
-`output_sanitization` is optional. Its values are `raw`, `strip_ansi`,
-and `strip_all`; omission means `raw`. A plugin applies this policy to
-buffered output and streaming notifications before capture accounting.
-PTY and bidirectional stdio traffic always remains raw.
 
 | method | params | result |
 | --- | --- | --- |
@@ -854,7 +849,7 @@ plugin → {"id":7,"result":{"result":{"exit_code":null,"termination":"killed",�
            "stdout_capture":{"observed_bytes":…,"retained_bytes":…,"omitted_bytes":…,
                              "truncated":false},
            "stderr_capture":{…},
-           "output_loss":{"dropped_frames":0,"dropped_bytes":0}}}
+           "output_loss":{"dropped_frames":0,"dropped_bytes":0,"truncated":false}}}
 ```
 
 Rules:
@@ -903,7 +898,7 @@ Rules:
   (default `false`) means bytes were lost *beyond* that accounting — the
   provider abandoned an unfinished drain — so the counts undercount the
   real output.
-- **Loss.** `output_loss` (additive; both fields default to `0`) counts
+- **Loss.** `output_loss` (additive; the counts default to `0`) counts
   output the plugin's own transport lost before it reached the channel:
   `dropped_frames` records it could not read and `dropped_bytes` the
   encoded bytes they held. A plugin that reports a loss must also set
@@ -911,6 +906,10 @@ Rules:
   only the capture flags still learns the output is incomplete. A loss
   never fails the request; the result carries the command's exit status
   and the count. Daytona's encoded output decoder is the producer today.
+  `output_loss.truncated` (additive; defaults to `false`) serves the
+  newer exec outcome, which has no capture flags. On this exchange the
+  capture flags carry truncation: a plugin may leave it `false`, and a
+  host must not rely on it.
 - **Backpressure and isolation.** The channel's socket is the
   backpressure: a plugin that cannot write must stall the producing
   process, never drop output. Because every exec has its own channel, a
@@ -932,7 +931,7 @@ retention, and result are those of `exec/stream`, without stdin. The spec:
 ```json
 {"image":{"registry":{"reference":"alpine:3.20"}},
  "entrypoint":"sh","args":["-c","echo hi"],"env":{},
- "working_dir":null,"timeout":{"secs":60,"nanos":0},"output_sanitization":"raw"}
+ "working_dir":null,"timeout":{"secs":60,"nanos":0}}
 ```
 
 `image` is `{"registry":{"reference":…}}` or, gated on `one_shot.build`,
@@ -1125,8 +1124,8 @@ Version 3 carries [the shared contract](shared-contract.md) between a host and
 a configured third-party plugin. The built-in providers (Host, Docker and
 Daytona) are never served over it: their kinds are reserved, and a plugin uses
 another kind. The framing, envelope, data channels and transport budgets of
-sections 2 and 3 are unchanged. Version 2 stays available on both sides until
-its consumers migrate, and a version 3 host never falls back to it.
+sections 2 and 3 are unchanged. Version 2 is unsupported on `main` and is being
+deleted (pin tag `v2` for it), and a version 3 host never falls back to it.
 
 **Host side.** `v3::PluginLoader` is the `ProviderFactory` an
 application passes to `Registry::plugins`. `discover` is section 15.

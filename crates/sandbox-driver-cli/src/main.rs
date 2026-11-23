@@ -2,7 +2,7 @@ mod cli;
 mod commands;
 mod config;
 mod output;
-mod provider;
+mod stdin;
 
 use std::fmt::Write as _;
 use std::io::stderr;
@@ -11,6 +11,7 @@ use std::process::ExitCode;
 use anyhow::{Context as _, Result};
 use clap::Parser as _;
 use cli::Cli;
+use sandbox_driver::Error;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
@@ -32,16 +33,29 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Opens the catalog, runs the command, and always shuts the catalog down:
+/// that ends plugin children and the sandboxes of `process`-durable
+/// providers, such as Host.
 async fn run(cli: &Cli) -> Result<u8> {
-    let config = config::Config::load(cli.config.as_deref()).await?;
-    commands::execute(cli, &config).await
+    let catalog = config::Catalog::load(cli.config.as_deref()).await?;
+    let providers = catalog.providers.clone();
+    let sandboxes = catalog.open()?;
+    let result = commands::execute(&cli.command, &sandboxes, &providers, cli.output).await;
+    let shutdown = sandboxes
+        .shutdown()
+        .await
+        .context("shutting down providers");
+    commands::after_cleanup(result, shutdown, "providers also failed to shut down")
 }
 
 fn configure_diagnostics(verbosity: u8) -> Result<()> {
     let default_level = match verbosity {
-        0 => LevelFilter::WARN,
-        1 => LevelFilter::INFO,
-        2 => LevelFilter::DEBUG,
+        // Errors reach the user through the command's own report; provider
+        // logs would repeat them.
+        0 => LevelFilter::OFF,
+        1 => LevelFilter::WARN,
+        2 => LevelFilter::INFO,
+        3 => LevelFilter::DEBUG,
         _ => LevelFilter::TRACE,
     };
     let filter = tracing_subscriber::EnvFilter::builder()
@@ -58,6 +72,15 @@ async fn report_error(error: &anyhow::Error) {
     let mut rendered = format!("error: {error}\n");
     for cause in error.chain().skip(1) {
         let _ = writeln!(rendered, "  caused by: {cause}");
+    }
+    match error.root_cause().downcast_ref::<Error>() {
+        Some(Error::NoEnvironment { .. }) => {
+            rendered.push_str("hint: `lithos-sandbox environments` lists them\n");
+        }
+        Some(Error::NoProvider { .. }) => {
+            rendered.push_str("hint: `lithos-sandbox providers` lists them\n");
+        }
+        _ => {}
     }
     if let Err(write_error) = output::write_stderr(rendered.as_bytes()).await {
         tracing::error!(error = ?write_error, "error report output failed");

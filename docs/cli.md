@@ -1,226 +1,206 @@
 # lithos-sandbox CLI
 
-The `sandbox-driver-cli` crate builds the `lithos-sandbox` executable. The CLI
-uses JSON-RPC for every provider, including Host, Docker, and Daytona. It
-does not link provider implementations or add resources to the core contract.
+The `sandbox-driver-cli` crate builds the `lithos-sandbox` executable, the
+command-line client of the library. It uses the same catalog an embedding
+application does: provider entries and environments, as
+[next-api.md](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/next-api.md#cli)
+describes. Host, Docker and Daytona are linked into the CLI and run in its
+process. Every other provider kind is a plugin, launched over protocol
+version 3 by the ordinary plugin loader.
 
-This guide describes the current CLI and version 2 protocol. The
-[planned CLI](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/next-api.md#cli)
-uses the upcoming environment catalog and is not available yet.
+It is also the quickest way to try a provider by hand: create a sandbox, run
+commands in it, move files, stop and start it, and destroy it.
 
-## Provider executables
+## Quick start
 
-Build the CLI and all provider executables with `mise run dev`. Each provider
-package builds its same-named executable: `sandbox-driver-host`,
-`sandbox-driver-docker`, and `sandbox-driver-daytona`.
-
-For the default profiles, the CLI resolves the executable in this order:
-
-1. `SANDBOX_DRIVER_<KIND>_PLUGIN`, with the kind in uppercase.
-2. The same directory as `lithos-sandbox`.
-3. `PATH`.
-
-Set `SANDBOX_DRIVER_<KIND>_SHA256` to the expected binary checksum. A missing
-checksum is rejected unless `SANDBOX_DRIVER_PLUGIN_DEV=1` explicitly allows
-local development. A checksum mismatch is always rejected.
+With no configuration, the CLI has one provider entry and one environment of
+the same name for each built-in: `host`, `docker` and `daytona`. The Docker
+and Daytona environments start from `ubuntu:24.04`.
 
 ```sh
-mise run dev
-SANDBOX_DRIVER_PLUGIN_DEV=1 target/debug/lithos-sandbox --provider host provider health
+lithos-sandbox providers
+lithos-sandbox environments
+lithos-sandbox provider health docker
+
+lithos-sandbox run docker -- uname -a
+lithos-sandbox run docker --image alpine:3 -- sh -c 'cat /etc/os-release'
 ```
 
-Default profiles forward `PATH`, `HOME`, `TMPDIR`, `RUST_LOG`, and
-`LLVM_PROFILE_FILE` when set. Docker also receives `DOCKER_HOST`,
-`DOCKER_TLS_VERIFY`, `DOCKER_CERT_PATH`, and `DOCKER_CONFIG`. Daytona receives its standard
-API key, JWT token, organization ID, API/server URL, and target variables.
-All other ambient variables are removed. Plugin diagnostics default to
-`warn` when the CLI has no `RUST_LOG` setting.
-
-The default Host profile uses a temporary in-memory registry. To configure a
-durable registry or a different environment, use an explicit plugin profile.
-The current CLI still limits Host sandbox operations to `sandbox run`.
-
-### Current Host recovery and workspace ownership
-
-The current Host plugin can recover across restarts on Linux and macOS when
-`SANDBOX_DRIVER_HOST_REGISTRY` names a caller-owned directory in an explicit
-plugin profile's environment. Stop fences sandbox process groups; recovery
-never signals saved process IDs. The CLI still exposes Host sandbox operations
-only through `sandbox run`.
-
-A named workspace remains caller-owned unless `workspace_ownership: Managed`
-explicitly transfers its creation and deletion to the provider. Managed
-workspaces are deleted only after work stops. See the
-[current Host design](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/design.md#durable-host-recovery).
-
-This recovery model is part of the existing API. The
-[target Host contract](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/shared-contract.md#host-ownership-and-retained-workspaces)
-instead promises process durability and access through its owning process.
-
-## Command structure
-
-Use a built-in provider name or a configured profile with `--provider`:
-
-```text
-lithos-sandbox [--provider PROFILE] [--output table|json|id] COMMAND
-```
-
-Provider commands check configuration and capabilities:
+A persistent sandbox is named by the ref that `create` prints,
+`<provider entry>/<id>`:
 
 ```sh
-lithos-sandbox provider list
-lithos-sandbox --provider docker provider health
-lithos-sandbox --provider docker provider capabilities
+sb=$(lithos-sandbox create docker --label job=1842)
+
+lithos-sandbox status "$sb"
+lithos-sandbox exec "$sb" -- sh -c 'echo hello > /tmp/greeting'
+lithos-sandbox cp "$sb":/tmp/greeting ./greeting
+lithos-sandbox cp ./input.txt "$sb":/work/input.txt
+lithos-sandbox ls "$sb":/work
+lithos-sandbox shell "$sb"
+lithos-sandbox stop "$sb"
+lithos-sandbox start "$sb"
+lithos-sandbox find --label job=1842
+lithos-sandbox destroy "$sb"
 ```
 
-Sandbox commands manage persistent provider resources:
+`--output json` on `create` or `status` prints the full status, whose
+`reference` is the durable `{provider, namespace, id}` ref. Every command
+that takes a sandbox on its own also accepts that JSON object; `cp` and `ls`,
+which take `SANDBOX:PATH`, need the short form. The short form takes its
+namespace from the entry's provider at the time of the command.
+
+## Commands
+
+| Command | Does |
+| --- | --- |
+| `providers` | List provider entries |
+| `provider describe ENTRY` | Show the descriptor: namespace, durability, sources, resources, network, ports and capabilities |
+| `provider health ENTRY` | Check that the provider is reachable and authorized; exits 1 when unhealthy |
+| `environments` | List environments with their entry and source |
+| `create ENVIRONMENT` | Create a sandbox and print its ref |
+| `run ENVIRONMENT -- CMD...` | Create a sandbox, run one command, destroy the sandbox |
+| `find --label K=V` | List matching sandboxes across every provider entry |
+| `status SANDBOX` | Show the sandbox's status |
+| `start SANDBOX`, `stop SANDBOX` | Start or stop it; stop ends every command in it |
+| `exec SANDBOX -- CMD...` | Run a command and stream its output |
+| `shell SANDBOX` | Open the provider's interactive shell |
+| `cp SRC DEST` | Copy one file; one side is `SANDBOX:PATH`, `-` is stdin or stdout |
+| `ls SANDBOX:PATH` | List a directory; `--depth N` descends N more levels |
+| `expose SANDBOX PORT` | Print a URL for a port and hold it until Ctrl-C |
+| `destroy SANDBOX` | Destroy the sandbox |
+
+`shell` runs the shell command the provider reports, such as `docker exec
+-it`. Providers without one say so; use `exec` with `sh -c` instead.
+Interactive terminals over exec arrive with the providers' tty support.
+
+## Creating
+
+`create` and `run` start from the environment's spec and apply the options
+given on the command line:
 
 ```sh
-id=$(lithos-sandbox --provider docker --output id sandbox create \
-  --image ubuntu:24.04 --name example)
-
-lithos-sandbox --provider docker sandbox inspect "$id"
-lithos-sandbox --provider docker sandbox exec "$id" -- bash -lc 'uname -a'
-lithos-sandbox --provider docker sandbox stop "$id" --wait
-lithos-sandbox --provider docker sandbox start "$id" --wait
-lithos-sandbox --provider docker sandbox delete "$id"
-```
-
-The CLI also provides `pause`, `resume`, `archive`, `recover`,
-`refresh-activity`, and `undelete`. It checks the selected provider's
-capabilities before it calls an optional operation.
-
-Upload and download one file with the filesystem facet:
-
-```sh
-lithos-sandbox --provider docker sandbox fs upload \
-  "$id" ./input.txt /workspace/input.txt
-lithos-sandbox --provider docker sandbox fs download \
-  "$id" /workspace/result.txt ./result.txt
-```
-
-Open an interactive shell when the sandbox provides either a local shell
-command or a PTY:
-
-```sh
-lithos-sandbox --provider docker sandbox shell "$id"
-```
-
-## One-shot runs
-
-`sandbox run` creates a sandbox, activates it, runs one command, and deletes
-it. It deletes the sandbox after command failure too.
-
-```sh
-lithos-sandbox --provider docker sandbox run --image ubuntu:24.04 -- \
-  bash -lc 'printf "hello\n"'
-```
-
-Use `--keep` with a persistent provider to preserve the sandbox. The CLI
-writes its ID to stderr so command stdout stays unchanged.
-
-The default Host profile stores its handles in plugin process memory. Its
-handles cannot be used by a later CLI invocation. Use Host only with
-`sandbox run`. `--workspace PATH` designates a caller-owned directory. Host
-cleanup releases the handle and does not delete that directory.
-
-```sh
-lithos-sandbox --provider host sandbox run --workspace "$PWD" -- \
-  bash -lc 'cargo test'
-```
-
-## Creation input
-
-Common creation fields have command-line options:
-
-```sh
-lithos-sandbox --provider docker sandbox create \
+lithos-sandbox create docker \
   --image ubuntu:24.04 \
   --name example \
-  --kind container \
   --cpu 2 \
-  --memory-mb 4096 \
+  --memory 4GB \
   --env RUST_BACKTRACE=1 \
   --label project=example \
-  --network allow-all
+  --network block
 ```
 
-Use `--spec FILE` for the complete serialized `SandboxSpec`. The file is JSON.
-Convenience options override the corresponding fields from the file. Use
-`--spec -` to read JSON from stdin.
+The source is `--image`, `--dockerfile FILE` or `--snapshot ID`, at most one.
+Sizes take a unit (`4GB`, `512MiB`). `--workspace PATH` sets the working
+directory; for a host directory source it designates a caller-owned
+directory. `--provider-config JSON` merges keys into the spec's
+`provider_config`, which the provider's `spec_schema` validates.
+
+`--spec FILE` replaces the environment's spec with a JSON `SandboxSpec`
+(`-` reads stdin); the options above still apply on top of it.
+
+The descriptor decides what a provider accepts. A request it cannot honour
+fails before anything is created, naming the field, such as
+`unsupported capability: resources.memory_mb`.
+
+### Host
+
+Host sandboxes last as long as the process that created them, which for the
+CLI is one command. `run` works; `create` and `run --keep` are refused
+because they would leave nothing behind.
 
 ```sh
-lithos-sandbox --provider daytona sandbox create --spec sandbox.json
+lithos-sandbox run host --workspace "$PWD" -- cargo test
 ```
 
-Provider-specific creation options can stay in the JSON specification or be
-passed as a JSON value:
+## Exec
 
 ```sh
-lithos-sandbox --provider docker sandbox create \
-  --image ubuntu:24.04 \
-  --provider-config '{"auto_pull":true}'
+lithos-sandbox exec "$sb" -w /work -e RUST_LOG=debug --timeout 5m -- make test
+printf 'data' | lithos-sandbox exec -i "$sb" -- wc -c
 ```
+
+The command is argv, passed as given; wrap it in `sh -c` for shell syntax.
+`-i` streams local stdin to it. `run` takes the same options and `--keep`,
+which preserves the sandbox and prints its ref on stderr.
+
+The first Ctrl-C asks the command to terminate; a second kills it.
 
 ## Configuration
 
-The CLI reads the first applicable configuration source:
+The CLI reads the first catalog it finds:
 
 1. `--config PATH`
 2. `SANDBOX_DRIVER_CONFIG`
 3. `$XDG_CONFIG_HOME/sandbox-driver/config.toml`
 4. `$HOME/.config/sandbox-driver/config.toml`
 
-Without configuration, the built-in profile names are `host`, `docker`, and
-`daytona`. The default provider is `host`.
+A catalog file replaces the built-in defaults. It has the two levels of the
+library's catalog:
 
 ```toml
-default-provider = "local-docker"
-
-[providers.local-docker]
-type = "docker"
+[providers.docker]
+plugin = "docker"
+config = { host = "unix:///var/run/docker.sock" }
 
 [providers.daytona]
-type = "daytona"
-api-key-env = "DAYTONA_API_KEY"
-api-url = "https://app.daytona.io/api"
-target = "us"
+plugin  = "daytona"
+config  = { api_url = "https://app.daytona.io/api", target = "us" }
+secrets = ["DAYTONA_API_KEY"]
+
+[providers.lima]
+plugin = "lima"
+path   = "~/.local/share/sandbox-driver/plugins/lima/sandbox-driver-lima"
+sha256 = "9f2c…"                   # or dev = true while developing it
+
+[environments.ci-linux]
+provider = "docker"
+
+[environments.ci-linux.spec]
+source  = { image = "ghcr.io/lithoscomputer/ubuntu-24.04:slim-f8bbbfd81934" }
+network = { mode = "block" }
+
+[environments.cloud]
+provider = "daytona"
+
+[environments.cloud.spec]
+source    = { image = "ubuntu:24.04" }
+resources = { cpu = 2, memory = "4GB" }
 ```
 
-An unconfigured built-in Daytona profile forwards the standard Daytona
-environment variables to the plugin. A configured profile can name different environment
-variables. Named settings override the standard values; unspecified settings
-keep the SDK environment defaults. The configuration stores environment
-variable names, not secret values.
+Each entry's `config` is checked against its provider's `config_schema` when
+the entry is first used, so a typo fails with the field named.
+`lithos-sandbox provider describe ENTRY --output json` shows the schemas.
 
-Configure an explicit plugin profile for a bundled or third-party provider as follows:
+The CLI resolves `secrets` from its own environment. Built-in providers read
+nothing else from the environment; the Docker entry's daemon is its
+`config.host`, not `DOCKER_HOST`. The default Daytona entry is the one
+exception: with no catalog file, it takes `DAYTONA_API_KEY` (or
+`DAYTONA_JWT_TOKEN`), `DAYTONA_API_URL`, `DAYTONA_ORGANIZATION_ID` and
+`DAYTONA_TARGET` from the environment.
 
-```toml
-[providers.e2b]
-type = "plugin"
-kind = "e2b"
-path = "/usr/local/bin/lithos-sandbox-e2b" # or omit: `lithos-sandbox-<kind>` on PATH
-sha256 = "0123456789abcdef..."
-inherit-env = ["PATH", "E2B_API_KEY"]
-```
+### Plugins
 
-The CLI verifies the checksum before it starts the plugin. Set `dev = true`
-only for local plugin development when no checksum is available. Explicit
-plugin profiles use their own `dev` and `sha256` fields; the default-profile
-environment overrides above do not change them. Plugin
-processes receive only configured `env` values and variables named by
-`inherit-env`.
+A plugin entry names its executable with an absolute `path` (`~/` is
+expanded) and trusts it with a `sha256` pin or `dev = true`, never both. The
+CLI hashes the executable before every launch and refuses a mismatch. The
+plugin starts with an empty environment plus `PATH`, `HOME`, `TMPDIR` and
+`USER` (or exactly the names in `inherit_env`), the entry's `env`, and its
+resolved `secrets`.
 
-## Output and exit behavior
+The kinds `host`, `docker` and `daytona` are the built-ins; an entry of one of
+those kinds with a `path` or trust setting is refused, so a plugin picks
+another kind.
 
-Resource commands default to tables. Use `--output json` for structured data
-or `--output id` when a script only needs resource IDs.
+## Output and exit codes
 
-Lifecycle progress goes to stderr. Select `--events json` for newline-delimited
-JSON events or `--events off` to hide progress.
+Results are tables by default. `--output json` prints structured data and
+`--output id` prints only refs or names, for scripts. `exec`, `run` and
+`shell` reserve stdout and stderr for the command and require the default
+output.
 
-`sandbox exec` and `sandbox run` reserve stdout and stderr for the sandbox
-command. They require the default `--output table` mode. The CLI returns the
-sandbox command's exit code when it fits in the platform exit-code range. It
-returns 124 for a timeout, 130 for cancellation, and 125 when a command ended
-without a usable exit code. CLI and provider errors return 1.
+`exec` and `run` exit with the command's exit code. They return 124 when the
+command timed out, 130 when it was terminated, 137 when it was killed, and
+125 when it ended without a usable code, including when its outcome is
+unknown. CLI and provider errors exit 1. `-v` shows provider diagnostics on
+stderr; repeat it for more.

@@ -17,8 +17,10 @@ path = "src/main.rs"
 anyhow.workspace = true
 async-trait.workspace = true
 clap.workspace = true
-nix = { workspace = true, features = ["term"] }
 sandbox-driver.workspace = true
+sandbox-driver-daytona = { path = "../sandbox-driver-daytona" }
+sandbox-driver-docker.workspace = true
+sandbox-driver-host.workspace = true
 sandbox-driver-protocol = { path = "../sandbox-driver-protocol" }
 serde.workspace = true
 serde_json.workspace = true

@@ -7,6 +7,7 @@
 //! covers the executable, not an interpreter or its dependencies.
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -102,12 +103,25 @@ impl SchemaDiscovery {
     /// On Unix its working directory is `/` and it runs in its own process
     /// group, which is killed when the probe ends, fails or is cancelled.
     pub async fn discover(&self, location: &PluginLocation) -> Result<DiscoveredPlugin, Error> {
-        time::timeout(self.limits.timeout, self.discover_inner(location))
-            .await
-            .map_err(|_| unavailable(&location.entry, "metadata discovery timed out"))?
+        let mut phase = Phase::ResolvingExecutable;
+        time::timeout(
+            self.limits.timeout,
+            self.discover_inner(location, &mut phase),
+        )
+        .await
+        .map_err(|_| {
+            unavailable(
+                &location.entry,
+                &format!("metadata discovery timed out while {phase}"),
+            )
+        })?
     }
 
-    async fn discover_inner(&self, location: &PluginLocation) -> Result<DiscoveredPlugin, Error> {
+    async fn discover_inner(
+        &self,
+        location: &PluginLocation,
+        phase: &mut Phase,
+    ) -> Result<DiscoveredPlugin, Error> {
         let entry = &location.entry;
         let trust = location.trust.as_ref().ok_or_else(|| {
             invalid_config(
@@ -117,6 +131,7 @@ impl SchemaDiscovery {
             )
         })?;
         let path = resolve(location).await?;
+        *phase = Phase::HashingExecutable;
         let digest = executable_digest(entry, &path).await?;
         if let PluginTrust::Sha256 { digest: expected } = trust {
             if expected != &digest {
@@ -131,18 +146,22 @@ impl SchemaDiscovery {
             }
         }
         let cell = self.cell(&digest);
+        *phase = Phase::AwaitingSharedProbe;
         let schemas = cell
             .get_or_try_init(|| async {
                 let schemas = {
+                    *phase = Phase::AwaitingProbeCapacity;
                     let _permit = self
                         .probes
                         .acquire()
                         .await
                         .expect("the probe semaphore is never closed");
+                    *phase = Phase::RunningProbe;
                     probe(entry, &path, &self.limits).await?
                 };
                 // A replacement during the probe must not be cached under
                 // the digest that was trusted.
+                *phase = Phase::VerifyingExecutable;
                 if executable_digest(entry, &path).await? != digest {
                     return Err(invalid_config(
                         entry,
@@ -185,6 +204,31 @@ impl SchemaDiscovery {
         let cell = Probe::default();
         cache.push_back((digest.clone(), Arc::clone(&cell)));
         cell
+    }
+}
+
+/// The step a discovery call has reached, named when the call times out.
+#[derive(Debug)]
+enum Phase {
+    ResolvingExecutable,
+    HashingExecutable,
+    /// Another caller may be running the probe for the same binary.
+    AwaitingSharedProbe,
+    AwaitingProbeCapacity,
+    RunningProbe,
+    VerifyingExecutable,
+}
+
+impl fmt::Display for Phase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ResolvingExecutable => "resolving executable",
+            Self::HashingExecutable => "hashing executable",
+            Self::AwaitingSharedProbe => "waiting for shared metadata probe",
+            Self::AwaitingProbeCapacity => "waiting for metadata probe capacity",
+            Self::RunningProbe => "running metadata probe",
+            Self::VerifyingExecutable => "verifying executable after metadata probe",
+        })
     }
 }
 
