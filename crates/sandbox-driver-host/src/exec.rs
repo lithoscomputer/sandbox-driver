@@ -31,7 +31,9 @@ use crate::terminal::Terminal;
 /// Bash sources this file at startup. Dropped from the inherited
 /// environment so a worker's startup file never runs inside a sandboxed
 /// `bash -c`; [`sandbox_driver::legacy::ExecSpec::bash`] blanks it per command.
-const BASH_ENV_VAR: &str = "BASH_ENV";
+/// A value in a command's own env reaches that command and no shell the
+/// driver runs around it.
+pub(crate) const BASH_ENV_VAR: &str = "BASH_ENV";
 
 /// How long the output pipes may stay silent after the process has ended
 /// before the drain gives up, so a backgrounded grandchild holding the
@@ -189,18 +191,12 @@ impl HostExec {
         Ok(())
     }
 
-    /// Sets the command's directory and its environment: the effective
-    /// environment overlaid with `env`.
-    fn place(
-        &self,
-        command: &mut Command,
-        working_dir: Option<&str>,
-        env: &BTreeMap<String, String>,
-    ) {
-        command.current_dir(self.resolve_dir(working_dir));
-        command.env_clear();
-        command.envs(effective_env(&self.base_env));
-        command.envs(env);
+    /// The environment a command starts with: the effective environment
+    /// overlaid with `env`.
+    fn command_env(&self, env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+        let mut command_env = effective_env(&self.base_env);
+        command_env.extend(env.clone());
+        command_env
     }
 
     async fn spawn_command(
@@ -212,14 +208,17 @@ impl HostExec {
         stdin: Stdio,
     ) -> Result<HostChild> {
         self.prepare_workspace().await?;
+        let command_env = self.command_env(env);
         let configure = |command: &mut Command| {
-            self.place(command, working_dir, env);
+            command.current_dir(self.resolve_dir(working_dir));
             command
                 .stdin(stdin)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
         };
-        self.groups.spawn(program, args, configure).await
+        self.groups
+            .spawn(program, args, &command_env, configure)
+            .await
     }
 }
 
@@ -548,10 +547,11 @@ impl HostExec {
             .as_ref()
             .map_or_else(TerminalSize::default, |resize| *resize.borrow());
         self.prepare_workspace().await?;
+        let command_env = self.command_env(&spec.launch_env());
         let (child, terminal) = self
             .groups
-            .spawn_terminal(&spec.program, &spec.args, size, |command| {
-                self.place(command, spec.working_dir.as_deref(), &spec.launch_env());
+            .spawn_terminal(&spec.program, &spec.args, &command_env, size, |command| {
+                command.current_dir(self.resolve_dir(spec.working_dir.as_deref()));
             })
             .await?;
         let stdin_task =

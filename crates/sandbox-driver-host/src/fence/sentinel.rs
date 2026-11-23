@@ -11,6 +11,7 @@
 //! process groups of their own; the fence reaches them as members of the
 //! session (see [`super::observation::Members`]).
 
+use std::collections::BTreeMap;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, ExitStatus};
@@ -30,6 +31,7 @@ use tokio::task::spawn_blocking;
 use tokio::{fs, time};
 
 use super::observation::{group_is_live, live_groups, members};
+use crate::exec::BASH_ENV_VAR;
 use crate::host_kind;
 use crate::terminal::Terminal;
 
@@ -64,11 +66,13 @@ fn sentinel_shell() -> &'static str {
 /// control, and closes its own copies of the workload's input, so a
 /// terminal reports its end once the workload's processes have closed it.
 const SENTINEL_SCRIPT: &str = r#"
-sf="$1"; gf="$2"; fence="$3"; owner="$4"; shift 4
+sf="$1"; gf="$2"; fence="$3"; owner="$4"; startup_set="$5"; startup="$6"; shift 6
 printf '%s\n' "$$" > "$gf.tmp" && /bin/mv "$gf.tmp" "$gf" || exit 125
 if [ -e "$fence" ]; then exit 0; fi
 exec 3<&0
-( trap - INT QUIT; exec "$@" ) <&3 &
+( trap - INT QUIT
+  if [ "$startup_set" = 1 ]; then export BASH_ENV="$startup"; fi
+  exec "$@" ) <&3 &
 w=$!
 trap '' TERM HUP INT QUIT TSTP
 exec </dev/null >/dev/null 2>&1 3<&-
@@ -272,10 +276,26 @@ impl GroupState {
     }
 }
 
-/// The sentinel invocation that runs `program` with `args` and reports
-/// through `paths`.
-fn sentinel_command(paths: &RecordPaths, program: &str, args: &[String]) -> Command {
+/// The sentinel invocation that runs `program` with `args` in `env` and
+/// reports through `paths`, after `configure` has set its directory and
+/// pipes.
+///
+/// `env` is the command's whole environment, but the sentinel is a shell
+/// that starts first, and Bash sources the file `BASH_ENV` names at startup.
+/// So the sentinel starts without the variable and sets a configured value
+/// on the command alone.
+fn sentinel_command(
+    paths: &RecordPaths,
+    program: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    configure: impl FnOnce(&mut Command),
+) -> Command {
     let mut command = Command::new(sentinel_shell());
+    configure(&mut command);
+    command.env_clear();
+    command.envs(env.iter().filter(|(name, _)| *name != BASH_ENV_VAR));
+    let startup = env.get(BASH_ENV_VAR);
     command
         .arg("-c")
         .arg(SENTINEL_SCRIPT)
@@ -284,6 +304,8 @@ fn sentinel_command(paths: &RecordPaths, program: &str, args: &[String]) -> Comm
         .arg(&paths.group)
         .arg(&paths.marker)
         .arg(process::id().to_string())
+        .arg(if startup.is_some() { "1" } else { "0" })
+        .arg(startup.map_or("", String::as_str))
         .arg(program)
         .args(args);
     command
@@ -320,10 +342,11 @@ impl ProcessGroups {
         self: &Arc<Self>,
         program: &str,
         args: &[String],
+        env: &BTreeMap<String, String>,
         configure: impl FnOnce(&mut Command),
     ) -> Result<HostChild> {
         let (child, ()) = self
-            .spawn_in(program, args, configure, |command| {
+            .spawn_in(program, args, env, configure, |command| {
                 command.process_group(0);
                 Ok(())
             })
@@ -338,10 +361,11 @@ impl ProcessGroups {
         self: &Arc<Self>,
         program: &str,
         args: &[String],
+        env: &BTreeMap<String, String>,
         size: TerminalSize,
         configure: impl FnOnce(&mut Command),
     ) -> Result<(HostChild, Terminal)> {
-        self.spawn_in(program, args, configure, |command| {
+        self.spawn_in(program, args, env, configure, |command| {
             Terminal::lead(command, size)
         })
         .await
@@ -354,6 +378,7 @@ impl ProcessGroups {
         self: &Arc<Self>,
         program: &str,
         args: &[String],
+        env: &BTreeMap<String, String>,
         configure: impl FnOnce(&mut Command),
         attach: impl FnOnce(&mut Command) -> io::Result<T>,
     ) -> Result<(HostChild, T)> {
@@ -365,8 +390,7 @@ impl ProcessGroups {
         }
         let generation = state.generation_or_create(&self.root).await?;
         let paths = generation.next_record_paths();
-        let mut command = sentinel_command(&paths, program, args);
-        configure(&mut command);
+        let mut command = sentinel_command(&paths, program, args, env, configure);
         command.kill_on_drop(false);
         let (mut child, attached) = {
             #[cfg(target_os = "macos")]

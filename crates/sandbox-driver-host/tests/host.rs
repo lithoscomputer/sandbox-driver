@@ -366,6 +366,60 @@ async fn exec_never_sources_bash_env() {
 }
 
 #[tokio::test]
+async fn exec_gives_a_spec_bash_env_to_the_command_alone() {
+    let provider = HostProvider::new();
+    let sandbox = provider.create(&host_spec(), None).await.expect("create");
+    sandbox
+        .fs()
+        .write("startup.sh", b"echo startup-ran\n")
+        .await
+        .expect("write");
+    sandbox
+        .fs()
+        .write("script.sh", b"echo ok\n")
+        .await
+        .expect("write");
+    let startup = format!("{}/startup.sh", sandbox.working_directory());
+
+    let cases = [
+        // A program that is not Bash only carries the variable: nothing
+        // around the command may source the file on its behalf.
+        (
+            ExecSpec::new("printenv")
+                .args(["BASH_ENV"])
+                .env_var("BASH_ENV", &startup),
+            format!("{startup}\n"),
+        ),
+        // The caller's own Bash sources the file, once. It runs a script
+        // file because `bash -c` is the helper's argv, which never does.
+        (
+            ExecSpec::new("bash")
+                .args(["script.sh"])
+                .env_var("BASH_ENV", &startup),
+            "startup-ran\nok\n".to_owned(),
+        ),
+        // An empty value stays set rather than becoming unset.
+        (
+            ExecSpec::new("printenv")
+                .args(["BASH_ENV"])
+                .env_var("BASH_ENV", ""),
+            "\n".to_owned(),
+        ),
+    ];
+    for (spec, stdout) in cases {
+        let result = sandbox
+            .exec()
+            .run(&spec.timeout(Duration::from_secs(10)))
+            .await
+            .expect("exec");
+        assert!(result.success(), "stderr: {}", result.stderr_lossy());
+        assert_eq!(result.stdout_lossy(), stdout);
+    }
+
+    sandbox.delete().await.expect("delete");
+}
+
+#[tokio::test]
 async fn exec_resolves_the_program_through_the_spec_path() {
     let provider = HostProvider::new();
     let sandbox = provider.create(&host_spec(), None).await.expect("create");
