@@ -35,7 +35,7 @@ use super::{runner, spec};
 use crate::labels::{IMAGE_LABEL, INTERNAL_PREFIX};
 use crate::sandbox::status_from_sdk;
 use crate::sdk::{find_sandbox, map_state};
-use crate::{DaytonaSandbox, TRANSITION_BUDGET};
+use crate::{DaytonaSandbox, TRANSITION_BUDGET, pty};
 
 /// How often a running command checks whether its sandbox was stopped.
 const WATCH_POLL: Duration = Duration::from_secs(2);
@@ -183,7 +183,7 @@ impl Workload {
     /// as `Killed`, and a failure that leaves its fate unknown is `Lost`.
     async fn fenced(
         &self,
-        work: impl Future<Output = legacy::Result<ExecStreamingResult>>,
+        work: impl Future<Output = legacy::Result<ExecOutcome>>,
         admitted: Option<String>,
     ) -> Result<ExecOutcome, Error> {
         let result = tokio::select! {
@@ -195,7 +195,7 @@ impl Workload {
             }
         };
         match result {
-            Ok(result) => Ok(outcome(&result)),
+            Ok(outcome) => Ok(outcome),
             Err(error) => {
                 // A stop comes first: Daytona answers polls of a command in
                 // a stopping sandbox with 400 as well as 502.
@@ -310,6 +310,27 @@ impl Workload {
             () = expired => Ok(Err(Termination::TimedOut)),
             bytes = Self::buffered(input, "stdin") => bytes.map(Ok),
         }
+    }
+
+    /// Runs a command attached to a terminal. Its input streams straight to
+    /// the terminal, nested or not, so nothing is buffered first.
+    async fn terminal(&self, spec: ExecSpec, controls: ExecControls) -> Result<ExecOutcome, Error> {
+        let admitted = self.admit().await?;
+        let run = async {
+            let terminal = self
+                .handle
+                .terminal(&spec.env, spec.working_directory.as_deref(), &spec.argv)
+                .await?;
+            Box::pin(pty::run(
+                self.handle.client(),
+                self.handle.sdk_id(),
+                terminal,
+                spec.timeout_ms.map(Duration::from_millis),
+                controls,
+            ))
+            .await
+        };
+        self.fenced(run, admitted).await
     }
 
     /// Whether the direct workload can run one-shot containers on its own
@@ -545,9 +566,7 @@ impl Sandbox for Workload {
     async fn exec(&self, spec: ExecSpec, controls: ExecControls) -> Result<ExecOutcome, Error> {
         spec.validate()?;
         if spec.tty {
-            return Err(Error::Unsupported {
-                capability: "tty".to_owned(),
-            });
+            return self.terminal(spec, controls).await;
         }
         let ExecControls {
             stdin,
@@ -575,11 +594,9 @@ impl Sandbox for Workload {
         }
         let mut legacy_controls = Self::output_controls(sink, term, kill);
         legacy_controls.stdin = stdin.map(StdinSource::new);
-        self.fenced(
-            self.handle.exec().run_streaming(&legacy, legacy_controls),
-            admitted,
-        )
-        .await
+        let run = self.handle.exec().run_streaming(&legacy, legacy_controls);
+        self.fenced(async { run.await.map(|result| outcome(&result)) }, admitted)
+            .await
     }
 
     fn files(&self) -> &dyn Files {
@@ -725,7 +742,9 @@ impl Containers for Workload {
         let one_shot = self.handle.one_shot().ok_or_else(|| Error::Unsupported {
             capability: "containers".to_owned(),
         })?;
-        self.fenced(one_shot.run(&legacy, controls), admitted).await
+        let run = one_shot.run(&legacy, controls);
+        self.fenced(async { run.await.map(|result| outcome(&result)) }, admitted)
+            .await
     }
 }
 

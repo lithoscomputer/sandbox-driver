@@ -14,9 +14,10 @@
 //! within 24 hours of deletion), refresh-activity, all five timers (TTL
 //! and auto-pause included), labels, runtime network updates, and — on
 //! VM sandbox classes, narrowed per sandbox — pause/resume, fork, and
-//! sandbox-to-snapshot with filesystem and live-process-state modes. The
-//! PTY facet rides the toolbox
-//! WebSocket; `spawn_stdio` rides command sessions and is UTF-8-only
+//! sandbox-to-snapshot with filesystem and live-process-state modes. A
+//! command run with `ExecSpec::tty` rides the toolbox PTY WebSocket, in a
+//! nested container through `docker exec -t`; `spawn_stdio` rides command
+//! sessions and is UTF-8-only
 //! (see the stdio module). The outbound proxy is `provider_config`
 //! (`{"outbound_proxy_url": …}`), composing with a domain allow list as
 //! upstream intends rather than competing as a network policy. Plain execs run
@@ -33,9 +34,6 @@
 //! Snapshots used with these facets must therefore provide the commands
 //! documented by [`sandbox_driver::legacy::Search`] and
 //! [`sandbox_driver::legacy::Services`], plus `git`, on `PATH`.
-//! Resize remains in the normalized interface, but the current hosted
-//! Daytona API and official SDK do not expose a working resize route, so
-//! this provider does not declare it.
 //!
 //! # Failed creation
 //!
@@ -110,7 +108,6 @@ pub use crate::fs::DaytonaFs;
 pub use crate::git::DaytonaGit;
 pub use crate::logs::DaytonaLogs;
 pub use crate::provider::DaytonaProvider;
-pub use crate::pty::DaytonaPty;
 pub use crate::runtime::DaytonaFactory;
 pub use crate::sandbox::DaytonaSandbox;
 

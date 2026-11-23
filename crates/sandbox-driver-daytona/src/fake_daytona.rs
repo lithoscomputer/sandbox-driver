@@ -8,10 +8,14 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use daytona_sdk::{Client, DaytonaConfig};
+use futures_util::future::BoxFuture;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tokio::time;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+use tokio_tungstenite::tungstenite::protocol::Role;
 
 use crate::exec::DaytonaTransport;
 
@@ -21,6 +25,9 @@ pub(crate) enum Reply {
     Json(u16, String),
     /// Nothing, until the client closes the connection.
     Hang,
+    /// A WebSocket upgrade, the socket then handed to this handler, as the
+    /// toolbox serves a terminal.
+    WebSocket(Arc<dyn Fn(WebSocketStream<TcpStream>) -> BoxFuture<'static, ()> + Send + Sync>),
 }
 
 pub(crate) type Script = Arc<dyn Fn(&str, &str) -> Reply + Send + Sync>;
@@ -112,6 +119,42 @@ impl FakeDaytona {
                                     if socket.write_all(response.as_bytes()).await.is_err() {
                                         return;
                                     }
+                                }
+                                Reply::WebSocket(serve) => {
+                                    let header = |name: &str| {
+                                        head.lines()
+                                            .filter_map(|line| line.split_once(':'))
+                                            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                                            .map(|(_, value)| value.trim().to_owned())
+                                            .unwrap_or_default()
+                                    };
+                                    // A client that offers subprotocols must
+                                    // be answered with one, as the toolbox does.
+                                    let protocol = header("sec-websocket-protocol")
+                                        .split(',')
+                                        .next()
+                                        .unwrap_or_default()
+                                        .trim()
+                                        .to_owned();
+                                    let response = format!(
+                                        "HTTP/1.1 101 Switching Protocols\r\nConnection: \
+                                         Upgrade\r\nUpgrade: websocket\r\n\
+                                         Sec-WebSocket-Accept: {}\r\n\
+                                         Sec-WebSocket-Protocol: {protocol}\r\n\r\n",
+                                        derive_accept_key(header("sec-websocket-key").as_bytes())
+                                    );
+                                    if socket.write_all(response.as_bytes()).await.is_ok() {
+                                        serve(
+                                            WebSocketStream::from_raw_socket(
+                                                socket,
+                                                Role::Server,
+                                                None,
+                                            )
+                                            .await,
+                                        )
+                                        .await;
+                                    }
+                                    return;
                                 }
                                 Reply::Hang => {
                                     while let Ok(read) = socket.read(&mut chunk).await {

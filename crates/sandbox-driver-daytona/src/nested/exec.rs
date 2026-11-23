@@ -1,25 +1,25 @@
 //! Execute Docker CLI commands through Daytona's byte-preserving exec facet.
 
-use std::fmt::Write as _;
+use std::collections::{BTreeMap, HashMap};
+use std::io;
 use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use std::{io, mem};
 
 use async_trait::async_trait;
 use sandbox_driver::legacy::{
     BASH_ENV_VAR, Capability, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult,
-    OutputSink, Pty, PtyOptions, PtySession, PtySize, Result, SpawnSpec, StdioProcess,
-    StdioProcessHandle, StopLevel, Termination, drain_with_stops, run_with_stop_grace,
+    OutputSink, Result, SpawnSpec, StdioProcess, StdioProcessHandle, StopLevel, Termination,
+    drain_with_stops, run_with_stop_grace,
 };
 use sandbox_driver_docker::DockerExec;
 use tokio::runtime::Handle;
-use tokio::sync::Mutex;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 use super::{CONTAINER_NAME, DockerCli};
+use crate::pty::{Terminal, push_words};
 use crate::shell::{exec_line, shell_quote};
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -333,115 +333,59 @@ impl StdioProcessHandle for NestedStdioHandle {
     }
 }
 
-#[async_trait]
-impl Pty for NestedExec {
-    async fn open(&self, options: &PtyOptions) -> Result<Box<dyn PtySession>> {
-        let nonce: u128 = rand::random();
-        let nonce = format!("{nonce:032x}");
-        let pid_file = format!("/tmp/.sandbox-driver/pty-{nonce}.pid");
-        let mut environment = options.env.clone();
-        environment
-            .entry("TERM".to_owned())
-            .or_insert_with(|| "xterm-256color".to_owned());
-        environment
-            .entry("LANG".to_owned())
-            .or_insert_with(|| "C.UTF-8".to_owned());
-        environment.insert(BASH_ENV_VAR.to_owned(), String::new());
-        let mut native_options = PtyOptions::default();
-        native_options.size = options.size;
-        native_options.working_dir = Some("/".to_owned());
+impl NestedExec {
+    /// `argv` run in the workload container over `docker exec -t`, from a
+    /// terminal on the sandbox. The command records its pid first, so a
+    /// stop can end it inside the container: killing the Docker client
+    /// does not.
+    pub(super) fn terminal(
+        &self,
+        env: &BTreeMap<String, String>,
+        working_directory: Option<&str>,
+        argv: &[String],
+    ) -> Terminal {
+        let pid_file = format!(
+            "/tmp/.sandbox-driver/terminal-{:032x}.pid",
+            rand::random::<u128>()
+        );
         let command = DockerCli::command(vec![
             "exec".to_owned(),
             "-it".to_owned(),
             "--workdir".to_owned(),
-            self.cli
-                .resolve(options.working_dir.as_deref().unwrap_or(".")),
+            self.cli.resolve(working_directory.unwrap_or(".")),
         ]);
-        let mut bootstrap = exec_line(&command.env, &command.program, &command.args);
-        // The PTY echoes its bootstrap before stty can disable echo. Forward
-        // values through private environment names, so echoed source contains
-        // only keys and references, including for Docker's own environment.
-        for (index, (key, value)) in environment.into_iter().enumerate() {
-            let alias = format!("SANDBOX_DRIVER_PTY_ENV_{index}");
-            native_options.env.insert(alias.clone(), value);
-            write!(
-                bootstrap,
-                " --env {}\"${alias}\"",
-                shell_quote(&format!("{key}="))
-            )
-            .expect("writing a String cannot fail");
-        }
-        let terminal = format!(
-            "mkdir -p /tmp/.sandbox-driver; printf '%s' $$ > {}; \
-             printf '\\n%s%s\\n' sandbox-driver-ready- {}; exec sh -l",
-            shell_quote(&pid_file),
-            shell_quote(&nonce)
+        let cli = Arc::clone(&self.cli);
+        let stopped = {
+            let pid_file = pid_file.clone();
+            async move {
+                if let Err(error) = close_terminal(&cli, &pid_file).await {
+                    tracing::warn!(error = %error, "stopping the nested terminal command failed");
+                }
+            }
+        };
+        let mut terminal = Terminal {
+            cwd:     "/".to_owned(),
+            echo:    false,
+            line:    exec_line(&command.env, &command.program, &command.args),
+            env:     HashMap::new(),
+            stopped: Some(Box::pin(stopped)),
+        };
+        let forwarded = terminal.forward("--env ", env);
+        terminal.line.push_str(&forwarded);
+        let record = format!(
+            "mkdir -p /tmp/.sandbox-driver && printf '%s' $$ > {} && exec \"$@\"",
+            shell_quote(&pid_file)
         );
-        for arg in [CONTAINER_NAME, "/bin/sh", "-c", &terminal] {
-            bootstrap.push(' ');
-            bootstrap.push_str(&shell_quote(arg));
-        }
-        let native: Arc<dyn PtySession> = Arc::from(self.cli.pty.open(&native_options).await?);
-        let session = NestedPtySession {
-            cli: Arc::clone(&self.cli),
-            native,
-            pid_file,
-            pending: Mutex::new(Vec::new()),
-            closed: AtomicBool::new(false),
-        };
-        session
-            .native
-            .write_input(format!("stty -echo; {bootstrap}\n").as_bytes())
-            .await?;
-        let marker = format!("sandbox-driver-ready-{nonce}").into_bytes();
-        let ready = async {
-            let mut output = Vec::new();
-            while let Some(bytes) = session.native.read_output().await? {
-                output.extend(bytes);
-                if let Some(index) = output
-                    .windows(marker.len())
-                    .position(|window| window == marker)
-                {
-                    session
-                        .pending
-                        .lock()
-                        .await
-                        .extend_from_slice(&output[index + marker.len()..]);
-                    return Ok(());
-                }
-                // Keep only the suffix needed to match a split marker.
-                if output.len() > marker.len() {
-                    output.drain(..output.len() - marker.len());
-                }
-            }
-            Err(Error::io(
-                "starting nested terminal",
-                io::Error::other("terminal ended before startup"),
-            ))
-        };
-        match time::timeout(Duration::from_secs(30), ready).await {
-            Ok(Ok(())) => Ok(Box::new(session)),
-            result => {
-                let _ = session.close().await;
-                match result {
-                    Ok(Err(error)) => Err(error),
-                    Err(_) => Err(Error::io(
-                        "starting nested terminal",
-                        io::Error::other("terminal startup timed out"),
-                    )),
-                    Ok(Ok(())) => unreachable!("successful startup returned above"),
-                }
-            }
-        }
+        push_words(&mut terminal.line, &[
+            CONTAINER_NAME,
+            "/bin/sh",
+            "-c",
+            &record,
+            "sandbox-driver",
+        ]);
+        push_words(&mut terminal.line, argv);
+        terminal
     }
-}
-
-struct NestedPtySession {
-    cli:      Arc<DockerCli>,
-    native:   Arc<dyn PtySession>,
-    pid_file: String,
-    pending:  Mutex<Vec<u8>>,
-    closed:   AtomicBool,
 }
 
 async fn close_terminal(cli: &DockerCli, pid_file: &str) -> Result<()> {
@@ -475,53 +419,6 @@ async fn close_terminal(cli: &DockerCli, pid_file: &str) -> Result<()> {
             )
         })??;
     Ok(())
-}
-
-#[async_trait]
-impl PtySession for NestedPtySession {
-    async fn write_input(&self, bytes: &[u8]) -> Result<()> {
-        self.native.write_input(bytes).await
-    }
-
-    async fn read_output(&self) -> Result<Option<Vec<u8>>> {
-        let mut pending = self.pending.lock().await;
-        if !pending.is_empty() {
-            return Ok(Some(mem::take(&mut *pending)));
-        }
-        drop(pending);
-        self.native.read_output().await
-    }
-
-    async fn resize(&self, size: PtySize) -> Result<()> {
-        self.native.resize(size).await
-    }
-
-    async fn close(&self) -> Result<()> {
-        if self.closed.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let stopped = close_terminal(&self.cli, &self.pid_file).await;
-        let closed = self.native.close().await;
-        self.closed.store(true, Ordering::Release);
-        stopped.and(closed)
-    }
-}
-
-impl Drop for NestedPtySession {
-    fn drop(&mut self) {
-        if self.closed.load(Ordering::Acquire) {
-            return;
-        }
-        if let Ok(runtime) = Handle::try_current() {
-            let cli = Arc::clone(&self.cli);
-            let native = Arc::clone(&self.native);
-            let pid_file = self.pid_file.clone();
-            runtime.spawn(async move {
-                let _ = close_terminal(&cli, &pid_file).await;
-                let _ = native.close().await;
-            });
-        }
-    }
 }
 
 #[cfg(test)]

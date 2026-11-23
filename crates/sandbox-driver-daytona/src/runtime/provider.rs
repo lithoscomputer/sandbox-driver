@@ -416,16 +416,24 @@ impl Provider for DaytonaRuntime {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::num::NonZeroU16;
     use std::path::Path;
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
+    use futures_util::future::BoxFuture;
+    use futures_util::{SinkExt as _, StreamExt as _};
     use sandbox_driver::{
         CatalogOptions, Environment, EnvironmentName, ExecControls, ExecSpec, OneShotImage,
-        OneShotSpec, ProviderEntry, Registry, SandboxSpec, SandboxState, Sandboxes, SecretResolver,
-        Source, StaticEnvironments, Termination,
+        OneShotSpec, OutputSink, OutputStream, ProviderEntry, Registry, SandboxSpec, SandboxState,
+        Sandboxes, SecretResolver, Source, StaticEnvironments, TerminalSize, Termination,
     };
-    use tokio::io::{AsyncReadExt as _, duplex, repeat};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, duplex, repeat};
+    use tokio::net::TcpStream;
+    use tokio::sync::{Notify, watch};
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::Message;
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -800,5 +808,250 @@ mod tests {
             "{:?}",
             fake.requests()
         );
+    }
+
+    /// Every chunk a sink received, with its stream.
+    type Collected = Arc<StdMutex<Vec<(OutputStream, Vec<u8>)>>>;
+
+    type Serve = Arc<dyn Fn(WebSocketStream<TcpStream>) -> BoxFuture<'static, ()> + Send + Sync>;
+
+    /// A started direct workload whose toolbox serves each terminal with
+    /// `serve`.
+    async fn terminal_fake(serve: Serve) -> FakeDaytona {
+        FakeDaytona::start(move |address| {
+            Arc::new(move |method, target| match (method, target) {
+                ("GET", target) if target.ends_with("/api-keys/current") => {
+                    Reply::Json(200, CURRENT_KEY.to_owned())
+                }
+                ("GET", target) if target.starts_with("/sandbox/sb-1/toolbox-proxy-url") => {
+                    Reply::Json(200, toolbox_url(&address))
+                }
+                ("GET", target) if target.starts_with("/sandbox/sb-1?") => {
+                    Reply::Json(200, started("2026-11-10T19:22:08.169Z"))
+                }
+                ("GET", target)
+                    if target.starts_with("/toolbox/sb-1/process/pty/create-connect") =>
+                {
+                    Reply::WebSocket(Arc::clone(&serve))
+                }
+                ("POST", target) if target.ends_with("/resize") => Reply::Json(
+                    200,
+                    serde_json::json!({
+                        "active": true, "cols": 132, "rows": 50, "createdAt": "now",
+                        "cwd": "/workspace", "envs": {}, "id": "pty", "lazyStart": false,
+                    })
+                    .to_string(),
+                ),
+                ("DELETE", target) if target.starts_with("/toolbox/sb-1/process/pty/") => {
+                    Reply::Json(200, "{}".to_owned())
+                }
+                _ => Reply::Json(404, "{}".to_owned()),
+            })
+        })
+        .await
+    }
+
+    /// The next input the terminal receives, as text.
+    async fn typed(ws: &mut WebSocketStream<TcpStream>) -> String {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Binary(bytes))) => {
+                    return String::from_utf8(bytes.to_vec()).expect("text input");
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected input, got {other:?}"),
+            }
+        }
+    }
+
+    /// What the shell prints once it has read `line`: the startup marker.
+    fn marker(line: &str) -> String {
+        let nonce = line
+            .split("sandbox-driver-ready- ")
+            .nth(1)
+            .and_then(|rest| rest.split(';').next())
+            .expect("the line prints a marker");
+        format!("sandbox-driver-ready-{nonce}")
+    }
+
+    async fn send(ws: &mut WebSocketStream<TcpStream>, message: Message) {
+        ws.send(message).await.expect("terminal frame");
+    }
+
+    fn collecting(output: &Collected, first: &Arc<Notify>) -> OutputSink {
+        let output = Arc::clone(output);
+        let first = Arc::clone(first);
+        Arc::new(move |stream, bytes| {
+            output.lock().expect("output lock").push((stream, bytes));
+            first.notify_one();
+            Box::pin(async { Ok(()) })
+        })
+    }
+
+    #[tokio::test]
+    async fn a_command_runs_in_a_terminal_with_its_input_size_and_exit_status() {
+        let typed_line = Arc::new(StdMutex::new(String::new()));
+        let fake = terminal_fake({
+            let typed_line = Arc::clone(&typed_line);
+            Arc::new(move |mut ws| {
+                let typed_line = Arc::clone(&typed_line);
+                Box::pin(async move {
+                    send(
+                        &mut ws,
+                        Message::text(r#"{"type":"control","status":"connected"}"#),
+                    )
+                    .await;
+                    send(&mut ws, Message::binary(b"$ ".to_vec())).await;
+                    let line = typed(&mut ws).await;
+                    // The terminal echoes the line, and the marker arrives
+                    // split across frames.
+                    send(&mut ws, Message::binary(line.clone().into_bytes())).await;
+                    let marker = marker(&line);
+                    let (head, tail) = marker.split_at(10);
+                    send(&mut ws, Message::binary(head.as_bytes().to_vec())).await;
+                    send(
+                        &mut ws,
+                        Message::binary(format!("{tail}hello\r\n").into_bytes()),
+                    )
+                    .await;
+                    *typed_line.lock().expect("line lock") = line;
+                    let input = typed(&mut ws).await;
+                    send(&mut ws, Message::binary(format!("<{input}>").into_bytes())).await;
+                    send(
+                        &mut ws,
+                        Message::text(r#"{"type":"control","status":"exited","exitCode":3}"#),
+                    )
+                    .await;
+                    let _ = ws.close(None).await;
+                })
+            })
+        })
+        .await;
+        let sandbox = catalog(&fake, Some("test-key"))
+            .attach(&reference("sb-1"))
+            .await
+            .expect("attach");
+        let size = |rows, columns| TerminalSize {
+            rows:    NonZeroU16::new(rows).unwrap(),
+            columns: NonZeroU16::new(columns).unwrap(),
+        };
+        let (resize, resized) = watch::channel(size(40, 100));
+        let (mut input, stdin) = duplex(64);
+        let output = Arc::new(StdMutex::new(Vec::new()));
+        let first = Arc::new(Notify::new());
+        let sink = collecting(&output, &first);
+        let mut spec = ExecSpec::argv(["make", "test"]);
+        spec.tty = true;
+        spec.working_directory = Some("sub".to_owned());
+        spec.env.insert("TOKEN".to_owned(), "s3cret".to_owned());
+        let exec = tokio::spawn(async move {
+            sandbox
+                .exec(spec, ExecControls {
+                    stdin: Some(Box::pin(stdin)),
+                    sink: Some(sink),
+                    resize: Some(resized),
+                    ..ExecControls::default()
+                })
+                .await
+                .map(|outcome| (outcome, output))
+        });
+        first.notified().await;
+        resize.send(size(50, 132)).expect("resize");
+        input.write_all(b"typed").await.expect("input");
+        let (outcome, output) = time::timeout(Duration::from_secs(10), exec)
+            .await
+            .expect("the command ends")
+            .expect("task")
+            .expect("exec");
+
+        assert_eq!(outcome.termination, Termination::Exited);
+        assert_eq!(outcome.exit_code, Some(3));
+        let output = output.lock().expect("output lock").clone();
+        assert!(
+            output
+                .iter()
+                .all(|(stream, _)| *stream == OutputStream::Terminal),
+            "{output:?}"
+        );
+        let text: Vec<u8> = output.into_iter().flat_map(|(_, bytes)| bytes).collect();
+        // Neither the prompt nor the echoed line reaches the caller.
+        assert_eq!(String::from_utf8_lossy(&text), "hello\r\n<typed>");
+        let line = typed_line.lock().expect("line lock").clone();
+        assert!(
+            !line.contains("s3cret"),
+            "the echoed line holds no value: {line}"
+        );
+        assert!(
+            line.ends_with("'TOKEN='\"$SANDBOX_DRIVER_ENV_0\" 'make' 'test'\n"),
+            "{line}"
+        );
+        let requests = fake.requests();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("create-connect")
+                    && request.contains("cols=100&rows=40&cwd=%2Fworkspace%2Fsub")),
+            "{requests:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.starts_with("POST") && request.ends_with("/resize")),
+            "{requests:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.starts_with("DELETE")),
+            "a command that exited is not killed: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_killed_terminal_command_is_killed_in_the_sandbox() {
+        let fake = terminal_fake(Arc::new(|mut ws| {
+            Box::pin(async move {
+                send(
+                    &mut ws,
+                    Message::text(r#"{"type":"control","status":"connected"}"#),
+                )
+                .await;
+                let line = typed(&mut ws).await;
+                send(
+                    &mut ws,
+                    Message::binary(format!("{}ready", marker(&line)).into_bytes()),
+                )
+                .await;
+                while let Some(Ok(_)) = ws.next().await {}
+            })
+        }))
+        .await;
+        let sandbox = catalog(&fake, Some("test-key"))
+            .attach(&reference("sb-1"))
+            .await
+            .expect("attach");
+        let output = Arc::new(StdMutex::new(Vec::new()));
+        let first = Arc::new(Notify::new());
+        let kill = CancellationToken::new();
+        let mut spec = ExecSpec::argv(["sleep", "600"]);
+        spec.tty = true;
+        let exec = sandbox.exec(spec, ExecControls {
+            sink: Some(collecting(&output, &first)),
+            kill: Some(kill.clone()),
+            ..ExecControls::default()
+        });
+        tokio::pin!(exec);
+        tokio::select! {
+            () = first.notified() => {}
+            result = &mut exec => panic!("ended before it was killed: {result:?}"),
+        }
+        kill.cancel();
+        let outcome = time::timeout(Duration::from_secs(10), exec)
+            .await
+            .expect("the kill ends the command")
+            .expect("exec");
+        assert_eq!(outcome.termination, Termination::Killed);
+        fake.saw("DELETE /toolbox/sb-1/process/pty/sandbox-driver-")
+            .await;
     }
 }

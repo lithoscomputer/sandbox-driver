@@ -39,3 +39,4 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 sandbox-driver-conformance.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
+tokio-tungstenite = "0.26"

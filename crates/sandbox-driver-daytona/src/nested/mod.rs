@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use sandbox_driver::legacy::{
     Capabilities, DirEntry, Error, Exec, ExecControls, ExecFailure, ExecResult, ExecSpec,
-    ExecStreamingResult, FileMetadata, Filesystem, OneShotCaps, Pty, PtyOptions, PtySession,
-    Result, SandboxSpec, SpawnSpec, StdioProcess,
+    ExecStreamingResult, FileMetadata, Filesystem, OneShotCaps, Result, SandboxSpec, SpawnSpec,
+    StdioProcess,
 };
 use sandbox_driver_daytona_config::{DockerExecutionTarget, NestedDockerConfig};
 use sandbox_driver_docker_config::{RegistryAuth, Sidecar};
@@ -30,8 +30,9 @@ use tokio::time;
 use self::exec::NestedExec;
 use self::fs::NestedFs;
 use self::operation::{run_command, run_owned};
+use crate::pty::Terminal;
 use crate::sdk::DaytonaClient;
-use crate::{DaytonaExec, DaytonaFs, DaytonaPty, RUNTIME_DIRECTORY, resolve_path};
+use crate::{DaytonaExec, DaytonaFs, RUNTIME_DIRECTORY, resolve_path};
 
 pub(crate) const CONTAINER_NAME: &str = "sandbox-driver-workspace";
 const NETWORK: &str = "sandbox-driver-services";
@@ -94,7 +95,6 @@ for name, path in (
 pub(crate) struct DockerCli {
     pub(crate) exec:        Arc<dyn Exec>,
     pub(crate) fs:          Arc<dyn Filesystem>,
-    pub(super) pty:         Arc<dyn Pty>,
     pub(crate) working_dir: String,
 }
 
@@ -107,11 +107,6 @@ impl DockerCli {
                 working_dir.to_owned(),
             )),
             fs:          Arc::new(DaytonaFs::new(
-                Arc::clone(client),
-                sandbox_id.to_owned(),
-                working_dir.to_owned(),
-            )),
-            pty:         Arc::new(DaytonaPty::new(
                 Arc::clone(client),
                 sandbox_id.to_owned(),
                 working_dir.to_owned(),
@@ -808,11 +803,17 @@ impl Exec for NestedDocker {
     }
 }
 
-#[async_trait]
-impl Pty for NestedDocker {
-    async fn open(&self, options: &PtyOptions) -> Result<Box<dyn PtySession>> {
+impl NestedDocker {
+    /// `argv` for a terminal, run in the workload container once Docker
+    /// and the container are ready.
+    pub(crate) async fn terminal(
+        &self,
+        env: &BTreeMap<String, String>,
+        working_directory: Option<&str>,
+        argv: &[String],
+    ) -> Result<Terminal> {
         self.ensure_ready().await?;
-        self.exec.open(options).await
+        Ok(self.exec.terminal(env, working_directory, argv))
     }
 }
 
@@ -1282,7 +1283,6 @@ mod tests {
             Arc::new(DockerCli {
                 exec:        exec.clone(),
                 fs:          Arc::clone(&native.cli.fs),
-                pty:         Arc::clone(&native.cli.pty),
                 working_dir: "/workspace".to_owned(),
             }),
             DockerExecutionTarget::VirtualMachine,
@@ -1366,7 +1366,6 @@ mod tests {
             Arc::new(DockerCli {
                 exec:        exec.clone(),
                 fs:          Arc::clone(&native.cli.fs),
-                pty:         Arc::clone(&native.cli.pty),
                 working_dir: "/workspace".to_owned(),
             }),
             DockerExecutionTarget::VirtualMachine,
@@ -1404,5 +1403,82 @@ mod tests {
             .expect("the run");
         assert_eq!(result.result.termination, Termination::Killed);
         assert_eq!(*exec.signals.lock().unwrap(), ["TERM", "KILL"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_terminal_command_runs_in_the_container_and_records_its_pid() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Command;
+        use std::{env, fs};
+
+        let nested = fake_nested(|_| unreachable!()).await;
+        let terminal = nested.exec.terminal(
+            &BTreeMap::from([("TOKEN".to_owned(), "s3cret".to_owned())]),
+            Some("sub"),
+            &words(["printf", "<%s>", "two words"]),
+        );
+        assert!(
+            !terminal.echo,
+            "docker exec -t attaches a terminal of its own"
+        );
+        assert!(!terminal.line.contains("s3cret"), "{}", terminal.line);
+
+        // A stand-in `docker` that prints the arguments it was given.
+        let bin = env::temp_dir().join(format!("nested-terminal-{:032x}", rand::random::<u128>()));
+        fs::create_dir(&bin).expect("test directory");
+        let docker = bin.join("docker");
+        fs::write(&docker, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").expect("docker stand-in");
+        fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).expect("executable");
+        let output = Command::new("/bin/sh")
+            .args(["-c", &terminal.line])
+            .envs(&terminal.env)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .output()
+            .expect("shell");
+        fs::remove_dir_all(&bin).expect("remove test directory");
+        let args: Vec<String> = String::from_utf8(output.stdout)
+            .expect("text output")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let (record, workload) = (&args[9], &args[10..]);
+        assert_eq!(
+            args[..9],
+            words([
+                "exec",
+                "-it",
+                "--workdir",
+                "/workspace/sub",
+                "--env",
+                "TOKEN=s3cret",
+                CONTAINER_NAME,
+                "/bin/sh",
+                "-c",
+            ])
+        );
+        assert_eq!(
+            workload,
+            words(["sandbox-driver", "printf", "<%s>", "two words"])
+        );
+
+        // Inside the container, the command records its pid and becomes it.
+        let output = Command::new("/bin/sh")
+            .args(["-c", record])
+            .args(workload)
+            .output()
+            .expect("container shell");
+        assert_eq!(output.stdout, b"<two words>");
+        let pid_file = record
+            .split('\'')
+            .find(|word| word.starts_with("/tmp/.sandbox-driver/terminal-"))
+            .expect("pid file");
+        assert!(
+            fs::read_to_string(pid_file)
+                .expect("recorded pid")
+                .parse::<u32>()
+                .is_ok()
+        );
+        fs::remove_file(pid_file).expect("remove pid file");
     }
 }

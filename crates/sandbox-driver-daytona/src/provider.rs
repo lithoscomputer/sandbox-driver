@@ -18,10 +18,10 @@ use futures_util::TryStreamExt;
 use futures_util::future::BoxFuture;
 use sandbox_driver::legacy::{
     Action, AuthError, Capabilities, Error, EventContext, EventEmitter, EventSubject, HealthStatus,
-    Isolation, LogsCaps, NetworkPolicy, ProviderError, ProviderHealth, ProviderKind, PtyCaps,
-    ResourceKind, Resources, Result, Sandbox, SandboxFilter, SandboxId, SandboxKind,
-    SandboxProvider, SandboxSource, SandboxSpec, SandboxState, SandboxStatus, SnapshotCaps,
-    SnapshotId, SnapshotProvider, SnapshotSource, SnapshotSpec, VolumeCaps, VolumeProvider,
+    Isolation, LogsCaps, NetworkPolicy, ProviderError, ProviderHealth, ProviderKind, ResourceKind,
+    Resources, Result, Sandbox, SandboxFilter, SandboxId, SandboxKind, SandboxProvider,
+    SandboxSource, SandboxSpec, SandboxState, SandboxStatus, SnapshotCaps, SnapshotId,
+    SnapshotProvider, SnapshotSource, SnapshotSpec, VolumeCaps, VolumeProvider,
 };
 use sandbox_driver_daytona_config::{DaytonaProviderConfig, NestedDockerConfig};
 use serde::Deserialize;
@@ -622,11 +622,6 @@ pub(crate) fn daytona_capabilities() -> Capabilities {
     caps.git.supported = true;
     caps.git.native = true;
     caps.services.supported = true;
-    caps.pty = Some({
-        let mut pty = PtyCaps::default();
-        pty.resize = true;
-        pty
-    });
     caps.logs = Some({
         let mut logs = LogsCaps::default();
         logs.entrypoint = true;

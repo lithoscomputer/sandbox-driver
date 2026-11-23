@@ -9,8 +9,8 @@ use daytona_sdk::Client;
 use futures_util::FutureExt;
 use sandbox_driver::legacy;
 use sandbox_driver::legacy::{
-    ExecControls, ExecSpec, OneShotImage, OneShotSpec, PtyOptions, PtySize, SandboxKind,
-    SandboxProvider, SandboxSource, SandboxSpec, SnapshotId, SpawnSpec, Termination,
+    ExecControls, ExecSpec, OneShotImage, OneShotSpec, SandboxKind, SandboxProvider, SandboxSource,
+    SandboxSpec, SnapshotId, SpawnSpec, Termination,
 };
 use sandbox_driver_daytona::{
     DaytonaProvider, DaytonaProviderConfig, DockerExecutionTarget, NestedDockerConfig,
@@ -167,25 +167,6 @@ async fn nested_job_sidecars_one_shots_and_restart_share_the_sandbox_lifecycle()
             timeout(Duration::from_secs(20), process.handle.terminate())
                 .await
                 .unwrap();
-            tracing::info!("nested live gate: PTY resize and close");
-            let terminal = sandbox.pty().unwrap().open(&PtyOptions::default()).await?;
-            terminal.resize(PtySize { rows: 31, cols: 91 }).await?;
-            terminal.write_input(b"stty size\n").await?;
-            timeout(Duration::from_secs(20), async {
-                let mut output = Vec::new();
-                loop {
-                    let chunk = terminal.read_output().await?.expect("open nested terminal");
-                    output.extend_from_slice(&chunk);
-                    assert!(output.len() < 32768, "bounded terminal output");
-                    if String::from_utf8_lossy(&output).contains("31 91") {
-                        break;
-                    }
-                }
-                Ok::<_, legacy::Error>(())
-            })
-            .await
-            .unwrap()?;
-            terminal.close().await?;
             tracing::info!("nested live gate: one-shot");
             let result = sandbox
                 .one_shot()

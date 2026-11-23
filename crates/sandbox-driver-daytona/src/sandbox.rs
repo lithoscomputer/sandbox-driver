@@ -12,7 +12,7 @@ use daytona_sdk::DaytonaError;
 use sandbox_driver::legacy::{
     Action, Capabilities, Capability, Error, EventEmitter, EventSubject, Exec, ExecFailure,
     ExecSpec, Filesystem, ForkOptions, Git, LifecycleTimers, Logs, NetworkPolicy, OneShot,
-    PlatformInfo, PreviewUrls, Pty, Resources, Result, Sandbox, SandboxId, SandboxSnapshotOptions,
+    PlatformInfo, PreviewUrls, Resources, Result, Sandbox, SandboxId, SandboxSnapshotOptions,
     SandboxState, SandboxStatus, SnapshotId, SnapshotMode, SshAccess, Vnc, WebTerminal,
 };
 use tokio::time;
@@ -22,6 +22,7 @@ use crate::labels::{
 };
 use crate::nested::NestedDocker;
 use crate::provider::narrowed_capabilities;
+use crate::pty::Terminal;
 use crate::sdk::{
     DaytonaClient, auto_delete_minutes, dashboard_url, daytona_error, is_not_found,
     is_state_change_in_progress, map_state, minutes, sandbox_kind_from_class, to_u64,
@@ -29,8 +30,8 @@ use crate::sdk::{
 use crate::snapshots::{create_sandbox_snapshot, generated_snapshot_name};
 use crate::{
     CLEANUP_TIMEOUT, CREATE_TIMEOUT, DaytonaAccess, DaytonaExec, DaytonaFs, DaytonaGit,
-    DaytonaLogs, DaytonaPty, FALLBACK_WORKING_DIR, RUNTIME_DIRECTORY, TRANSITION_BUDGET,
-    TRANSITION_POLL,
+    DaytonaLogs, FALLBACK_WORKING_DIR, RUNTIME_DIRECTORY, TRANSITION_BUDGET, TRANSITION_POLL,
+    resolve_path,
 };
 
 /// The fields a [`SandboxStatus`] reads, borrowed from either a full sandbox
@@ -164,7 +165,6 @@ pub struct DaytonaSandbox {
     fs:                DaytonaFs,
     access:            DaytonaAccess,
     logs:              DaytonaLogs,
-    pty:               DaytonaPty,
     events:            EventEmitter,
 }
 
@@ -209,7 +209,6 @@ impl DaytonaSandbox {
             fs: DaytonaFs::new(Arc::clone(client), sdk.id.clone(), working_dir.clone()),
             access: DaytonaAccess::new(Arc::clone(client), sdk.id.clone()),
             logs: DaytonaLogs::new(Arc::clone(client), sdk.id.clone()),
-            pty: DaytonaPty::new(Arc::clone(client), sdk.id.clone(), working_dir.clone()),
             id,
             name: (!sdk.name.is_empty()).then(|| sdk.name.clone()),
             capabilities,
@@ -241,6 +240,24 @@ impl DaytonaSandbox {
     /// sandbox, rather than in the sandbox itself.
     pub(crate) fn runs_in_container(&self) -> bool {
         self.container().is_some()
+    }
+
+    /// `argv` for a terminal, in the workload: the sandbox itself, or its
+    /// container.
+    pub(crate) async fn terminal(
+        &self,
+        env: &BTreeMap<String, String>,
+        working_directory: Option<&str>,
+        argv: &[String],
+    ) -> Result<Terminal> {
+        match self.container() {
+            Some(nested) => nested.terminal(env, working_directory, argv).await,
+            None => Ok(Terminal::direct(
+                resolve_path(&self.working_dir, working_directory.unwrap_or(".")),
+                env,
+                argv,
+            )),
+        }
     }
 
     fn container(&self) -> Option<&NestedDocker> {
@@ -886,13 +903,6 @@ impl Sandbox for DaytonaSandbox {
 
     fn ssh(&self) -> Option<&dyn SshAccess> {
         self.capabilities.access.ssh.then_some(&self.access)
-    }
-
-    fn pty(&self) -> Option<&dyn Pty> {
-        Some(
-            self.container()
-                .map_or(&self.pty as &dyn Pty, |nested| nested),
-        )
     }
 
     fn logs(&self) -> Option<&dyn Logs> {
