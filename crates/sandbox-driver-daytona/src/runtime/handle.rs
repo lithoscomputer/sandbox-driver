@@ -133,6 +133,15 @@ impl Workload {
         )
     }
 
+    /// Success of a stop: Daytona's listing, which lags the sandbox's own
+    /// record, shows it stopped too.
+    async fn listed_stopped(&self) -> Result<(), Error> {
+        super::until_listed(self.handle.client(), self.handle.sdk_id(), |state| {
+            state.is_some_and(Self::stopped)
+        })
+        .await
+    }
+
     /// Resolves once the sandbox is confirmed stopped; any work admitted
     /// before has then ended with it.
     async fn watch_for_stop(&self) {
@@ -522,7 +531,7 @@ impl Sandbox for Workload {
     async fn stop(&self) -> Result<(), Error> {
         self.ensure_open()?;
         match self.state().await.map_err(not_started)? {
-            LegacyState::Stopped | LegacyState::Archived => return Ok(()),
+            LegacyState::Stopped | LegacyState::Archived => return self.listed_stopped().await,
             LegacyState::Deleted => return Err(self.absent()),
             _ => {}
         }
@@ -530,7 +539,7 @@ impl Sandbox for Workload {
         // Success is Daytona's own report that the sandbox is stopped, read
         // after the request: an accepted stop is not a fence.
         let state = match self.state().await? {
-            LegacyState::Stopped | LegacyState::Archived => return Ok(()),
+            LegacyState::Stopped | LegacyState::Archived => return self.listed_stopped().await,
             LegacyState::Deleted => return Err(self.absent()),
             state => state,
         };

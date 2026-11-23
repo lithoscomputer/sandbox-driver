@@ -13,15 +13,23 @@ mod runner;
 mod spec;
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
+use daytona_api_client::apis::sandbox_api;
+use daytona_sdk::Client;
+use sandbox_driver::legacy::SandboxState as LegacyState;
 use sandbox_driver::{
     Activation, Error, JsonSchema, MutationOutcome, PluginLocation, Provider, ProviderFactory,
     ProviderKind, ProviderSchemas,
 };
+use tokio::time;
 use tokio_util::sync::CancellationToken;
 
+use self::error::classify;
 use self::provider::DaytonaRuntime;
+use crate::sdk::{generated_error, map_state};
+use crate::{TRANSITION_BUDGET, TRANSITION_POLL};
 
 /// The Daytona built-in for the shared contract's registry.
 ///
@@ -99,6 +107,73 @@ fn ensure_open(closed: &CancellationToken) -> Result<(), Error> {
         })
     } else {
         Ok(())
+    }
+}
+
+/// Waits until Daytona's sandbox listing, which lags the sandbox's own
+/// record, reports sandbox `id` in a state `settled` accepts, `None` when
+/// it is not listed. A stop or destroy returns only then, so a list
+/// that follows it shows the change.
+async fn until_listed(
+    client: &Client,
+    id: &str,
+    settled: impl Fn(Option<LegacyState>) -> bool,
+) -> Result<(), Error> {
+    let started = Instant::now();
+    loop {
+        let listed = sandbox_api::list_sandboxes(
+            client.api_configuration(),
+            client.organization_id(),
+            None,
+            None,
+            Some(id),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .map_err(|error| {
+            classify(
+                "listing sandboxes",
+                generated_error("listing sandboxes", error),
+            )
+        })?;
+        let state = listed
+            .items
+            .into_iter()
+            .find(|item| item.id == id)
+            .map(|item| map_state(item.state));
+        if settled(state) {
+            return Ok(());
+        }
+        if started.elapsed() >= TRANSITION_BUDGET {
+            return Err(Error::Unavailable {
+                message: format!("Daytona still lists the sandbox as {state:?}"),
+                outcome: MutationOutcome::Unknown,
+            });
+        }
+        time::sleep(TRANSITION_POLL).await;
     }
 }
 
