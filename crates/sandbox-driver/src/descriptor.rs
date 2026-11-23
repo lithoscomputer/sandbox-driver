@@ -143,15 +143,19 @@ pub enum PortSupport {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CapabilitySet {
-    pub endpoints:        BTreeSet<EndpointCapability>,
-    pub services:         bool,
+    pub endpoints:         BTreeSet<EndpointCapability>,
+    pub services:          bool,
     /// One-shot containers in the workload's workspace/network.
-    pub containers:       bool,
+    pub containers:        bool,
     /// Supported workload container options, independent of service support.
-    pub container_fields: BTreeSet<ContainerField>,
+    pub container_fields:  BTreeSet<ContainerField>,
+    /// Whether the provider pulls the workload's own image with a registry
+    /// credential, `SandboxSpec::credential`. Service credentials are part
+    /// of `services`.
+    pub image_credentials: bool,
     /// Timers the provider enforces. A request for any other timer is
     /// `Unsupported`, never silently ignored.
-    pub timers:           BTreeSet<TimerCapability>,
+    pub timers:            BTreeSet<TimerCapability>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]

@@ -38,6 +38,7 @@ fn unsupported_requests_are_refused_even_when_false_or_zero() {
             "container.shm_size_mb",
             json!({"container":{"shm_size_mb":64}}),
         ),
+        ("credential", json!({"credential":"registry"})),
         (
             "container.platform",
             json!({"container":{"platform":"linux/amd64"}}),
@@ -95,12 +96,12 @@ fn the_provider_default_network_needs_no_advertisement() {
 #[test]
 fn advertised_requests_pass_but_invalid_requests_do_not() {
     let mut descriptor = descriptor();
-    descriptor.capabilities = serde_json::from_value(
-        json!({"container_fields":["init", "platform"], "timers":["auto_stop"]}),
-    )
+    descriptor.capabilities = serde_json::from_value(json!({
+        "container_fields":["init", "platform"], "image_credentials":true, "timers":["auto_stop"]
+    }))
     .expect("caps");
     let mut spec: SandboxSpec = serde_json::from_value(json!({
-        "source":{"image":"test"},
+        "source":{"image":"test"}, "credential":"registry",
         "container":{"init":false, "platform":"linux/arm64"},
         "timers":{"auto_stop_ms":0}
     }))

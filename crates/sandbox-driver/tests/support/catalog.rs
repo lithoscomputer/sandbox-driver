@@ -28,9 +28,12 @@ pub(super) struct Factory {
     pub(super) activations:    Mutex<Vec<Activation>>,
     pub(super) namespace:      Mutex<Option<NamespaceId>>,
     pub(super) list_results:   Mutex<Option<Result<Vec<SandboxSummary>, Error>>>,
+    /// Capabilities the runtime advertises on top of the fake's.
+    pub(super) capabilities:   CapabilitySet,
+    /// Every admission that reached the runtime, before any scripted error.
+    pub(super) admissions:     Mutex<Vec<WorkloadAdmission>>,
     pub(super) shutdown_error: Option<Error>,
     pub(super) create_error:   Option<Error>,
-    pub(super) creates:        AtomicUsize,
     pub(super) mutations:      AtomicUsize,
     pub(super) discovery:      AtomicUsize,
     pub(super) list_delay:     Duration,
@@ -45,9 +48,10 @@ impl Default for Factory {
             activations:    Mutex::new(Vec::new()),
             namespace:      Mutex::new(None),
             list_results:   Mutex::new(None),
+            capabilities:   CapabilitySet::default(),
+            admissions:     Mutex::new(Vec::new()),
             shutdown_error: None,
             create_error:   None,
-            creates:        AtomicUsize::new(0),
             mutations:      AtomicUsize::new(0),
             discovery:      AtomicUsize::new(0),
             list_delay:     Duration::ZERO,
@@ -81,6 +85,7 @@ impl Provider for Runtime {
     async fn describe(&self) -> Result<Descriptor, Error> {
         let mut descriptor = self.runtime.describe().await?;
         descriptor.schemas = self.factory.schemas.clone();
+        descriptor.capabilities = self.factory.capabilities.clone();
         if let Some(namespace) = self.factory.namespace.lock().await.as_ref() {
             descriptor.namespace.id = namespace.clone();
         }
@@ -90,7 +95,7 @@ impl Provider for Runtime {
         self.runtime.health().await
     }
     async fn create(&self, admission: WorkloadAdmission) -> Result<Box<dyn Sandbox>, Error> {
-        self.factory.creates.fetch_add(1, Ordering::SeqCst);
+        self.factory.admissions.lock().await.push(admission.clone());
         if let Some(error) = &self.factory.create_error {
             return Err(error.clone());
         }

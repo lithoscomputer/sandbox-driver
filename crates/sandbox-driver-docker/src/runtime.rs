@@ -219,10 +219,10 @@ impl Provider for DockerRuntime {
             network:      BTreeSet::from([NetworkMode::AllowAll, NetworkMode::Block]),
             ports:        PortSupport::Any,
             capabilities: CapabilitySet {
-                endpoints:        BTreeSet::from([EndpointCapability::ShellCommand]),
-                services:         true,
-                containers:       true,
-                container_fields: BTreeSet::from([
+                endpoints:         BTreeSet::from([EndpointCapability::ShellCommand]),
+                services:          true,
+                containers:        true,
+                container_fields:  BTreeSet::from([
                     ContainerField::Init,
                     ContainerField::Privileged,
                     ContainerField::CapabilitiesAdd,
@@ -231,7 +231,8 @@ impl Provider for DockerRuntime {
                     ContainerField::ExtraHosts,
                     ContainerField::ShmSizeMb,
                 ]),
-                timers:           BTreeSet::new(),
+                image_credentials: false,
+                timers:            BTreeSet::new(),
             },
         })
     }

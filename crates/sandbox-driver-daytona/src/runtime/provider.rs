@@ -253,17 +253,18 @@ fn descriptor(schemas: ProviderSchemas, namespace: NamespaceId) -> Descriptor {
         ]),
         ports: PortSupport::Any,
         capabilities: CapabilitySet {
-            endpoints:        BTreeSet::new(),
-            services:         true,
-            containers:       true,
-            container_fields: BTreeSet::from([
+            endpoints:         BTreeSet::new(),
+            services:          true,
+            containers:        true,
+            container_fields:  BTreeSet::from([
                 ContainerField::Init,
                 ContainerField::Privileged,
                 ContainerField::CapabilitiesAdd,
                 ContainerField::CapabilitiesDrop,
                 ContainerField::ShmSizeMb,
             ]),
-            timers:           BTreeSet::from([
+            image_credentials: false,
+            timers:            BTreeSet::from([
                 TimerCapability::AutoStop,
                 TimerCapability::AutoArchive,
                 TimerCapability::AutoDelete,

@@ -488,6 +488,7 @@ Connection loss, a plugin crash, or `Error::Stale` does not establish whether an
 - `timers` are milliseconds. If you do not implement timers, refuse a non-empty `timers` with `unsupported`.
 - `labels` and `env` are string maps and round-trip exactly (labels) or reach every process in the sandbox (env).
 - `working_directory` and `user` are what commands run as and where; return the working directory you actually used in the create result.
+- `credential` names the secret that holds the registry credential for the workload's own image: a JSON object with `username`, `password` and an optional `server`. The library resolves the name at admission and sends the value beside the spec, never in it. Set `capabilities.image_credentials` to `true` if you pull the workload image with it; the library refuses the field with `unsupported` otherwise.
 - `services` is a workload beside the sandbox: named containers with an image, env, published ports, a registry credential name, and a readiness check executed inside the service container. The provider waits for readiness before `create` or `start` returns success. Every readiness check states its whole budget: `interval_ms`, a per-attempt `timeout_ms`, `retries` and an overall `deadline_ms`, all required and non-zero, so the bound is explicit rather than inferred; a timeout longer than the deadline, or an interval that leaves no room for a second attempt, is `invalid_spec`. Each service must be reachable from the sandbox workload and its one-shot containers; `status.services` reports the host and port used from that workload, because on Docker that is a network alias and in a pod it is localhost. Services follow the sandbox lifecycle and participate in its stop fence. Declare `services` in your capabilities or refuse a non-empty `services` with `unsupported`.
 - `container` is the typed subset of container options a job can ask for: `init`, `privileged`, `capabilities_add`, `capabilities_drop`, `dns`, `extra_hosts`, `shm_size_mb`, `platform` (the image platform to pull and run, such as `linux/amd64`). Honour what you can; refuse the rest with `unsupported` naming the field.
 - `provider_config` is yours, for the few settings with no provider-neutral meaning. Describe it with a `spec_schema` in your descriptor and the library validates overrides against it; otherwise it is passed through unread.
@@ -512,7 +513,8 @@ Connection loss, a plugin crash, or `Error::Stale` does not establish whether an
   "network": ["allow_all"],
   "ports": {"exposable": "any"},
   "capabilities": {"endpoints": [], "services": false, "containers": false,
-                   "container_fields": [], "timers": ["auto_stop"]}
+                   "container_fields": [], "image_credentials": false,
+                   "timers": ["auto_stop"]}
 }
 ```
 
