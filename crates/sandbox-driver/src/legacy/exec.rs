@@ -75,8 +75,8 @@ pub trait Exec: Send + Sync {
     /// [`Termination::Killed`] for `kill` (`Killed` wins when both fired).
     /// A caller who wants an escalation ladder owns it: fire `term`, wait
     /// as long as it likes, fire `kill`. A provider that cannot deliver a
-    /// signal (Daytona ends a command by deleting its session) ends the
-    /// command on either token and reports the one it honoured.
+    /// signal ends the command on either token and reports the one it
+    /// honoured.
     ///
     /// The provider's own stops have no caller present to escalate, so
     /// they are hard: `spec.timeout` and a failing sink SIGKILL the
@@ -344,20 +344,6 @@ impl ExecControls {
         tokio::select! {
             () = stop_signal(self.term.as_ref()) => StopLevel::Term,
             () = stop_signal(self.kill.as_ref()) => StopLevel::Kill,
-        }
-    }
-}
-
-impl StopLevel {
-    /// The termination a provider reports for a command this stop ended.
-    ///
-    /// Hidden from the docs: it returns this module's [`Termination`], not
-    /// the one the documented `StopLevel` sits beside.
-    #[doc(hidden)]
-    pub fn termination(self) -> Termination {
-        match self {
-            Self::Term => Termination::Cancelled,
-            Self::Kill => Termination::Killed,
         }
     }
 }

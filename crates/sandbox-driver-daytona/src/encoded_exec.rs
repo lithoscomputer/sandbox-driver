@@ -27,6 +27,9 @@ const MAX_FRAME_BYTES: usize = 512;
 
 const ENCODE_OUTPUT: &str = r#"
 encode() {
+    # A term signals the whole process group. The encoders outlive it so
+    # what the command writes while it stops still arrives.
+    trap '' TERM
     local LC_ALL=C chunk= byte status count=96
     # Timed reads can consume a NUL just as the timeout fires, then report
     # a timeout instead of the delimiter. Read bytes without a timer and
@@ -59,7 +62,13 @@ exec 3> >(encode O)
 stdout_encoder=$!
 exec 4> >(encode E 3>&-)
 stderr_encoder=$!
-{ command "$@" >&3 2>&4 3>&- 4>&-; status=$?; } 2>&4
+# This shell waits out a term too, to report the command's status: a
+# trap (not an ignore, which the command would inherit) defers the TERM
+# until the command ends. Bash's own report of a command a signal ended
+# ("Terminated") goes nowhere, as on the other providers; the command's
+# stderr is its own.
+trap : TERM
+{ command "$@" >&3 2>&4 3>&- 4>&-; status=$?; } 2>/dev/null
 exec 3>&- 4>&-
 # Older Bash can forget already-finished process substitution children.
 # Wait for any still running without leaking its bookkeeping diagnostics.
