@@ -18,6 +18,7 @@ use sandbox_driver::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
 use tokio::sync::{mpsc, watch};
 use tokio::time;
+use tokio_util::sync::CancellationToken;
 
 use crate::check::{CheckOutcome, Verdict, fail};
 
@@ -107,7 +108,9 @@ impl Conformance {
     /// (`ExecSpec::tty`) and that the workload provides Bash and `stty`,
     /// which adds a check that a command sees a terminal of the requested
     /// size, follows a resize, reads its input from the terminal, writes one
-    /// terminal stream, and that the interrupt character stops it.
+    /// terminal stream, that the interrupt character stops it, and that
+    /// `term` ends an interactive shell on it. Opt-in until every built-in
+    /// provider runs commands on a terminal.
     #[must_use]
     pub fn with_terminal(mut self) -> Self {
         self.terminal = true;
@@ -315,7 +318,8 @@ impl Conformance {
         // Reports the terminal's size, then again for each line it reads.
         let script = r#"stty size; while read -r line && [ "$line" != done ]; do stty size; done; echo finished"#;
         let (resize, resized) = watch::channel(terminal_size(30, 100));
-        let (mut terminal, exec) = Terminal::start(sandbox, script, Some(resized));
+        let (mut terminal, exec) =
+            Terminal::start(sandbox, ExecSpec::bash(script), Some(resized), None);
         let mut exec = pin!(exec);
         terminal.wait_for(exec.as_mut(), "30 100").await?;
         resize.send_replace(terminal_size(40, 120));
@@ -345,20 +349,42 @@ impl Conformance {
             "terminal output arrived on stdout or stderr",
         )?;
 
-        let (mut terminal, exec) = Terminal::start(sandbox, "echo ready; exec sleep 30", None);
+        let (mut terminal, exec) = Terminal::start(
+            sandbox,
+            ExecSpec::bash("echo ready; exec sleep 30"),
+            None,
+            None,
+        );
         let mut exec = pin!(exec);
         terminal.wait_for(exec.as_mut(), "ready").await?;
         terminal.write(&[0x03]).await?;
         let outcome = terminal.finish(exec).await?;
-        if outcome.termination == Termination::Exited
-            && (outcome.signal == Some(2) || outcome.exit_code == Some(130))
+        if !(outcome.termination == Termination::Exited
+            && (outcome.signal == Some(2) || outcome.exit_code == Some(130)))
         {
-            Ok(())
-        } else {
-            fail(format!(
+            return fail(format!(
                 "the interrupt character did not stop the command: {outcome:?}"
-            ))
+            ));
         }
+
+        // An interactive shell ignores SIGTERM; `term` on a terminal must
+        // still end it, as closing the terminal would.
+        let term = CancellationToken::new();
+        let (mut terminal, exec) = Terminal::start(
+            sandbox,
+            ExecSpec::argv(["bash", "--norc", "--noprofile", "-i"]),
+            None,
+            Some(term.clone()),
+        );
+        let mut exec = pin!(exec);
+        terminal.write(b"echo ready-$((40 + 2))\n").await?;
+        terminal.wait_for(exec.as_mut(), "ready-42").await?;
+        term.cancel();
+        let outcome = terminal.finish(exec).await?;
+        require(
+            outcome.termination == Termination::Terminated,
+            &format!("term did not end an interactive shell on a terminal: {outcome:?}"),
+        )
     }
     async fn fence_with(&self, sandbox: &dyn Sandbox, catalog: &Sandboxes) -> CheckOutcome {
         let reference = sandbox.reference();
@@ -456,14 +482,14 @@ struct Terminal {
 }
 
 impl Terminal {
-    /// Starts a Bash script on a terminal. The command runs only while the
+    /// Starts a command on a terminal. The command runs only while the
     /// returned future is polled.
-    fn start<'a>(
-        sandbox: &'a dyn Sandbox,
-        script: &str,
+    fn start(
+        sandbox: &dyn Sandbox,
+        mut spec: ExecSpec,
         resize: Option<watch::Receiver<TerminalSize>>,
-    ) -> (Self, Running<'a>) {
-        let mut spec = ExecSpec::bash(script);
+        term: Option<CancellationToken>,
+    ) -> (Self, Running<'_>) {
         spec.tty = true;
         spec.timeout_ms = Some(20_000);
         let (input, stdin) = duplex(1024);
@@ -476,6 +502,7 @@ impl Terminal {
             stdin: Some(Box::pin(stdin)),
             sink: Some(sink),
             resize,
+            term,
             ..ExecControls::default()
         });
         (

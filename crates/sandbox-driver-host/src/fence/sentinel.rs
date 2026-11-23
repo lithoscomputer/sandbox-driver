@@ -346,7 +346,7 @@ impl ProcessGroups {
         configure: impl FnOnce(&mut Command),
     ) -> Result<HostChild> {
         let (child, ()) = self
-            .spawn_in(program, args, env, configure, |command| {
+            .spawn_in(program, args, env, false, configure, |command| {
                 command.process_group(0);
                 Ok(())
             })
@@ -365,7 +365,7 @@ impl ProcessGroups {
         size: TerminalSize,
         configure: impl FnOnce(&mut Command),
     ) -> Result<(HostChild, Terminal)> {
-        self.spawn_in(program, args, env, configure, |command| {
+        self.spawn_in(program, args, env, true, configure, |command| {
             Terminal::lead(command, size)
         })
         .await
@@ -379,6 +379,7 @@ impl ProcessGroups {
         program: &str,
         args: &[String],
         env: &BTreeMap<String, String>,
+        terminal: bool,
         configure: impl FnOnce(&mut Command),
         attach: impl FnOnce(&mut Command) -> io::Result<T>,
     ) -> Result<(HostChild, T)> {
@@ -422,6 +423,7 @@ impl ProcessGroups {
                 group,
                 _groups: self.clone(),
                 status_file: paths.status,
+                terminal,
             },
             attached,
         ))
@@ -635,6 +637,9 @@ pub(crate) struct HostChild {
     // A standalone stdio process can outlive the HostExec that spawned it.
     _groups:           Arc<ProcessGroups>,
     status_file:       PathBuf,
+    /// Whether the command runs on a terminal, its sentinel leading the
+    /// session.
+    terminal:          bool,
 }
 
 impl HostChild {
@@ -642,8 +647,27 @@ impl HostChild {
     /// [`sandbox_driver::legacy::ExecControls::term`] path. Whether the command
     /// ends is the command's business; the caller escalates to `kill` if
     /// it must.
+    ///
+    /// On a terminal, `term` hangs the command up first, as closing the
+    /// terminal would: an interactive shell ignores SIGTERM but ends on
+    /// SIGHUP, and hangs up its jobs. Both signals reach every process group
+    /// of the session; the sentinel ignores them.
     pub(crate) fn term(&self) {
+        if !self.terminal {
+            let _ = self.group.signal(Signal::SIGTERM);
+            return;
+        }
+        let _ = self.group.signal(Signal::SIGHUP);
         let _ = self.group.signal(Signal::SIGTERM);
+        let group = Arc::clone(&self.group);
+        // Best effort, like the group signals: the scan for the session's
+        // other groups runs off the runtime and nothing waits on it.
+        drop(spawn_blocking(move || {
+            for (_, pid) in members(&[group.pgid]).by_session {
+                group.signal_member(pid, Signal::SIGHUP);
+                group.signal_member(pid, Signal::SIGTERM);
+            }
+        }));
     }
 
     /// SIGKILLs the process group and waits for the group to settle: the
