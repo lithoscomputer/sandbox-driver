@@ -5,8 +5,8 @@ use std::future;
 use std::io::Cursor;
 use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{self, Arc, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -30,6 +30,9 @@ pub mod legacy;
 mod path;
 
 static NEXT_NAMESPACE: AtomicU64 = AtomicU64::new(1);
+/// Numbers sandboxes across every fake in the process, so two fakes, or two
+/// catalogs over fresh fakes, never hand out the same id.
+static NEXT_SANDBOX: AtomicU64 = AtomicU64::new(1);
 
 /// A scripted command. Output is delivered through the real sink. Pending
 /// commands finish only on cancellation, timeout or sandbox stop/destroy.
@@ -39,7 +42,10 @@ pub struct FakeExec {
     pub stderr:        Vec<u8>,
     pub exit_code:     i32,
     pub wait_for_stop: bool,
+    /// Reported on the outcome, as a provider that lost output would.
+    pub output_loss:   OutputLoss,
 }
+type Script = Box<dyn Fn(&ExecSpec) -> Option<FakeExec> + Send + Sync>;
 /// Observable calls contain IDs/operation names, never runtime secret values.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FakeCall {
@@ -55,10 +61,9 @@ pub struct FakeProvider {
 }
 struct FakeState {
     descriptor: Descriptor,
-    next_id:    AtomicU64,
     records:    Mutex<BTreeMap<SandboxId, Arc<Record>>>,
     calls:      Mutex<Vec<FakeCall>>,
-    scripts:    Mutex<BTreeMap<Vec<String>, FakeExec>>,
+    scripts:    sync::Mutex<Vec<Script>>,
 }
 struct Runtime {
     fake:   FakeProvider,
@@ -113,23 +118,22 @@ impl FakeProvider {
                     ports:        PortSupport::None,
                     capabilities: CapabilitySet::default(),
                 },
-                next_id:    AtomicU64::new(1),
                 records:    Mutex::new(BTreeMap::new()),
                 calls:      Mutex::new(Vec::new()),
-                scripts:    Mutex::new(BTreeMap::new()),
+                scripts:    sync::Mutex::new(Vec::new()),
             }),
         }
     }
-    pub async fn script(
-        &self,
-        argv: impl IntoIterator<Item = impl Into<String>>,
-        response: FakeExec,
-    ) {
+    /// Answers the commands `respond` returns a response for. The newest
+    /// script that answers a command wins; a command no script answers fails.
+    pub fn script(&self, respond: impl Fn(&ExecSpec) -> Option<FakeExec> + Send + Sync + 'static) {
+        self.scripts().push(Box::new(respond));
+    }
+    fn scripts(&self) -> sync::MutexGuard<'_, Vec<Script>> {
         self.inner
             .scripts
             .lock()
-            .await
-            .insert(argv.into_iter().map(Into::into).collect(), response);
+            .unwrap_or_else(PoisonError::into_inner)
     }
     pub async fn calls(&self) -> Vec<FakeCall> {
         self.inner.calls.lock().await.clone()
@@ -275,7 +279,7 @@ impl Provider for Runtime {
         }
         let id = SandboxId::try_new(format!(
             "sandbox-{}",
-            self.fake.inner.next_id.fetch_add(1, Ordering::Relaxed)
+            NEXT_SANDBOX.fetch_add(1, Ordering::Relaxed)
         ))
         .expect("generated id");
         let directory = PathBuf::from(
@@ -471,12 +475,10 @@ impl Sandbox for Handle {
         let (_fence, stop) = self.admit().await?;
         let response = self
             .fake
-            .inner
-            .scripts
-            .lock()
-            .await
-            .get(&spec.argv)
-            .cloned()
+            .scripts()
+            .iter()
+            .rev()
+            .find_map(|respond| respond(&spec))
             .ok_or_else(|| Error::Unsupported {
                 capability: "unscripted fake command".into(),
             })?;
@@ -526,7 +528,7 @@ impl Sandbox for Handle {
             termination,
             exit_code: (termination == Termination::Exited).then_some(response.exit_code),
             signal: None,
-            output_loss: OutputLoss::default(),
+            output_loss: response.output_loss,
         })
     }
     fn files(&self) -> &dyn Files {
