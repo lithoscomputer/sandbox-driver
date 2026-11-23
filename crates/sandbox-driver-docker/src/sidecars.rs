@@ -234,7 +234,7 @@ async fn start_all(
 /// the bounded provisioning budget held under the claim.
 pub(crate) async fn prepare_images(docker: &Docker, services: &[Service]) -> Result<()> {
     for Service { sidecar, .. } in services {
-        if !image_present(docker, &sidecar.image).await? {
+        if !image_present(docker, &sidecar.image, None).await? {
             pull_image(docker, &sidecar.image, sidecar.registry_auth.as_ref(), None).await?;
         }
     }

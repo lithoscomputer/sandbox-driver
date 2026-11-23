@@ -12,16 +12,18 @@ use bollard::container::{ListContainersOptions, RemoveContainerOptions};
 use bollard::models::ContainerInspectResponse;
 use bollard::network::ListNetworksOptions;
 use sandbox_driver::{
-    AccessScope, CatalogOptions, Durability, Environment, EnvironmentName, Error, ExecControls,
-    ExecSpec, LabelFilter, OneShotImage, OneShotSpec, OutputSink, ProviderEntry, ProviderKind,
-    ProviderName, ReadinessCheck, Registry, SandboxSpec, SandboxState, Sandboxes, SecretResolver,
-    ServiceSpec, Source, StaticEnvironments, Termination,
+    AccessScope, CatalogOptions, ContainerSpec, Durability, Environment, EnvironmentName, Error,
+    ExecControls, ExecSpec, LabelFilter, OneShotImage, OneShotSpec, OutputSink, ProviderEntry,
+    ProviderKind, ProviderName, ReadinessCheck, Registry, SandboxSpec, SandboxState, Sandboxes,
+    SecretResolver, ServiceSpec, Source, StaticEnvironments, Termination,
 };
 use sandbox_driver_conformance::{Commands, Conformance};
 use sandbox_driver_docker::DockerFactory;
 
 const IMAGE: &str = "ghcr.io/fabro-sh/dhi-alpine-base:3.23-dev-2026-06-17";
 const SERVICE_IMAGE: &str = "redis:7-alpine";
+/// Multi-platform, with `386` beside `amd64` and `arm64`.
+const PLATFORM_IMAGE: &str = "alpine:3.22";
 
 struct NoSecrets;
 
@@ -400,4 +402,52 @@ async fn destroy_reconciles_services_of_a_vanished_primary() {
         .await
         .expect("destroy reconciles");
     assert_eq!(owned().await, (0, 0), "services and network removed");
+}
+
+/// A workload runs the image for the platform it asks for, though the
+/// daemon already holds that image for its own platform. An amd64 daemon
+/// runs `linux/386` natively; any other daemon is asked for `linux/amd64`,
+/// which needs emulation, as Docker Desktop provides.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a live Docker daemon"]
+async fn a_workload_runs_the_platform_it_asks_for() {
+    let native = daemon().version().await.expect("version").arch;
+    let (platform, arch) = if native.as_deref() == Some("amd64") {
+        ("linux/386", "x86")
+    } else {
+        ("linux/amd64", "x86_64")
+    };
+    let default = SandboxSpec::new(Source::Image(PLATFORM_IMAGE.to_owned()));
+    let mut chosen = default.clone();
+    chosen.container = Some(ContainerSpec {
+        platform: Some(platform.to_owned()),
+        ..ContainerSpec::default()
+    });
+    let catalog = catalog(BTreeMap::from([("default", default), ("chosen", chosen)]));
+    for (environment, expected) in [("default", None), ("chosen", Some(arch))] {
+        let sandbox = catalog
+            .builder(environment)
+            .await
+            .expect("builder")
+            .create()
+            .await
+            .expect("create");
+        let (sink, output) = capture();
+        let outcome = sandbox
+            .exec(ExecSpec::argv(["cat", "/etc/apk/arch"]), ExecControls {
+                sink: Some(sink),
+                ..ExecControls::default()
+            })
+            .await
+            .expect("exec");
+        catalog
+            .destroy(&sandbox.reference())
+            .await
+            .expect("destroy");
+        assert_eq!(outcome.exit_code, Some(0));
+        if let Some(expected) = expected {
+            let output = output.lock().expect("output").clone();
+            assert_eq!(String::from_utf8_lossy(&output).trim(), expected);
+        }
+    }
 }

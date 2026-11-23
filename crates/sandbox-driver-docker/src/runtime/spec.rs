@@ -34,7 +34,6 @@ const RESERVED_LABEL_PREFIX: &str = "sh.sandbox-driver.";
 #[serde(default, deny_unknown_fields)]
 struct DockerSpecOptions {
     auto_pull:    Option<bool>,
-    platform:     Option<String>,
     binds:        Vec<BindMount>,
     host_network: bool,
 }
@@ -47,7 +46,6 @@ pub(crate) fn spec_schema() -> serde_json::Value {
         "additionalProperties": false,
         "properties": {
             "auto_pull": {"type": "boolean"},
-            "platform": {"type": "string", "minLength": 1},
             "host_network": {"type": "boolean"},
             "binds": {
                 "type": "array",
@@ -98,15 +96,6 @@ pub(crate) fn plan(
     }
     if spec.workspace_ownership.is_some() {
         return Err(unsupported("workspace_ownership"));
-    }
-    // Refused by name until Docker honours the portable field; until then
-    // `provider_config.platform` is how a caller chooses a platform here.
-    if spec
-        .container
-        .as_ref()
-        .is_some_and(|container| container.platform.is_some())
-    {
-        return Err(unsupported("container.platform"));
     }
     let network = match &spec.network {
         NetworkPolicy::ProviderDefault => legacy::NetworkPolicy::ProviderDefault,
@@ -201,7 +190,7 @@ fn provider_config(options: DockerSpecOptions, container: &ContainerSpec) -> Doc
         privileged: container.privileged.unwrap_or(false),
         // The legacy plan refuses host networking beside services.
         host_network: options.host_network,
-        platform: options.platform,
+        platform: container.platform.clone(),
         binds: options.binds,
         extra_hosts: container
             .extra_hosts
@@ -369,7 +358,7 @@ mod tests {
             dns:               vec!["1.1.1.1".to_owned()],
             extra_hosts:       BTreeMap::from([("db".to_owned(), "10.0.0.2".to_owned())]),
             shm_size_mb:       NonZeroU64::new(64),
-            platform:          None,
+            platform:          Some("linux/arm64".to_owned()),
         });
         spec.resources.cpu_cores = NonZeroU32::new(2);
         spec.resources.memory_mb = NonZeroU64::new(512);
@@ -384,6 +373,9 @@ mod tests {
         assert_eq!(host.shm_size, Some(64 * 1024 * 1024));
         assert_eq!(host.memory, Some(512 * 1024 * 1024));
         assert_eq!(host.cpu_quota, Some(200_000));
+        assert_eq!(plan.platform.as_deref(), Some("linux/arm64"));
+        let options = plan.options.as_ref().expect("a platform names options");
+        assert_eq!(options.platform.as_deref(), Some("linux/arm64"));
         let mut spec = image();
         spec.container = Some(ContainerSpec {
             init: Some(false),
@@ -481,12 +473,6 @@ mod tests {
         assert_eq!(refused(spec), Some(unsupported("network")));
         let spec = SandboxSpec::new(Source::Dockerfile("FROM alpine".to_owned()));
         assert_eq!(refused(spec), Some(unsupported("source")));
-        let mut spec = image();
-        spec.container = Some(ContainerSpec {
-            platform: Some("linux/amd64".to_owned()),
-            ..ContainerSpec::default()
-        });
-        assert_eq!(refused(spec), Some(unsupported("container.platform")));
         let mut spec = image();
         spec.network = NetworkPolicy::Block;
         spec.services

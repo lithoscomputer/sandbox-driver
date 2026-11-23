@@ -230,6 +230,7 @@ impl Provider for DockerRuntime {
                     ContainerField::Dns,
                     ContainerField::ExtraHosts,
                     ContainerField::ShmSizeMb,
+                    ContainerField::Platform,
                 ]),
                 timers:           BTreeSet::new(),
             },
