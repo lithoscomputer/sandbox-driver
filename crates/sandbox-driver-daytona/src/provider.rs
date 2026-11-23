@@ -16,6 +16,7 @@ use daytona_sdk::{
 };
 use futures_util::TryStreamExt;
 use futures_util::future::BoxFuture;
+use reqwest::Method;
 use sandbox_driver::legacy::{
     Action, AuthError, Capabilities, Error, EventContext, EventEmitter, EventSubject, HealthStatus,
     Isolation, LogsCaps, NetworkPolicy, ProviderError, ProviderHealth, ProviderKind, PtyCaps,
@@ -30,8 +31,8 @@ use tokio::time;
 use crate::labels::{MANAGED_LABEL, stored_labels};
 use crate::sandbox::{DaytonaSandbox, status_from_sdk};
 use crate::sdk::{
-    DaytonaClient, auto_delete_minutes, daytona_error, fetch_error, gigabytes, map_state, minutes,
-    sandbox_kind_from_class,
+    self, DaytonaClient, auto_delete_minutes, daytona_error, fetch_error, gigabytes, map_state,
+    minutes, sandbox_kind_from_class,
 };
 use crate::snapshots::DaytonaSnapshots;
 use crate::volumes::DaytonaVolumes;
@@ -244,17 +245,14 @@ impl DaytonaProvider {
     /// name, scopes, and the organization it selects. The error is the
     /// transport failure's message.
     pub(crate) async fn current_api_key(&self) -> StdResult<reqwest::Response, String> {
-        let config = self.client.api_configuration();
-        let mut request = config
-            .client
-            .get(format!("{}/api-keys/current", config.base_path));
-        if let Some(token) = &config.bearer_access_token {
-            request = request.bearer_auth(token);
-        }
-        if let Some(organization) = self.client.organization_id() {
-            request = request.header("X-Daytona-Organization-ID", organization);
-        }
-        request.send().await.map_err(|error| error.to_string())
+        let url = format!(
+            "{}/api-keys/current",
+            self.client.api_configuration().base_path
+        );
+        sdk::request(&self.client, Method::GET, url)
+            .send()
+            .await
+            .map_err(|error| error.to_string())
     }
 
     fn jwt_health_identity(&self) -> Option<String> {

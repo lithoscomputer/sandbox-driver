@@ -11,6 +11,8 @@ use daytona_api_client::models::{
     VolumeState as ApiVolumeState,
 };
 use daytona_sdk::{Client, DaytonaError, Sandbox};
+use reqwest::header::USER_AGENT;
+use reqwest::{IntoUrl, Method};
 use sandbox_driver::legacy::{
     AuthError, Error, ProviderError, ProviderKind, ResourceKind, Result, SandboxKind, SandboxState,
     SnapshotState, VolumeState,
@@ -96,6 +98,27 @@ where
         provider.retryable = status.is_server_error();
     }
     Error::Provider(provider)
+}
+
+/// A request on the SDK's HTTP client that carries what the SDK's own
+/// requests carry: the configured User-Agent, credential and organization.
+pub(crate) fn request(
+    client: &Client,
+    method: Method,
+    url: impl IntoUrl,
+) -> reqwest_middleware::RequestBuilder {
+    let config = client.api_configuration();
+    let mut request = config.client.request(method, url);
+    if let Some(user_agent) = &config.user_agent {
+        request = request.header(USER_AGENT, user_agent);
+    }
+    if let Some(token) = &config.bearer_access_token {
+        request = request.bearer_auth(token);
+    }
+    if let Some(organization) = client.organization_id() {
+        request = request.header("X-Daytona-Organization-ID", organization);
+    }
+    request
 }
 
 pub(crate) fn is_generated_not_found<T>(error: &ApiError<T>) -> bool {
