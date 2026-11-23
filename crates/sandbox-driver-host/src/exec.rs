@@ -28,7 +28,7 @@ use crate::registry;
 /// `bash -c`; [`sandbox_driver::legacy::ExecSpec::bash`] blanks it per command.
 /// A value in a command's own env reaches that command and no shell the
 /// driver runs around it.
-pub(crate) const BASH_ENV_VAR: &str = "BASH_ENV";
+const BASH_ENV_VAR: &str = "BASH_ENV";
 
 /// How long the output pipes may stay silent after the process has ended
 /// before the drain gives up, so a backgrounded grandchild holding the
