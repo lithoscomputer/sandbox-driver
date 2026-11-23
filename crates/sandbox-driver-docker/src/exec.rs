@@ -1,18 +1,21 @@
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::{io, process};
+use std::{future, io, process};
 
 use async_trait::async_trait;
 use bollard::container::LogOutput;
-use bollard::exec::CreateExecOptions;
+use bollard::exec::{CreateExecOptions, ResizeExecOptions};
 use futures_util::StreamExt;
+use sandbox_driver::TerminalSize;
 use sandbox_driver::legacy::{
     BASH_ENV_VAR, Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, Result,
     SpawnSpec, StderrTail, StdioProcess, StdioProcessHandle, StopLevel, Termination, feed_stdin,
     finish_stdin_writer, run_with_stop_grace,
 };
 use tokio::io::{AsyncWriteExt, duplex};
+use tokio::sync::watch;
 use tokio::time;
 
 use crate::container::{AttachedExec, ContainerRef, exit_code_of};
@@ -118,10 +121,14 @@ impl DockerExec {
 
     /// The exec of one wrapped command: the wrapper under `/bin/sh` with
     /// the environment, program, and arguments as its positional
-    /// parameters, attached to both output streams and, when asked, to
-    /// stdin, in the resolved working directory. The wrapper shell itself
-    /// gets a blank `BASH_ENV`; the command's environment travels through
-    /// `env` inside the wrapper.
+    /// parameters, attached to both output streams (or to a terminal, when
+    /// `tty`) and, when asked, to stdin, in the resolved working directory.
+    /// The wrapper shell itself gets a blank `BASH_ENV`; the command's
+    /// environment travels through `env` inside the wrapper.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one exec's control files, command and attachments"
+    )]
     fn wrapped_exec_options(
         &self,
         stop_file: &str,
@@ -131,13 +138,18 @@ impl DockerExec {
         env: &BTreeMap<String, String>,
         working_dir: Option<&str>,
         attach_stdin: bool,
+        tty: bool,
     ) -> CreateExecOptions<String> {
-        let wrapper = Self::command_wrapper(stop_file, pid_file, attach_stdin);
+        let wrapper = if tty {
+            terminal_wrapper(stop_file)
+        } else {
+            Self::command_wrapper(stop_file, pid_file, attach_stdin)
+        };
         CreateExecOptions {
             attach_stdin: Some(attach_stdin),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
-            tty: Some(false),
+            tty: Some(tty),
             cmd: Some(Self::wrapped_cmd(
                 wrapper,
                 self.env_entries(env),
@@ -238,6 +250,68 @@ impl DockerExec {
     }
 }
 
+/// The `/bin/sh` wrapper of a command attached to a terminal. The command
+/// replaces the wrapper (`exec env "$@"`), so it keeps the terminal as its
+/// controlling terminal and leads the process group Docker starts a
+/// terminal exec in. The watcher is forked first, polls the same stop file
+/// as [`DockerExec::command_wrapper`]'s, and ends with the command. It
+/// shares the command's group, so it ignores the signals it sends there.
+/// A `term` hangs the group up, as a closing terminal would, and also
+/// sends SIGTERM: an interactive shell ignores SIGTERM alone. A `kill`, or
+/// a group that outlives the command, gets SIGKILL.
+fn terminal_wrapper(stop_file: &str) -> String {
+    let stop_file = shell_quote(stop_file);
+    format!(
+        "stop_file={stop_file}\n\
+         child=$$\n\
+         (\n\
+           trap '' HUP TERM\n\
+           while [ ! -s \"$stop_file\" ]; do\n\
+             kill -0 \"$child\" 2>/dev/null || exit 0\n\
+             sleep {STOP_POLL_SLEEP_SECONDS}\n\
+           done\n\
+           if [ \"$(cat \"$stop_file\")\" != kill ]; then\n\
+             kill -HUP \"-$child\" 2>/dev/null\n\
+             kill -TERM \"-$child\" 2>/dev/null\n\
+             while kill -0 \"$child\" 2>/dev/null && [ \"$(cat \"$stop_file\")\" != kill ]; do\n\
+               sleep {STOP_POLL_SLEEP_SECONDS}\n\
+             done\n\
+           fi\n\
+           rm -f \"$stop_file\"\n\
+           kill -KILL \"-$child\" 2>/dev/null\n\
+         ) </dev/null >/dev/null 2>&1 &\n\
+         exec env \"$@\""
+    )
+}
+
+/// Resizes a terminal exec to the size `resize` holds and then to each
+/// new one. Never returns, so it runs beside the exec's drain.
+async fn follow_resizes(
+    container: &ContainerRef,
+    exec_id: &str,
+    resize: Option<watch::Receiver<TerminalSize>>,
+) -> Infallible {
+    if let Some(mut resize) = resize {
+        loop {
+            let size = *resize.borrow_and_update();
+            let options = ResizeExecOptions {
+                height: size.rows.get(),
+                width:  size.columns.get(),
+            };
+            // A resize that races the command's end fails; the exec's
+            // outcome reports that end.
+            if let Err(error) = container.docker.resize_exec(exec_id, options).await {
+                let error = docker_error("resizing a terminal exec", error);
+                tracing::debug!(error = %error, "terminal resize failed");
+            }
+            if resize.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+    future::pending().await
+}
+
 /// Requests a stop by writing the rendered `level` into the stop file
 /// the in-container watcher polls for; a stop that arrives before
 /// the command starts is honored by the wrapper's pre-check. Runs
@@ -292,22 +366,13 @@ impl Exec for DockerExec {
         streaming.into_complete()
     }
 
-    #[tracing::instrument(
-        skip_all,
-        fields(
-            provider_kind = "docker",
-            sandbox_id = %self.container.id,
-            has_stdin = spec.stdin.is_some()
-        ),
-        err
-    )]
     async fn run_streaming(
         &self,
         spec: &ExecSpec,
         controls: ExecControls,
     ) -> Result<ExecStreamingResult> {
         run_with_stop_grace(spec, controls, |spec, controls| async move {
-            self.run_signals(&spec, controls).await
+            self.run_signals(&spec, controls, false, None).await
         })
         .await
     }
@@ -319,11 +384,24 @@ impl Exec for DockerExec {
 
 impl DockerExec {
     /// Runs the command under raw stop signals; the trait method wraps
-    /// this in the spec's stop grace.
-    async fn run_signals(
+    /// this in the spec's stop grace. With `tty` the command is attached to
+    /// a terminal, which `resize` sizes, and its output arrives as stdout.
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            provider_kind = "docker",
+            sandbox_id = %self.container.id,
+            has_stdin = spec.stdin.is_some() || controls.stdin.is_some(),
+            tty
+        ),
+        err
+    )]
+    pub(crate) async fn run_signals(
         &self,
         spec: &ExecSpec,
         controls: ExecControls,
+        tty: bool,
+        resize: Option<watch::Receiver<TerminalSize>>,
     ) -> Result<ExecStreamingResult> {
         let started = Instant::now();
         let (stop_file, pid_file) = self.control_paths();
@@ -336,6 +414,7 @@ impl DockerExec {
             &spec.launch_env(),
             spec.working_dir.as_deref(),
             stdin_reader.is_some(),
+            tty,
         );
         let AttachedExec {
             id: exec_id,
@@ -347,15 +426,18 @@ impl DockerExec {
         let stdin_task = stdin_reader.map(|reader| tokio::spawn(feed_stdin(input, reader)));
 
         let mut captured = StreamOutput::new(controls.retained_output_limit);
-        let outcome = drain_with_stops(
+        let drained = drain_with_stops(
             &mut captured,
             output,
             &controls,
             spec.timeout
                 .map(|timeout| timeout.saturating_sub(started.elapsed())),
             |level| request_stop(&self.container, &stop_file, level),
-        )
-        .await?;
+        );
+        let outcome = tokio::select! {
+            outcome = drained => outcome?,
+            never = follow_resizes(&self.container, &exec_id, resize) => match never {},
+        };
 
         if let Some(stdin_task) = stdin_task {
             finish_stdin_writer(stdin_task).await?;
@@ -387,6 +469,7 @@ impl DockerExec {
             &spec.launch_env(),
             spec.working_dir.as_deref(),
             true,
+            false,
         );
         let AttachedExec {
             id: exec_id,

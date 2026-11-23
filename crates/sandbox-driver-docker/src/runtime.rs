@@ -437,10 +437,13 @@ impl DockerContractSandbox {
     }
 
     /// Runs `run` with the contract's controls as legacy controls. A sink
-    /// failure stops the command and is returned as the call's error.
+    /// failure stops the command and is returned as the call's error. The
+    /// output of a command attached to a terminal, which Docker delivers
+    /// as stdout, reaches the sink as the terminal stream.
     async fn streamed<F, Fut>(
         &self,
         controls: ExecControls,
+        tty: bool,
         run: F,
     ) -> Result<ExecOutcome, ContractError>
     where
@@ -452,6 +455,7 @@ impl DockerContractSandbox {
             let failure = Arc::clone(&sink_failure);
             Arc::new(move |stream: legacy::OutputStream, bytes: Vec<u8>| {
                 let stream = match stream {
+                    legacy::OutputStream::Stdout if tty => OutputStream::Terminal,
                     legacy::OutputStream::Stdout => OutputStream::Stdout,
                     legacy::OutputStream::Stderr => OutputStream::Stderr,
                 };
@@ -591,14 +595,9 @@ impl Sandbox for DockerContractSandbox {
     async fn exec(
         &self,
         spec: ExecSpec,
-        controls: ExecControls,
+        mut controls: ExecControls,
     ) -> Result<ExecOutcome, ContractError> {
         spec.validate()?;
-        if spec.tty {
-            return Err(ContractError::Unsupported {
-                capability: "exec.tty".to_owned(),
-            });
-        }
         let (program, args) = spec.argv.split_first().expect("validated argv");
         let mut legacy_spec = legacy::ExecSpec::new(program.as_str())
             .args(args.iter().cloned())
@@ -613,8 +612,10 @@ impl Sandbox for DockerContractSandbox {
             legacy_spec = legacy_spec.env_var(key.as_str(), value.as_str());
         }
         let exec = Arc::clone(&self.inner.exec);
-        self.streamed(controls, |controls| async move {
-            exec.run_streaming(&legacy_spec, controls).await
+        let resize = controls.resize.take().filter(|_| spec.tty);
+        self.streamed(controls, spec.tty, |controls| async move {
+            exec.run_signals(&legacy_spec, controls, spec.tty, resize)
+                .await
         })
         .await
     }
@@ -835,7 +836,7 @@ impl Containers for DockerContractSandbox {
             .one_shot
             .as_ref()
             .expect("containers() offers one-shots only with a workspace");
-        self.streamed(controls, |controls| async move {
+        self.streamed(controls, false, |controls| async move {
             one_shot.run(&legacy_spec, controls).await
         })
         .await
