@@ -5,6 +5,7 @@
 //! or a fence appears. After the workload exits, the idle sentinel watches
 //! the same conditions, so descendants cannot outlive the provider either.
 
+use std::collections::BTreeMap;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, ExitStatus};
@@ -23,6 +24,7 @@ use tokio::task::spawn_blocking;
 use tokio::{fs, time};
 
 use super::observation::{group_is_live, live_groups};
+use crate::exec::BASH_ENV_VAR;
 use crate::host_kind;
 
 const POLL: Duration = Duration::from_millis(25);
@@ -49,11 +51,11 @@ fn sentinel_shell() -> &'static str {
 }
 
 const SENTINEL_SCRIPT: &str = r#"
-sf="$1"; gf="$2"; fence="$3"; owner="$4"; shift 4
+sf="$1"; gf="$2"; fence="$3"; owner="$4"; startup_set="$5"; startup="$6"; shift 6
 printf '%s\n' "$$" > "$gf.tmp" && /bin/mv "$gf.tmp" "$gf" || exit 125
 if [ -e "$fence" ]; then exit 0; fi
 exec 3<&0
-"$@" <&3 &
+if [ "$startup_set" = 1 ]; then BASH_ENV="$startup" "$@" <&3 & else "$@" <&3 & fi
 w=$!
 trap '' TERM
 exec >/dev/null 2>&1
@@ -237,10 +239,26 @@ impl GroupState {
     }
 }
 
-/// The sentinel invocation that runs `program` with `args` and reports
-/// through `paths`.
-fn sentinel_command(paths: &RecordPaths, program: &str, args: &[String]) -> Command {
+/// The sentinel invocation that runs `program` with `args` in `env` and
+/// reports through `paths`, after `configure` has set its directory and
+/// pipes.
+///
+/// `env` is the command's whole environment, but the sentinel is a shell
+/// that starts first, and Bash sources the file `BASH_ENV` names at startup.
+/// So the sentinel starts without the variable and sets a configured value
+/// on the command alone.
+fn sentinel_command(
+    paths: &RecordPaths,
+    program: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    configure: impl FnOnce(&mut Command),
+) -> Command {
     let mut command = Command::new(sentinel_shell());
+    configure(&mut command);
+    command.env_clear();
+    command.envs(env.iter().filter(|(name, _)| *name != BASH_ENV_VAR));
+    let startup = env.get(BASH_ENV_VAR);
     command
         .arg("-c")
         .arg(SENTINEL_SCRIPT)
@@ -249,6 +267,8 @@ fn sentinel_command(paths: &RecordPaths, program: &str, args: &[String]) -> Comm
         .arg(&paths.group)
         .arg(&paths.marker)
         .arg(process::id().to_string())
+        .arg(if startup.is_some() { "1" } else { "0" })
+        .arg(startup.map_or("", String::as_str))
         .arg(program)
         .args(args);
     command
@@ -285,6 +305,7 @@ impl ProcessGroups {
         self: &Arc<Self>,
         program: &str,
         args: &[String],
+        env: &BTreeMap<String, String>,
         configure: impl FnOnce(&mut Command),
     ) -> Result<HostChild> {
         let mut state = self.state.lock().await;
@@ -295,8 +316,7 @@ impl ProcessGroups {
         }
         let generation = state.generation_or_create(&self.root).await?;
         let paths = generation.next_record_paths();
-        let mut command = sentinel_command(&paths, program, args);
-        configure(&mut command);
+        let mut command = sentinel_command(&paths, program, args, env, configure);
         command.process_group(0);
         command.kill_on_drop(false);
         let mut child = {
