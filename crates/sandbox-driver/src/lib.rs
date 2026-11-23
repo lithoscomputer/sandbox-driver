@@ -16,6 +16,7 @@ mod descriptor;
 mod error;
 mod execution;
 mod failure;
+mod git;
 mod id;
 mod identity;
 #[doc(hidden)]
@@ -28,6 +29,7 @@ mod provider;
 mod redact;
 mod sanitize;
 mod schema;
+mod search;
 mod status;
 mod units;
 mod wire_time;
@@ -53,6 +55,11 @@ pub use execution::{
     TerminalSize, Termination, stop_signal,
 };
 pub use failure::{CommandError, CommandFailure};
+pub use git::{
+    GitChange, GitCommit, GitDiffEntry, GitDiffOptions, GitError, GitFailure, GitFailureKind,
+    GitIdentity, GitLogOptions, GitNumstat, GitRevisionRange, git_blob_sizes, git_blobs,
+    git_diff_entries, git_diff_numstat, git_diff_patch, git_log,
+};
 pub use id::{
     EnvironmentName, InvalidIdError, NamespaceId, ProviderKind, ProviderName, SandboxId,
     Sha256Digest, SnapshotId,
@@ -65,6 +72,9 @@ pub use provider::{
     SshAccessInfo, VncConnection, WorkloadAdmission,
 };
 pub use sanitize::{OutputSanitization, OutputSanitizer};
+pub use search::{
+    GrepMatch, GrepOptions, WalkOptions, WalkedFile, glob_files, grep_files, walk_files,
+};
 pub use status::{SandboxState, ServiceAddress, Status};
 pub use units::{ParseUnitError, parse_duration_ms, parse_size_mib};
 pub use workload::{

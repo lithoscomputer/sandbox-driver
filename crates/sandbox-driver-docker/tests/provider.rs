@@ -22,6 +22,8 @@ use sandbox_driver_docker::DockerFactory;
 
 const IMAGE: &str = "ghcr.io/fabro-sh/dhi-alpine-base:3.23-dev-2026-06-17";
 const SERVICE_IMAGE: &str = "redis:7-alpine";
+/// `IMAGE` has no Bash.
+const BASH_IMAGE: &str = "ghcr.io/lithoscomputer/ubuntu-24.04:slim-df708f910111";
 
 struct NoSecrets;
 
@@ -103,6 +105,33 @@ async fn docker_passes_the_shared_contract_suite() {
     eprintln!("{report}");
     report.assert_pass();
     peer.shutdown().await.expect("peer shutdown");
+    catalog.shutdown().await.expect("shutdown");
+}
+
+/// What the library derives over a Bash exec is checked on an image that
+/// has Bash. Its GNU `grep` also serves the search, which `BusyBox` `grep`
+/// cannot, and it has `git`, which the `BusyBox` image lacks.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a live Docker daemon"]
+#[expect(
+    clippy::print_stderr,
+    reason = "the per-check report is the test's evidence"
+)]
+async fn docker_passes_the_bash_checks_on_an_image_with_bash() {
+    let workload = SandboxSpec::new(Source::Image(BASH_IMAGE.to_owned()));
+    let catalog = catalog(BTreeMap::from([("bash", workload)]));
+    let report = Conformance::new(catalog.clone(), "bash", Commands {
+        probe:        ExecSpec::argv(["printf", "workload\\n"]),
+        probe_output: b"workload\n".to_vec(),
+        long_running: ExecSpec::argv(["sh", "-c", "echo ready; exec sleep 600"]),
+    })
+    .with_bash()
+    .with_search()
+    .with_git()
+    .run()
+    .await;
+    eprintln!("{report}");
+    report.assert_pass();
     catalog.shutdown().await.expect("shutdown");
 }
 
