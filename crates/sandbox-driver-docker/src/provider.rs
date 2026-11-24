@@ -85,7 +85,7 @@ impl DockerProvider {
         platform: Option<&str>,
         reporter: &OperationReporter,
     ) -> Result<()> {
-        if image_present(&self.docker, reference).await? {
+        if image_present(&self.docker, reference, platform).await? {
             return Ok(());
         }
         if !auto_pull {

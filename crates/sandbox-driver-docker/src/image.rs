@@ -9,12 +9,25 @@ use sandbox_driver::legacy::Result;
 use crate::config::{RegistryAuth, to_credentials};
 use crate::daemon::{docker_error, is_not_found};
 
-/// Whether the daemon has `reference` locally. Only a definitive "not
-/// present" is `false`; a daemon or transport failure surfaces as what
-/// it is.
-pub(crate) async fn image_present(docker: &Docker, reference: &str) -> Result<bool> {
+/// Whether the daemon has `reference` locally, for `platform`
+/// (`os/arch[/variant]`) when one is named: the daemon refuses to create a
+/// container for a platform its copy does not provide. Only a definitive
+/// "not present" is `false`; a daemon or transport failure surfaces as
+/// what it is.
+pub(crate) async fn image_present(
+    docker: &Docker,
+    reference: &str,
+    platform: Option<&str>,
+) -> Result<bool> {
     match docker.inspect_image(reference).await {
-        Ok(_) => Ok(true),
+        Ok(image) => Ok(platform.is_none_or(|platform| {
+            let mut parts = platform.split('/');
+            parts.next() == image.os.as_deref()
+                && parts.next() == image.architecture.as_deref()
+                && parts
+                    .next()
+                    .is_none_or(|variant| Some(variant) == image.variant.as_deref())
+        })),
         Err(error) if is_not_found(&error) => Ok(false),
         Err(error) => Err(docker_error("inspecting image", error)),
     }

@@ -174,8 +174,11 @@ shell-command endpoint. No timers are enforced, so any timer request is
   now. A service
   `credential` names a secret whose value is a JSON object with `username`,
   `password` and an optional `server`.
-- **`provider_config`** takes `auto_pull`, `platform`, `binds` and
-  `host_network`, described by the descriptor's `spec_schema`. `binds` is
+- **`container.platform`** pulls and runs the image for that platform, such
+  as `linux/amd64`. An image the daemon holds only for another platform is
+  pulled again for the requested one.
+- **`provider_config`** takes `auto_pull`, `binds` and `host_network`,
+  described by the descriptor's `spec_schema`. `binds` is
   refused unless the daemon is local (`unix://`), matching the descriptor's
   `mounts_host_paths`.
 - **Labels** under `sh.sandbox-driver.` are reserved. Docker merges an image's

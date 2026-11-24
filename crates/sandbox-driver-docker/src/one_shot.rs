@@ -70,7 +70,7 @@ impl DockerOneShot {
     /// Pulls a registry image, retrying once for the fallback platform
     /// when the daemon's own has no manifest.
     async fn ensure_registry_image(&self, reference: &str) -> Result<()> {
-        if image_present(&self.container.docker, reference).await? {
+        if image_present(&self.container.docker, reference, None).await? {
             return Ok(());
         }
         let Err(error) = pull_image(&self.container.docker, reference, None, None).await else {
@@ -121,7 +121,7 @@ impl DockerOneShot {
         tag: &str,
         reuse: bool,
     ) -> Result<()> {
-        if reuse && image_present(&self.container.docker, tag).await? {
+        if reuse && image_present(&self.container.docker, tag, None).await? {
             return Ok(());
         }
         let context_tar = self.download_context(context).await?;
