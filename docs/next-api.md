@@ -436,10 +436,11 @@ Each stream has its own connection, so a slow reader stalls only that stream, a 
 
 Errors are `{"id": 7, "error": {"code": "not_found", "message": "…"}}` using the closed code set above.
 
-Three rules about what crosses the contract:
+Four rules about what crosses the contract:
 
 - **The name is a hint.** `spec.name` is what the caller would like the sandbox called. Use it as is, adapt it to your backend's rules, or generate your own, and return the name you used. If your backend enforces unique names and the hint collides, you may return `already_exists` with the existing id; you are not required to detect duplicates. Callers find sandboxes again by labels and by the id you returned, never by name.
 - **Labels round-trip exactly.** Whatever keys and values the caller sets must come back unchanged from `status` and must match in `list` filters. If your backend cannot store a value as given, encode it reversibly; if it cannot store it at all, refuse with `invalid_spec` naming the label. Never truncate or drop one.
+- **A list follows your own stops and destroys.** Once `stop` or `destroy` has returned success, `list` shows that sandbox `stopped`, or no longer shows it. If your backend's listing lags behind its record of a single sandbox, wait for the listing before you return.
 - Unavailable is not lost. When you cannot reach a sandbox but do not know it to be gone, report state `unavailable` and fail commands with the `unavailable` error. The library does not infer deletion or replace the sandbox because contact was lost. Report a known lifecycle state only when it can be established. The caller decides how its application responds to the uncertainty.
 
 The contract has no pause, resume, archive or recover. When the backend paused or archived a sandbox, on its own timer or through another tool, `start` brings it back to running; status reports `paused` or `archived` until then. Docker unpauses the container, so its processes carry on; Daytona starts the sandbox, which also resumes a paused one.

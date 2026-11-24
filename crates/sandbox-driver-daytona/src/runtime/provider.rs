@@ -156,6 +156,15 @@ impl DaytonaRuntime {
         Ok(Some(sdk))
     }
 
+    /// Success of a destroy: Daytona's listing, which lags the sandbox's
+    /// own record, no longer shows it either.
+    async fn listed_gone(&self, id: &SandboxId) -> Result<(), Error> {
+        super::until_listed(&self.provider.client, id.as_str(), |state| {
+            matches!(state, None | Some(LegacyState::Deleted))
+        })
+        .await
+    }
+
     /// Daytona refuses a duplicate name with a conflict; report the
     /// existing sandbox's id when it can be read.
     async fn name_conflict(&self, name: Option<&str>, error: Error) -> Error {
@@ -378,7 +387,7 @@ impl Provider for DaytonaRuntime {
         // Everything nested lives inside the sandbox, so its confirmed
         // removal is the confirmed removal of every managed resource.
         if self.contract_sandbox(id).await?.is_none() {
-            return Ok(());
+            return self.listed_gone(id).await;
         }
         let confirmed = time::timeout(
             FAILED_CREATE_CLEANUP_BUDGET,
@@ -386,7 +395,7 @@ impl Provider for DaytonaRuntime {
         )
         .await;
         let message = match confirmed {
-            Ok(Ok(())) => return Ok(()),
+            Ok(Ok(())) => return self.listed_gone(id).await,
             Ok(Err(error)) => {
                 let error = classify("destroying sandbox", error);
                 // A refused delete was not admitted; the sandbox is intact.
@@ -417,6 +426,7 @@ impl Provider for DaytonaRuntime {
 mod tests {
     use std::io::Cursor;
     use std::path::Path;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
@@ -759,6 +769,99 @@ mod tests {
             "nothing was started: {:?}",
             fake.requests()
         );
+    }
+
+    /// Daytona's sandbox listing trails the sandbox's own record. Once
+    /// `stop` or `destroy` returns, a list shows the change.
+    #[tokio::test]
+    async fn a_list_after_stop_or_destroy_shows_the_change() {
+        /// Daytona's record of `sb-1`, and the listing, which catches up
+        /// only on the second list request after a change.
+        struct Backend {
+            record:  Option<&'static str>,
+            listed:  Option<&'static str>,
+            lagging: usize,
+        }
+        impl Backend {
+            fn change(&mut self, record: Option<&'static str>) {
+                self.record = record;
+                self.lagging = 2;
+            }
+        }
+        const UPDATED: &str = "2026-11-10T19:22:08.169Z";
+        let backend = Arc::new(Mutex::new(Backend {
+            record:  Some("started"),
+            listed:  Some("started"),
+            lagging: 0,
+        }));
+        let fake = FakeDaytona::start(move |address| {
+            Arc::new(move |method, target| {
+                let mut backend = backend.lock().unwrap();
+                match (method, target) {
+                    ("GET", target) if target.ends_with("/api-keys/current") => {
+                        Reply::Json(200, CURRENT_KEY.to_owned())
+                    }
+                    ("GET", target) if target.starts_with("/sandbox/sb-1/toolbox-proxy-url") => {
+                        Reply::Json(200, toolbox_url(&address))
+                    }
+                    ("POST", target) if target.starts_with("/sandbox/sb-1/stop") => {
+                        backend.change(Some("stopped"));
+                        Reply::Json(200, direct("stopped", UPDATED))
+                    }
+                    ("DELETE", target) if target.starts_with("/sandbox/sb-1") => {
+                        backend.change(None);
+                        Reply::Json(200, direct("destroying", UPDATED))
+                    }
+                    ("GET", target) if target.starts_with("/sandbox/sb-1?") => {
+                        match backend.record {
+                            Some(state) => Reply::Json(200, direct(state, UPDATED)),
+                            None => Reply::Json(404, r#"{"message":"not found"}"#.to_owned()),
+                        }
+                    }
+                    ("GET", target) if target.starts_with("/sandbox?") => {
+                        if backend.lagging > 0 {
+                            backend.lagging -= 1;
+                            if backend.lagging == 0 {
+                                backend.listed = backend.record;
+                            }
+                        }
+                        let items: Vec<serde_json::Value> = backend
+                            .listed
+                            .map(|state| serde_json::from_str(&direct(state, UPDATED)).unwrap())
+                            .into_iter()
+                            .collect();
+                        Reply::Json(
+                            200,
+                            serde_json::json!({"items": items, "nextCursor": null}).to_string(),
+                        )
+                    }
+                    _ => Reply::Json(404, r#"{"message":"not found"}"#.to_owned()),
+                }
+            })
+        })
+        .await;
+        let sandboxes = catalog(&fake, Some("test-key"));
+        let listed = || async {
+            sandboxes
+                .provider("cloud")
+                .unwrap()
+                .list(&LabelFilter::default())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|summary| summary.state)
+                .collect::<Vec<_>>()
+        };
+
+        let sandbox = sandboxes.attach(&reference("sb-1")).await.expect("attach");
+        sandbox.stop().await.expect("stop");
+        assert_eq!(listed().await, [SandboxState::Stopped]);
+
+        sandboxes
+            .destroy(&reference("sb-1"))
+            .await
+            .expect("destroy");
+        assert_eq!(listed().await, []);
     }
 
     /// A write longer than the upload limit is refused before anything is

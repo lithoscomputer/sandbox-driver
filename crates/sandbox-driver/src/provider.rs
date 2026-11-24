@@ -120,6 +120,8 @@ pub trait Provider: Send + Sync {
     async fn health(&self) -> Result<Health, Error>;
     async fn create(&self, admission: WorkloadAdmission) -> Result<Box<dyn Sandbox>, Error>;
     async fn attach(&self, id: &SandboxId) -> Result<Box<dyn Sandbox>, Error>;
+    /// Reflects every `stop` and `destroy` that has returned success: the
+    /// sandbox lists as stopped, or is no longer listed.
     async fn list(&self, filter: &LabelFilter) -> Result<Vec<SandboxSummary>, Error>;
     async fn destroy(&self, id: &SandboxId) -> Result<(), Error>;
     /// Ends owned runtime tasks with bounded cleanup; does not implicitly

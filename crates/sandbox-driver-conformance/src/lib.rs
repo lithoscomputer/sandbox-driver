@@ -164,6 +164,12 @@ impl Conformance {
             Ok(Err(error)) => return Err(format!("destroy failed: {error}")),
             Err(_) => return Err("destroy deadline elapsed; removal unconfirmed".into()),
         }
+        match time::timeout(self.timeout, listed_state(&self.catalog, reference)).await {
+            Ok(Ok(None)) => {}
+            Ok(Ok(Some(_))) => return Err("sandbox still listed after destroy".into()),
+            Ok(Err(error)) => return Err(format!("listing after destroy failed: {error}")),
+            Err(_) => return Err("listing after destroy deadline elapsed".into()),
+        }
         match time::timeout(self.timeout, self.catalog.attach(reference)).await {
             Ok(Err(Error::NotFound { .. })) => Ok(()),
             Ok(Ok(_)) => Err("sandbox still attachable after destroy".into()),
@@ -329,6 +335,10 @@ impl Conformance {
                 attached.status().await?.state == SandboxState::Stopped,
                 "stop did not reach stopped",
             )?;
+            require(
+                listed_state(catalog, &reference).await? == Some(SandboxState::Stopped),
+                "list did not show the stopped sandbox stopped",
+            )?;
             attached.start().await?;
             require(
                 attached.status().await?.state == SandboxState::Running,
@@ -346,6 +356,19 @@ impl Conformance {
             "stop did not confirm execution termination",
         )
     }
+}
+/// The sandbox's state as its entry lists it, `None` when it is not listed.
+async fn listed_state(
+    catalog: &Sandboxes,
+    reference: &SandboxRef,
+) -> Result<Option<SandboxState>, Error> {
+    Ok(catalog
+        .provider(reference.provider.as_str())?
+        .list(&LabelFilter::eq(LABEL_KEY, LABEL_VALUE))
+        .await?
+        .into_iter()
+        .find(|summary| summary.reference == *reference)
+        .map(|summary| summary.state))
 }
 async fn read(
     sandbox: &dyn Sandbox,
