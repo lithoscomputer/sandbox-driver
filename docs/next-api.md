@@ -165,7 +165,7 @@ pub trait Sandbox: Send + Sync {
     async fn start(&self) -> Result<(), Error>;      // also brings a paused sandbox back
     async fn stop(&self) -> Result<(), Error>;
     async fn exec(&self, spec: ExecSpec, controls: ExecControls) -> Result<ExecOutcome, Error>;
-    fn files(&self) -> &dyn Files;                   // get, put, list; stat/rm/mv/mkdir derived over exec
+    fn files(&self) -> &dyn Files;                   // get, put, list
     fn ports(&self) -> &dyn Ports;                   // expose, release
     fn endpoints(&self) -> Option<&dyn Endpoints>;   // optional capability: ssh, shell command, vnc
     fn containers(&self) -> Option<&dyn Containers>; // optional capability: run a one-shot container in this sandbox's world
@@ -238,7 +238,7 @@ Host, Docker and Daytona keep `BASH_ENV` blank for that argv, and for the same o
 
 ### Files and ports
 
-`Files` is `get(path, range)`, `put(path, bytes)` creating parents, and `list(path, depth)`. Everything else (`stat`, `remove`, `rename`, `mkdir`) is derived over exec by the library and works on every provider.
+`Files` is `get(path, range)`, `put(path, bytes)` creating parents, and `list(path, depth)`. The library adds no other file operations: a client that needs `stat`, `remove`, `rename` or `mkdir` runs the command itself over `exec`, which works on every provider.
 
 `Ports` is `expose(port, Expose { signed, ttl }) -> Exposure { url, headers, expires_at }` and `release(port)`. Some providers hold a real local forward until `release`.
 
