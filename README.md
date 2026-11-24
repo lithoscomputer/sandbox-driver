@@ -13,7 +13,7 @@ use sandbox_driver_testing::{FakeExec, FakeProvider};
 async fn main() -> Result<(), Error> {
     // Offline example: script a result; no command runs on the host.
     let fake = FakeProvider::new();
-    fake.script(["cargo", "test"], FakeExec::default()).await;
+    fake.script(|spec| (spec.argv == ["cargo", "test"]).then(FakeExec::default));
     let sandboxes = fake.sandboxes();
     let sandbox = sandboxes.builder("default").await?
         .label("job", "1842").create().await?;

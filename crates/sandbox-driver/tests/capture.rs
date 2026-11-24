@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 /// A sandbox on a fake that answers `argv` with `response`.
 async fn scripted(argv: Vec<String>, response: FakeExec) -> (Sandboxes, Box<dyn Sandbox>) {
     let fake = FakeProvider::new();
-    fake.script(argv, response).await;
+    fake.script(move |spec| (spec.argv == argv).then(|| response.clone()));
     let catalog = fake.sandboxes();
     let sandbox = catalog
         .builder("default")

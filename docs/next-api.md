@@ -565,9 +565,12 @@ let sandboxes = sandbox_driver_testing::fake();
 
 The fake lives in `sandbox-driver-testing`, which consumers add as a
 dev-dependency. It implements the required in-memory lifecycle, identity, files,
-and scripted streaming execution surface. Use `FakeProvider::script` to define
-command responses and `FakeProvider::sandboxes` to retain access to its call log.
-Unscripted commands fail; no command executes on the host. It advertises no
+and scripted streaming execution surface. `FakeProvider::script` takes a
+function of the command's `ExecSpec` that returns a response or `None`; the
+newest script that answers wins. Use `FakeProvider::sandboxes` to retain access
+to its call log. Unscripted commands fail; no command executes on the host.
+Sandbox ids are unique across every fake in the process, and catalogs made from
+one `FakeProvider` share its sandboxes. It advertises no
 optional services, container, endpoint or port capabilities.
 The common conformance checks run against it; optional workload and provider
 restart/failure scenarios remain integration gates, not claims made by the fake.
