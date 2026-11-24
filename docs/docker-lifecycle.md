@@ -183,14 +183,20 @@ shell-command endpoint. No timers are enforced, so any timer request is
   `sh.sandbox-driver.labels` and only those are reported by `status` and
   `list` or matched by a label filter. Sandboxes created before that label
   existed report every label the provider did not write.
-- **Exec** runs argv without a shell; `tty` is unsupported. A command on a
-  sandbox that is not running is refused, never reported as an outcome. A
-  command that loses its stream reports `killed` only once its container run
-  is confirmed ended: at once if the run changed, or after waiting up to ten
-  seconds while a stop or delete holds the claim; otherwise the transport
-  error is returned. `files.list` uses POSIX `sh` and `find`, so it needs no
-  `bash`; a directory that exists but cannot be read fails the listing
-  instead of reporting `not_found`.
+- **Exec** runs argv without a shell. With `tty` the command runs on a
+  terminal Docker allocates, which is its controlling terminal; its output
+  reaches the sink as the `terminal` stream, and each size the `resize`
+  control holds is applied to the terminal. Until the first resize lands the
+  terminal reports Docker's default size of zero rows and columns. A `term`
+  hangs up the command's process group and sends it SIGTERM, so an
+  interactive shell ends as it would when its terminal closes; `kill` sends
+  SIGKILL. A command on a sandbox that is not running is refused, never
+  reported as an outcome. A command that loses its stream reports `killed`
+  only once its container run is confirmed ended: at once if the run changed,
+  or after waiting up to ten seconds while a stop or delete holds the claim;
+  otherwise the transport error is returned. `files.list` uses POSIX `sh` and
+  `find`, so it needs no `bash`; a directory that exists but cannot be read
+  fails the listing instead of reporting `not_found`.
 - **Errors:** a daemon 404 maps to `not_found` only when the primary is gone;
   a missing image or service is `unhealthy`, so callers do not treat the
   sandbox as removed.

@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bollard::Docker;
@@ -13,12 +14,16 @@ use bollard::models::ContainerInspectResponse;
 use bollard::network::ListNetworksOptions;
 use sandbox_driver::{
     AccessScope, CatalogOptions, Durability, Environment, EnvironmentName, Error, ExecControls,
-    ExecSpec, LabelFilter, OneShotImage, OneShotSpec, OutputSink, ProviderEntry, ProviderKind,
-    ProviderName, ReadinessCheck, Registry, SandboxSpec, SandboxState, Sandboxes, SecretResolver,
-    ServiceSpec, Source, StaticEnvironments, Termination,
+    ExecSpec, LabelFilter, OneShotImage, OneShotSpec, OutputSink, OutputStream, ProviderEntry,
+    ProviderKind, ProviderName, ReadinessCheck, Registry, SandboxSpec, SandboxState, Sandboxes,
+    SecretResolver, ServiceSpec, Source, StaticEnvironments, TerminalSize, Termination,
 };
 use sandbox_driver_conformance::{Commands, Conformance};
 use sandbox_driver_docker::DockerFactory;
+use tokio::io::{self, AsyncWriteExt};
+use tokio::sync::watch;
+use tokio::time;
+use tokio_util::sync::CancellationToken;
 
 const IMAGE: &str = "ghcr.io/fabro-sh/dhi-alpine-base:3.23-dev-2026-06-17";
 const SERVICE_IMAGE: &str = "redis:7-alpine";
@@ -208,6 +213,179 @@ async fn services_and_one_shots_share_the_workload() {
         .await
         .expect("list");
     assert!(leftovers.is_empty(), "services left: {leftovers:?}");
+}
+
+/// The output a terminal command wrote so far, with the streams it used.
+#[derive(Clone, Default)]
+struct Screen(Arc<Mutex<(Vec<u8>, Vec<OutputStream>)>>);
+
+impl Screen {
+    fn sink(&self) -> OutputSink {
+        let screen = self.clone();
+        Arc::new(move |stream, bytes| {
+            let mut seen = screen.0.lock().expect("screen");
+            seen.0.extend(bytes);
+            seen.1.push(stream);
+            Box::pin(async { Ok(()) })
+        })
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("screen").0).into_owned()
+    }
+
+    fn streams(&self) -> Vec<OutputStream> {
+        self.0.lock().expect("screen").1.clone()
+    }
+
+    async fn shows(&self, text: &str) {
+        time::timeout(Duration::from_secs(30), async {
+            while !self.text().contains(text) {
+                time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{text:?} never appeared in {:?}", self.text()));
+    }
+}
+
+fn size(rows: u16, columns: u16) -> TerminalSize {
+    TerminalSize {
+        rows:    NonZeroU16::new(rows).expect("rows"),
+        columns: NonZeroU16::new(columns).expect("columns"),
+    }
+}
+
+/// A command run with `tty` has a terminal for its input and output, at
+/// the size the caller sets and then at each new size, and its output
+/// reaches the sink as the terminal stream.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a live Docker daemon"]
+async fn a_command_runs_in_a_terminal_that_follows_resizes() {
+    let catalog = catalog(BTreeMap::from([("tty", workload())]));
+    let sandbox = catalog
+        .builder("tty")
+        .await
+        .expect("builder")
+        .label("contract-test", "tty")
+        .create()
+        .await
+        .expect("create");
+    let reference = sandbox.reference();
+    async {
+        let mut spec = ExecSpec::argv([
+            "sh",
+            "-c",
+            "until [ \"$(stty size)\" = '30 100' ]; do sleep 0.1; done; echo first-size; \
+             read -r line; \
+             until [ \"$(stty size)\" = '40 120' ]; do sleep 0.1; done; echo \"got-$line\"; \
+             [ -t 0 ] && [ -t 1 ] && [ -t 2 ] && exit 3",
+        ]);
+        spec.tty = true;
+        spec.timeout_ms = Some(30_000);
+        let screen = Screen::default();
+        let (mut input, stdin) = io::duplex(1024);
+        let (resize, resized) = watch::channel(size(30, 100));
+        let exec = sandbox.exec(spec, ExecControls {
+            stdin: Some(Box::pin(stdin)),
+            sink: Some(screen.sink()),
+            resize: Some(resized),
+            ..ExecControls::default()
+        });
+        let typist = async {
+            screen.shows("first-size").await;
+            resize.send(size(40, 120)).expect("resize");
+            input.write_all(b"second\n").await.expect("input");
+        };
+        let (outcome, ()) = tokio::join!(exec, typist);
+        let outcome = outcome.expect("exec");
+        assert_eq!(
+            (outcome.termination, outcome.exit_code),
+            (Termination::Exited, Some(3)),
+            "{:?}",
+            screen.text()
+        );
+        assert!(screen.text().contains("got-second"), "{:?}", screen.text());
+        let streams = screen.streams();
+        assert!(
+            !streams.is_empty()
+                && streams
+                    .iter()
+                    .all(|stream| *stream == OutputStream::Terminal),
+            "{streams:?}"
+        );
+    }
+    .await;
+    catalog.destroy(&reference).await.expect("destroy");
+}
+
+/// `term` ends an interactive shell in a terminal, as closing the terminal
+/// would, though such a shell ignores SIGTERM, and the hangup also ends
+/// the job it runs in the foreground.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a live Docker daemon"]
+async fn term_ends_an_interactive_shell_in_a_terminal() {
+    let catalog = catalog(BTreeMap::from([("tty", workload())]));
+    let sandbox = catalog
+        .builder("tty")
+        .await
+        .expect("builder")
+        .label("contract-test", "tty-term")
+        .create()
+        .await
+        .expect("create");
+    let reference = sandbox.reference();
+    async {
+        let mut spec = ExecSpec::argv(["sh", "-i"]);
+        spec.tty = true;
+        let screen = Screen::default();
+        let (mut input, stdin) = io::duplex(1024);
+        let term = CancellationToken::new();
+        let exec = sandbox.exec(spec, ExecControls {
+            stdin: Some(Box::pin(stdin)),
+            sink: Some(screen.sink()),
+            term: Some(term.clone()),
+            resize: Some(watch::channel(size(24, 80)).1),
+            ..ExecControls::default()
+        });
+        let user = async {
+            input
+                .write_all(b"echo started; sleep 600\n")
+                .await
+                .expect("input");
+            screen.shows("started").await;
+            term.cancel();
+        };
+        let (outcome, ()) = tokio::join!(
+            async {
+                time::timeout(Duration::from_secs(30), exec)
+                    .await
+                    .expect("the shell ends")
+            },
+            user
+        );
+        assert_eq!(
+            outcome.expect("exec").termination,
+            Termination::Terminated,
+            "{:?}",
+            screen.text()
+        );
+        let (sink, output) = capture();
+        sandbox
+            .exec(ExecSpec::argv(["ps", "-o", "args"]), ExecControls {
+                sink: Some(sink),
+                ..ExecControls::default()
+            })
+            .await
+            .expect("ps");
+        let processes = String::from_utf8_lossy(&output.lock().expect("output")).into_owned();
+        assert!(
+            !processes.lines().any(|line| line == "sleep 600"),
+            "left running: {processes}"
+        );
+    }
+    .await;
+    catalog.destroy(&reference).await.expect("destroy");
 }
 
 /// Only the caller's labels come back, though the image carries its own,
