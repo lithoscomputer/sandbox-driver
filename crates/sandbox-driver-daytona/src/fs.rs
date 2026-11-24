@@ -8,12 +8,19 @@ use sandbox_driver::legacy::{
     BoundedBuffer, DEFAULT_BUFFER_BYTES, DirEntry, Error, FileKind, FileMetadata, Filesystem,
     ResourceKind, Result,
 };
-use tokio::fs as tokio_fs;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::OnceCell;
+use tokio::{fs as tokio_fs, time};
 
 use crate::sdk::{DaytonaClient, daytona_error, is_not_found};
 use crate::{resolve_path, toolbox};
+
+/// Downloads of a file that is still being written fail now and then
+/// although the file exists, either with a non-2xx answer or a body cut
+/// short; Daytona does not say why. A buffered read tries this many
+/// times before the failure reaches its caller.
+const READ_ATTEMPTS: u32 = 5;
+const READ_RETRY_DELAY: Duration = Duration::from_millis(200);
 
 /// Native filesystem access through the Daytona toolbox file API.
 ///
@@ -76,9 +83,20 @@ impl Filesystem for DaytonaFs {
         err(level = "debug")
     )]
     async fn read(&self, path: &str) -> Result<Vec<u8>> {
-        let mut buffer = BoundedBuffer::new(DEFAULT_BUFFER_BYTES);
-        let outcome = self.read_to(path, &mut buffer).await;
-        buffer.finish(outcome)
+        let mut attempt = 1;
+        loop {
+            let mut buffer = BoundedBuffer::new(DEFAULT_BUFFER_BYTES);
+            let outcome = self.read_to(path, &mut buffer).await;
+            match buffer.finish(outcome) {
+                // Nothing has reached the caller yet, so the whole
+                // download is repeated rather than resumed.
+                Err(Error::Io { .. }) if attempt < READ_ATTEMPTS => {
+                    attempt += 1;
+                    time::sleep(READ_RETRY_DELAY).await;
+                }
+                result => return result,
+            }
+        }
     }
 
     async fn read_to(

@@ -417,7 +417,7 @@ impl Provider for DaytonaRuntime {
 mod tests {
     use std::io::Cursor;
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use sandbox_driver::{
@@ -759,6 +759,69 @@ mod tests {
             "nothing was started: {:?}",
             fake.requests()
         );
+    }
+
+    /// Daytona sometimes fails the download of a file that exists while
+    /// something appends to it. A read repeats the download and returns
+    /// the whole file; a download that keeps failing is still reported.
+    #[tokio::test]
+    async fn a_file_that_is_still_being_written_reads_whole() {
+        const CONTENT: &str = "tick\ntick\ntick\n";
+        for (failures, expected) in [(2, Some(CONTENT)), (usize::MAX, None)] {
+            let counted = Arc::new(AtomicUsize::new(0));
+            let fake = FakeDaytona::start(move |address| {
+                Arc::new(move |method, target| match (method, target) {
+                    ("GET", target) if target.ends_with("/api-keys/current") => {
+                        Reply::Json(200, CURRENT_KEY.to_owned())
+                    }
+                    ("GET", target) if target.starts_with("/sandbox/sb-1/toolbox-proxy-url") => {
+                        Reply::Json(200, toolbox_url(&address))
+                    }
+                    ("GET", target) if target.starts_with("/sandbox/sb-1?") => {
+                        Reply::Json(200, started("2026-11-10T19:22:08.169Z"))
+                    }
+                    ("GET", target) if target.contains("/files/info") => Reply::Json(
+                        200,
+                        serde_json::json!({
+                            "name": "heartbeat", "isDir": false, "size": 10, "mode": "644",
+                            "modTime": "2026-11-10T19:22:08Z",
+                            "modifiedAt": "2026-11-10T19:22:08Z", "owner": "daytona",
+                            "group": "daytona", "permissions": "-rw-r--r--",
+                        })
+                        .to_string(),
+                    ),
+                    ("GET", target) if target.contains("/files/download") => {
+                        if counted.fetch_add(1, Ordering::SeqCst) < failures {
+                            Reply::Json(500, r#"{"message":"download failed"}"#.to_owned())
+                        } else {
+                            Reply::Json(200, CONTENT.to_owned())
+                        }
+                    }
+                    _ => Reply::Json(404, r#"{"message":"not found"}"#.to_owned()),
+                })
+            })
+            .await;
+            let sandbox = catalog(&fake, Some("test-key"))
+                .attach(&reference("sb-1"))
+                .await
+                .expect("attach");
+            let read = async {
+                let mut bytes = Vec::new();
+                sandbox
+                    .files()
+                    .get("heartbeat", None)
+                    .await?
+                    .read_to_end(&mut bytes)
+                    .await
+                    .expect("buffered bytes");
+                Ok::<_, Error>(String::from_utf8(bytes).expect("utf-8"))
+            };
+            match (read.await, expected) {
+                (Ok(content), Some(expected)) => assert_eq!(content, expected),
+                (Err(Error::Unavailable { .. }), None) => {}
+                (read, _) => panic!("failures {failures}: {read:?}"),
+            }
+        }
     }
 
     /// A write longer than the upload limit is refused before anything is
