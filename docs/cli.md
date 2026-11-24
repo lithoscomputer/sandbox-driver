@@ -4,7 +4,7 @@ The `sandbox-driver-cli` crate builds the `lithos-sandbox` executable, the
 command-line client of the library. It uses the same catalog an embedding
 application does: provider entries and environments, as
 [next-api.md](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/next-api.md#cli)
-describes. Host, Docker and Daytona are linked into the CLI and run in its
+describes. Host, Docker, Daytona and boxd are linked into the CLI and run in its
 process. Every other provider kind is a plugin, launched over protocol
 version 3 by the ordinary plugin loader.
 
@@ -14,8 +14,10 @@ commands in it, move files, stop and start it, and destroy it.
 ## Quick start
 
 With no configuration, the CLI has one provider entry and one environment of
-the same name for each built-in: `host`, `docker` and `daytona`. The Docker
-and Daytona environments start from `ubuntu:24.04`.
+the same name for each built-in: `host`, `docker`, `daytona` and `boxd`. The
+Docker and Daytona environments start from `ubuntu:24.04`; the boxd
+environment starts from boxd's own base image, `boxd`, and its entry reads
+its key from `BOXD_API_KEY`.
 
 ```sh
 lithos-sandbox providers
@@ -148,6 +150,11 @@ plugin  = "daytona"
 config  = { api_url = "https://app.daytona.io/api", target = "us" }
 secrets = ["DAYTONA_API_KEY"]
 
+[providers.boxd]
+plugin  = "boxd"
+config  = { region = "nyc" }       # optional; the org's home region otherwise
+secrets = ["BOXD_API_KEY"]
+
 [providers.lima]
 plugin = "lima"
 path   = "~/.local/share/sandbox-driver/plugins/lima/sandbox-driver-lima"
@@ -188,7 +195,7 @@ plugin starts with an empty environment plus `PATH`, `HOME`, `TMPDIR` and
 `USER` (or exactly the names in `inherit_env`), the entry's `env`, and its
 resolved `secrets`.
 
-The kinds `host`, `docker` and `daytona` are the built-ins; an entry of one of
+The kinds `host`, `docker`, `daytona` and `boxd` are the built-ins; an entry of one of
 those kinds with a `path` or trust setting is refused, so a plugin picks
 another kind.
 

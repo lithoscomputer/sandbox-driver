@@ -3,7 +3,7 @@ args = ["--config", "config.toml", "provider", "health", "local"]
 status.code = 1
 stdout = ""
 stderr = """
-error: invalid provider entry local at plugin: host, docker and daytona are built-in providers, not plugins; a plugin must use another kind
+error: invalid provider entry local at plugin: host, docker, daytona and boxd are built-in providers, not plugins; a plugin must use another kind
 """
 
 [env]

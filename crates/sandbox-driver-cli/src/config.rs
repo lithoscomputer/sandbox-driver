@@ -13,6 +13,7 @@ use sandbox_driver::{
     CatalogOptions, Environment, EnvironmentName, Error, ProviderEntry, ProviderFactory,
     ProviderName, Registry, SandboxSpec, Sandboxes, SecretResolver, Source, StaticEnvironments,
 };
+use sandbox_driver_boxd::BoxdFactory;
 use sandbox_driver_daytona::DaytonaFactory;
 use sandbox_driver_docker::DockerFactory;
 use sandbox_driver_host::{HostFactory, schemas as host_schemas};
@@ -58,7 +59,8 @@ impl Catalog {
     /// One entry and one same-named environment per built-in provider, so
     /// `lithos-sandbox run docker -- uname -a` works with no configuration.
     /// Unlike a configured entry, the default Daytona entry takes its
-    /// settings from the standard `DAYTONA_*` variables.
+    /// settings from the standard `DAYTONA_*` variables, and the default
+    /// boxd entry its key from `BOXD_API_KEY`.
     fn builtin() -> Self {
         let mut daytona = entry("daytona");
         let secret = if has_env("DAYTONA_API_KEY") || !has_env("DAYTONA_JWT_TOKEN") {
@@ -77,18 +79,24 @@ impl Catalog {
             }
         }
 
+        let mut boxd = entry("boxd");
+        boxd.secrets.push("BOXD_API_KEY".to_owned());
+
         let image = || SandboxSpec::new(Source::Image(DEFAULT_IMAGE.to_owned()));
         Self {
             providers:    [
                 (name("host"), entry("host")),
                 (name("docker"), entry("docker")),
                 (name("daytona"), daytona),
+                (name("boxd"), boxd),
             ]
             .into(),
             environments: [
                 ("host", SandboxSpec::new(Source::HostDirectory)),
                 ("docker", image()),
                 ("daytona", image()),
+                // boxd's own base image, which boots in well under a second.
+                ("boxd", SandboxSpec::new(Source::Image("boxd".to_owned()))),
             ]
             .into_iter()
             .map(|(environment, spec)| {
@@ -104,14 +112,15 @@ impl Catalog {
         }
     }
 
-    /// Builds the catalog with Host, Docker and Daytona linked in and the
+    /// Builds the catalog with Host, Docker, Daytona and boxd linked in and the
     /// protocol 3 loader for every other kind. Nothing starts until a
     /// provider entry is first used.
     pub(crate) fn open(self) -> Result<Sandboxes> {
-        let builtins: [(_, Arc<dyn ProviderFactory>); 3] = [
+        let builtins: [(_, Arc<dyn ProviderFactory>); 4] = [
             (host_schemas().kind, Arc::new(HostFactory)),
             (DockerFactory::schemas().kind, Arc::new(DockerFactory)),
             (DaytonaFactory::kind(), Arc::new(DaytonaFactory)),
+            (BoxdFactory::kind(), Arc::new(BoxdFactory)),
         ];
         let mut registry = Registry::new().plugins(Arc::new(PluginLoader::default()));
         for (kind, factory) in builtins {
@@ -237,7 +246,7 @@ resources = { memory = "1GB" }
     #[test]
     fn default_catalog_pairs_every_builtin_with_an_environment() {
         let catalog = Catalog::builtin();
-        for kind in ["host", "docker", "daytona"] {
+        for kind in ["host", "docker", "daytona", "boxd"] {
             assert_eq!(catalog.providers[&name(kind)].plugin.as_str(), kind);
             let environment = &catalog.environments[&EnvironmentName::try_new(kind).unwrap()];
             assert_eq!(environment.provider, name(kind));

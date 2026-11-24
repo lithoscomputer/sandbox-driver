@@ -69,7 +69,7 @@ impl Registry {
 }
 
 /// The kinds of the built-in providers. A plugin must choose another kind.
-const RESERVED_KINDS: [&str; 3] = ["host", "docker", "daytona"];
+const RESERVED_KINDS: [&str; 4] = ["host", "docker", "daytona", "boxd"];
 
 fn is_reserved(kind: &ProviderKind) -> bool {
     RESERVED_KINDS.contains(&kind.as_str())
@@ -786,8 +786,8 @@ fn validate_entry(name: &ProviderName, entry: &ProviderEntry) -> Result<(), Erro
         return Err(Error::invalid_config(
             name,
             "plugin",
-            "host, docker and daytona are built-in providers, not plugins; a plugin must use \
-             another kind",
+            "host, docker, daytona and boxd are built-in providers, not plugins; a plugin must \
+             use another kind",
         ));
     }
     validate_env("env", &entry.env)

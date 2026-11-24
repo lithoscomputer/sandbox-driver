@@ -158,7 +158,7 @@ sequence does not require a new transport. Keep JSON control over stdio and a
 separate authenticated per-operation socket connection for output, input, and
 file contents. Preserve reserved control capacity for stop/cancel/health and
 bounded data buffering. The v2 framing is retained unless separately negotiated.
-Host, Docker and Daytona are built-in providers. Their kinds are reserved: an
+Host, Docker, Daytona and boxd are built-in providers. Their kinds are reserved: an
 entry naming one with a plugin path, checksum or development trust is
 `invalid_config`, and a reserved kind is never routed to the plugin loader.
 

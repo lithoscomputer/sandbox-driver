@@ -3,6 +3,7 @@ args = ["environments"]
 status = "success"
 stdout = """
 NAME\tPROVIDER\tSOURCE
+boxd\tboxd\timage boxd
 daytona\tdaytona\timage ubuntu:24.04
 docker\tdocker\timage ubuntu:24.04
 host\thost\thost_directory

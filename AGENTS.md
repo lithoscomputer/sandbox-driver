@@ -25,7 +25,7 @@ Authoritative documents:
   it.
 
 The workspace is `crates/sandbox-driver` (core traits and types) plus
-`sandbox-driver-{conformance,host,docker,docker-config,daytona,daytona-config,protocol,cli}`.
+`sandbox-driver-{conformance,host,docker,docker-config,daytona,daytona-config,boxd,protocol,cli}`.
 The Host, Docker, and Daytona packages each build a same-named executable.
 There are no separate `*-plugin` packages.
 

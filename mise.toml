@@ -69,6 +69,10 @@ depends = ["plugins:build"]
 description = "Run the live Daytona tests; requires DAYTONA_API_KEY and creates real resources"
 run = "cargo nextest run --locked --run-ignored only -E '(package(sandbox-driver-daytona) - binary(nested_docker) - binary(spawned_conformance)) | (package(sandbox-driver-cli) & binary(live))'"
 
+[tasks."test:live:boxd"]
+description = "Run the live boxd tests; requires BOXD_API_KEY and creates real machines"
+run = "cargo nextest run --locked --run-ignored only -p sandbox-driver-boxd"
+
 [tasks."coverage:cli"]
 description = "Measure full-stack CLI black-box coverage with live providers required"
 env = { LITHOS_CLI_E2E_REQUIRE_LIVE = "1" }

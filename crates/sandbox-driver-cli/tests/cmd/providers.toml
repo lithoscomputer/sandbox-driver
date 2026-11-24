@@ -3,6 +3,7 @@ args = ["providers"]
 status = "success"
 stdout = """
 NAME\tPLUGIN\tPATH
+boxd\tboxd\tbuilt in
 daytona\tdaytona\tbuilt in
 docker\tdocker\tbuilt in
 host\thost\tbuilt in

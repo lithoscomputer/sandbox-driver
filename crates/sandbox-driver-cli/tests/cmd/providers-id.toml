@@ -2,6 +2,7 @@ bin.name = "lithos-sandbox"
 args = ["--output", "id", "providers"]
 status = "success"
 stdout = """
+boxd
 daytona
 docker
 host

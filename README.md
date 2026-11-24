@@ -29,7 +29,7 @@ async fn main() -> Result<(), Error> {
 
 **Status:** `Sandboxes` is the sandbox-driver API, exported from the crate root.
 The examples run against the in-memory
-provider in `sandbox-driver-testing`. Host, Docker, and Daytona implement it as
+provider in `sandbox-driver-testing`. Host, Docker, Daytona, and boxd implement it as
 built-ins, and protocol version 3 loads third-party plugins. See the
 [API specification](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/next-api.md).
 
@@ -72,8 +72,9 @@ An **environment** is a named workload template on a **provider entry**.
 The entry defines the connection, credentials, and plugin trust settings.
 The environment defines what to run: its source, resources, network, and services.
 
-Host, Docker, and [Daytona](https://www.daytona.io/), a cloud sandbox service,
-are built-in providers that run in the application's process. Third-party
+Host, Docker, [Daytona](https://www.daytona.io/), a cloud sandbox service, and
+[boxd](https://boxd.sh), cloud microVMs, are built-in providers that run in the
+application's process. Third-party
 providers run as separately installed plugins. Applications use the same
 `Sandboxes` API for each.
 
@@ -86,6 +87,7 @@ Host runs processes in a directory and provides no isolation boundary.
 | `sandbox-driver` | Build against the `Sandboxes` API |
 | `sandbox-driver-docker` | Embed the built-in Docker provider |
 | `sandbox-driver-daytona` | Embed the built-in Daytona provider |
+| `sandbox-driver-boxd` | Embed the built-in boxd provider |
 | `sandbox-driver-host` | Embed the built-in Host provider |
 | `sandbox-driver-docker-config` | Construct typed Docker options for the old provider API, which is being removed |
 | `sandbox-driver-daytona-config` | Construct typed Daytona options for the old provider API, which is being removed |
@@ -190,8 +192,8 @@ and [diagnostics](https://github.com/lithoscomputer/sandbox-driver/blob/main/doc
 
 ### Use it from the command line
 
-The CLI drives the same environment catalog. Host, Docker, and Daytona are
-built in; any other provider is a configured plugin entry:
+The CLI drives the same environment catalog. Host, Docker, Daytona, and boxd
+are built in; any other provider is a configured plugin entry:
 
 ```sh
 cargo install --git https://github.com/lithoscomputer/sandbox-driver --locked sandbox-driver-cli
@@ -200,14 +202,14 @@ lithos-sandbox providers
 lithos-sandbox run docker -- uname -a
 ```
 
-Docker needs a reachable daemon; Daytona needs API credentials.
+Docker needs a reachable daemon; Daytona and boxd need API credentials.
 See the [CLI guide](https://github.com/lithoscomputer/sandbox-driver/blob/main/docs/cli.md).
 
 ## Status and compatibility
 
 - **Maturity:** Pre-1.0; the public API may change before 1.0.
-- **Implemented:** The catalog, schema validation, scripted fake, and common conformance suite are available at their crates' roots; Host, Docker, and Daytona provide built-in factories, and `PluginLoader` loads protocol 3 plugins.
-- **Conformance:** Host runs the shared conformance suite in the routine tests; Docker runs it with `mise run test:docker` and Daytona with `mise run test:live`.
+- **Implemented:** The catalog, schema validation, scripted fake, and common conformance suite are available at their crates' roots; Host, Docker, Daytona, and boxd provide built-in factories, and `PluginLoader` loads protocol 3 plugins.
+- **Conformance:** Host runs the shared conformance suite in the routine tests; Docker runs it with `mise run test:docker`, Daytona with `mise run test:live`, and boxd with `mise run test:live:boxd`.
 - **MSRV:** Rust 1.85, as declared in the workspace manifest.
 - **CI platforms:** macOS arm64, Linux x86_64, and Linux arm64.
 - **Public formats:** Serialized configuration and sandbox references; plugin protocol version 3. Version 2 is still in the tree and is being removed.
@@ -215,6 +217,7 @@ See the [CLI guide](https://github.com/lithoscomputer/sandbox-driver/blob/main/d
 Many provider tests still use the old API; they are being ported to `Sandboxes`.
 Docker's live checks need a daemon: run `mise run test:docker`.
 Daytona's live checks are opt-in: set `DAYTONA_API_KEY` and run `mise run test:live`.
+boxd's are too: set `BOXD_API_KEY` and run `mise run test:live:boxd`.
 See [development and verification](https://github.com/lithoscomputer/sandbox-driver/blob/main/DEVELOPING.md).
 
 ## Part of Lithos

@@ -2,7 +2,7 @@
 
 > **Status:** This is the specification of the `Sandboxes` API, which the
 > `sandbox_driver` crate root exports, and it changes in the same PR as that
-> code. Host, Docker, and Daytona implement it as
+> code. Host, Docker, Daytona, and boxd implement it as
 > built-ins, and protocol version 3 loads third-party plugins. The
 > [CLI](#cli) section is not implemented yet: until the CLI is ported, it runs
 > every provider as a protocol version 2 plugin, as the
@@ -85,11 +85,11 @@ The library provisions and operates sandboxes. Scheduling, queueing, lease manag
 
 | Term | Meaning |
 | --- | --- |
-| **Provider** | A backend that makes sandboxes. Built in (`docker`, `daytona`) or a plugin (`host`, and any third party's). |
+| **Provider** | A backend that makes sandboxes. Built in (`docker`, `daytona`, `boxd`) or a plugin (`host`, and any third party's). |
 | **Provider entry** | A named, configured connection to a provider: which plugin, its config, the secrets it needs, and for a plugin its path and checksum. Operator-owned. One entry serves many environments; two entries can use the same plugin (a production and a staging Daytona org). |
 | **Environment** | A named spec template on a provider entry: source, resources, network, timers, labels, env, working directory. User-owned. What clients and workflows name. |
 | **Plugin** | An executable implementing the contract, run as a supervised child process. Every third-party provider ships this way. |
-| **Built-in** | `host`, `docker` and `daytona`. Library code, compiled in, no child process. They implement the same internal trait a plugin is adapted to, so clients cannot tell the two apart. |
+| **Built-in** | `host`, `docker`, `daytona` and `boxd`. Library code, compiled in, no child process. They implement the same internal trait a plugin is adapted to, so clients cannot tell the two apart. |
 | **Namespace** | The stable, non-secret id a provider reports for where its sandboxes live: a Docker daemon, a Daytona organization, a machine. |
 | **SandboxRef** | `{provider, namespace, id}`. The only identity. Serializable. `attach` resolves it by namespace. |
 | **Durability** | What a provider promises about a sandbox outliving things: `process`, `machine`, or `remote`. |
@@ -299,7 +299,7 @@ provider = "lima"
 source = { image = "ubuntu-lts" }
 ```
 
-Per provider entry: `plugin`, `config` (whatever that provider's `config_schema` accepts, validated on first selected-entry activation so a typo fails with the field named; the library never reads its contents), `secrets`, and for a third-party plugin `path`, `sha256` or `dev`, `args`, `env`, `inherit_env`. A `sha256` pin together with `dev = true` is a decoding error, so a pin is never silently skipped. The kinds `host`, `docker` and `daytona` are reserved for the built-in providers: an entry naming one of them with `path`, `sha256` or `dev` is a configuration error, so a third-party plugin picks another kind, such as `acme-daytona`.
+Per provider entry: `plugin`, `config` (whatever that provider's `config_schema` accepts, validated on first selected-entry activation so a typo fails with the field named; the library never reads its contents), `secrets`, and for a third-party plugin `path`, `sha256` or `dev`, `args`, `env`, `inherit_env`. A `sha256` pin together with `dev = true` is a decoding error, so a pin is never silently skipped. The kinds `host`, `docker`, `daytona` and `boxd` are reserved for the built-in providers: an entry naming one of them with `path`, `sha256` or `dev` is a configuration error, so a third-party plugin picks another kind, such as `acme-daytona`.
 
 Credentials and conveniences take different paths:
 
@@ -319,18 +319,18 @@ Plugins are found in `~/.local/share/sandbox-driver/plugins/<name>/` or any dire
 
 ## Providers
 
-Host, Docker and Daytona are built in: the application registers each one, and their kinds are reserved, so none of them is ever loaded as a plugin.
+Host, Docker, Daytona and boxd are built in: the application registers each one, and their kinds are reserved, so none of them is ever loaded as a plugin.
 
-|  | host | docker | daytona |
-| --- | --- | --- | --- |
-| Namespace | `host:<machine-id>` | `docker:<daemon-id>` | `daytona:<org>` |
-| Durability | `process` | `machine` | `remote` |
-| Sources | host directory | image | image, dockerfile, snapshot |
-| Reaches the client's machine | yes | yes, via gateway alias (local daemon only) | no |
-| Mounts host paths | yes | local daemon only | no |
-| Network policy | default only | allow all, block | allow all, block, CIDR list, domain list |
-| Resources | ignored | cpu, memory | cpu, memory, disk |
-| Optional capabilities | none | endpoints (shell command), services, containers | endpoints (ssh, vnc), services, containers |
+|  | host | docker | daytona | boxd |
+| --- | --- | --- | --- | --- |
+| Namespace | `host:<machine-id>` | `docker:<daemon-id>` | `daytona:<org>` | `boxd:<org>/<region>` |
+| Durability | `process` | `machine` | `remote` | `remote` |
+| Sources | host directory | image | image, dockerfile, snapshot | image (`boxd` for its base image), snapshot |
+| Reaches the client's machine | yes | yes, via gateway alias (local daemon only) | no | no |
+| Mounts host paths | yes | local daemon only | no | no |
+| Network policy | default only | allow all, block | allow all, block, CIDR list, domain list | allow all, block, CIDR list, domain list |
+| Resources | ignored | cpu, memory | cpu, memory, disk | cpu, memory (rounded up to a size class), disk (fixed 100 GiB) |
+| Optional capabilities | none | endpoints (shell command), services, containers | endpoints (ssh, vnc), services, containers | endpoints (shell command) |
 
 Each of these facts comes from the provider's descriptor at runtime; the table summarizes them.
 
@@ -550,7 +550,7 @@ The suite also verifies that exec and files address the requested workload rathe
 
 - `try_new` checks local provider-entry structure and freezes launch conveniences; it starts nothing and resolves no secrets. Entry errors are reported when that entry is selected.
 - One backend is activated per immutable provider entry per catalog. Editing an environment touches no backend. Changing connection or launch settings requires a new catalog; shutdown explicitly retires the old catalog.
-- Host, Docker and Daytona run in the caller's process. No provider process is spawned for them, ever.
+- Host, Docker, Daytona and boxd run in the caller's process. No provider process is spawned for them, ever.
 - Each Host instance keeps its process-group fence state in a temporary directory it owns, which lasts as long as its sandboxes do. `shutdown()` fences and destroys them; process loss alone is not proof that children died.
 - A third-party plugin child starts on the first call to its entry, one per entry per process, and is supervised. On a crash it is restarted; handles from the old generation return `Error::Stale` and should be re-attached by ref.
 - `shutdown()` ends supervised plugin children with bounded cleanup. Children also exit on stdin EOF. Neither shutdown nor a client or plugin crash proves that remote workload execution has stopped; sandbox durability and the explicit workload lifecycle guarantees determine what remains. Ending a client is not an implicit request to stop or destroy durable sandboxes.
@@ -616,7 +616,7 @@ Prior art: Jupyter kernelspecs and `jupyter_client`, Kubernetes CRI and RuntimeC
 `Sandboxes` requires an explicit `Registry`, `SecretResolver` and
 `CatalogOptions`; no real provider is registered by core. `Registry::builtin`
 registers an adapter, and `Registry::plugins` supplies the ordinary plugin
-loader. Host, Docker and Daytona are built-ins, and their reserved kinds never
+loader. Host, Docker, Daytona and boxd are built-ins, and their reserved kinds never
 reach the plugin loader, even when the application did not register that
 built-in. `sandbox_driver_host::HostFactory` is Host's built-in: an
 `owner_process`, `process`-durable provider where only the instance that
