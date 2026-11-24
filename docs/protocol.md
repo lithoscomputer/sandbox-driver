@@ -1035,10 +1035,7 @@ implementation is `sandbox_driver_protocol::discovery`.
 
 - **Naming convention.** A plugin binary is found either at an
   explicitly configured path or as `<prefix>-<kind>` on `PATH`, where
-  `<prefix>` is chosen by the embedder. The reference plugins ship under
-  the `sandbox-driver` prefix: `sandbox-driver-host`,
-  `sandbox-driver-docker`, and `sandbox-driver-daytona`, one archive and
-  one checksum each per target. There is no other fallback; unknown
+  `<prefix>` is chosen by the embedder. There is no other fallback; unknown
   kinds are never launched (deny by default).
 - **Checksum or dev, never neither.** Configuration pins the binary's
   SHA-256, verified before exec; a mismatch is a hard failure naming

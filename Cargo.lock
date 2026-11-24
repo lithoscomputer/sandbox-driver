@@ -2227,7 +2227,6 @@ dependencies = [
 name = "sandbox-driver-daytona"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "base64",
  "daytona-api-client",
@@ -2264,7 +2263,6 @@ dependencies = [
 name = "sandbox-driver-docker"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "bollard",
  "futures-util",
@@ -2278,7 +2276,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -2308,18 +2305,15 @@ dependencies = [
 name = "sandbox-driver-host"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "nix",
  "sandbox-driver",
  "sandbox-driver-conformance",
- "sandbox-driver-protocol",
  "serde",
  "serde_json",
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

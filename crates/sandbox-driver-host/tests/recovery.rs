@@ -1,27 +1,20 @@
-//! Real plugin crashes must leave recoverable records and must never make a
-//! saved, recycled process-group id safe to signal.
+//! Fencing a saved generation must never signal a recycled process-group id
+//! and must keep new work out of a fenced generation.
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{self, Stdio};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use nix::errno::Errno;
-use nix::sys::signal::kill;
-use nix::unistd::Pid;
-use sandbox_driver::legacy::{
-    Error, ExecSpec, SandboxFilter, SandboxId, SandboxProvider, SandboxSource, SandboxSpec,
-};
-use sandbox_driver_protocol::channel::TrustedPeer;
-use sandbox_driver_protocol::{PluginProvider, TransportLimits};
-use tokio::process::{Child, Command};
-use tokio::{fs, time};
+use sandbox_driver::legacy::{Error, ExecSpec, SandboxProvider, SandboxSource, SandboxSpec};
+use sandbox_driver_host::HostProvider;
+use tokio::fs;
+use tokio::process::Command;
 
 fn registry() -> PathBuf {
     env::temp_dir().join(format!(
-        "host-plugin-recovery-{}-{}",
+        "host-recovery-{}-{}",
         process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -30,199 +23,10 @@ fn registry() -> PathBuf {
     ))
 }
 
-async fn connect(root: &Path) -> (PluginProvider, Child) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_sandbox-driver-host"))
-        .env("SANDBOX_DRIVER_HOST_REGISTRY", root)
-        .env("RUST_LOG", "error")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn plugin");
-    let provider = PluginProvider::connect_with_limits(
-        child.stdout.take().expect("stdout"),
-        child.stdin.take().expect("stdin"),
-        TransportLimits::default(),
-        TrustedPeer::Process(child.id().expect("plugin PID")),
-    )
-    .await
-    .expect("connect");
-    (provider, child)
-}
-
-async fn wait_for_file(path: &Path) {
-    time::timeout(Duration::from_secs(10), async {
-        loop {
-            if fs::metadata(path).await.is_ok_and(|m| m.len() > 0) {
-                break;
-            }
-            time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("workload started");
-}
-
-/// The process-group id the sandbox's single saved generation recorded for
-/// the exec with sequence number `seq`.
-async fn saved_pgid(root: &Path, id: &SandboxId, seq: usize) -> i32 {
-    let mut generations = fs::read_dir(root.join(id.as_str()).join("groups"))
-        .await
-        .expect("generations");
-    let generation = generations
-        .next_entry()
-        .await
-        .expect("entry")
-        .expect("one generation")
-        .path();
-    fs::read_to_string(generation.join(format!("{seq}.group")))
-        .await
-        .expect("saved group id")
-        .trim()
-        .parse()
-        .expect("positive process-group id")
-}
-
-/// Whether the sentinel leading `pgid` still exists. A sentinel is never
-/// reaped while its owner lives, so a vanished pid means its owner is gone and
-/// the sentinel ended and was reaped by init.
-fn sentinel_exists(pgid: i32) -> bool {
-    !matches!(kill(Pid::from_raw(pgid), None), Err(Errno::ESRCH))
-}
-
-async fn wait_for_sentinel_exit(pgid: i32) {
-    time::timeout(Duration::from_secs(10), async {
-        while sentinel_exists(pgid) {
-            time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("an idle sentinel ends once its owner is gone");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_plugin_crash_stops_work_and_preserves_recoverable_identity() {
-    let root = registry();
-    let (provider, mut child) = connect(&root).await;
-    let sandbox = provider
-        .create(
-            &{
-                let mut spec = SandboxSpec::new(SandboxSource::HostDirectory)
-                    .label("run", "recovery")
-                    .working_directory(root.join("named-workspace").to_string_lossy());
-                spec.workspace_ownership = Some(sandbox_driver::WorkspaceOwnership::Managed);
-                spec
-            },
-            None,
-        )
-        .await
-        .expect("create");
-    let id = sandbox.id().clone();
-    let workspace = PathBuf::from(sandbox.working_directory());
-    sandbox
-        .fs()
-        .write("binary", &[0, 255, 128, 10])
-        .await
-        .expect("binary write");
-    let old = sandbox
-        .exec()
-        .run(&ExecSpec::bash("exit 5"))
-        .await
-        .expect("old status");
-    assert_eq!(old.exit_code, Some(5));
-    let running = Arc::clone(&sandbox);
-    let pending = tokio::spawn(async move {
-        running
-            .exec()
-            .run(
-                &ExecSpec::bash("while :; do echo tick >> heartbeat; sleep 0.05; done")
-                    .no_timeout(),
-            )
-            .await
-    });
-    let heartbeat = workspace.join("heartbeat");
-    wait_for_file(&heartbeat).await;
-    let running_pgid = saved_pgid(&root, &id, 1).await;
-    child
-        .kill()
-        .await
-        .expect("crash plugin and reap its owned child");
-    // No replacement provider has fenced this generation: the watcher must
-    // end live work itself when its owning plugin dies.
-    wait_for_sentinel_exit(running_pgid).await;
-    let crashed_size = fs::metadata(&heartbeat).await.expect("heartbeat").len();
-    time::sleep(Duration::from_millis(350)).await;
-    let final_crashed_size = fs::metadata(&heartbeat).await.expect("heartbeat").len();
-    let failed = time::timeout(Duration::from_secs(5), pending)
-        .await
-        .expect("pending call ends")
-        .expect("task");
-    assert!(
-        failed.is_err(),
-        "an interrupted call is never reported as complete"
-    );
-
-    let (fresh, mut child) = connect(&root).await;
-    let mut filter = SandboxFilter::default();
-    filter
-        .labels
-        .insert("run".to_owned(), "recovery".to_owned());
-    let found = fresh.list(&filter).await.expect("durable list");
-    let attached = fresh.attach(&id, None).await.expect("durable attach");
-    attached.stop().await.expect("fence old work");
-    let stopped_size = fs::metadata(&heartbeat).await.expect("heartbeat").len();
-    time::sleep(Duration::from_millis(350)).await;
-    let final_size = fs::metadata(&heartbeat).await.expect("heartbeat").len();
-    attached.start().await.expect("new generation");
-    let bytes = attached
-        .fs()
-        .read("binary")
-        .await
-        .expect("retained workspace");
-    let result = attached
-        .exec()
-        .run(&ExecSpec::bash("sleep 0.2; exit 7"))
-        .await
-        .expect("new status");
-    attached
-        .delete()
-        .await
-        .expect("delete managed workspace after stopping work");
-    let remaining = fresh
-        .list(&filter)
-        .await
-        .expect("deleted resource is absent");
-    fresh.shutdown().await.expect("shutdown");
-    child
-        .kill()
-        .await
-        .expect("reap the externally owned plugin child");
-    fs::remove_dir_all(&root).await.expect("registry cleanup");
-    assert_eq!(found.len(), 1);
-    assert_eq!(found[0].id, id);
-    assert_eq!(
-        crashed_size, final_crashed_size,
-        "work kept writing after its plugin died"
-    );
-    assert_eq!(
-        stopped_size, final_size,
-        "stop returned while old work was writing"
-    );
-    assert_eq!(bytes, [0, 255, 128, 10]);
-    assert_eq!(
-        result.exit_code,
-        Some(7),
-        "a stale status must not resolve new work"
-    );
-    assert!(remaining.is_empty());
-    assert!(!workspace.exists());
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn a_saved_innocent_group_is_observed_but_never_signalled() {
     let root = registry();
-    let (provider, mut child) = connect(&root).await;
+    let provider = HostProvider::with_registry(&root).await.expect("registry");
     let sandbox = provider
         .create(&SandboxSpec::new(SandboxSource::HostDirectory), None)
         .await
@@ -260,11 +64,6 @@ async fn a_saved_innocent_group_is_observed_but_never_signalled() {
         .await
         .expect("new generation");
     sandbox.delete().await.expect("retry after group ended");
-    provider.shutdown().await.expect("shutdown");
-    child
-        .kill()
-        .await
-        .expect("reap the externally owned plugin child");
     fs::remove_dir_all(root).await.expect("registry cleanup");
     assert!(still_alive, "the fencer signalled an unrelated group");
     assert!(
@@ -281,7 +80,7 @@ async fn a_saved_innocent_group_is_observed_but_never_signalled() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_prefenced_generation_cannot_start_another_workload() {
     let root = registry();
-    let (provider, mut child) = connect(&root).await;
+    let provider = HostProvider::with_registry(&root).await.expect("registry");
     let sandbox = provider
         .create(&SandboxSpec::new(SandboxSource::HostDirectory), None)
         .await
@@ -312,37 +111,6 @@ async fn a_prefenced_generation_cannot_start_another_workload() {
         .join("started")
         .exists();
     sandbox.delete().await.expect("delete");
-    provider.shutdown().await.expect("shutdown");
-    child
-        .kill()
-        .await
-        .expect("reap the externally owned plugin child");
     fs::remove_dir_all(root).await.expect("registry cleanup");
     assert!(!started, "work started in a fenced generation");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn an_idle_sentinel_exits_when_its_owner_dies() {
-    let root = registry();
-    let (provider, mut child) = connect(&root).await;
-    let sandbox = provider
-        .create(&SandboxSpec::new(SandboxSource::HostDirectory), None)
-        .await
-        .expect("create");
-    let done = sandbox
-        .exec()
-        .run(&ExecSpec::bash("exit 0"))
-        .await
-        .expect("completed workload");
-    assert_eq!(done.exit_code, Some(0));
-    let pgid = saved_pgid(&root, sandbox.id(), 0).await;
-    assert!(sentinel_exists(pgid), "the provider pins the idle sentinel");
-    child
-        .kill()
-        .await
-        .expect("crash plugin and reap its owned child");
-    // No new plugin ever fences this generation. The sentinel must notice its
-    // owner is gone and end its own group instead of idling forever.
-    wait_for_sentinel_exit(pgid).await;
-    fs::remove_dir_all(root).await.expect("registry cleanup");
 }

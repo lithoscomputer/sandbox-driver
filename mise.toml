@@ -24,8 +24,8 @@ description = "Build the workspace"
 run = "cargo build --locked"
 
 [tasks."plugins:build"]
-description = "Build the provider and fixture plugin executables used by tests"
-run = "cargo build --locked --bins -p sandbox-driver-host -p sandbox-driver-docker -p sandbox-driver-daytona -p sandbox-driver-fixture-plugins"
+description = "Build the fixture plugin executables used by tests"
+run = "cargo build --locked --bins -p sandbox-driver-fixture-plugins"
 
 [tasks.fmt]
 description = "Format Rust with the pinned nightly formatter"
@@ -56,7 +56,7 @@ run = "cargo nextest run --locked -p sandbox-driver-cli --test trycmd --test liv
 
 [tasks."test:docker"]
 depends = ["plugins:build"]
-description = "Require live Docker and test lifecycle races, driver processes, and the CLI"
+description = "Require live Docker and test lifecycle races, independent clients, and the CLI"
 env = { LITHOS_CLI_E2E_REQUIRE_LIVE = "1" }
 run = [
   "cargo test --locked -p sandbox-driver-docker --test lifecycle --test conformance --test fence --test provider -- --include-ignored --nocapture",
@@ -67,7 +67,7 @@ run = [
 [tasks."test:live"]
 depends = ["plugins:build"]
 description = "Run the live Daytona tests; requires DAYTONA_API_KEY and creates real resources"
-run = "cargo nextest run --locked --run-ignored only -E '(package(sandbox-driver-daytona) - binary(nested_docker) - binary(spawned_conformance)) | (package(sandbox-driver-cli) & binary(live))'"
+run = "cargo nextest run --locked --run-ignored only -E '(package(sandbox-driver-daytona) - binary(nested_docker)) | (package(sandbox-driver-cli) & binary(live))'"
 
 [tasks."coverage:cli"]
 description = "Measure full-stack CLI black-box coverage with live providers required"
@@ -76,10 +76,7 @@ run = "bin/coverage-cli"
 
 [tasks."test:release"]
 description = "Run all Rust tests in release mode"
-run = [
-  "cargo build --locked --release --bins -p sandbox-driver-host -p sandbox-driver-docker -p sandbox-driver-daytona",
-  "cargo nextest run --locked --release --all-targets --all-features --no-tests=pass",
-]
+run = "cargo nextest run --locked --release --all-targets --all-features --no-tests=pass"
 
 [tasks."check:msrv"]
 description = "Check all targets with the declared minimum Rust version"
@@ -103,5 +100,5 @@ description = "Run the extended nightly verification gate"
 depends = ["check", "check:msrv", "test:release"]
 
 [tasks.release]
-description = "Build and package the plugin executables for the current platform"
+description = "Build and package the lithos-sandbox CLI for the current platform"
 run = "bin/build-release"

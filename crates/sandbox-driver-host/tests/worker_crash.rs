@@ -1,13 +1,16 @@
-//! Killing only an embedding worker must end its Host commands, without a
-//! replacement worker or an explicit recovery fence.
+//! Killing only an embedding worker must end its Host commands and idle
+//! sentinels, without a replacement worker or an explicit recovery fence.
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
-use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{self, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{env, future};
 
+use nix::errno::Errno;
+use nix::sys::signal::kill;
+use nix::unistd::Pid;
 use sandbox_driver::legacy::{
     ExecControls, ExecSpec, SandboxFilter, SandboxProvider, SandboxSource, SandboxSpec, Termination,
 };
@@ -17,6 +20,7 @@ use tokio::{fs, time};
 use tokio_util::sync::CancellationToken;
 
 const WORKER_ROOT: &str = "SANDBOX_DRIVER_TEST_WORKER_ROOT";
+const IDLE_WORKER_ROOT: &str = "SANDBOX_DRIVER_TEST_IDLE_WORKER_ROOT";
 const DELAY: Duration = Duration::from_secs(3);
 
 fn root() -> PathBuf {
@@ -72,6 +76,78 @@ async fn embedded_worker() {
         .run(&delayed_writes(&root))
         .await
         .expect("workload");
+}
+
+// Re-executed like `embedded_worker`: a completed command leaves its
+// sentinel idle, and the worker records that sentinel's group and waits.
+#[tokio::test]
+async fn embedded_idle_worker() {
+    let Some(root) = env::var_os(IDLE_WORKER_ROOT).map(PathBuf::from) else {
+        return;
+    };
+    let provider = HostProvider::new();
+    let sandbox = provider
+        .create(&SandboxSpec::new(SandboxSource::HostDirectory), None)
+        .await
+        .expect("sandbox");
+    let done = sandbox
+        .exec()
+        .run(&ExecSpec::bash("echo $PPID"))
+        .await
+        .expect("completed workload");
+    fs::write(root.join("sentinel.pgid"), done.stdout_lossy().trim())
+        .await
+        .expect("record the idle sentinel");
+    future::pending::<()>().await;
+}
+
+/// Whether the sentinel leading `pgid` still exists. A sentinel is never
+/// reaped while its owner lives, so a vanished pid means its owner is gone and
+/// the sentinel ended and was reaped by init.
+fn sentinel_exists(pgid: i32) -> bool {
+    !matches!(kill(Pid::from_raw(pgid), None), Err(Errno::ESRCH))
+}
+
+#[tokio::test]
+async fn an_idle_sentinel_exits_when_its_worker_dies() {
+    let root = root();
+    fs::create_dir_all(&root).await.expect("case directory");
+    let mut worker = Command::new(env::current_exe().expect("test executable"))
+        .args(["--exact", "embedded_idle_worker", "--nocapture"])
+        .env(IDLE_WORKER_ROOT, &root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("embedding worker");
+    let pgid_file = root.join("sentinel.pgid");
+    let pgid: i32 = time::timeout(Duration::from_secs(10), async {
+        loop {
+            let recorded = fs::read_to_string(&pgid_file).await.unwrap_or_default();
+            if let Ok(pgid) = recorded.parse() {
+                break pgid;
+            }
+            time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the worker's command completed");
+    assert!(sentinel_exists(pgid), "the provider pins the idle sentinel");
+    worker
+        .kill()
+        .await
+        .expect("SIGKILL only the worker and reap it");
+    // No provider ever fences this generation. The sentinel must notice its
+    // owner is gone and end its own group instead of idling forever.
+    let ended = time::timeout(Duration::from_secs(10), async {
+        while sentinel_exists(pgid) {
+            time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    fs::remove_dir_all(root).await.expect("case cleanup");
+    assert!(ended.is_ok(), "an idle sentinel outlived its worker");
 }
 
 #[tokio::test]

@@ -5,9 +5,7 @@
 This repository is `sandbox-driver`: providers for managing sandboxes,
 snapshots, and volumes. Petri and fabro are the primary consumers. Host,
 Docker, and Daytona are each a library with a supported public API for
-in-process embedding and a plugin executable that serves the same provider
-over JSON-RPC. Applications either link a bundled provider library or use
-the protocol client; both present the same trait family. Third-party
+in-process embedding; applications link them as built-ins. Third-party
 providers are plugins.
 
 Authoritative documents:

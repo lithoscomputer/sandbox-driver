@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Builds every plugin executable for the native target and packages each
-# one as its own archive with a SHA-256 checksum, so a host bundling the
-# plugins can pin each binary independently.
+# Builds the lithos-sandbox CLI for the native target and packages it as an
+# archive with a SHA-256 checksum.
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
@@ -11,7 +10,7 @@ fi
 
 target=$1
 version=$2
-plugins=(sandbox-driver-host sandbox-driver-docker sandbox-driver-daytona)
+binary_name=lithos-sandbox
 
 case "$target" in
   aarch64-apple-darwin | x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu) ;;
@@ -41,19 +40,9 @@ if [[ "$host_target" != "$target" ]]; then
   exit 1
 fi
 
-cargo build --locked --release --target "$target" \
-  --package sandbox-driver-host \
-  --package sandbox-driver-docker \
-  --package sandbox-driver-daytona
+cargo build --locked --release --target "$target" --bin "$binary_name"
 
 output_dir=dist-release
-staging_dir=$(mktemp -d)
-
-cleanup() {
-  rm -rf -- "$staging_dir"
-}
-trap cleanup EXIT HUP INT TERM
-
 mkdir -p "$output_dir"
 
 checksum() {
@@ -64,22 +53,11 @@ checksum() {
   fi
 }
 
-for binary_name in "${plugins[@]}"; do
-  archive_name="${binary_name}-${version}-${target}.tar.gz"
-  cp "target/$target/release/$binary_name" "$staging_dir/$binary_name"
-  tar -C "$staging_dir" -czf "$output_dir/$archive_name" "$binary_name"
-  (
-    cd "$output_dir"
-    checksum "$archive_name" > "$archive_name.sha256"
-  )
-  # The checksum of the executable itself, which is what a host pins.
-  (
-    cd "$staging_dir"
-    checksum "$binary_name"
-  ) > "$output_dir/${binary_name}-${version}-${target}.bin.sha256"
-  # The staging copy may be reused by name; keep one binary per iteration.
-  rm -f -- "$staging_dir/$binary_name"
-  echo "$output_dir/$archive_name"
-  echo "$output_dir/$archive_name.sha256"
-  echo "$output_dir/${binary_name}-${version}-${target}.bin.sha256"
-done
+archive_name="${binary_name}-${version}-${target}.tar.gz"
+tar -C "target/$target/release" -czf "$output_dir/$archive_name" "$binary_name"
+(
+  cd "$output_dir"
+  checksum "$archive_name" > "$archive_name.sha256"
+)
+echo "$output_dir/$archive_name"
+echo "$output_dir/$archive_name.sha256"
