@@ -50,6 +50,7 @@ pub(super) struct DaytonaRuntime {
     provider:     DaytonaProvider,
     descriptor:   Descriptor,
     runner_image: String,
+    target:       Option<String>,
     closed:       CancellationToken,
 }
 
@@ -113,6 +114,7 @@ impl DaytonaRuntime {
             runner_image: config
                 .runner_image
                 .unwrap_or_else(|| DEFAULT_RUNNER_IMAGE.to_owned()),
+            target: config.target,
             closed: CancellationToken::new(),
         })
     }
@@ -298,7 +300,9 @@ impl Provider for DaytonaRuntime {
         self.ensure_open()?;
         let WorkloadAdmission { spec, credentials } = admission;
         spec.validate_for(&self.descriptor)?;
-        let plan = spec::plan(&spec, &self.runner_image)?;
+        let mut plan = spec::plan(&spec, &self.runner_image)?;
+        // The sandbox and the snapshot it is built from share the region.
+        plan.legacy.region.clone_from(&self.target);
         let auth = runner::service_auth(&spec.services, &credentials)?;
         let provision = plan.nested.map(|nested| -> Provision {
             Box::new(move |handle| runner::provision(handle, nested, auth).boxed())
@@ -484,9 +488,13 @@ mod tests {
     }
 
     fn catalog(fake: &FakeDaytona, key: Option<&'static str>) -> Sandboxes {
+        catalog_with(&serde_json::json!({"api_url": fake.url()}), key)
+    }
+
+    fn catalog_with(config: &serde_json::Value, key: Option<&'static str>) -> Sandboxes {
         let entry: ProviderEntry = serde_json::from_value(serde_json::json!({
             "plugin": "daytona",
-            "config": {"api_url": fake.url()},
+            "config": config,
             "secrets": [API_KEY],
         }))
         .expect("valid entry");
@@ -759,6 +767,44 @@ mod tests {
             "nothing was started: {:?}",
             fake.requests()
         );
+    }
+
+    /// An entry's `target` is the region its sandboxes run in, so the
+    /// snapshot an image builds into is built there too, under a name of
+    /// its own: an entry in another region never reuses it.
+    #[tokio::test]
+    async fn an_image_snapshot_is_built_in_the_entrys_region() {
+        let fake = FakeDaytona::start(|_| {
+            Arc::new(|method, target| match (method, target) {
+                ("GET", target) if target.ends_with("/api-keys/current") => {
+                    Reply::Json(200, CURRENT_KEY.to_owned())
+                }
+                ("GET", target) if target.starts_with("/snapshots?") => Reply::Json(
+                    200,
+                    r#"{"items":[],"total":0,"page":1,"totalPages":1}"#.to_owned(),
+                ),
+                // Building the snapshot fails, which ends the create there.
+                _ => Reply::Json(500, r#"{"message":"unavailable"}"#.to_owned()),
+            })
+        })
+        .await;
+        for region in ["us", "eu"] {
+            let sandboxes = catalog_with(
+                &serde_json::json!({"api_url": fake.url(), "target": region}),
+                Some("test-key"),
+            );
+            let created = sandboxes.builder("cloud").await.unwrap().create().await;
+            assert!(created.is_err(), "the fake builds no snapshot");
+        }
+        let built: Vec<serde_json::Value> = fake
+            .bodies("POST /snapshots")
+            .iter()
+            .map(|body| serde_json::from_str(body).expect("snapshot request"))
+            .collect();
+        assert_eq!(built.len(), 2, "{built:?}");
+        assert_eq!(built[0]["regionId"], "us");
+        assert_eq!(built[1]["regionId"], "eu");
+        assert_ne!(built[0]["name"], built[1]["name"]);
     }
 
     /// A write longer than the upload limit is refused before anything is

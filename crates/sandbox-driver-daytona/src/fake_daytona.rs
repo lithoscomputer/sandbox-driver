@@ -42,6 +42,7 @@ pub(crate) fn sandbox_json(state: &str) -> String {
 pub(crate) struct FakeDaytona {
     address:     SocketAddr,
     requests:    Arc<StdMutex<Vec<String>>>,
+    bodies:      Arc<StdMutex<Vec<(String, String)>>>,
     hang_closed: Arc<Notify>,
 }
 
@@ -51,14 +52,17 @@ impl FakeDaytona {
         let address = listener.local_addr().expect("address");
         let script = script(address);
         let requests = Arc::new(StdMutex::new(Vec::new()));
+        let bodies = Arc::new(StdMutex::new(Vec::new()));
         let hang_closed = Arc::new(Notify::new());
         tokio::spawn({
             let requests = Arc::clone(&requests);
+            let bodies = Arc::clone(&bodies);
             let hang_closed = Arc::clone(&hang_closed);
             async move {
                 while let Ok((mut socket, _)) = listener.accept().await {
                     let script = Arc::clone(&script);
                     let requests = Arc::clone(&requests);
+                    let bodies = Arc::clone(&bodies);
                     let hang_closed = Arc::clone(&hang_closed);
                     tokio::spawn(async move {
                         let mut buffer = Vec::new();
@@ -91,11 +95,17 @@ impl FakeDaytona {
                                     Ok(read) => buffer.extend_from_slice(&chunk[..read]),
                                 }
                             }
+                            let body = String::from_utf8_lossy(
+                                &buffer[head_end..head_end + content_length],
+                            )
+                            .into_owned();
                             buffer.drain(..head_end + content_length);
-                            requests
+                            let request = format!("{method} {target}");
+                            bodies
                                 .lock()
-                                .expect("requests lock")
-                                .push(format!("{method} {target}"));
+                                .expect("bodies lock")
+                                .push((request.clone(), body));
+                            requests.lock().expect("requests lock").push(request);
                             match script(&method, &target) {
                                 Reply::Json(status, body) => {
                                     let reason = match status {
@@ -131,6 +141,7 @@ impl FakeDaytona {
         Self {
             address,
             requests,
+            bodies,
             hang_closed,
         }
     }
@@ -159,6 +170,18 @@ impl FakeDaytona {
 
     pub(crate) fn requests(&self) -> Vec<String> {
         self.requests.lock().expect("requests lock").clone()
+    }
+
+    /// The bodies of the requests whose `METHOD target` line starts with
+    /// `prefix`, in the order they arrived.
+    pub(crate) fn bodies(&self, prefix: &str) -> Vec<String> {
+        self.bodies
+            .lock()
+            .expect("bodies lock")
+            .iter()
+            .filter(|(request, _)| request.starts_with(prefix))
+            .map(|(_, body)| body.clone())
+            .collect()
     }
 
     pub(crate) fn deletes(&self) -> usize {

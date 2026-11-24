@@ -82,15 +82,17 @@ fn missing_permission_names(granted: &[Permissions]) -> Vec<String> {
 }
 
 /// The name of the snapshot an image or Dockerfile builds into, for the
-/// given resources and kind: `sandbox-driver-` and 32 hex digits of an
-/// HMAC over the inputs, keyed by the credential so a rotated key never
-/// collides with another tenant's snapshots. The manifest carries a
-/// version; changing it renames every existing snapshot.
+/// given resources, kind and region: `sandbox-driver-` and 32 hex digits
+/// of an HMAC over the inputs, keyed by the credential so a rotated key
+/// never collides with another tenant's snapshots. The manifest carries a
+/// version; changing it renames every existing snapshot. A region joins
+/// the manifest only when one is set, so names without one are unchanged.
 fn cached_snapshot_name(
     secret: &str,
     source: &SnapshotSource,
     resources: &Resources,
     kind: Option<SandboxKind>,
+    region: Option<&str>,
 ) -> String {
     use hmac::{Hmac, Mac};
     use sha2::{Digest, Sha256};
@@ -101,13 +103,16 @@ fn cached_snapshot_name(
         }
         _ => "other".to_owned(),
     };
-    let manifest = format!(
+    let mut manifest = format!(
         "sandbox-driver snapshot v1\n{kind:?}\n{source_line}\ncpu {:?}\nmemory_gb {:?}\ndisk_gb {:?}\ngpu {:?}\n",
         resources.cpu_cores,
         resources.memory_mb.map(gigabytes),
         resources.disk_mb.map(gigabytes),
         resources.gpus,
     );
+    if let Some(region) = region {
+        let _ = writeln!(manifest, "region {region}");
+    }
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
         .expect("HMAC-SHA256 accepts keys of any length");
     mac.update(manifest.as_bytes());
@@ -430,7 +435,13 @@ impl DaytonaProvider {
             .bearer_access_token
             .clone()
             .unwrap_or_default();
-        let name = cached_snapshot_name(&secret, &source, &spec.resources, spec.sandbox_kind);
+        let name = cached_snapshot_name(
+            &secret,
+            &source,
+            &spec.resources,
+            spec.sandbox_kind,
+            spec.region.as_deref(),
+        );
         let mut snapshot = SnapshotSpec::new(source).name(name);
         snapshot.sandbox_kind = spec.sandbox_kind.or(Some(SandboxKind::Container));
         snapshot.region.clone_from(&spec.region);
@@ -1310,33 +1321,43 @@ mod tests {
         let mut resources = Resources::default();
         resources.cpu_cores = Some(2);
         resources.memory_mb = Some(4096);
-        let name = cached_snapshot_name("key-a", &image, &resources, None);
+        let name = cached_snapshot_name("key-a", &image, &resources, None, None);
         assert!(name.starts_with("sandbox-driver-"), "{name}");
         assert_eq!(name.len(), "sandbox-driver-".len() + 32, "{name}");
         assert_eq!(
             name,
-            cached_snapshot_name("key-a", &image, &resources, None),
+            cached_snapshot_name("key-a", &image, &resources, None, None),
             "the same inputs name the same snapshot"
         );
         assert_ne!(
             name,
-            cached_snapshot_name("key-b", &image, &resources, None),
+            cached_snapshot_name("key-b", &image, &resources, None, None),
             "another credential never shares a name"
         );
         let mut larger = resources;
         larger.memory_mb = Some(8192);
-        assert_ne!(name, cached_snapshot_name("key-a", &image, &larger, None));
+        assert_ne!(
+            name,
+            cached_snapshot_name("key-a", &image, &larger, None, None)
+        );
         let dockerfile = SnapshotSource::Dockerfile {
             content: "FROM ubuntu:24.04".to_owned(),
         };
         assert_ne!(
             name,
-            cached_snapshot_name("key-a", &dockerfile, &resources, None)
+            cached_snapshot_name("key-a", &dockerfile, &resources, None, None)
         );
         // Sizing rounds to whole gigabytes, so two requests inside one
         // gigabyte share a snapshot.
         let mut rounded = resources;
         rounded.memory_mb = Some(3900);
-        assert_eq!(name, cached_snapshot_name("key-a", &image, &rounded, None));
+        assert_eq!(
+            name,
+            cached_snapshot_name("key-a", &image, &rounded, None, None)
+        );
+        // A snapshot is built in one region, so each region names its own.
+        let in_region = |region| cached_snapshot_name("key-a", &image, &resources, None, region);
+        assert_ne!(name, in_region(Some("eu")));
+        assert_ne!(in_region(Some("eu")), in_region(Some("us")));
     }
 }
