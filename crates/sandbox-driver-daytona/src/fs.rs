@@ -4,6 +4,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use daytona_sdk::{FileSystemService, SetFilePermissionsOptions};
+use reqwest::Method;
 use sandbox_driver::legacy::{
     BoundedBuffer, DEFAULT_BUFFER_BYTES, DirEntry, Error, FileKind, FileMetadata, Filesystem,
     ResourceKind, Result,
@@ -12,7 +13,7 @@ use tokio::fs as tokio_fs;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::OnceCell;
 
-use crate::sdk::{DaytonaClient, daytona_error, is_not_found};
+use crate::sdk::{self, DaytonaClient, daytona_error, is_not_found};
 use crate::{resolve_path, toolbox};
 
 /// Native filesystem access through the Daytona toolbox file API.
@@ -86,7 +87,6 @@ impl Filesystem for DaytonaFs {
         path: &str,
         output: &mut (dyn AsyncWrite + Unpin + Send),
     ) -> Result<()> {
-        let config = self.client.api_configuration();
         let endpoint = self
             .download_endpoint
             .get_or_try_init(|| async {
@@ -94,17 +94,8 @@ impl Filesystem for DaytonaFs {
                 Ok::<_, Error>(format!("{endpoint}/files/download"))
             })
             .await?;
-        let mut request = config
-            .client
-            .get(endpoint)
-            .query(&[("path", self.resolve(path))]);
-        if let Some(token) = &config.bearer_access_token {
-            request = request.bearer_auth(token);
-        }
-        if let Some(org) = self.client.organization_id() {
-            request = request.header("X-Daytona-Organization-ID", org);
-        }
-        let mut response = request
+        let mut response = sdk::request(&self.client, Method::GET, endpoint)
+            .query(&[("path", self.resolve(path))])
             .send()
             .await
             .map_err(|error| Error::io("requesting file download", io::Error::other(error)))?;

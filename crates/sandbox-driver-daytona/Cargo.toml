@@ -23,6 +23,7 @@ futures-util.workspace = true
 hmac.workspace = true
 rand.workspace = true
 reqwest.workspace = true
+reqwest-middleware.workspace = true
 sandbox-driver.workspace = true
 sandbox-driver-protocol = { path = "../sandbox-driver-protocol" }
 sandbox-driver-daytona-config.workspace = true

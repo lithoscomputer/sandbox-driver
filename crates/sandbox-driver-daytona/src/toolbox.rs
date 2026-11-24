@@ -8,7 +8,7 @@ use reqwest::Method;
 use sandbox_driver::legacy::{DEFAULT_BUFFER_BYTES, Error, Result};
 use serde_json::Value;
 
-use crate::sdk::{DaytonaClient, daytona_error};
+use crate::sdk::{self, DaytonaClient, daytona_error};
 
 /// The control-plane record for `sandbox_id`, the starting point for every
 /// toolbox service.
@@ -76,25 +76,14 @@ pub(crate) async fn request(
     url.path_segments_mut()
         .map_err(|()| Error::invalid_spec("toolbox", "invalid endpoint path"))?
         .extend(path);
-    let config = client.api_configuration();
-    let mut request = config
-        .client
-        .request(
-            if body.is_some() {
-                Method::POST
-            } else {
-                Method::GET
-            },
-            url,
-        )
+    let method = if body.is_some() {
+        Method::POST
+    } else {
+        Method::GET
+    };
+    let mut request = sdk::request(client, method, url)
         .header("Accept", "application/json, text/plain, */*")
         .header("X-Daytona-Split-Output", "true");
-    if let Some(token) = &config.bearer_access_token {
-        request = request.bearer_auth(token);
-    }
-    if let Some(org) = client.organization_id() {
-        request = request.header("X-Daytona-Organization-ID", org);
-    }
     if let Some(body) = body {
         request = request.json(&body);
     }

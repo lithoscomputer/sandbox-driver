@@ -43,6 +43,8 @@ struct EntryConfig {
     organization: Option<String>,
     target:       Option<String>,
     runner_image: Option<String>,
+    user_agent:   Option<String>,
+    direct:       bool,
 }
 
 pub(super) struct DaytonaRuntime {
@@ -87,14 +89,28 @@ impl DaytonaRuntime {
                 message: "a JWT credential needs an explicit organization".to_owned(),
             });
         }
+        // Otherwise the SDK builds its own client, which takes the system
+        // proxy settings.
+        let http_client = config
+            .direct
+            .then(|| reqwest::Client::builder().no_proxy().build())
+            .transpose()
+            .map_err(|error| Error::Transport {
+                message: format!("building a direct Daytona client: {error}"),
+                outcome: MutationOutcome::NotStarted,
+            })?;
         let sdk_config = DaytonaConfig {
             api_key,
             jwt_token,
             organization_id: config.organization.clone(),
             api_url: config.api_url.clone(),
             target: config.target.clone(),
-            user_agent: Some(format!("sandbox-driver/{}", env!("CARGO_PKG_VERSION"))),
-            ..DaytonaConfig::default()
+            http_client,
+            user_agent: Some(
+                config
+                    .user_agent
+                    .unwrap_or_else(|| format!("sandbox-driver/{}", env!("CARGO_PKG_VERSION"))),
+            ),
         };
         let provider = DaytonaProvider::connect_explicit(sdk_config)
             .await
@@ -484,9 +500,13 @@ mod tests {
     }
 
     fn catalog(fake: &FakeDaytona, key: Option<&'static str>) -> Sandboxes {
+        entry_catalog(&serde_json::json!({"api_url": fake.url()}), key)
+    }
+
+    fn entry_catalog(config: &serde_json::Value, key: Option<&'static str>) -> Sandboxes {
         let entry: ProviderEntry = serde_json::from_value(serde_json::json!({
             "plugin": "daytona",
-            "config": {"api_url": fake.url()},
+            "config": config,
             "secrets": [API_KEY],
         }))
         .expect("valid entry");
@@ -622,6 +642,52 @@ mod tests {
             "{:?}",
             fake.requests()
         );
+    }
+
+    /// Daytona attributes traffic by User-Agent, so an application that
+    /// names itself on its entry is who every request comes from: the
+    /// SDK's own requests and the provider's hand-built ones alike.
+    #[tokio::test]
+    async fn every_daytona_request_names_the_entrys_application() {
+        let default = format!("sandbox-driver/{}", env!("CARGO_PKG_VERSION"));
+        for (user_agent, expected) in [
+            (None, default.as_str()),
+            (Some("fabro-server/1.2.3"), "fabro-server/1.2.3"),
+        ] {
+            let fake = FakeDaytona::start(|_| {
+                Arc::new(|_, target: &str| {
+                    if target.ends_with("/api-keys/current") {
+                        Reply::Json(200, CURRENT_KEY.to_owned())
+                    } else {
+                        Reply::Json(200, started("2026-11-10T19:22:08.169Z"))
+                    }
+                })
+            })
+            .await;
+            let mut config = serde_json::json!({"api_url": fake.url()});
+            if let Some(user_agent) = user_agent {
+                config["user_agent"] = user_agent.into();
+            }
+            let sandboxes = entry_catalog(&config, Some("test-key"));
+
+            sandboxes
+                .provider("cloud")
+                .unwrap()
+                .describe()
+                .await
+                .unwrap();
+            sandboxes.attach(&reference("sb-1")).await.unwrap();
+
+            let user_agents = fake.user_agents();
+            assert!(user_agents.len() >= 2, "{:?}", fake.requests());
+            assert!(
+                user_agents
+                    .iter()
+                    .all(|seen| seen.as_deref() == Some(expected)),
+                "{user_agents:?} for {:?}",
+                fake.requests()
+            );
+        }
     }
 
     /// Daytona can stop and restart a sandbox in about a second and then

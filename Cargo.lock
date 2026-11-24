@@ -2236,6 +2236,7 @@ dependencies = [
  "hmac",
  "rand 0.10.2",
  "reqwest",
+ "reqwest-middleware",
  "sandbox-driver",
  "sandbox-driver-conformance",
  "sandbox-driver-daytona-config",

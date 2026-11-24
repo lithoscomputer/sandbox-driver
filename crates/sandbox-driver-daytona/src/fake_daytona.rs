@@ -42,6 +42,7 @@ pub(crate) fn sandbox_json(state: &str) -> String {
 pub(crate) struct FakeDaytona {
     address:     SocketAddr,
     requests:    Arc<StdMutex<Vec<String>>>,
+    user_agents: Arc<StdMutex<Vec<Option<String>>>>,
     hang_closed: Arc<Notify>,
 }
 
@@ -51,14 +52,17 @@ impl FakeDaytona {
         let address = listener.local_addr().expect("address");
         let script = script(address);
         let requests = Arc::new(StdMutex::new(Vec::new()));
+        let user_agents = Arc::new(StdMutex::new(Vec::new()));
         let hang_closed = Arc::new(Notify::new());
         tokio::spawn({
             let requests = Arc::clone(&requests);
+            let user_agents = Arc::clone(&user_agents);
             let hang_closed = Arc::clone(&hang_closed);
             async move {
                 while let Ok((mut socket, _)) = listener.accept().await {
                     let script = Arc::clone(&script);
                     let requests = Arc::clone(&requests);
+                    let user_agents = Arc::clone(&user_agents);
                     let hang_closed = Arc::clone(&hang_closed);
                     tokio::spawn(async move {
                         let mut buffer = Vec::new();
@@ -80,11 +84,21 @@ impl FakeDaytona {
                             let mut request_line = lines.next().unwrap_or_default().split(' ');
                             let method = request_line.next().unwrap_or_default().to_owned();
                             let target = request_line.next().unwrap_or_default().to_owned();
-                            let content_length = lines
-                                .filter_map(|line| line.split_once(':'))
-                                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                            let headers: Vec<_> =
+                                lines.filter_map(|line| line.split_once(':')).collect();
+                            let header = |wanted: &str| {
+                                headers
+                                    .iter()
+                                    .find(|(name, _)| name.eq_ignore_ascii_case(wanted))
+                                    .map(|(_, value)| value.trim().to_owned())
+                            };
+                            let content_length = header("content-length")
+                                .and_then(|value| value.parse::<usize>().ok())
                                 .unwrap_or(0);
+                            user_agents
+                                .lock()
+                                .expect("user agents lock")
+                                .push(header("user-agent"));
                             while buffer.len() < head_end + content_length {
                                 match socket.read(&mut chunk).await {
                                     Ok(0) | Err(_) => return,
@@ -131,6 +145,7 @@ impl FakeDaytona {
         Self {
             address,
             requests,
+            user_agents,
             hang_closed,
         }
     }
@@ -159,6 +174,11 @@ impl FakeDaytona {
 
     pub(crate) fn requests(&self) -> Vec<String> {
         self.requests.lock().expect("requests lock").clone()
+    }
+
+    /// The `User-Agent` of every request so far, in arrival order.
+    pub(crate) fn user_agents(&self) -> Vec<Option<String>> {
+        self.user_agents.lock().expect("user agents lock").clone()
     }
 
     pub(crate) fn deletes(&self) -> usize {
