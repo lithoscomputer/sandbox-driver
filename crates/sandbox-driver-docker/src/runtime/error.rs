@@ -48,6 +48,19 @@ fn from_provider(provider: ProviderError) -> ContractError {
     let message = provider.to_string();
     match provider.code.as_deref() {
         Some("busy") => return ContractError::Busy { message },
+        Some("already_exists") => {
+            let field = |key: &str| {
+                provider
+                    .detail
+                    .as_ref()
+                    .and_then(|detail| detail.get(key))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            };
+            if let (Some(name), Some(id)) = (field("name"), field("id")) {
+                return ContractError::AlreadyExists { name, id };
+            }
+        }
         Some("fence_leaked") => return ContractError::FenceLeaked { message },
         Some("incomplete_cleanup") => {
             let remaining = provider
