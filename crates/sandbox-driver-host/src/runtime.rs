@@ -406,6 +406,7 @@ impl Sandbox for HostSandbox {
         let program = argv.next().expect("validated argv");
         let mut legacy = legacy::ExecSpec::new(program).args(argv);
         legacy.timeout = spec.timeout_ms.map(Duration::from_millis);
+        legacy.stop_grace = spec.stop_grace_ms.map(Duration::from_millis);
         legacy.working_dir = spec.working_directory;
         legacy.env = spec.env;
         let sink = controls.sink.map(|sink| {

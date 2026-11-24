@@ -4,18 +4,18 @@
 //! only on completion, so streaming, cancellation, and
 //! partial-output-on-timeout all ride on command sessions instead: the
 //! command runs asynchronously inside a dedicated session, logs follow
-//! over a live stream with server-side stdout/stderr separation, and
-//! deleting the session kills the command. Ported from fabro's
-//! session transport.
+//! over a live stream with server-side stdout/stderr separation, a term
+//! sends SIGTERM to the command's process group, and deleting the
+//! session kills the command. Ported from fabro's session transport.
 
-use std::future::{Future, pending};
+use std::future::pending;
 use std::time::Duration;
-use std::{mem, process};
+use std::{io, mem, process};
 
 use daytona_sdk::{
     ProcessService, Sandbox as SdkSandbox, SessionCommandLogsResult, SessionExecuteResult,
 };
-use sandbox_driver::legacy::{Error, OutputCaptureBuffer, Result, StopLevel, Termination};
+use sandbox_driver::legacy::{Error, OutputCaptureBuffer, Result, Termination, stop_signal};
 use tokio::runtime::Handle;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
@@ -67,17 +67,19 @@ impl Session {
     }
 
     /// Creates a session and starts `command` in it, as one quoted
-    /// `/bin/bash -c` that pins `cwd` and blanks `BASH_ENV`. A session
-    /// whose command fails to start is closed before the error returns,
-    /// so the caller never holds a session with nothing running in it.
+    /// `/bin/bash -c` that pins `cwd`, blanks `BASH_ENV`, and runs the
+    /// command in its own process group for [`Session::terminate`]. A
+    /// session whose command fails to start is closed before the error
+    /// returns, so the caller never holds a session with nothing running
+    /// in it.
     pub(crate) async fn start_command(
         client: &DaytonaClient,
         sandbox: &SdkSandbox,
         cwd: &str,
         command: &str,
     ) -> Result<(Self, SessionExecuteResult)> {
-        let program = wrap_session_script(&build_session_script(cwd, command));
         let mut session = Self::create(client, sandbox).await?;
+        let program = wrap_session_script(&build_session_script(cwd, &session.pid_file(), command));
         match session.execute(&program).await {
             Ok(started) => Ok((session, started)),
             Err(error) => {
@@ -89,6 +91,52 @@ impl Session {
 
     pub(crate) fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Where the session script records its command's process group.
+    fn pid_file(&self) -> String {
+        format!("/tmp/.{}.pid", self.id)
+    }
+
+    /// Sends SIGTERM to the command's process group, once, through a
+    /// second toolbox command; the command keeps running until it exits
+    /// or the session is deleted. A command that has not recorded its
+    /// group yet gets a moment to; one that has already ended is left
+    /// alone. Only a refused request is an error.
+    pub(crate) async fn terminate(&self) -> Result<()> {
+        let (client, endpoint) = self
+            .logs
+            .as_ref()
+            .filter(|_| self.process.is_some())
+            .ok_or_else(|| Error::invalid_spec("session", "command session is closed"))?;
+        let script = format!(
+            "pid_file={}; tries=0; \
+             while [ ! -s \"$pid_file\" ] && [ \"$tries\" -lt 20 ]; do sleep 0.1; tries=$((tries + 1)); done; \
+             if [ -s \"$pid_file\" ]; then kill -TERM \"-$(cat \"$pid_file\")\" 2>/dev/null; fi; exit 0",
+            shell_quote(&self.pid_file())
+        );
+        let request = toolbox::request(
+            client,
+            endpoint,
+            &["process", "execute"],
+            Some(serde_json::json!({"command": script, "timeout": CLEANUP_TIMEOUT.as_secs()})),
+        );
+        let status = match time::timeout(CLEANUP_TIMEOUT, request).await {
+            Ok(response) => response?.0,
+            Err(_) => {
+                return Err(Error::io(
+                    "terminating session command",
+                    io::Error::other("request timed out"),
+                ));
+            }
+        };
+        if !(200..300).contains(&status) {
+            return Err(Error::io(
+                "terminating session command",
+                io::Error::other(format!("HTTP {status}")),
+            ));
+        }
+        Ok(())
     }
 
     fn service(&self) -> Result<&ProcessService> {
@@ -195,14 +243,25 @@ impl Drop for Session {
 /// Bash source run inside the session's `/bin/bash -c`: pin the working
 /// directory, blank `BASH_ENV` (sandbox-level hygiene; the command's own
 /// env comes with it, see [`crate::shell::exec_line`]), then run the
-/// command in a subshell so its exit status is the script's.
-fn build_session_script(cwd: &str, command: &str) -> String {
+/// command in a subshell so its exit status is the script's. Job control
+/// gives the subshell its own process group, recorded in `pid_file`, so a
+/// term signals the command and leaves this script to report its status.
+fn build_session_script(cwd: &str, pid_file: &str, command: &str) -> String {
     [
         format!("cd {} || exit $?", shell_quote(cwd)),
         "export BASH_ENV=''".to_owned(),
+        format!("pid_file={}", shell_quote(pid_file)),
+        "set -m".to_owned(),
         "(".to_owned(),
         command.to_owned(),
-        ")".to_owned(),
+        ") &".to_owned(),
+        "child=$!".to_owned(),
+        "set +m".to_owned(),
+        "printf '%s' \"$child\" > \"$pid_file\"".to_owned(),
+        "wait \"$child\"".to_owned(),
+        "status=$?".to_owned(),
+        "rm -f \"$pid_file\"".to_owned(),
+        "exit \"$status\"".to_owned(),
     ]
     .join("\n")
 }
@@ -276,18 +335,20 @@ pub(crate) struct WaitOutcome {
     pub final_logs:  Option<SessionCommandLogsResult>,
 }
 
-/// Polls the command until it exits, the deadline passes, the caller's
-/// stop request resolves, or the sink-failure token fires (a failing
-/// sink cancels the execution). The toolbox cannot signal a process, so
-/// either stop level ends the command the same way (the session is
-/// deleted) and the outcome reports the level the caller asked for. The
-/// caller owns the log-stream task and the session close.
+/// Polls the command until it exits, the deadline passes, `kill` fires,
+/// or the sink-failure token fires (a failing sink cancels the
+/// execution). `term` sends SIGTERM to the command once and the poll
+/// goes on: a command that then exits reports `Cancelled`, and one that
+/// ignores it runs until `kill` or the deadline, which end it by deleting
+/// the session. The caller owns the log-stream task and the session
+/// close.
 pub(crate) async fn wait_for_completion(
     session: &Session,
     command_id: &str,
     initial_exit_code: Option<i32>,
     timeout: Option<Duration>,
-    stop_requested: impl Future<Output = StopLevel>,
+    term: Option<&CancellationToken>,
+    kill: Option<&CancellationToken>,
     sink_failed: CancellationToken,
 ) -> Result<WaitOutcome> {
     if let Some(code) = initial_exit_code {
@@ -303,15 +364,38 @@ pub(crate) async fn wait_for_completion(
             None => pending().await,
         }
     };
-    tokio::pin!(deadline, stop_requested);
+    tokio::pin!(deadline);
+    let mut termed = false;
     loop {
         tokio::select! {
+            biased;
+            () = stop_signal(kill) => {
+                return Ok(WaitOutcome {
+                    exit_code:   None,
+                    termination: Termination::Killed,
+                    final_logs:  session.fetch_logs(command_id).await,
+                });
+            }
+            () = stop_signal(term), if !termed => {
+                session.terminate().await?;
+                termed = true;
+            }
             () = time::sleep(STATUS_POLL) => {
                 if let Some(code) = session.exit_code(command_id).await? {
-                    return Ok(WaitOutcome {
-                        exit_code:   Some(code),
-                        termination: Termination::Exited,
-                        final_logs:  None,
+                    // A command that exited after the term was stopped by
+                    // it; its logs are fetched before the session goes.
+                    return Ok(if termed {
+                        WaitOutcome {
+                            exit_code:   Some(code),
+                            termination: Termination::Cancelled,
+                            final_logs:  session.fetch_logs(command_id).await,
+                        }
+                    } else {
+                        WaitOutcome {
+                            exit_code:   Some(code),
+                            termination: Termination::Exited,
+                            final_logs:  None,
+                        }
                     });
                 }
             }
@@ -319,13 +403,6 @@ pub(crate) async fn wait_for_completion(
                 return Ok(WaitOutcome {
                     exit_code:   None,
                     termination: Termination::TimedOut,
-                    final_logs:  session.fetch_logs(command_id).await,
-                });
-            }
-            level = &mut stop_requested => {
-                return Ok(WaitOutcome {
-                    exit_code:   None,
-                    termination: level.termination(),
                     final_logs:  session.fetch_logs(command_id).await,
                 });
             }

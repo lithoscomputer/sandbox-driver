@@ -606,6 +606,7 @@ impl Sandbox for DockerContractSandbox {
         if let Some(ms) = spec.timeout_ms {
             legacy_spec = legacy_spec.timeout(Duration::from_millis(ms));
         }
+        legacy_spec.stop_grace = spec.stop_grace_ms.map(Duration::from_millis);
         if let Some(directory) = &spec.working_directory {
             legacy_spec = legacy_spec.working_dir(directory.as_str());
         }

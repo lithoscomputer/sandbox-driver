@@ -374,7 +374,6 @@ const CHECKS: &[(&str, CheckFn)] = checks![
     exec_stop::exec_term_terminates,
     exec_stop::exec_kill_terminates,
     exec_stop::exec_term_does_not_escalate,
-    exec_stop::exec_stop_grace_escalates_a_timeout,
     exec_stop::exec_stop_grace_escalates_a_term,
     exec::exec_reports_a_foreign_signal,
     exec::exec_reports_environment,

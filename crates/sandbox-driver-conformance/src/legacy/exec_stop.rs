@@ -133,56 +133,6 @@ pub(super) async fn exec_term_does_not_escalate(ctx: &Conformance) -> CheckOutco
     .await
 }
 
-/// With a stop grace, the provider's own timeout runs the ladder: TERM
-/// first, then KILL once the grace has passed. A command that traps TERM
-/// therefore lives through the grace and ends on the KILL, and the
-/// result still says it timed out. A provider that cannot deliver a
-/// signal ends the command on the TERM; that is honest too.
-pub(super) async fn exec_stop_grace_escalates_a_timeout(ctx: &Conformance) -> CheckOutcome {
-    ctx.require(Capability::ExecStop)?;
-    ctx.with_ready(|sandbox| async move {
-        let started = Instant::now();
-        let spec = ExecSpec::bash("trap '' TERM; sleep 300")
-            .timeout(Duration::from_secs(2))
-            .stop_grace(Duration::from_secs(3));
-        let result = sandbox
-            .exec()
-            .run_streaming(&spec, ExecControls::buffered())
-            .await
-            .map_err(|error| format!("exec failed: {error}"))?;
-        if result.result.termination != Termination::TimedOut {
-            return fail(format!(
-                "expected TimedOut, got {:?}",
-                result.result.termination
-            ));
-        }
-        match result.result.signal {
-            Some(SIGKILL) => {
-                if started.elapsed() < Duration::from_secs(5) {
-                    return fail(format!(
-                        "the command was killed {:?} after start, before the grace passed",
-                        started.elapsed()
-                    ));
-                }
-            }
-            None => {
-                // A provider without signal delivery ended it on the TERM.
-            }
-            Some(signal) => {
-                return fail(format!(
-                    "expected signal {SIGKILL} after the grace, got {signal} (code {:?})",
-                    result.result.exit_code
-                ));
-            }
-        }
-        if started.elapsed() > Duration::from_secs(60) {
-            return fail("graceful timeout enforcement took over a minute");
-        }
-        PASS
-    })
-    .await
-}
-
 /// With a stop grace, a caller's `term` is the first rung of the ladder:
 /// the provider KILLs on its own once the grace has passed, with no
 /// caller `kill`, and the result names the kill.

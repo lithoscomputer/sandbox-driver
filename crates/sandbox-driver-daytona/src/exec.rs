@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,8 +8,8 @@ use daytona_sdk::{DaytonaError, FileSystemService, ProcessService, SessionComman
 use sandbox_driver::legacy;
 use sandbox_driver::legacy::{
     Error, Exec, ExecControls, ExecResult, ExecSpec, ExecStreamingResult, IncompleteOperation,
-    OutputCaptureBuffer, OutputSink, OutputStream, Result, SpawnSpec, StdioProcess, StopLevel,
-    Termination, run_with_stop_grace,
+    OutputCaptureBuffer, OutputSink, OutputStream, Result, SpawnSpec, StdioProcess, Termination,
+    run_with_stop_grace,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -180,8 +179,9 @@ impl Exec for DaytonaExec {
 /// after completion (`streams_separated: false`, `live_streaming:
 /// false`, stderr empty) at one API call. A run with a sink or stop
 /// token uses a command session instead: logs stream live with
-/// server-side stdout/stderr separation, stops and timeouts kill the
-/// command by deleting its session, and partial output survives a
+/// server-side stdout/stderr separation, a term sends SIGTERM to the
+/// command's process group, a kill or timeout ends the command by
+/// deleting its session, and partial output survives a
 /// timeout via a final log fetch. The toolbox takes a shell
 /// string on both transports, so the spec's environment, program, and
 /// arguments are quoted into one `exec env …` word list — the quoting
@@ -281,9 +281,8 @@ impl DaytonaTransport {
         // Sessions cost three extra API calls, so plain buffered runs —
         // every derived fs/search/git operation — keep the one-shot
         // endpoint; only streamed stdin, a sink, or a stop token needs the
-        // session transport. Daytona ends a command by deleting its session,
-        // which is one stop level: a term and a kill end the command the
-        // same way, and the result reports whichever was asked for.
+        // session transport, which signals the command on a term and
+        // deletes its session on a kill.
         if controls.stdin.is_some()
             || controls.sink.is_some()
             || controls.term.is_some()
@@ -416,7 +415,10 @@ impl DaytonaTransport {
     ) -> Result<ExecStreamingResult> {
         let started = Instant::now();
         let mut run = SessionRun::start(self, spec, &controls).await?;
-        let outcome = match run.wait(spec.timeout, controls.stop_requested()).await {
+        let outcome = match run
+            .wait(spec.timeout, controls.term.as_ref(), controls.kill.as_ref())
+            .await
+        {
             Ok(outcome) => outcome,
             Err(error) => return Err(run.abort(error).await),
         };
@@ -536,14 +538,16 @@ impl SessionRun {
     async fn wait(
         &mut self,
         timeout: Option<Duration>,
-        stop_requested: impl Future<Output = StopLevel>,
+        term: Option<&CancellationToken>,
+        kill: Option<&CancellationToken>,
     ) -> Result<WaitOutcome> {
         let completion = wait_for_completion(
             &self.session,
             &self.command_id,
             self.initial_exit_code,
             timeout,
-            stop_requested,
+            term,
+            kill,
             self.sink_failed.clone(),
         );
         tokio::select! {
@@ -845,6 +849,7 @@ impl SessionOutput {
 mod tests {
     use std::net::SocketAddr;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
     use crate::fake_daytona::{FakeDaytona, Reply, Script, sandbox_json};
@@ -967,6 +972,86 @@ mod tests {
                 _ => Reply::Json(404, "{}".to_owned()),
             })
         }
+    }
+
+    /// A running command whose TERM arrives as a toolbox command; with
+    /// `exits_on_term` it exits once that command has run, otherwise it
+    /// runs until its session is deleted.
+    fn signalled(exits_on_term: bool) -> impl FnOnce(SocketAddr) -> Script {
+        move |address| {
+            let running = script(None, false, 200)(address);
+            let termed = AtomicBool::new(false);
+            Arc::new(move |method: &str, target: &str| match (method, target) {
+                ("POST", "/toolbox/sb-1/process/execute") => {
+                    termed.store(true, Ordering::SeqCst);
+                    Reply::Json(200, r#"{"exitCode":0,"result":""}"#.to_owned())
+                }
+                ("GET", target)
+                    if exits_on_term
+                        && termed.load(Ordering::SeqCst)
+                        && target.ends_with("/command/cmd-1") =>
+                {
+                    Reply::Json(
+                        200,
+                        r#"{"command":"true","id":"cmd-1","exitCode":0}"#.to_owned(),
+                    )
+                }
+                _ => running(method, target),
+            })
+        }
+    }
+
+    /// Runs `sleep 60` under `timeout` and `grace` against `fake`, and
+    /// checks that the command was signalled once before its session was
+    /// deleted once.
+    async fn run_signalled(
+        fake: &FakeDaytona,
+        timeout: Duration,
+        grace: Duration,
+    ) -> ExecStreamingResult {
+        let spec = ExecSpec::new("sleep")
+            .arg("60")
+            .timeout(timeout)
+            .stop_grace(grace);
+        let result = fake
+            .transport()
+            .await
+            .run_streaming(&spec, ExecControls::buffered())
+            .await
+            .expect("the command stopped");
+        let stops: Vec<String> = fake
+            .requests()
+            .into_iter()
+            .filter(|request| {
+                request.ends_with("/process/execute") || request.starts_with("DELETE ")
+            })
+            .collect();
+        assert_eq!(stops.len(), 2, "{stops:?}");
+        assert_eq!(stops[0], "POST /toolbox/sb-1/process/execute");
+        assert!(
+            stops[1].starts_with("DELETE /toolbox/sb-1/process/session/"),
+            "{stops:?}"
+        );
+        result
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_command_that_exits_on_term_is_not_held_for_its_grace() {
+        let fake = FakeDaytona::start(signalled(true)).await;
+        let started = Instant::now();
+        let result =
+            run_signalled(&fake, Duration::from_millis(200), Duration::from_secs(30)).await;
+        assert_eq!(result.result.termination, Termination::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_command_that_ignores_term_is_killed_after_its_grace() {
+        let fake = FakeDaytona::start(signalled(false)).await;
+        let started = Instant::now();
+        let result = run_signalled(&fake, Duration::from_millis(200), Duration::from_secs(1)).await;
+        assert_eq!(result.result.termination, Termination::TimedOut);
+        assert!(started.elapsed() >= Duration::from_millis(1200));
     }
 
     /// Buffered capture with a kill token, so the run takes the session

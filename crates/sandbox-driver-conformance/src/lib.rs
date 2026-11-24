@@ -7,11 +7,11 @@
 use std::future;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sandbox_driver::{
     AccessScope, Error, ExecControls, ExecSpec, FileRange, LabelFilter, MutationOutcome,
-    OutputSink, Sandbox, SandboxRef, SandboxState, Sandboxes, Termination, run_bash,
+    OutputSink, Sandbox, SandboxRef, SandboxState, Sandboxes, Termination, run_bash, run_captured,
 };
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
@@ -59,6 +59,7 @@ enum Scenario<'a> {
     Files,
     Exec,
     Bash,
+    GracefulTimeout,
     /// Stops the sandbox through a handle attached from this catalog.
     Fence(&'a Sandboxes),
 }
@@ -88,10 +89,11 @@ impl Conformance {
         self
     }
 
-    /// Declares that the environment's workload provides Bash, which adds a
-    /// check that the provider carries a Bash spec's argv intact, keeps
-    /// stdout and stderr apart, and reports the script's exit code. The exec
-    /// contract itself assumes no shell, so the check is opt-in.
+    /// Declares that the environment's workload provides Bash, which adds
+    /// checks that the provider carries a Bash spec's argv intact, keeps
+    /// stdout and stderr apart, and reports the script's exit code, and
+    /// that a timeout with a stop grace sends TERM before KILL. The exec
+    /// contract itself assumes no shell, so the checks are opt-in.
     #[must_use]
     pub fn with_bash(mut self) -> Self {
         self.bash = true;
@@ -111,6 +113,7 @@ impl Conformance {
         ];
         if self.bash {
             scenarios.push(("captured_bash", Scenario::Bash));
+            scenarios.push(("graceful_timeout", Scenario::GracefulTimeout));
         }
         if let Some(peer) = &self.peer {
             scenarios.push(("cross_instance_stop_fence", Scenario::Fence(peer)));
@@ -133,6 +136,7 @@ impl Conformance {
                     Scenario::Files => Self::files(sandbox).await,
                     Scenario::Exec => self.exec(sandbox).await,
                     Scenario::Bash => Self::bash(sandbox).await,
+                    Scenario::GracefulTimeout => Self::graceful_timeout(sandbox).await,
                     Scenario::Fence(catalog) => self.fence_with(sandbox, catalog).await,
                 }
             };
@@ -289,6 +293,43 @@ impl Conformance {
         require(
             captured.stderr.bytes == b"to stderr",
             "bash stderr differed",
+        )
+    }
+    /// A timeout with a stop grace sends TERM first: a command that traps
+    /// it exits cleanly, without waiting out the grace, and one that
+    /// ignores it is killed once the grace has passed. Both report that
+    /// they timed out.
+    async fn graceful_timeout(sandbox: &dyn Sandbox) -> CheckOutcome {
+        let mut honours =
+            ExecSpec::bash("trap 'echo stopped; exit 0' TERM; echo started; sleep 300 & wait");
+        honours.timeout_ms = Some(1_000);
+        honours.stop_grace_ms = Some(20_000);
+        let started = Instant::now();
+        let captured = run_captured(sandbox, honours).await?;
+        require(
+            captured.outcome.termination == Termination::TimedOut,
+            "a command that exited on TERM did not report its timeout",
+        )?;
+        require(
+            captured.stdout.bytes == b"started\nstopped\n",
+            "the command's TERM trap did not run",
+        )?;
+        require(
+            started.elapsed() < Duration::from_secs(15),
+            "a command that exited on TERM waited out the grace",
+        )?;
+        let mut ignores = ExecSpec::bash("trap '' TERM; sleep 300");
+        ignores.timeout_ms = Some(500);
+        ignores.stop_grace_ms = Some(2_000);
+        let started = Instant::now();
+        let outcome = run_captured(sandbox, ignores).await?.outcome;
+        require(
+            outcome.termination == Termination::TimedOut,
+            "a command killed after its grace did not report its timeout",
+        )?;
+        require(
+            started.elapsed() >= Duration::from_millis(2_500),
+            "the command was killed before its grace passed",
         )
     }
     async fn fence_with(&self, sandbox: &dyn Sandbox, catalog: &Sandboxes) -> CheckOutcome {
